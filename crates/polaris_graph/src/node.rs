@@ -4,10 +4,12 @@
 //! or control flow decisions.
 
 use crate::predicate::BoxedPredicate;
-use core::any::TypeId;
-use core::fmt;
+use polaris_system::plugin::{IntoScheduleIds, ScheduleId};
 use polaris_system::resource::LocalResource;
-use polaris_system::system::{BoxedSystem, ErasedSystem};
+use polaris_system::system::{BoxedSystem, ErasedSystem, IntoSystem};
+use std::any::TypeId;
+use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Unique identifier for a node in the graph.
@@ -116,6 +118,10 @@ pub struct SystemNode {
     /// Optional timeout for this system's execution.
     /// If set and exceeded, the executor will follow any timeout edge if present.
     pub timeout: Option<core::time::Duration>,
+    /// Custom schedules attached to this system node.
+    /// System lifecycle events are re-emitted on these schedules,
+    /// allowing hooks to subscribe to events for this system only.
+    pub schedules: Vec<ScheduleId>,
 }
 
 impl SystemNode {
@@ -126,6 +132,7 @@ impl SystemNode {
             id: NodeId::new(),
             system: Box::new(system),
             timeout: None,
+            schedules: Vec::new(),
         }
     }
 
@@ -136,6 +143,7 @@ impl SystemNode {
             id: NodeId::new(),
             system,
             timeout: None,
+            schedules: Vec::new(),
         }
     }
 
@@ -143,6 +151,13 @@ impl SystemNode {
     #[must_use]
     pub fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the custom schedules for this system node.
+    #[must_use]
+    pub fn with_schedules(mut self, schedules: Vec<ScheduleId>) -> Self {
+        self.schedules = schedules;
         self
     }
 
@@ -171,6 +186,7 @@ impl fmt::Debug for SystemNode {
             .field("id", &self.id)
             .field("name", &self.name())
             .field("output_type", &self.output_type_name())
+            .field("schedules", &self.schedules)
             .finish()
     }
 }
@@ -411,9 +427,50 @@ impl JoinNode {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// IntoSystemNode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Converts a type into the components needed for a [`SystemNode`].
+///
+/// Enables `add_system` to accept both bare systems and
+/// `(custom_schedules, system)` tuples.
+pub trait IntoSystemNode<Marker> {
+    /// Converts into a boxed system and its custom schedules.
+    fn into_system_node(self) -> (BoxedSystem, Vec<ScheduleId>);
+}
+
+/// Marker for bare system nodes.
+pub struct NodeMarker<M>(PhantomData<M>);
+
+/// Marker for system nodes with custom schedules attached.
+pub struct ScheduledNodeMarker<M>(PhantomData<M>);
+
+impl<S, M> IntoSystemNode<NodeMarker<M>> for S
+where
+    S: IntoSystem<M>,
+    S::System: 'static,
+{
+    fn into_system_node(self) -> (BoxedSystem, Vec<ScheduleId>) {
+        (Box::new(self.into_system()), Vec::new())
+    }
+}
+
+impl<Sch, S, M> IntoSystemNode<ScheduledNodeMarker<M>> for (Sch, S)
+where
+    Sch: IntoScheduleIds,
+    S: IntoSystem<M>,
+    S::System: 'static,
+{
+    fn into_system_node(self) -> (BoxedSystem, Vec<ScheduleId>) {
+        (Box::new(self.1.into_system()), Sch::schedule_ids())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polaris_system::plugin::Schedule;
     use polaris_system::system::IntoSystem;
 
     // Test system functions
@@ -460,5 +517,43 @@ mod tests {
 
         assert_eq!(node.output_type_id(), TypeId::of::<i32>());
         assert!(node.output_type_name().contains("i32"));
+    }
+
+    struct MarkerA;
+    impl Schedule for MarkerA {}
+
+    struct MarkerB;
+    impl Schedule for MarkerB {}
+
+    #[test]
+    fn into_system_node_bare() {
+        let (_, schedules) = sys_fn.into_system_node();
+        assert!(schedules.is_empty());
+    }
+
+    #[test]
+    fn into_system_node_single_schedule() {
+        let (_, schedules) = (MarkerA, sys_fn).into_system_node();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0], ScheduleId::of::<MarkerA>());
+    }
+
+    #[test]
+    fn into_system_node_multi_schedules() {
+        let (_, schedules) = ((MarkerA, MarkerB), sys_fn).into_system_node();
+        assert_eq!(schedules.len(), 2);
+        assert_eq!(schedules[0], ScheduleId::of::<MarkerA>());
+        assert_eq!(schedules[1], ScheduleId::of::<MarkerB>());
+    }
+
+    #[test]
+    fn system_node_with_schedules() {
+        let node = SystemNode::new(sys_fn.into_system()).with_schedules(vec![
+            ScheduleId::of::<MarkerA>(),
+            ScheduleId::of::<MarkerB>(),
+        ]);
+        assert_eq!(node.schedules.len(), 2);
+        assert_eq!(node.schedules[0], ScheduleId::of::<MarkerA>());
+        assert_eq!(node.schedules[1], ScheduleId::of::<MarkerB>());
     }
 }

@@ -273,10 +273,12 @@ pub trait Plugin: Send + Sync + 'static {
     /// # Example
     ///
     /// ```
-    /// # use polaris_system::plugin::{Plugin, ScheduleId, Version};
+    /// # use polaris_system::plugin::{Plugin, Schedule, ScheduleId, Version};
     /// # use polaris_system::server::Server;
     /// # pub struct PostAgentRun;
+    /// # impl Schedule for PostAgentRun {}
     /// # pub struct PreTurn;
+    /// # impl Schedule for PreTurn {}
     /// struct MetricsPlugin;
     ///
     /// impl Plugin for MetricsPlugin {

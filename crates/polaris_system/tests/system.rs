@@ -621,6 +621,9 @@ fn context_with_both_global_and_local() {
 struct TestScheduleA;
 struct TestScheduleB;
 
+impl Schedule for TestScheduleA {}
+impl Schedule for TestScheduleB {}
+
 #[test]
 fn plugin_registers_for_schedule_gets_ticked() {
     use core::sync::atomic::{AtomicUsize, Ordering};

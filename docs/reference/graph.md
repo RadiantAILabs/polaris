@@ -210,6 +210,25 @@ Each hook is registered against one or more schedule types. The executor invokes
 
 When multiple hooks are registered for the same schedule, they execute in registration order, and each hook sees context changes made by previous hooks.
 
+### Custom System Schedules
+
+System nodes can be tagged with custom schedules. When the executor runs a tagged system, it re-emits the standard system lifecycle events (`SystemStart`, `SystemComplete`, `SystemError`) on each custom schedule in addition to the built-in schedules. This allows hooks to subscribe to lifecycle events for specific systems rather than all systems.
+
+Define a custom schedule by implementing `Schedule`, then attach it when adding the system to the graph:
+
+```rust
+struct OnToolCall;
+impl Schedule for OnToolCall {}
+
+graph.add_system((OnToolCall, execute_tool));
+```
+
+Multiple custom schedules can be attached using a tuple:
+
+```rust
+graph.add_system(((OnToolCall, OnExpensiveOp), execute_tool));
+```
+
 ### DevToolsPlugin
 
 `DevToolsPlugin` demonstrates provider hooks. It registers a hook on `OnSystemStart` that injects `SystemInfo` into the context before each system executes. Systems can then access the current node ID and system name via `Res<SystemInfo>`:

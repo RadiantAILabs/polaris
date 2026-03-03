@@ -25,10 +25,11 @@ use variadics_please::all_tuples;
 /// # Example
 ///
 /// ```
-/// # use polaris_system::plugin::{Plugin, PluginId, Version, ScheduleId};
+/// # use polaris_system::plugin::{Plugin, PluginId, Schedule, Version, ScheduleId};
 /// # use polaris_system::server::Server;
 /// // Layer 2 defines a schedule marker type
 /// pub struct PostAgentRun;
+/// impl Schedule for PostAgentRun {}
 ///
 /// // Layer 3 plugin subscribes to it
 /// # struct MetricsPlugin;
@@ -59,15 +60,16 @@ impl ScheduleId {
     /// # Example
     ///
     /// ```
-    /// # use polaris_system::plugin::ScheduleId;
+    /// # use polaris_system::plugin::{Schedule, ScheduleId};
     /// // Define a schedule marker type
     /// pub struct PostAgentRun;
+    /// impl Schedule for PostAgentRun {}
     ///
     /// // Create an identifier for it
     /// let schedule = ScheduleId::of::<PostAgentRun>();
     /// ```
     #[must_use]
-    pub fn of<S: 'static>() -> Self {
+    pub fn of<S: Schedule + 'static>() -> Self {
         Self {
             type_id: TypeId::of::<S>(),
             type_name: core::any::type_name::<S>(),
@@ -93,13 +95,18 @@ impl ScheduleId {
 
 /// Marker trait for schedule types.
 ///
-/// Implemented by Layer 2 for lifecycle markers (e.g. `OnGraphStart`,
-/// `OnSystemComplete`). The trait carries no methods; it exists so that
-/// [`IntoScheduleIds`] can accept schedule types by trait bound.
-///
-/// Note that [`ScheduleId::of`] accepts any `'static` type and does not
-/// require this trait — `Schedule` is a convention, not a hard constraint.
-pub trait Schedule: 'static {}
+/// Layer 2 implements this trait for schedule markers. The trait is intentionally
+/// minimal (a pure marker) to keep Layer 1 generic. Event types are defined and
+/// associated with schedules at Layer 2.
+pub trait Schedule: 'static {
+    /// Returns the [`ScheduleId`] for this schedule type.
+    fn schedule_id() -> ScheduleId
+    where
+        Self: Sized,
+    {
+        ScheduleId::of::<Self>()
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IntoScheduleIds Trait
@@ -165,9 +172,10 @@ mod tests {
     }
 
     #[test]
-    fn schedule_id_type_id() {
-        let id = ScheduleId::of::<ScheduleA>();
-        assert_eq!(id.type_id(), TypeId::of::<ScheduleA>());
+    fn schedule_id_method() {
+        assert_eq!(ScheduleA::schedule_id(), ScheduleId::of::<ScheduleA>());
+        assert_eq!(ScheduleB::schedule_id(), ScheduleId::of::<ScheduleB>());
+        assert_ne!(ScheduleA::schedule_id(), ScheduleB::schedule_id());
     }
 
     #[test]

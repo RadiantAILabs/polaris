@@ -58,7 +58,7 @@
 
 use crate::api::API;
 use crate::param::SystemContext;
-use crate::plugin::{DynPlugin, Plugin, PluginId, Plugins, ScheduleId};
+use crate::plugin::{DynPlugin, Plugin, PluginId, Plugins, Schedule, ScheduleId};
 use crate::resource::{
     GlobalResource, LocalResource, Resource, ResourceRef, ResourceRefMut, Resources,
 };
@@ -552,15 +552,17 @@ impl Server {
     ///
     /// ```
     /// # use polaris_system::server::Server;
+    /// # use polaris_system::plugin::Schedule;
     /// // Layer 2 defines schedule marker types:
     /// pub struct PostAgentRun;
+    /// impl Schedule for PostAgentRun {}
     ///
     /// // Layer 2 executor triggers the tick:
     /// # let mut server = Server::new();
     /// server.tick::<PostAgentRun>();
     /// ```
-    pub fn tick<S: 'static>(&mut self) {
-        self.tick_schedule(ScheduleId::of::<S>());
+    pub fn tick<S: Schedule + 'static>(&mut self) {
+        self.tick_schedule(S::schedule_id());
     }
 
     /// Triggers a tick for the given schedule ID.
