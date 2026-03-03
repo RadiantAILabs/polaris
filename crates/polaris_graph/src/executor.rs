@@ -323,8 +323,8 @@ impl GraphExecutor {
         let hook_provided: HashSet<TypeId> = hooks
             .map(|h| {
                 let mut resources = HashSet::new();
-                resources.extend(h.provided_resources_for(ScheduleId::of::<OnGraphStart>()));
-                resources.extend(h.provided_resources_for(ScheduleId::of::<OnSystemStart>()));
+                resources.extend(h.provided_resources_for(OnGraphStart::schedule_id()));
+                resources.extend(h.provided_resources_for(OnSystemStart::schedule_id()));
                 resources
             })
             .unwrap_or_default();
@@ -467,7 +467,21 @@ impl GraphExecutor {
         event: &GraphEvent,
     ) {
         if let Some(api) = hooks {
-            api.invoke(ScheduleId::of::<S>(), ctx, event);
+            api.invoke(S::schedule_id(), ctx, event);
+        }
+    }
+
+    /// Invokes a graph event on each custom schedule attached to a system node.
+    fn invoke_custom_schedules(
+        hooks: Option<&HooksAPI>,
+        ctx: &mut SystemContext<'_>,
+        schedules: &[ScheduleId],
+        event: &GraphEvent,
+    ) {
+        if let Some(api) = hooks {
+            for schedule in schedules {
+                api.invoke(*schedule, ctx, event);
+            }
         }
     }
 
@@ -789,14 +803,12 @@ impl GraphExecutor {
                 match node {
                     Node::System(sys) => {
                         // Invoke OnSystemStart hook
-                        Self::invoke_hook::<OnSystemStart>(
-                            hooks,
-                            ctx,
-                            &GraphEvent::SystemStart {
-                                node_id: current.clone(),
-                                system_name: sys.name(),
-                            },
-                        );
+                        let start_event = GraphEvent::SystemStart {
+                            node_id: current.clone(),
+                            system_name: sys.name(),
+                        };
+                        Self::invoke_hook::<OnSystemStart>(hooks, ctx, &start_event);
+                        Self::invoke_custom_schedules(hooks, ctx, &sys.schedules, &start_event);
 
                         let system_start = std::time::Instant::now();
 
@@ -825,14 +837,17 @@ impl GraphExecutor {
                                 ctx.insert_output_boxed(sys.output_type_id(), output);
 
                                 // Invoke OnSystemComplete hook
-                                Self::invoke_hook::<OnSystemComplete>(
+                                let complete_event = GraphEvent::SystemComplete {
+                                    node_id: current.clone(),
+                                    system_name: sys.name(),
+                                    duration: system_start.elapsed(),
+                                };
+                                Self::invoke_hook::<OnSystemComplete>(hooks, ctx, &complete_event);
+                                Self::invoke_custom_schedules(
                                     hooks,
                                     ctx,
-                                    &GraphEvent::SystemComplete {
-                                        node_id: current.clone(),
-                                        system_name: sys.name(),
-                                        duration: system_start.elapsed(),
-                                    },
+                                    &sys.schedules,
+                                    &complete_event,
                                 );
 
                                 match self.find_next_sequential(graph, &current) {
@@ -845,14 +860,17 @@ impl GraphExecutor {
                                 let error_string = err.to_string();
 
                                 // Invoke OnSystemError hook
-                                Self::invoke_hook::<OnSystemError>(
+                                let error_event = GraphEvent::SystemError {
+                                    node_id: current.clone(),
+                                    system_name: sys.name(),
+                                    error: error_string.clone(),
+                                };
+                                Self::invoke_hook::<OnSystemError>(hooks, ctx, &error_event);
+                                Self::invoke_custom_schedules(
                                     hooks,
                                     ctx,
-                                    &GraphEvent::SystemError {
-                                        node_id: current.clone(),
-                                        system_name: sys.name(),
-                                        error: error_string.clone(),
-                                    },
+                                    &sys.schedules,
+                                    &error_event,
                                 );
 
                                 if let Some(handler) = self.find_error_edge(graph, &current) {

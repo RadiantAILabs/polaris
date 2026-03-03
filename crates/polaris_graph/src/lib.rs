@@ -78,7 +78,8 @@ pub mod prelude {
     };
     pub use crate::graph::{Graph, ValidationError, ValidationWarning};
     pub use crate::node::{
-        DecisionNode, JoinNode, LoopNode, Node, NodeId, ParallelNode, SwitchNode, SystemNode,
+        DecisionNode, IntoSystemNode, JoinNode, LoopNode, Node, NodeId, NodeMarker, ParallelNode,
+        ScheduledNodeMarker, SwitchNode, SystemNode,
     };
     pub use crate::predicate::{
         BoxedDiscriminator, BoxedPredicate, Discriminator, ErasedDiscriminator, ErasedPredicate,

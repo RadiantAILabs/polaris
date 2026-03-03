@@ -445,6 +445,7 @@ mod tests {
     use super::*;
     use crate::hooks::schedule::{OnSystemComplete, OnSystemStart};
     use crate::node::NodeId;
+    use polaris_system::plugin::Schedule;
     use polaris_system::resource::LocalResource;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -452,7 +453,7 @@ mod tests {
     #[test]
     fn hooks_api_register_increments_count() {
         let api = HooksAPI::new();
-        let schedule = ScheduleId::of::<OnSystemStart>();
+        let schedule = OnSystemStart::schedule_id();
 
         api.register_observer::<OnSystemStart, _>("test_hook", |_: &GraphEvent| {})
             .expect("registration should succeed");
@@ -468,7 +469,7 @@ mod tests {
     #[test]
     fn hooks_api_invoke_calls_hooks() {
         let api = HooksAPI::new();
-        let schedule = ScheduleId::of::<OnSystemStart>();
+        let schedule = OnSystemStart::schedule_id();
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = Arc::clone(&counter);
 
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn hooks_api_invoke_calls_all_hooks_in_order() {
         let api = HooksAPI::new();
-        let schedule = ScheduleId::of::<OnSystemStart>();
+        let schedule = OnSystemStart::schedule_id();
         let execution_order = Arc::new(Mutex::new(Vec::new()));
 
         for name in ["first", "second", "third"] {
@@ -531,7 +532,7 @@ mod tests {
         };
 
         // Should not panic when no hooks are registered
-        api.invoke(ScheduleId::of::<OnSystemStart>(), &mut ctx, &event);
+        api.invoke(OnSystemStart::schedule_id(), &mut ctx, &event);
     }
 
     // Test resource type for provider tests
@@ -560,7 +561,7 @@ mod tests {
         // Before invoke, resource should not exist
         assert!(!ctx.contains_resource::<TestResource>());
 
-        api.invoke(ScheduleId::of::<OnSystemStart>(), &mut ctx, &event);
+        api.invoke(OnSystemStart::schedule_id(), &mut ctx, &event);
 
         // After invoke, resource should exist
         let resource = ctx
@@ -572,7 +573,7 @@ mod tests {
     #[test]
     fn provided_resources_for_returns_provider_types() {
         let api = HooksAPI::new();
-        let schedule = ScheduleId::of::<OnSystemStart>();
+        let schedule = OnSystemStart::schedule_id();
 
         // No hooks registered yet
         assert!(api.provided_resources_for(schedule).is_empty());
@@ -599,7 +600,7 @@ mod tests {
     #[test]
     fn register_boxed_rejects_duplicate_names() {
         let api = HooksAPI::new();
-        let schedule = ScheduleId::of::<OnSystemStart>();
+        let schedule = OnSystemStart::schedule_id();
 
         // First registration should succeed
         api.register_boxed(
@@ -634,8 +635,8 @@ mod tests {
         api.register_observer::<OnSystemComplete, _>("logger", |_: &GraphEvent| {})
             .expect("same name on different schedule should succeed");
 
-        assert_eq!(api.hook_count(ScheduleId::of::<OnSystemStart>()), 1);
-        assert_eq!(api.hook_count(ScheduleId::of::<OnSystemComplete>()), 1);
+        assert_eq!(api.hook_count(OnSystemStart::schedule_id()), 1);
+        assert_eq!(api.hook_count(OnSystemComplete::schedule_id()), 1);
     }
 
     #[test]
@@ -647,13 +648,13 @@ mod tests {
             .register_observer::<OnSystemStart, _>("second", |_: &GraphEvent| {})
             .unwrap();
 
-        assert_eq!(api.hook_count(ScheduleId::of::<OnSystemStart>()), 2);
+        assert_eq!(api.hook_count(OnSystemStart::schedule_id()), 2);
     }
 
     #[test]
     fn contains_hook() {
         let api = HooksAPI::new();
-        let schedule = ScheduleId::of::<OnSystemStart>();
+        let schedule = OnSystemStart::schedule_id();
 
         assert!(!api.contains_hook(schedule, "my_hook"));
 
@@ -667,7 +668,7 @@ mod tests {
     #[test]
     fn multiple_providers_last_write_wins() {
         let api = HooksAPI::new();
-        let schedule = ScheduleId::of::<OnSystemStart>();
+        let schedule = OnSystemStart::schedule_id();
 
         // Register three providers that write the same resource type
         api.register_provider::<OnSystemStart, TestResource, _>(
@@ -721,13 +722,13 @@ mod tests {
         .unwrap();
 
         // Should register on both schedules
-        assert_eq!(api.hook_count(ScheduleId::of::<OnSystemStart>()), 1);
-        assert_eq!(api.hook_count(ScheduleId::of::<OnSystemComplete>()), 1);
+        assert_eq!(api.hook_count(OnSystemStart::schedule_id()), 1);
+        assert_eq!(api.hook_count(OnSystemComplete::schedule_id()), 1);
 
         let mut ctx = SystemContext::new();
 
         api.invoke(
-            ScheduleId::of::<OnSystemStart>(),
+            OnSystemStart::schedule_id(),
             &mut ctx,
             &GraphEvent::SystemStart {
                 node_id: NodeId::new(),
@@ -736,7 +737,7 @@ mod tests {
         );
 
         api.invoke(
-            ScheduleId::of::<OnSystemComplete>(),
+            OnSystemComplete::schedule_id(),
             &mut ctx,
             &GraphEvent::SystemComplete {
                 node_id: NodeId::new(),
@@ -766,7 +767,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         api.invoke(
-            ScheduleId::of::<OnSystemStart>(),
+            OnSystemStart::schedule_id(),
             &mut ctx,
             &GraphEvent::SystemStart {
                 node_id: NodeId::new(),

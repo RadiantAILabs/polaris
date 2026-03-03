@@ -4,6 +4,7 @@
 //! as a directed graph of systems and control flow constructs.
 
 use crate::edge::{Edge, EdgeId, ErrorEdge, SequentialEdge, TimeoutEdge};
+use crate::node::IntoSystemNode;
 use crate::node::{
     DecisionNode, JoinNode, LoopNode, Node, NodeId, ParallelNode, SwitchNode, SystemNode,
 };
@@ -12,7 +13,6 @@ use core::any::TypeId;
 use core::fmt;
 use hashbrown::{HashMap, HashSet};
 use polaris_system::resource::Output;
-use polaris_system::system::IntoSystem;
 
 /// A directed graph of systems.
 ///
@@ -123,10 +123,17 @@ impl Graph {
     /// The system is connected sequentially to the previous node (if any).
     /// If this is the first node, it becomes the entry point.
     ///
+    /// # Custom schedules
+    ///
+    /// Custom [`Schedule`] types can be attached to a system by passing a
+    /// `(custom_schedules, system)` tuple. System lifecycle events are then
+    /// re-emitted on those schedules, allowing hooks to subscribe to events
+    /// for this system only.
+    ///
     /// # Type Parameters
     ///
-    /// * `S` - Any type implementing [`IntoSystem`] (typically an async function)
-    /// * `M` - Marker type for the system's parameter signature
+    /// * `S` - Any type implementing [`IntoSystemNode`] (a system or schedule+system tuple)
+    /// * `M` - Marker type for trait dispatch
     ///
     /// # Returns
     ///
@@ -143,11 +150,10 @@ impl Graph {
     /// ```
     pub fn add_system_node<S, M>(&mut self, system: S) -> NodeId
     where
-        S: IntoSystem<M>,
-        S::System: 'static,
+        S: IntoSystemNode<M>,
     {
-        let system = system.into_system();
-        let node = Node::System(SystemNode::new(system));
+        let (boxed_system, schedules) = system.into_system_node();
+        let node = Node::System(SystemNode::new_boxed(boxed_system).with_schedules(schedules));
         let id = node.id();
 
         // Connect to previous node if exists
@@ -183,8 +189,7 @@ impl Graph {
     /// ```
     pub fn add_system<S, M>(&mut self, system: S) -> &mut Self
     where
-        S: IntoSystem<M>,
-        S::System: 'static,
+        S: IntoSystemNode<M>,
     {
         self.add_system_node(system);
         self
