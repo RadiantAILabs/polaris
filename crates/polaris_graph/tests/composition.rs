@@ -16,9 +16,11 @@
 //! tracker node fired the expected number of times.
 //!
 //! Decision and Switch fragments are **parameterized**: `Decision { take_true }` controls
-//! which branch is taken, and `Switch { case }` selects between cases "a" and "b". This
-//! enables both hand-written tests with explicit branching and property-based tests that
-//! randomly generate fragment trees with varying branch choices.
+//! which branch is taken, and `Switch { case }` selects between cases "a" and "b".
+//! `Fallible { handler }` represents a system that always fails, routing to its error
+//! handler body via an error edge. This enables both hand-written tests with explicit
+//! branching and property-based tests that randomly generate fragment trees with varying
+//! branch choices.
 //!
 //! ## Prediction Model
 //!
@@ -29,14 +31,15 @@
 //! - **Decision**: taken branch gets real counts, non-taken branch gets zeros
 //! - **Loop { n }**: multiplies body counts by `n`
 //! - **Switch**: selected case gets real counts, unselected case gets zeros
+//! - **Fallible**: handler body predictions (failing system has no tracker)
 //!
 //! ## Property-Based Testing
 //!
 //! The `prop_tests` module uses `proptest` to generate random `Fragment` trees (depth 3,
-//! 256 cases). At each non-leaf level, one of the 5 composite types (Seq, Par, Decision,
-//! Loop, Switch) is chosen with equal probability, ensuring broad coverage of nesting
-//! combinations. The property asserts that per-node execution counts match the predicted
-//! counts for every generated tree.
+//! 256 cases). At each non-leaf level, one of the 6 composite types (Seq, Par, Decision,
+//! Loop, Switch, Fallible) is chosen with equal probability, ensuring broad coverage of
+//! nesting combinations including error handling paths. The property asserts that per-node
+//! execution counts match the predicted counts for every generated tree.
 //!
 //! ## Test Infrastructure
 //!
@@ -50,8 +53,8 @@ use polaris_graph::executor::{ExecutionError, GraphExecutor};
 use polaris_graph::graph::Graph;
 use polaris_graph::node::NodeId;
 use test_utils::{
-    DecisionOutput, DecisionSystem, ExecutionLog, SwitchKeySystem, SwitchOutput, TrackerNodes,
-    add_tracker, branch, create_test_server, get_hooks,
+    DecisionOutput, DecisionSystem, ExecutionLog, FailingSystem, SwitchKeySystem, SwitchOutput,
+    TrackerNodes, add_tracker, branch, create_test_server, get_hooks,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -86,6 +89,10 @@ enum Fragment {
         a: Box<Fragment>,
         b: Box<Fragment>,
     },
+    /// Fallible system with error handler. The system always fails, and the
+    /// handler body executes via the error edge. Execution continues normally
+    /// after the handler completes.
+    Fallible { handler: Box<Fragment> },
 }
 
 impl Fragment {
@@ -153,6 +160,24 @@ impl Fragment {
                     None,
                 );
             }
+            Fragment::Fallible { handler } => {
+                let handler = handler.clone();
+                let trackers = trackers.clone();
+                g.system_boxed(Box::new(FailingSystem))
+                    .on_error(move |g| handler.build(g, &trackers))
+                    .done();
+            }
+        }
+    }
+
+    /// Returns `true` if this fragment always diverts execution away from the
+    /// sequential path (the failing system takes the error edge, so the
+    /// sequential continuation is unreachable).
+    fn is_diverting(&self) -> bool {
+        match self {
+            Fragment::Fallible { .. } => true,
+            Fragment::Seq(items) => items.iter().any(Fragment::is_diverting),
+            _ => false,
         }
     }
 
@@ -168,6 +193,7 @@ impl Fragment {
             Fragment::Decision { t, f, .. } => t.tracker_count() + f.tracker_count(),
             Fragment::Loop { body, .. } => body.tracker_count(),
             Fragment::Switch { a, b, .. } => a.tracker_count() + b.tracker_count(),
+            Fragment::Fallible { handler } => handler.tracker_count(),
         }
     }
 
@@ -195,10 +221,21 @@ impl Fragment {
     fn predicted_counts_inner(&self, multiplier: usize) -> Vec<usize> {
         match self {
             Fragment::Track => vec![multiplier],
-            Fragment::Seq(items) => items
-                .iter()
-                .flat_map(|i| i.predicted_counts_inner(multiplier))
-                .collect(),
+            Fragment::Seq(items) => {
+                let mut counts = Vec::new();
+                let mut diverted = false;
+                for item in items {
+                    if diverted {
+                        counts.extend(item.zero_counts());
+                    } else {
+                        counts.extend(item.predicted_counts_inner(multiplier));
+                        if item.is_diverting() {
+                            diverted = true;
+                        }
+                    }
+                }
+                counts
+            }
             Fragment::Par(branches) => branches
                 .iter()
                 .flat_map(|b| b.predicted_counts_inner(multiplier))
@@ -226,6 +263,8 @@ impl Fragment {
                     counts
                 }
             }
+            // FailingSystem has no tracker; only the handler body has trackers.
+            Fragment::Fallible { handler } => handler.predicted_counts_inner(multiplier),
         }
     }
 }
@@ -266,6 +305,12 @@ fn switch(case: &'static str, a: Fragment, b: Fragment) -> Fragment {
         case,
         a: Box::new(a),
         b: Box::new(b),
+    }
+}
+
+fn fallible(handler: Fragment) -> Fragment {
+    Fragment::Fallible {
+        handler: Box::new(handler),
     }
 }
 
@@ -519,6 +564,50 @@ async fn test_complex_nested_composition() {
     assert_eq!(log.count(&nodes[8]), 0, "outer false branch not taken");
 }
 
+/// Verifies that a fallible system routes to its error handler.
+#[tokio::test]
+async fn test_fallible_handler_executes() {
+    let (log, nodes) = run_fragment(fallible(track())).await.unwrap();
+    assert_eq!(log.count(&nodes[0]), 1, "error handler tracker should fire");
+}
+
+/// Verifies fallible in a sequence: before -> fallible(handler) -> after.
+/// The "after" node is unreachable because the error edge diverts execution
+/// away from the sequential path (the sequential edge from `FailingSystem` to
+/// the after node is only taken on success).
+#[tokio::test]
+async fn test_fallible_in_sequence() {
+    let fragment = seq([track(), fallible(track()), track()]);
+    let (log, nodes) = run_fragment(fragment).await.unwrap();
+
+    assert_eq!(log.count(&nodes[0]), 1, "before should execute");
+    assert_eq!(log.count(&nodes[1]), 1, "error handler should execute");
+    assert_eq!(
+        log.count(&nodes[2]),
+        0,
+        "after should not execute (unreachable after error diversion)"
+    );
+}
+
+/// Verifies fallible inside a loop: handler fires on each iteration.
+#[tokio::test]
+async fn test_fallible_in_loop() {
+    let fragment = loop_n(3, fallible(track()));
+    let (log, nodes) = run_fragment(fragment).await.unwrap();
+
+    assert_eq!(log.count(&nodes[0]), 3, "error handler should fire 3 times");
+}
+
+/// Verifies fallible with a multi-node handler body.
+#[tokio::test]
+async fn test_fallible_with_seq_handler() {
+    let fragment = fallible(seq([track(), track()]));
+    let (log, nodes) = run_fragment(fragment).await.unwrap();
+
+    assert_eq!(log.count(&nodes[0]), 1, "handler step 1 should fire");
+    assert_eq!(log.count(&nodes[1]), 1, "handler step 2 should fire");
+}
+
 /// Parameterized depth test: builds N levels of nested decisions, each containing parallel.
 #[tokio::test]
 async fn test_arbitrary_depth_nesting() {
@@ -607,11 +696,11 @@ async fn test_arbitrary_composition() {
 ///
 /// `arb_fragment(depth)` generates fragment trees recursively:
 /// - **Leaf level** (`depth == 0`): Always produces `Track` — the only leaf type.
-/// - **Inner levels** (`depth > 0`): Chooses among all 5 composite types with
+/// - **Inner levels** (`depth > 0`): Chooses among all 6 composite types with
 ///   equal probability. `Track` is excluded at inner levels so every generated
 ///   tree reaches full depth, preventing trivial trees.
 ///
-/// With 5 composite types at each of 3 levels, running 256 cases provides good
+/// With 6 composite types at each of 3 levels, running 256 cases provides good
 /// coverage of nesting combinations.
 ///
 /// ## Parameterized Branching
@@ -635,7 +724,8 @@ mod prop_tests {
     ///
     /// At `depth == 0`, only `Track` leaves are produced.
     /// At `depth > 0`, only composite types are generated (equal weight),
-    /// ensuring every tree reaches full depth.
+    /// ensuring every tree reaches full depth. Includes `Fallible` to exercise
+    /// error edge routing under arbitrary nesting.
     fn arb_fragment(depth: u32) -> BoxedStrategy<Fragment> {
         if depth == 0 {
             Just(Fragment::Track).boxed()
@@ -656,6 +746,7 @@ mod prop_tests {
                     arb_fragment(depth - 1),
                 )
                     .prop_map(|(c, a, b)| switch(c, a, b)),
+                arb_fragment(depth - 1).prop_map(fallible),
             ]
             .boxed()
         }

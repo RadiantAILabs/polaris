@@ -82,8 +82,8 @@ impl AnthropicClient {
     }
 }
 
-impl core::fmt::Debug for AnthropicClient {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::fmt::Debug for AnthropicClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnthropicClient")
             .field("base_url", &self.base_url)
             .field("api_key", &"[REDACTED]")

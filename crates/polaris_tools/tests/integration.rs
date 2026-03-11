@@ -1,12 +1,12 @@
 //! Integration tests for the `polaris_tools` crate.
 
-use core::future::Future;
 use polaris_models::llm::ToolDefinition;
 use polaris_system::param::Res;
 use polaris_tools::registry::{ToolRegistry, ToolsPlugin};
 use polaris_tools::tool::Tool;
 use polaris_tools::{FunctionMetadata, ParameterInfo, ToolError, Toolset, tool, toolset};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 // ─────────────────────────────────────────────────────────────────────
 // 1. Tool trait manual impl
@@ -32,7 +32,7 @@ impl Tool for ManualTool {
     fn execute(
         &self,
         args: serde_json::Value,
-    ) -> core::pin::Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>
     {
         Box::pin(async move {
             let input = args
@@ -819,7 +819,7 @@ struct WrapperTools<T> {
 #[toolset]
 impl<T> WrapperTools<T>
 where
-    T: core::fmt::Display + Send + Sync + 'static,
+    T: std::fmt::Display + Send + Sync + 'static,
 {
     #[tool]
     /// Display the wrapped value.

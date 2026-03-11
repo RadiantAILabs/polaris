@@ -8,8 +8,11 @@
 //! - Loop node requirements
 //! - Error display formatting
 
+use polaris_graph::CaughtError;
 use polaris_graph::graph::{Graph, ValidationError, ValidationWarning};
 use polaris_graph::node::NodeId;
+use polaris_system::param::{ERROR_CONTEXT, ErrOut, SystemAccess, SystemContext, SystemParam};
+use polaris_system::system::{BoxFuture, System, SystemError};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Systems
@@ -53,9 +56,9 @@ fn validate_empty_graph_fails() {
     let result = graph.validate();
 
     assert!(result.is_err());
-    let errors = result.unwrap_err();
     assert!(
-        errors
+        result
+            .errors
             .iter()
             .any(|err| matches!(err, ValidationError::NoEntryPoint))
     );
@@ -71,7 +74,7 @@ fn validate_simple_graph_succeeds() {
     graph.add_system(first_step).add_system(second_step);
 
     let result = graph.validate();
-    assert!(result.is_ok(), "Validation failed: {:?}", result.err());
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
 }
 
 #[test]
@@ -102,7 +105,7 @@ fn validate_graph_with_conditional_branch_succeeds() {
         );
 
     let result = graph.validate();
-    assert!(result.is_ok(), "Validation failed: {:?}", result.err());
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
 }
 
 #[test]
@@ -121,7 +124,7 @@ fn validate_graph_with_parallel_succeeds() {
     );
 
     let result = graph.validate();
-    assert!(result.is_ok(), "Validation failed: {:?}", result.err());
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
 }
 
 #[test]
@@ -132,7 +135,7 @@ fn validate_graph_with_loop_succeeds() {
     });
 
     let result = graph.validate();
-    assert!(result.is_ok(), "Validation failed: {:?}", result.err());
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,7 +196,7 @@ fn validation_error_no_termination_condition_display() {
 
 #[test]
 fn validation_error_implements_error_trait() {
-    fn assert_error<E: core::error::Error>() {}
+    fn assert_error<E: std::error::Error>() {}
     assert_error::<ValidationError>();
 }
 
@@ -217,14 +220,15 @@ fn validate_parallel_conflicting_outputs_warns() {
         ],
     );
 
-    let warnings = graph
-        .validate()
-        .expect("graph should be structurally valid");
+    let result = graph.validate();
+    assert!(result.is_ok(), "graph should be structurally valid");
     assert!(
-        warnings
+        result
+            .warnings
             .iter()
             .any(|w| matches!(w, ValidationWarning::ConflictingParallelOutputs { .. })),
-        "expected ConflictingParallelOutputs warning, got: {warnings:?}"
+        "expected ConflictingParallelOutputs warning, got: {:?}",
+        result.warnings
     );
 }
 
@@ -248,12 +252,12 @@ fn validate_parallel_different_outputs_no_warning() {
         ],
     );
 
-    let warnings = graph
-        .validate()
-        .expect("graph should be structurally valid");
+    let result = graph.validate();
+    assert!(result.is_ok(), "graph should be structurally valid");
     assert!(
-        warnings.is_empty(),
-        "expected no warnings, got: {warnings:?}"
+        result.warnings.is_empty(),
+        "expected no warnings, got: {:?}",
+        result.warnings
     );
 }
 
@@ -278,12 +282,15 @@ fn validate_loop_predicate_output_not_produced() {
         },
     );
 
-    let errors = graph.validate().unwrap_err();
+    let result = graph.validate();
+    assert!(result.is_err());
     assert!(
-        errors
+        result
+            .errors
             .iter()
             .any(|err| matches!(err, ValidationError::LoopPredicateOutputNotProduced { .. })),
-        "expected LoopPredicateOutputNotProduced error, got: {errors:?}"
+        "expected LoopPredicateOutputNotProduced error, got: {:?}",
+        result.errors
     );
 }
 
@@ -309,5 +316,199 @@ fn validate_loop_predicate_output_produced() {
     );
 
     let result = graph.validate();
-    assert!(result.is_ok(), "Validation failed: {:?}", result.err());
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Edge Requirement Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A system that declares it requires an error edge (like one using `CaughtError`).
+struct ErrorHandlerSystem;
+
+impl System for ErrorHandlerSystem {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "error_handler_system"
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.require_context(ERROR_CONTEXT);
+        access
+    }
+}
+
+#[test]
+fn validate_missing_error_edge_for_caught_error_system() {
+    let mut graph = Graph::new();
+    // Place the error-requiring system on a normal sequential path
+    graph.add_boxed_system(Box::new(ErrorHandlerSystem));
+
+    let result = graph.validate();
+    assert!(result.is_err());
+    assert!(
+        result.errors.iter().any(|err| matches!(
+            err,
+            ValidationError::MissingEdgeRequirement {
+                requirement: ERROR_CONTEXT,
+                ..
+            }
+        )),
+        "expected MissingEdgeRequirement error, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn validate_error_edge_satisfies_requirement() {
+    let mut graph = Graph::new();
+
+    // Add a normal system first, then attach an error handler that requires error edge
+    let source_id = graph.add_system_node(first_step);
+    graph.add_error_handler_for(source_id, |g| {
+        g.add_boxed_system(Box::new(ErrorHandlerSystem));
+    });
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn context_requirements_affect_is_empty() {
+    let access = SystemAccess::default();
+    assert!(access.is_empty());
+
+    let mut access = SystemAccess::default();
+    access.require_context(ERROR_CONTEXT);
+    assert!(!access.is_empty());
+}
+
+#[test]
+fn context_requirements_merge() {
+    let mut a = SystemAccess::default();
+    a.require_context(ERROR_CONTEXT);
+
+    let mut b = SystemAccess::default();
+    b.require_context("timeout");
+
+    a.merge(&b);
+    assert!(a.context_requirements.contains(&ERROR_CONTEXT));
+    assert!(a.context_requirements.contains(&"timeout"));
+}
+
+#[test]
+fn context_requirements_no_duplicates() {
+    let mut access = SystemAccess::default();
+    access.require_context(ERROR_CONTEXT);
+    access.require_context(ERROR_CONTEXT);
+    assert_eq!(access.context_requirements.len(), 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ErrOut<CaughtError> Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// System that delegates its access to `ErrOut<CaughtError>`.
+struct ErrOutHandlerSystem;
+
+impl System for ErrOutHandlerSystem {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "err_out_handler_system"
+    }
+
+    fn access(&self) -> SystemAccess {
+        <ErrOut<CaughtError>>::access()
+    }
+}
+
+#[test]
+fn err_out_param_declares_error_context_requirement() {
+    let access = <ErrOut<CaughtError>>::access();
+    assert!(
+        access.context_requirements.contains(&ERROR_CONTEXT),
+        "ErrOut<CaughtError> should declare error context requirement"
+    );
+}
+
+#[test]
+fn err_out_param_rejected_without_error_edge() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(ErrOutHandlerSystem));
+
+    let result = graph.validate();
+    assert!(result.is_err());
+    assert!(
+        result.errors.iter().any(|err| matches!(
+            err,
+            ValidationError::MissingEdgeRequirement {
+                requirement: ERROR_CONTEXT,
+                ..
+            }
+        )),
+        "expected MissingEdgeRequirement, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn err_out_param_accepted_behind_error_edge() {
+    let mut graph = Graph::new();
+
+    let source_id = graph.add_system_node(first_step);
+    graph.add_error_handler_for(source_id, |g| {
+        g.add_boxed_system(Box::new(ErrOutHandlerSystem));
+    });
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ValidationResult API
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn validation_result_warnings_preserved_with_errors() {
+    // Build a graph that has both a warning (parallel output conflict)
+    // and an error (error-handler system without error edge).
+    let mut graph = Graph::new();
+    graph.add_parallel(
+        "conflict",
+        vec![
+            |g: &mut Graph| {
+                g.add_system(branch_a);
+            },
+            |g: &mut Graph| {
+                g.add_system(branch_b);
+            },
+        ],
+    );
+
+    // This system requires an error edge but is on a sequential path → error
+    graph.add_boxed_system(Box::new(ErrorHandlerSystem));
+
+    let result = graph.validate();
+    assert!(result.is_err(), "should have errors");
+    assert!(
+        result.has_warnings(),
+        "warnings should be preserved even when errors exist"
+    );
 }

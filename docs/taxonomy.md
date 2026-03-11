@@ -22,7 +22,7 @@ These primitives define *how code is organized and executed*. They are fixed and
 
 **Scope.** Layer 1 owns the core traits (`System`, `Resource`, `SystemParam`, `Plugin`, `API`, `IntoSystem`), the `SystemContext` hierarchy, resource containers, access descriptors and conflict detection, schedule identifiers, and the `Server` implementation. It does not contain anything agent-specific (graphs, LLMs, tools), domain-specific (memory backends, model providers), or optional.
 
-See [system.md](./reference/system.md) for system primitives and parameters, and [plugins.md](./reference/plugins.md) for the plugin system.
+See [system.md](./reference/system.md) for system primitives and parameters, [plugins.md](./reference/plugins.md) for the plugin system, and [api.md](./reference/api.md) for the API primitive.
 
 ## Layer 2: Graph Execution and Agent Patterns
 
@@ -32,7 +32,7 @@ This layer defines how agent behavior is structured. `polaris_graph` provides th
 
 These primitives define *how agents are structured*. They are fixed building blocks for expressing any agent topology.
 
-**Scope.** Layer 2 owns the `Graph` structure and builder API, node types (system, decision, switch, parallel, loop, join), edge types (sequential, conditional, parallel, loop-back, error, timeout), control flow primitives (`Predicate`, `Discriminator`), the `GraphExecutor`, the hook system (`HooksAPI`, `GraphEvent`, schedule markers), the `Agent` and `AgentExt` traits, and concrete API definitions for agent orchestration. It does not contain specific agent implementations, tool or LLM abstractions, memory backends, or I/O mechanisms.
+**Scope.** Layer 2 owns the `Graph` structure and builder API, node types (system, decision, switch, parallel, loop, join), edge types (sequential, conditional, parallel, loop-back, error, timeout), control flow primitives (`Predicate`, `Discriminator`), the `GraphExecutor`, the hook system (`HooksAPI`, `GraphEvent`, schedule markers), the `Agent` trait, and concrete API definitions for agent orchestration. It does not contain specific agent implementations, tool or LLM abstractions, memory backends, or I/O mechanisms.
 
 See [graph.md](./reference/graph.md) for graph construction and execution, and [agents.md](./reference/agents.md) for the agent trait.
 

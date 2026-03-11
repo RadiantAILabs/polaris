@@ -89,7 +89,7 @@ pub(crate) fn generate_tool_fn(input: &ItemFn) -> TokenStream {
             fn execute(
                 &self,
                 __args: serde_json::Value,
-            ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = Result<serde_json::Value, #pt::ToolError>> + Send + '_>> {
+            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<serde_json::Value, #pt::ToolError>> + Send + '_>> {
                 Box::pin(async move {
                     #execute_code
                 })

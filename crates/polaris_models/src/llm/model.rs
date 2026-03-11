@@ -1,8 +1,9 @@
 //! LLM handle for generation requests.
 
+use super::builder::LlmRequestBuilder;
 use super::error::{ExtractionError, GenerationError};
 use super::provider::LlmProvider;
-use super::types::{GenerationRequest, GenerationResponse};
+use super::types::{LlmRequest, LlmResponse};
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -28,10 +29,7 @@ impl Llm {
     /// # Errors
     ///
     /// Returns a [`GenerationError`] if the request fails.
-    pub async fn generate(
-        &self,
-        request: GenerationRequest,
-    ) -> Result<GenerationResponse, GenerationError> {
+    pub async fn generate(&self, request: LlmRequest) -> Result<LlmResponse, GenerationError> {
         self.provider.generate(&self.model, request).await
     }
 
@@ -48,7 +46,7 @@ impl Llm {
     /// - The response cannot be parsed as type `T`
     pub async fn generate_structured<T: JsonSchema + DeserializeOwned>(
         &self,
-        mut request: GenerationRequest,
+        mut request: LlmRequest,
     ) -> Result<T, ExtractionError> {
         // Inject schema into request
         let schema = schema_for!(T);
@@ -68,6 +66,15 @@ impl Llm {
 
         // Parse as structured data
         Ok(serde_json::from_str(&text)?)
+    }
+
+    /// Creates a builder for a single-shot LLM request.
+    ///
+    /// The builder accumulates messages, tool definitions, and options,
+    /// then sends a single generation request via [`LlmRequestBuilder::generate()`].
+    #[must_use]
+    pub fn builder(&self) -> LlmRequestBuilder<'_> {
+        LlmRequestBuilder::new(self)
     }
 
     /// Returns the model name (without provider prefix).

@@ -9,11 +9,14 @@
 //!
 //! # Parameter Types
 //!
+//!
 //! | Type | Access | Scope | Purpose |
 //! |------|--------|-------|---------|
 //! | [`Res<T>`] | Read-only | Walks context hierarchy | Read resources from any ancestor or global scope |
 //! | [`ResMut<T>`] | Read-write | Current scope only | Mutate resources owned by this context |
 //! | [`Out<T>`] | Read-only | Current context | Read the return value of a preceding system |
+//! | [`ErrOut<T>`] | Read-only | Current context | Read error context from a failed system on an
+//! error edge. The system must be reachable through an error edge from a fallible system |
 //!
 //! # Conflict Detection
 //!
@@ -56,13 +59,13 @@
 
 mod access;
 
-use variadics_please::all_tuples;
-
-pub use access::{Access, AccessMode, SystemAccess};
-
 use crate::resource::{
     LocalResource, Output, OutputRef, Outputs, Resource, ResourceRef, ResourceRefMut, Resources,
 };
+pub use access::{Access, AccessMode, SystemAccess};
+use std::any::{Any, TypeId, type_name};
+use std::sync::Arc;
+use variadics_please::all_tuples;
 
 /// A parameter that can be injected into a system function.
 ///
@@ -112,6 +115,14 @@ pub enum ParamError {
     /// The requested output was not found (no system has produced it yet).
     #[error("output not found: {0}")]
     OutputNotFound(&'static str),
+
+    /// Error context not found in outputs.
+    ///
+    /// A `ErrOut<T>` parameter requested error context, but no preceding
+    /// system has failed with a matching error type. This typically means the
+    /// system is not reachable through an error edge in the graph.
+    #[error("error context not found: {0}")]
+    ErrorNotFound(&'static str),
 }
 
 /// The execution context for a single scope in the resource hierarchy.
@@ -163,20 +174,22 @@ pub enum ParamError {
 /// ```text
 /// SystemContext<'parent>
 /// ├── parent:    Option<&'parent SystemContext>   // read-only ancestor chain
-/// ├── globals:   Option<&'parent Resources>       // server-level globals
+/// ├── globals:   Option<Arc<Resources>>           // server-level globals
 /// ├── resources: Resources                        // owned local state
 /// └── outputs:   Outputs                          // owned ephemeral outputs
 /// ```
 ///
-/// The `globals` reference is inherited by child contexts, so every context
+/// The `globals` is cloned into child contexts, so every context
 /// in a hierarchy can access server-level resources regardless of depth.
+/// Root contexts (no parent) are `SystemContext<'static>` since the `Arc`
+/// keeps globals alive independently of the server.
 pub struct SystemContext<'parent> {
     /// Parent context for hierarchical resource lookup.
     /// Read access walks up this chain; write access is current-scope only.
     parent: Option<&'parent SystemContext<'parent>>,
-    /// Reference to server's global resources.
-    /// Checked after parent chain is exhausted. Inherited by child contexts.
-    globals: Option<&'parent Resources>,
+    /// Handle to server's global resources.
+    /// Checked after parent chain is exhausted. Cloned into child contexts.
+    globals: Option<Arc<Resources>>,
     /// Resources owned by this scope.
     resources: Resources,
     /// Ephemeral system outputs for current execution (owned).
@@ -209,8 +222,8 @@ impl<'parent> SystemContext<'parent> {
     /// This is typically called by [`Server::create_context()`] to create
     /// execution contexts that can access server-level resources via `Res<T>`.
     #[must_use]
-    pub fn with_globals(globals: &'parent Resources) -> Self {
-        Self {
+    pub fn with_globals(globals: Arc<Resources>) -> SystemContext<'static> {
+        SystemContext {
             parent: None,
             globals: Some(globals),
             resources: Resources::new(),
@@ -244,13 +257,12 @@ impl<'parent> SystemContext<'parent> {
     /// Creates a child context with this context as its parent.
     ///
     /// The child can read resources from this context (and its ancestors)
-    /// but has its own local resources for writes. The child inherits the
-    /// globals reference, so it can access server-level resources.
+    /// but has its own local resources for writes.
     #[must_use]
     pub fn child(&'parent self) -> SystemContext<'parent> {
         SystemContext {
             parent: Some(self),
-            globals: self.globals,
+            globals: self.globals.clone(),
             resources: Resources::new(),
             outputs: Outputs::new(),
         }
@@ -281,11 +293,7 @@ impl<'parent> SystemContext<'parent> {
     /// This is used internally by the server to instantiate local resources
     /// from factories. The `type_id` must match the correct type of the boxed
     /// resource.
-    pub fn insert_boxed(
-        &mut self,
-        type_id: core::any::TypeId,
-        resource: Box<dyn core::any::Any + Send + Sync>,
-    ) {
+    pub fn insert_boxed(&mut self, type_id: TypeId, resource: Box<dyn Any + Send + Sync>) {
         self.resources.insert_boxed(type_id, resource);
     }
 
@@ -302,7 +310,7 @@ impl<'parent> SystemContext<'parent> {
         if let Some(parent) = self.parent {
             return parent.contains_resource::<R>();
         }
-        if let Some(globals) = self.globals {
+        if let Some(globals) = &self.globals {
             return globals.contains::<R>();
         }
         false
@@ -339,7 +347,7 @@ impl<'parent> SystemContext<'parent> {
         }
 
         // Check global resources (server-level)
-        if let Some(globals) = self.globals {
+        if let Some(globals) = &self.globals {
             match globals.get::<R>() {
                 Ok(r) => return Ok(r),
                 Err(crate::resource::ResourceError::BorrowConflict(name)) => {
@@ -351,7 +359,7 @@ impl<'parent> SystemContext<'parent> {
             }
         }
 
-        Err(ParamError::ResourceNotFound(core::any::type_name::<R>()))
+        Err(ParamError::ResourceNotFound(type_name::<R>()))
     }
 
     /// Returns a mutable reference to a resource in the current scope only.
@@ -387,7 +395,7 @@ impl<'parent> SystemContext<'parent> {
     /// Returns a reference to the global resources, if any.
     #[must_use]
     pub fn globals(&self) -> Option<&Resources> {
-        self.globals
+        self.globals.as_deref()
     }
 
     /// Returns `true` if a resource with the given `TypeId` exists in this scope,
@@ -396,14 +404,14 @@ impl<'parent> SystemContext<'parent> {
     /// This is useful for validation when the concrete type is not known
     /// at compile time (e.g., validating system access declarations).
     #[must_use]
-    pub fn contains_resource_by_type_id(&self, type_id: core::any::TypeId) -> bool {
+    pub fn contains_resource_by_type_id(&self, type_id: TypeId) -> bool {
         if self.resources.contains_by_type_id(type_id) {
             return true;
         }
         if let Some(parent) = self.parent {
             return parent.contains_resource_by_type_id(type_id);
         }
-        if let Some(globals) = self.globals {
+        if let Some(globals) = &self.globals {
             return globals.contains_by_type_id(type_id);
         }
         false
@@ -414,7 +422,7 @@ impl<'parent> SystemContext<'parent> {
     /// This is useful for validating mutable access (`ResMut`) which only operates
     /// on the current scope.
     #[must_use]
-    pub fn contains_local_resource_by_type_id(&self, type_id: core::any::TypeId) -> bool {
+    pub fn contains_local_resource_by_type_id(&self, type_id: TypeId) -> bool {
         self.resources.contains_by_type_id(type_id)
     }
 
@@ -434,11 +442,7 @@ impl<'parent> SystemContext<'parent> {
     ///
     /// Called by the executor when the concrete output type is not known
     /// at compile time. The `type_id` must match the correct type of the value.
-    pub fn insert_output_boxed(
-        &mut self,
-        type_id: core::any::TypeId,
-        output: Box<dyn core::any::Any + Send + Sync>,
-    ) {
+    pub fn insert_output_boxed(&mut self, type_id: TypeId, output: Box<dyn Any + Send + Sync>) {
         self.outputs.insert_boxed(type_id, output);
     }
 
@@ -453,7 +457,7 @@ impl<'parent> SystemContext<'parent> {
     /// This is useful for validation when the concrete type is not known
     /// at compile time (e.g., validating system access declarations).
     #[must_use]
-    pub fn contains_output_by_type_id(&self, type_id: core::any::TypeId) -> bool {
+    pub fn contains_output_by_type_id(&self, type_id: TypeId) -> bool {
         self.outputs.contains_by_type_id(type_id)
     }
 
@@ -495,7 +499,7 @@ impl<'parent> SystemContext<'parent> {
     /// parent context without borrow conflicts.
     #[must_use]
     pub fn take_outputs(&mut self) -> Outputs {
-        core::mem::take(&mut self.outputs)
+        std::mem::take(&mut self.outputs)
     }
 }
 
@@ -529,7 +533,7 @@ pub struct Res<'w, T: Resource> {
     inner: ResourceRef<'w, T>,
 }
 
-impl<'w, T: Resource> core::ops::Deref for Res<'w, T> {
+impl<'w, T: Resource> std::ops::Deref for Res<'w, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -592,7 +596,7 @@ pub struct ResMut<'w, T: LocalResource> {
     inner: ResourceRefMut<'w, T>,
 }
 
-impl<'w, T: LocalResource> core::ops::Deref for ResMut<'w, T> {
+impl<'w, T: LocalResource> std::ops::Deref for ResMut<'w, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -600,7 +604,7 @@ impl<'w, T: LocalResource> core::ops::Deref for ResMut<'w, T> {
     }
 }
 
-impl<'w, T: LocalResource> core::ops::DerefMut for ResMut<'w, T> {
+impl<'w, T: LocalResource> std::ops::DerefMut for ResMut<'w, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
@@ -659,7 +663,7 @@ pub struct Out<'w, T: Output> {
     inner: OutputRef<'w, T>,
 }
 
-impl<'w, T: Output> core::ops::Deref for Out<'w, T> {
+impl<'w, T: Output> std::ops::Deref for Out<'w, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -681,6 +685,92 @@ impl<'a, T: Output> SystemParam for Out<'a, T> {
         // We track this as output read access
         let mut access = SystemAccess::new();
         access.outputs.push(Access::read::<T>());
+        access
+    }
+}
+
+/// Context tag declared by [`ErrOut<T>`] to signal that the system expects
+/// to run on a failure path.
+pub const ERROR_CONTEXT: &str = "error";
+
+/// Marker trait for output types that represent error context.
+///
+/// Types implementing `ErrorContext` can be used with [`ErrOut<T>`] to read
+/// error information that is only available when execution routes through
+/// a failure path. `ErrOut<T>` declares an `"error"` context requirement
+/// so higher layers can validate the system is wired correctly.
+///
+/// `ErrorContext` is a subtrait of [`Output`], so any implementing type is
+/// automatically storable in the [`Outputs`] container via the existing
+/// blanket impl.
+///
+/// # Example
+///
+/// ```
+/// use polaris_system::param::ErrorContext;
+///
+/// #[derive(Debug, Clone)]
+/// struct FailureInfo { message: String }
+///
+/// impl ErrorContext for FailureInfo {}
+/// ```
+pub trait ErrorContext: Output {}
+
+/// Read-only access to a contextual output that requires an error path.
+///
+/// `ErrOut<T>` reads from the same [`Outputs`] store as [`Out<T>`], but
+/// additionally declares an `"error"` [context requirement](SystemAccess::require_context).
+/// This allows higher layers to validate that the system is reachable
+/// through the correct path before execution.
+///
+/// # When to Use
+///
+/// - **`Out<T>`**: Reading a previous system's return value (normal path)
+/// - **`ErrOut<T>`**: Reading error context that is only available after
+///   a system failure
+///
+/// # Example
+///
+/// ```
+/// use polaris_system::param::{ErrOut, ErrorContext};
+/// use polaris_system::system;
+///
+/// #[derive(Debug, Clone)]
+/// struct FailureInfo { message: String }
+/// impl ErrorContext for FailureInfo {}
+///
+/// #[system]
+/// async fn handle_failure(info: ErrOut<FailureInfo>) {
+///     eprint!("{}", info.message);
+/// }
+/// ```
+pub struct ErrOut<'w, T: ErrorContext> {
+    inner: OutputRef<'w, T>,
+}
+
+impl<'w, T: ErrorContext> std::ops::Deref for ErrOut<'w, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a, T: ErrorContext> SystemParam for ErrOut<'a, T> {
+    type Item<'w> = ErrOut<'w, T>;
+
+    fn fetch<'w>(ctx: &'w SystemContext<'_>) -> Result<Self::Item<'w>, ParamError> {
+        let inner = ctx.get_output::<T>().map_err(|err| match err {
+            ParamError::OutputNotFound(_) => ParamError::ErrorNotFound(type_name::<T>()),
+            other => other,
+        })?;
+        Ok(ErrOut { inner })
+    }
+
+    fn access() -> SystemAccess {
+        let mut access = SystemAccess::new();
+        access.outputs.push(Access::read::<T>());
+        access.require_context(ERROR_CONTEXT);
         access
     }
 }
@@ -1016,7 +1106,7 @@ mod tests {
 
     #[test]
     fn context_insert_boxed_resource() {
-        use core::any::{Any, TypeId};
+        use std::any::{Any, TypeId};
 
         let mut ctx = SystemContext::new();
 
@@ -1031,7 +1121,7 @@ mod tests {
 
     #[test]
     fn context_insert_output_boxed() {
-        use core::any::{Any, TypeId};
+        use std::any::{Any, TypeId};
 
         let mut ctx = SystemContext::new();
 
@@ -1048,7 +1138,7 @@ mod tests {
 
     #[test]
     fn contains_resource_by_type_id() {
-        use core::any::TypeId;
+        use std::any::TypeId;
 
         let ctx = SystemContext::new().with(Counter { value: 1 });
 
@@ -1061,7 +1151,7 @@ mod tests {
 
     #[test]
     fn contains_local_resource_by_type_id() {
-        use core::any::TypeId;
+        use std::any::TypeId;
 
         let parent = SystemContext::new().with(Counter { value: 1 });
         let child = parent.child().with(Config {
@@ -1082,7 +1172,7 @@ mod tests {
 
     #[test]
     fn contains_output_by_type_id() {
-        use core::any::TypeId;
+        use std::any::TypeId;
 
         let mut ctx = SystemContext::new();
         ctx.insert_output(ReasoningResult {
@@ -1269,5 +1359,56 @@ mod tests {
 
         let output = parent.get_output::<ReasoningResult>().unwrap();
         assert_eq!(output.action, "child");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ErrOut<T> tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(Debug, Clone)]
+    struct TestError {
+        message: String,
+    }
+
+    impl ErrorContext for TestError {}
+
+    #[test]
+    fn err_out_fetch_returns_error_from_outputs() {
+        let mut ctx = SystemContext::new();
+        ctx.insert_output(TestError {
+            message: "boom".into(),
+        });
+
+        let err_out = ErrOut::<TestError>::fetch(&ctx).unwrap();
+        assert_eq!(err_out.message, "boom");
+    }
+
+    #[test]
+    fn err_out_fetch_returns_error_when_missing() {
+        let ctx = SystemContext::new();
+        let result = ErrOut::<TestError>::fetch(&ctx);
+        assert!(matches!(result, Err(ParamError::ErrorNotFound(_))));
+    }
+
+    #[test]
+    fn err_out_deref_to_inner_type() {
+        let mut ctx = SystemContext::new();
+        ctx.insert_output(TestError {
+            message: "test".into(),
+        });
+
+        let err_out = ErrOut::<TestError>::fetch(&ctx).unwrap();
+        // Deref gives us &TestError
+        let inner: &TestError = &err_out;
+        assert_eq!(inner.message, "test");
+    }
+
+    #[test]
+    fn err_out_declares_output_access_and_context_requirement() {
+        let access = <ErrOut<TestError>>::access();
+        assert_eq!(access.outputs.len(), 1);
+        assert_eq!(access.outputs[0].mode, AccessMode::Read);
+        assert!(access.outputs[0].type_name.contains("TestError"));
+        assert_eq!(access.context_requirements, vec![ERROR_CONTEXT]);
     }
 }

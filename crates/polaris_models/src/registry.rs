@@ -23,7 +23,7 @@ use std::sync::Arc;
 /// # use polaris_system::plugin::{Plugin, PluginId, Version};
 /// # use polaris_system::server::Server;
 /// # use polaris_models::{ModelRegistry, ModelsPlugin};
-/// # use polaris_models::llm::{LlmProvider, GenerationRequest, GenerationResponse, GenerationError};
+/// # use polaris_models::llm::{LlmProvider, LlmRequest, LlmResponse, GenerationError};
 /// # use async_trait::async_trait;
 /// # use std::sync::Arc;
 ///
@@ -34,7 +34,7 @@ use std::sync::Arc;
 ///
 /// # #[async_trait]
 /// # impl LlmProvider for MyProvider {
-/// #   async fn generate(&self, _model: &str, _request: GenerationRequest) -> Result<GenerationResponse, GenerationError> {
+/// #   async fn generate(&self, _model: &str, _request: LlmRequest) -> Result<LlmResponse, GenerationError> {
 /// #     unimplemented!()
 /// #   }
 /// # }
@@ -64,8 +64,8 @@ pub struct ModelRegistry {
     llm_providers: HashMap<String, Arc<dyn LlmProvider>>,
 }
 
-impl core::fmt::Debug for ModelRegistry {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::fmt::Debug for ModelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelRegistry")
             .field("llm_providers", &self.llm_provider_names())
             .finish()

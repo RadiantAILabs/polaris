@@ -11,6 +11,7 @@ use std::any::TypeId;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Unique identifier for a node in the graph.
 ///
@@ -28,7 +29,7 @@ impl NodeId {
     /// Creates a new node ID with a unique nanoid.
     #[must_use]
     pub fn new() -> Self {
-        Self(nanoid::nanoid!().into())
+        Self(nanoid::nanoid!(8).into())
     }
 
     /// Creates a node ID from a specific string value.
@@ -58,6 +59,15 @@ impl fmt::Display for NodeId {
     }
 }
 
+impl IntoIterator for NodeId {
+    type Item = NodeId;
+    type IntoIter = std::iter::Once<NodeId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self)
+    }
+}
+
 /// A node in the graph.
 ///
 /// Each node represents either a computation unit (system) or a control flow
@@ -70,12 +80,12 @@ pub enum Node {
     Decision(DecisionNode),
     /// Routes flow based on discriminator (multi-way branch).
     Switch(SwitchNode),
-    /// Executes multiple paths concurrently.
+    /// Executes multiple paths of subgraphs concurrently.
+    /// The parallel node is both the entry and exit point — after all branches
+    /// complete, execution continues from the parallel node's outgoing edge.
     Parallel(ParallelNode),
     /// Repeats subgraph until termination condition.
     Loop(LoopNode),
-    /// Aggregates results from parallel paths.
-    Join(JoinNode),
 }
 
 impl Node {
@@ -88,20 +98,112 @@ impl Node {
             Node::Switch(n) => n.id.clone(),
             Node::Parallel(n) => n.id.clone(),
             Node::Loop(n) => n.id.clone(),
-            Node::Join(n) => n.id.clone(),
         }
     }
 
     /// Returns the node's name.
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'static str {
         match self {
             Node::System(n) => n.name(),
             Node::Decision(n) => n.name,
             Node::Switch(n) => n.name,
             Node::Parallel(n) => n.name,
             Node::Loop(n) => n.name,
-            Node::Join(n) => n.name,
+        }
+    }
+}
+
+/// Retry policy for system nodes that may fail transiently.
+///
+/// When a system fails and has a retry policy, the executor retries
+/// according to the policy before routing to error/timeout handlers.
+#[derive(Debug, Clone)]
+pub enum RetryPolicy {
+    /// Fixed delay between retries.
+    Fixed {
+        /// Maximum number of retry attempts (not counting the initial attempt).
+        max_retries: usize,
+        /// Delay between attempts.
+        delay: Duration,
+    },
+    /// Exponential backoff between retries.
+    Exponential {
+        /// Maximum number of retry attempts (not counting the initial attempt).
+        max_retries: usize,
+        /// Delay before the first retry.
+        initial_delay: Duration,
+        /// Maximum delay between retries (caps the exponential growth).
+        max_delay: Option<Duration>,
+    },
+}
+
+impl RetryPolicy {
+    /// Creates a fixed-delay retry policy.
+    #[must_use]
+    pub fn fixed(max_retries: usize, delay: Duration) -> Self {
+        RetryPolicy::Fixed { max_retries, delay }
+    }
+
+    /// Creates an exponential backoff retry policy.
+    #[must_use]
+    pub fn exponential(max_retries: usize, initial_delay: Duration) -> Self {
+        RetryPolicy::Exponential {
+            max_retries,
+            initial_delay,
+            max_delay: None,
+        }
+    }
+
+    /// Sets the maximum delay (for exponential backoff).
+    ///
+    /// Has no effect on [`Fixed`](RetryPolicy::Fixed) policies.
+    #[must_use]
+    pub fn with_max_delay(mut self, max_delay: Duration) -> Self {
+        if let RetryPolicy::Exponential {
+            max_delay: ref mut md,
+            ..
+        } = self
+        {
+            *md = Some(max_delay);
+        }
+        self
+    }
+
+    /// Returns the maximum number of retry attempts.
+    #[must_use]
+    pub fn max_retries(&self) -> usize {
+        match self {
+            RetryPolicy::Fixed { max_retries, .. }
+            | RetryPolicy::Exponential { max_retries, .. } => *max_retries,
+        }
+    }
+
+    /// Returns the delay for the given attempt number (0-indexed).
+    ///
+    /// Attempt 0 is the delay before the first retry (after the initial attempt fails).
+    #[must_use]
+    pub fn delay_for_attempt(&self, attempt: usize) -> Duration {
+        match self {
+            RetryPolicy::Fixed { delay, .. } => *delay,
+            RetryPolicy::Exponential {
+                initial_delay,
+                max_delay,
+                ..
+            } => {
+                // 2^attempt, saturating on overflow (attempt >= 32)
+                let multiplier = 1u32.checked_shl(attempt as u32);
+                let delay = if let Some(m) = multiplier {
+                    initial_delay.saturating_mul(m)
+                } else {
+                    max_delay.unwrap_or(Duration::MAX)
+                };
+                if let Some(cap) = max_delay {
+                    delay.min(*cap)
+                } else {
+                    delay
+                }
+            }
         }
     }
 }
@@ -117,7 +219,9 @@ pub struct SystemNode {
     pub system: BoxedSystem,
     /// Optional timeout for this system's execution.
     /// If set and exceeded, the executor will follow any timeout edge if present.
-    pub timeout: Option<core::time::Duration>,
+    pub timeout: Option<Duration>,
+    /// Optional retry policy for transient failures.
+    pub retry_policy: Option<RetryPolicy>,
     /// Custom schedules attached to this system node.
     /// System lifecycle events are re-emitted on these schedules,
     /// allowing hooks to subscribe to events for this system only.
@@ -132,6 +236,7 @@ impl SystemNode {
             id: NodeId::new(),
             system: Box::new(system),
             timeout: None,
+            retry_policy: None,
             schedules: Vec::new(),
         }
     }
@@ -143,13 +248,14 @@ impl SystemNode {
             id: NodeId::new(),
             system,
             timeout: None,
+            retry_policy: None,
             schedules: Vec::new(),
         }
     }
 
     /// Sets the timeout for this system node.
     #[must_use]
-    pub fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
@@ -307,17 +413,16 @@ impl fmt::Debug for SwitchNode {
 /// A node that executes multiple paths concurrently.
 ///
 /// Parallel nodes fork execution into multiple branches that run
-/// simultaneously. Results are collected at a corresponding Join node.
+/// simultaneously. After all branches complete, outputs are merged
+/// and execution continues from the parallel node's outgoing edge.
 #[derive(Debug)]
 pub struct ParallelNode {
     /// Unique identifier for this node.
     pub id: NodeId,
     /// Human-readable name for debugging and tracing.
     pub name: &'static str,
-    /// Node IDs for each parallel branch.
+    /// Node IDs for each parallel branch entry point.
     pub branches: Vec<NodeId>,
-    /// Node ID of the join node that collects results.
-    pub join: Option<NodeId>,
 }
 
 impl ParallelNode {
@@ -328,7 +433,6 @@ impl ParallelNode {
             id: NodeId::new(),
             name,
             branches: Vec::new(),
-            join: None,
         }
     }
 }
@@ -517,6 +621,45 @@ mod tests {
 
         assert_eq!(node.output_type_id(), TypeId::of::<i32>());
         assert!(node.output_type_name().contains("i32"));
+    }
+
+    #[test]
+    fn retry_policy_fixed_delay() {
+        let policy = RetryPolicy::fixed(3, Duration::from_millis(100));
+        assert_eq!(policy.max_retries(), 3);
+        assert_eq!(policy.delay_for_attempt(0), Duration::from_millis(100));
+        assert_eq!(policy.delay_for_attempt(1), Duration::from_millis(100));
+        assert_eq!(policy.delay_for_attempt(2), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn retry_policy_exponential_delay() {
+        let policy = RetryPolicy::exponential(4, Duration::from_millis(100));
+        assert_eq!(policy.max_retries(), 4);
+        assert_eq!(policy.delay_for_attempt(0), Duration::from_millis(100));
+        assert_eq!(policy.delay_for_attempt(1), Duration::from_millis(200));
+        assert_eq!(policy.delay_for_attempt(2), Duration::from_millis(400));
+        assert_eq!(policy.delay_for_attempt(3), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn retry_policy_exponential_with_max_delay() {
+        let policy = RetryPolicy::exponential(4, Duration::from_millis(100))
+            .with_max_delay(Duration::from_millis(300));
+        assert_eq!(policy.delay_for_attempt(0), Duration::from_millis(100));
+        assert_eq!(policy.delay_for_attempt(1), Duration::from_millis(200));
+        // 400ms capped to 300ms
+        assert_eq!(policy.delay_for_attempt(2), Duration::from_millis(300));
+        // 800ms capped to 300ms
+        assert_eq!(policy.delay_for_attempt(3), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn retry_policy_with_max_delay_no_effect_on_fixed() {
+        let policy = RetryPolicy::fixed(2, Duration::from_millis(100))
+            .with_max_delay(Duration::from_millis(50));
+        // with_max_delay has no effect on Fixed
+        assert_eq!(policy.delay_for_attempt(0), Duration::from_millis(100));
     }
 
     struct MarkerA;

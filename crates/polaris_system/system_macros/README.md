@@ -55,6 +55,24 @@ fn read_counter() -> ReadCounterSystem {
 }
 ```
 
+## Fallible Systems
+
+Systems that return `Result<T, SystemError>` are considered fallible. The macro detects this return type and:
+
+1. Extracts `T` as the system's `Output` type (not `Result<T, SystemError>`)
+2. Sets `is_fallible()` to return `true` (infallible systems return `false`)
+
+```rust
+#[system]
+async fn reason(llm: Res<LLM>) -> Result<ReasoningResult, SystemError> {
+    let response = llm.generate().await
+        .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+    Ok(ReasoningResult { action: response.action })
+}
+```
+
+On success, `T` is stored in the context for downstream `Out<T>` access. On error, the `SystemError` propagates to the executor.
+
 ## Generated Code
 
 For a function `foo_bar`, the macro generates:
@@ -64,6 +82,13 @@ For a function `foo_bar`, the macro generates:
 | `FooBarSystem` | Unit struct (PascalCase from snake_case) |
 | `impl System for FooBarSystem` | The `System` trait implementation |
 | `fn foo_bar() -> FooBarSystem` | Factory function returning the system |
+
+The generated `System` implementation includes:
+
+- `run()` — fetches each parameter via `SystemParam::fetch()` and executes the function body
+- `name()` — returns the original function name as a `&'static str`
+- `access()` — merges access declarations from all parameters
+- `is_fallible()` — returns `true` if the return type is `Result<T, SystemError>`, `false` otherwise
 
 ## Requirements
 

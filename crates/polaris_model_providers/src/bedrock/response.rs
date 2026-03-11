@@ -3,10 +3,10 @@
 use super::types::document_to_json;
 use aws_sdk_bedrockruntime::operation::converse::ConverseOutput;
 use aws_sdk_bedrockruntime::types as bedrock;
-use polaris_models::llm::{self as polaris_llm, GenerationError, GenerationResponse};
+use polaris_models::llm::{self as polaris_llm, GenerationError, LlmResponse};
 
 /// Converts a Bedrock converse response to a Polaris generation response.
-pub fn convert_response(response: ConverseOutput) -> Result<GenerationResponse, GenerationError> {
+pub fn convert_response(response: ConverseOutput) -> Result<LlmResponse, GenerationError> {
     let content = match response.output {
         Some(bedrock::ConverseOutput::Message(msg)) => msg
             .content
@@ -23,7 +23,7 @@ pub fn convert_response(response: ConverseOutput) -> Result<GenerationResponse, 
 
     let usage = convert_usage(response.usage);
 
-    Ok(GenerationResponse { content, usage })
+    Ok(LlmResponse { content, usage })
 }
 
 /// Converts a Bedrock content block to a Polaris assistant block.
@@ -37,6 +37,7 @@ fn convert_content_block(
             }))
         }
         bedrock::ContentBlock::ToolUse(tool_use) => Ok(convert_tool_use(tool_use)),
+        bedrock::ContentBlock::ReasoningContent(reasoning) => convert_reasoning(reasoning),
         other => Err(GenerationError::InvalidResponse(format!(
             "unsupported Bedrock content block type: {other:?}"
         ))),
@@ -55,6 +56,36 @@ fn convert_tool_use(tool_use: bedrock::ToolUseBlock) -> polaris_llm::AssistantBl
         signature: None,
         additional_params: None,
     })
+}
+
+/// Converts a Bedrock reasoning content block to a Polaris reasoning block.
+fn convert_reasoning(
+    reasoning: bedrock::ReasoningContentBlock,
+) -> Result<polaris_llm::AssistantBlock, GenerationError> {
+    match reasoning {
+        bedrock::ReasoningContentBlock::ReasoningText(block) => Ok(
+            polaris_llm::AssistantBlock::Reasoning(polaris_llm::ReasoningBlock {
+                id: None,
+                reasoning: vec![block.text],
+                signature: block.signature,
+            }),
+        ),
+        bedrock::ReasoningContentBlock::RedactedContent(_) => {
+            // Redacted reasoning is encrypted by the provider for safety.
+            // We represent it as an empty reasoning block since the content
+            // is not accessible.
+            Ok(polaris_llm::AssistantBlock::Reasoning(
+                polaris_llm::ReasoningBlock {
+                    id: None,
+                    reasoning: Vec::new(),
+                    signature: None,
+                },
+            ))
+        }
+        _ => Err(GenerationError::InvalidResponse(
+            "unknown Bedrock reasoning content variant".to_string(),
+        )),
+    }
 }
 
 /// Converts Bedrock token usage to Polaris usage.

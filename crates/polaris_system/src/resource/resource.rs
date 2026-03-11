@@ -14,9 +14,9 @@
 //! The distinction enables compile-time safety: `ResMut<T>` only works with
 //! `LocalResource`, preventing accidental mutation of global state.
 
-use core::any::{Any, TypeId};
 use hashbrown::HashMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::any::{Any, TypeId, type_name};
 
 /// A resource that can be stored in the registry and injected into systems.
 ///
@@ -45,7 +45,7 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub trait Resource: Send + Sync + 'static {
     /// Returns the type name for debugging purposes.
     fn type_name(&self) -> &'static str {
-        core::any::type_name::<Self>()
+        type_name::<Self>()
     }
 }
 
@@ -328,7 +328,7 @@ impl Resources {
     /// - [`ResourceError::BorrowConflict`] if the resource is mutably borrowed
     pub fn get<T: Resource>(&self) -> Result<ResourceRef<T>, ResourceError> {
         let id = ResourceId::of::<T>();
-        let type_name = core::any::type_name::<T>();
+        let type_name = type_name::<T>();
 
         let entry = self
             .storage
@@ -341,7 +341,7 @@ impl Resources {
 
         Ok(ResourceRef {
             guard,
-            _marker: core::marker::PhantomData,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -356,7 +356,7 @@ impl Resources {
     /// - [`ResourceError::BorrowConflict`] if the resource is already borrowed
     pub fn get_mut<T: Resource>(&self) -> Result<ResourceRefMut<T>, ResourceError> {
         let id = ResourceId::of::<T>();
-        let type_name = core::any::type_name::<T>();
+        let type_name = type_name::<T>();
 
         let entry = self
             .storage
@@ -369,7 +369,7 @@ impl Resources {
 
         Ok(ResourceRefMut {
             guard,
-            _marker: core::marker::PhantomData,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -409,10 +409,10 @@ impl Resources {
 /// guard is dropped.
 pub struct ResourceRef<'a, T: Resource> {
     guard: RwLockReadGuard<'a, Box<dyn Any + Send + Sync>>,
-    _marker: core::marker::PhantomData<&'a T>,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
-impl<T: Resource> core::ops::Deref for ResourceRef<'_, T> {
+impl<T: Resource> std::ops::Deref for ResourceRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -431,10 +431,10 @@ impl<T: Resource> core::ops::Deref for ResourceRef<'_, T> {
 /// guard is dropped.
 pub struct ResourceRefMut<'a, T: Resource> {
     guard: RwLockWriteGuard<'a, Box<dyn Any + Send + Sync>>,
-    _marker: core::marker::PhantomData<&'a mut T>,
+    _marker: std::marker::PhantomData<&'a mut T>,
 }
 
-impl<T: Resource> core::ops::Deref for ResourceRefMut<'_, T> {
+impl<T: Resource> std::ops::Deref for ResourceRefMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -445,7 +445,7 @@ impl<T: Resource> core::ops::Deref for ResourceRefMut<'_, T> {
     }
 }
 
-impl<T: Resource> core::ops::DerefMut for ResourceRefMut<'_, T> {
+impl<T: Resource> std::ops::DerefMut for ResourceRefMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: Same as ResourceRef
         self.guard

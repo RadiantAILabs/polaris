@@ -10,6 +10,5 @@ workspace = true
 
 [dependencies]
 polaris_graph = { path = "../polaris_graph" }
-
-[dev-dependencies]
 polaris_system = { path = "../polaris_system" }
+thiserror = "2"

@@ -5,7 +5,7 @@ use super::response::convert_response;
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::types as bedrock;
-use polaris_models::llm::{GenerationError, GenerationRequest, GenerationResponse, LlmProvider};
+use polaris_models::llm::{GenerationError, LlmProvider, LlmRequest, LlmResponse};
 use std::sync::Arc;
 
 /// AWS Bedrock [`LlmProvider`] implementation.
@@ -26,8 +26,23 @@ impl LlmProvider for BedrockProvider {
     async fn generate(
         &self,
         model: &str,
-        request: GenerationRequest,
-    ) -> Result<GenerationResponse, GenerationError> {
+        request: LlmRequest,
+    ) -> Result<LlmResponse, GenerationError> {
+        let tool_config = build_tool_config(&request)?;
+        let output_config = build_output_config(&request)?;
+
+        // Bedrock requires tool definitions whenever tool blocks appear in
+        // the message history. Surface a clear error instead of letting a
+        // cryptic Bedrock validation error propagate.
+        if tool_config.is_none() && request.contains_tool_blocks() {
+            return Err(GenerationError::InvalidRequest(
+                "messages contain tool use blocks but no tool definitions were provided; \
+                 include the tool definitions in the request when the conversation history \
+                 contains tool calls or tool results"
+                    .to_string(),
+            ));
+        }
+
         let messages = request
             .messages
             .iter()
@@ -38,9 +53,6 @@ impl LlmProvider for BedrockProvider {
             .system
             .as_ref()
             .map(|s| vec![bedrock::SystemContentBlock::Text(s.clone())]);
-
-        let tool_config = build_tool_config(&request)?;
-        let output_config = build_output_config(&request)?;
 
         let response = self
             .client

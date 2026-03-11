@@ -61,6 +61,7 @@
 // within this crate.
 extern crate self as polaris_tools;
 
+pub mod builder;
 pub mod error;
 pub mod param;
 pub mod registry;
@@ -69,6 +70,7 @@ pub mod tool;
 pub mod toolset;
 
 // Re-export core types at crate root.
+pub use builder::{LlmReasonExt, LlmRequestBuilderExt, ReasonError};
 pub use error::ToolError;
 pub use param::{FunctionCall, FunctionParam, InputParam};
 pub use registry::{ToolRegistry, ToolsPlugin};

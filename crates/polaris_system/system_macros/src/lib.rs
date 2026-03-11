@@ -207,7 +207,7 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let body_expr = if returns_result {
         quote!(#body)
     } else {
-        quote!(::core::result::Result::Ok(#body))
+        quote!(::std::result::Result::Ok(#body))
     };
 
     // Generate the struct and System impl
@@ -223,7 +223,7 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
             fn run<'a>(
                 &'a self,
                 ctx: &'a #ps::param::SystemContext<'_>,
-            ) -> #ps::system::BoxFuture<'a, ::core::result::Result<Self::Output, #ps::system::SystemError>> {
+            ) -> #ps::system::BoxFuture<'a, ::std::result::Result<Self::Output, #ps::system::SystemError>> {
                 ::std::boxed::Box::pin(async move {
                     #(#fetch_stmts)*
                     #body_expr
@@ -238,6 +238,10 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut access = #ps::param::SystemAccess::new();
                 #(#access_merges)*
                 access
+            }
+
+            fn is_fallible(&self) -> bool {
+                #returns_result
             }
         }
 

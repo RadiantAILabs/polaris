@@ -18,6 +18,7 @@ polaris_tools = { path = "../polaris_tools" }
 polaris_model_providers = { path = "../polaris_model_providers" }
 polaris_models = { path = "../polaris_models" }
 polaris_core_plugins = { path = "../polaris_core_plugins" }
+polaris_sessions = { path = "../polaris_sessions" }
 
 [lints]
 workspace = true

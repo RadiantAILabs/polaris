@@ -23,7 +23,7 @@
 //! Systems in different contexts (different agents) never conflict on
 //! [`LocalResource`](crate::resource::LocalResource), because each context has its own instance.
 
-use core::any::TypeId;
+use std::any::{TypeId, type_name};
 
 /// The mode of access to a resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,7 +56,7 @@ impl Access {
     pub fn read<T: 'static>() -> Self {
         Self {
             type_id: TypeId::of::<T>(),
-            type_name: core::any::type_name::<T>(),
+            type_name: type_name::<T>(),
             mode: AccessMode::Read,
             is_global: false,
         }
@@ -67,7 +67,7 @@ impl Access {
     pub fn write<T: 'static>() -> Self {
         Self {
             type_id: TypeId::of::<T>(),
-            type_name: core::any::type_name::<T>(),
+            type_name: type_name::<T>(),
             mode: AccessMode::Write,
             is_global: false,
         }
@@ -91,6 +91,11 @@ pub struct SystemAccess {
     pub resources: Vec<Access>,
     /// Outputs accessed by this system/parameter.
     pub outputs: Vec<Access>,
+    /// Execution context tags this system requires.
+    ///
+    /// Parameters can declare opaque string tags describing the execution
+    /// context they need (e.g. [`ERROR_CONTEXT`](super::ERROR_CONTEXT)).
+    pub context_requirements: Vec<&'static str>,
 }
 
 impl SystemAccess {
@@ -136,12 +141,22 @@ impl SystemAccess {
         self
     }
 
+    /// Adds a context requirement tag.
+    pub fn require_context(&mut self, tag: &'static str) {
+        if !self.context_requirements.contains(&tag) {
+            self.context_requirements.push(tag);
+        }
+    }
+
     /// Merges another access descriptor into this one.
     ///
     /// This is used to aggregate access from multiple parameters.
     pub fn merge(&mut self, other: &SystemAccess) {
         self.resources.extend(other.resources.iter().cloned());
         self.outputs.extend(other.outputs.iter().cloned());
+        for &tag in &other.context_requirements {
+            self.require_context(tag);
+        }
     }
 
     /// Creates a new access descriptor by merging two descriptors.
@@ -216,7 +231,7 @@ impl SystemAccess {
     /// Returns `true` if this descriptor has no accesses.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.resources.is_empty() && self.outputs.is_empty()
+        self.resources.is_empty() && self.outputs.is_empty() && self.context_requirements.is_empty()
     }
 }
 

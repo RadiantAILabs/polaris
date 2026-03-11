@@ -4,12 +4,12 @@
 //! generates code using `::polaris_system::` paths, which only work when
 //! the crate is used as an external dependency.
 
-use core::any::TypeId;
 use polaris_system::param::{Out, Res, ResMut, SystemContext};
 use polaris_system::prelude::SystemError;
 use polaris_system::resource::LocalResource;
 use polaris_system::system;
 use polaris_system::system::{ErasedSystem, System};
+use std::any::TypeId;
 
 #[derive(Debug, PartialEq, Clone)]
 struct TestOutput {
@@ -194,4 +194,26 @@ async fn macro_fallible_erased_err_propagates() {
 
     let result = erased.run_erased(&ctx).await;
     assert!(result.is_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// is_fallible
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn macro_infallible_is_not_fallible() {
+    let system = macro_read_counter();
+    assert!(!System::is_fallible(&system));
+
+    let erased: &dyn ErasedSystem = &system;
+    assert!(!erased.is_fallible());
+}
+
+#[test]
+fn macro_fallible_is_fallible() {
+    let system = macro_fallible();
+    assert!(System::is_fallible(&system));
+
+    let erased: &dyn ErasedSystem = &system;
+    assert!(erased.is_fallible());
 }

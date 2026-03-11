@@ -21,7 +21,7 @@
 //! ```
 
 use crate::{ExecutionError, node::NodeId};
-use core::time::Duration;
+use std::time::Duration;
 
 /// Unified event enum for all graph execution hooks.
 ///
@@ -38,6 +38,8 @@ pub enum GraphEvent {
     GraphStart {
         /// Number of nodes in the graph.
         node_count: usize,
+        /// Node ID to name mapping for all nodes in the graph.
+        node_map: Vec<(NodeId, &'static str)>,
     },
 
     /// Event fired after graph execution completes.
@@ -252,8 +254,18 @@ impl GraphEvent {
 impl std::fmt::Display for GraphEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GraphEvent::GraphStart { node_count } => {
-                write!(f, "GraphStart(nodes: {})", node_count)
+            GraphEvent::GraphStart {
+                node_count,
+                node_map,
+            } => {
+                write!(f, "GraphStart(nodes: {})", node_count)?;
+                if !node_map.is_empty() {
+                    writeln!(f, ", node_map:")?;
+                    for (id, name) in node_map {
+                        writeln!(f, "  {:20} {}", name, id)?;
+                    }
+                };
+                Ok(())
             }
             GraphEvent::GraphComplete {
                 nodes_executed,

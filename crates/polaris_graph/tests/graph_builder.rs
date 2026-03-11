@@ -121,7 +121,7 @@ fn add_sequential_systems() {
 
 #[test]
 fn system_node_stores_type_info() {
-    use core::any::TypeId;
+    use std::any::TypeId;
 
     let mut graph = Graph::new();
     graph.add_system(first_step); // returns i32
@@ -191,8 +191,8 @@ fn add_parallel_branches() {
         ],
     );
 
-    // Nodes: parallel, branch_a, branch_b, join
-    assert!(graph.node_count() >= 4);
+    // Nodes: parallel, branch_a, branch_b
+    assert!(graph.node_count() >= 3);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -379,4 +379,365 @@ fn ids_are_sequential_across_subgraphs() {
         "All node IDs should be unique, found {} duplicates",
         node_ids.len() - unique_ids.len()
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SystemNodeBuilder
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn fallback_system() -> String {
+    "fallback".to_string()
+}
+
+async fn timeout_handler() -> String {
+    "timeout".to_string()
+}
+
+#[test]
+fn system_builder_on_error_attaches_error_handler() {
+    let mut graph = Graph::new();
+    graph
+        .system(first_step)
+        .on_error(|g| {
+            g.add_system(fallback_system);
+        })
+        .done()
+        .add_system(second_step);
+
+    // Should have: first_step, fallback_system, second_step = 3 nodes
+    assert_eq!(graph.node_count(), 3);
+    // Should have error edge + sequential edge = at least 2 edges
+    assert!(graph.edge_count() >= 2);
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn system_builder_with_timeout_and_on_timeout() {
+    use std::time::Duration;
+
+    let mut graph = Graph::new();
+    graph
+        .system(first_step)
+        .with_timeout(Duration::from_secs(30))
+        .on_timeout(|g| {
+            g.add_system(timeout_handler);
+        })
+        .done()
+        .add_system(second_step);
+
+    // first_step, timeout_handler, second_step = 3 nodes
+    assert_eq!(graph.node_count(), 3);
+
+    // Verify timeout was set on the system node
+    let entry = graph.entry().unwrap();
+    if let Node::System(sys) = graph.get_node(entry).unwrap() {
+        assert_eq!(sys.timeout, Some(Duration::from_secs(30)));
+    } else {
+        panic!("Expected system node");
+    }
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn system_builder_on_error_and_on_timeout_chaining() {
+    use std::time::Duration;
+
+    let mut graph = Graph::new();
+    graph
+        .system(first_step)
+        .on_error(|g| {
+            g.add_system(fallback_system);
+        })
+        .with_timeout(Duration::from_secs(10))
+        .on_timeout(|g| {
+            g.add_system(timeout_handler);
+        });
+
+    // first_step, fallback_system, timeout_handler = 3 nodes
+    assert_eq!(graph.node_count(), 3);
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn system_builder_done_continues_fluent_chain() {
+    let mut graph = Graph::new();
+    graph
+        .system(first_step)
+        .done()
+        .add_system(second_step)
+        .add_system(third_step);
+
+    assert_eq!(graph.node_count(), 3);
+    assert_eq!(graph.edge_count(), 2); // first->second, second->third
+}
+
+#[test]
+fn system_builder_id_returns_correct_node_id() {
+    let mut graph = Graph::new();
+    let builder = graph.system(first_step);
+    let id = builder.id();
+
+    // The id should match the entry point since it's the first node
+    assert_eq!(graph.entry().unwrap(), id);
+}
+
+#[test]
+fn system_builder_node_connected_sequentially() {
+    let mut graph = Graph::new();
+    graph.add_system(first_step);
+    graph.system(second_step);
+
+    // first_step → second_step via sequential edge
+    assert_eq!(graph.node_count(), 2);
+    assert_eq!(graph.edge_count(), 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pipe (reusable graph fragments)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn reusable_fragment(g: &mut Graph) {
+    g.add_system(second_step).add_system(third_step);
+}
+
+#[test]
+fn pipe_preserves_fluent_chain() {
+    // first_step -> second_step -> third_step -> finalize
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .pipe(reusable_fragment)
+        .add_system(finalize);
+
+    assert_eq!(graph.node_count(), 4);
+    assert_eq!(graph.edge_count(), 3);
+}
+
+#[test]
+fn pipe_sets_entry_when_first() {
+    let mut graph = Graph::new();
+    graph.pipe(|g| {
+        g.add_system(first_step);
+    });
+
+    assert_eq!(graph.node_count(), 1);
+    assert!(graph.entry().is_some());
+}
+
+#[test]
+fn pipe_with_empty_closure_is_noop() {
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .pipe(|_| {})
+        .add_system(second_step);
+
+    assert_eq!(graph.node_count(), 2);
+    assert_eq!(graph.edge_count(), 1);
+}
+
+#[test]
+fn pipe_composes_multiple_fragments() {
+    fn frag_a(g: &mut Graph) {
+        g.add_system(first_step);
+    }
+    fn frag_b(g: &mut Graph) {
+        g.add_system(second_step);
+    }
+    fn frag_c(g: &mut Graph) {
+        g.add_system(third_step);
+    }
+
+    let mut graph = Graph::new();
+    graph.pipe(frag_a).pipe(frag_b).pipe(frag_c);
+
+    assert_eq!(graph.node_count(), 3);
+    assert_eq!(graph.edge_count(), 2);
+}
+
+#[test]
+fn pipe_works_with_control_flow_inside() {
+    fn conditional_fragment(g: &mut Graph) {
+        g.add_conditional_branch::<bool, _, _, _>(
+            "inner_decision",
+            |val| *val,
+            |g| {
+                g.add_system(true_path_system);
+            },
+            |g| {
+                g.add_system(false_path_system);
+            },
+        );
+    }
+
+    let mut graph = Graph::new();
+    graph
+        .add_system(before_decision)
+        .pipe(conditional_fragment)
+        .add_system(finalize);
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Append (graph + graph sequential composition)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn append_connects_two_graphs() {
+    let mut left = Graph::new();
+    left.add_system(first_step).add_system(second_step);
+
+    let mut right = Graph::new();
+    right.add_system(third_step).add_system(finalize);
+
+    left.append(right).unwrap();
+
+    assert_eq!(left.node_count(), 4);
+    // first->second, second->third (append edge), third->finalize
+    assert_eq!(left.edge_count(), 3);
+    assert!(left.entry().is_some());
+
+    let result = left.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn append_empty_other_is_noop() {
+    let mut graph = Graph::new();
+    graph.add_system(first_step);
+
+    let empty = Graph::new();
+    graph.append(empty).unwrap();
+
+    assert_eq!(graph.node_count(), 1);
+    assert_eq!(graph.edge_count(), 0);
+}
+
+#[test]
+fn append_into_empty_self_adopts_other() {
+    let mut empty = Graph::new();
+
+    let mut other = Graph::new();
+    other.add_system(first_step).add_system(second_step);
+
+    empty.append(other).unwrap();
+
+    assert_eq!(empty.node_count(), 2);
+    assert_eq!(empty.edge_count(), 1);
+    assert!(empty.entry().is_some());
+}
+
+#[test]
+fn append_with_control_flow() {
+    let mut left = Graph::new();
+    left.add_system(before_decision)
+        .add_conditional_branch::<bool, _, _, _>(
+            "decision",
+            |val| *val,
+            |g| {
+                g.add_system(true_path_system);
+            },
+            |g| {
+                g.add_system(false_path_system);
+            },
+        );
+
+    let mut right = Graph::new();
+    right.add_system(finalize);
+
+    left.append(right).unwrap();
+
+    let result = left.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn last_node_accessor() {
+    let mut graph = Graph::new();
+    assert!(graph.last_node().is_none());
+
+    graph.add_system(first_step);
+    assert!(graph.last_node().is_some());
+
+    graph.add_system(second_step);
+    let last = graph.last_node().unwrap();
+    // last_node should differ from entry (which is first_step)
+    assert_ne!(graph.entry().unwrap(), last);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global error handler (add_error_handler)
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod test_utils;
+
+use polaris_graph::edge::Edge;
+use test_utils::{FailingSystem, SuccessSystem};
+
+#[test]
+fn add_error_handler_wires_fallible_nodes() {
+    let mut graph = Graph::new();
+
+    // FailingSystem is fallible (is_fallible() == true)
+    let fallible_id = graph.add_boxed_system(Box::new(FailingSystem));
+    // SuccessSystem is infallible (is_fallible() == false)
+    let _infallible_id = graph.add_boxed_system(Box::new(SuccessSystem));
+
+    graph.add_error_handler(|g| {
+        g.add_system(fallback_system);
+    });
+
+    // Count error edges
+    let error_edges: Vec<_> = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)))
+        .collect();
+
+    // Only the fallible node should have an error edge
+    assert_eq!(error_edges.len(), 1);
+    assert_eq!(error_edges[0].from(), fallible_id);
+}
+
+#[test]
+fn add_error_handler_skips_existing_error_edges() {
+    let mut graph = Graph::new();
+
+    // Two fallible nodes
+    let fallible_a = graph.add_boxed_system(Box::new(FailingSystem));
+    let fallible_b = graph.add_boxed_system(Box::new(FailingSystem));
+
+    // Manually wire an error handler for fallible_a
+    graph.add_error_handler_for(fallible_a.clone(), |g| {
+        g.add_system(respond);
+    });
+
+    // Now add global error handler — should only wire fallible_b
+    graph.add_error_handler(|g| {
+        g.add_system(fallback_system);
+    });
+
+    // Count error edges sourced from each fallible node
+    let errors_from_a = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)) && edge.from() == fallible_a)
+        .count();
+    let errors_from_b = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)) && edge.from() == fallible_b)
+        .count();
+
+    // fallible_a: 1 (manual), fallible_b: 1 (global)
+    assert_eq!(errors_from_a, 1);
+    assert_eq!(errors_from_b, 1);
 }

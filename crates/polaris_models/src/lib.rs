@@ -16,7 +16,7 @@
 //!
 //! ```
 //! use polaris_models::{ModelRegistry, ModelsPlugin};
-//! use polaris_models::llm::GenerationRequest;
+//! use polaris_models::llm::LlmRequest;
 //! use polaris_system::param::Res;
 //! use polaris_system::system::SystemError;
 //! use polaris_system::system;
@@ -27,9 +27,10 @@
 //!         .llm("openai/gpt-4o")
 //!         .map_err(|e| SystemError::ExecutionError(e.to_string()))?;
 //!
-//!     let request = GenerationRequest::with_system("You are helpful", "Hello!");
-//!     let response = llm
-//!         .generate(request)
+//!     let response = llm.builder()
+//!         .system("You are helpful")
+//!         .user("Hello!")
+//!         .generate()
 //!         .await
 //!         .map_err(|e| SystemError::ExecutionError(e.to_string()))?;
 //!

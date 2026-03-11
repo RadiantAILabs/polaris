@@ -63,14 +63,14 @@
 //! ```
 
 use super::events::GraphEvent;
-use core::any::TypeId;
-use core::fmt;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use polaris_system::api::API;
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::{IntoScheduleIds, ScheduleId};
 use polaris_system::resource::LocalResource;
+use std::any::TypeId;
+use std::fmt;
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,7 +156,7 @@ impl fmt::Display for HookRegistrationError {
     }
 }
 
-impl core::error::Error for HookRegistrationError {}
+impl std::error::Error for HookRegistrationError {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HookEntry
@@ -449,6 +449,7 @@ mod tests {
     use polaris_system::resource::LocalResource;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn hooks_api_register_increments_count() {
@@ -742,7 +743,7 @@ mod tests {
             &GraphEvent::SystemComplete {
                 node_id: NodeId::new(),
                 system_name: "test",
-                duration: core::time::Duration::ZERO,
+                duration: Duration::ZERO,
             },
         );
 

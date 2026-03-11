@@ -1,7 +1,8 @@
 //! Development tools for graph execution.
 //!
 //! The [`DevToolsPlugin`] injects [`SystemInfo`] before each system runs,
-//! providing execution context for debugging and observability.
+//! providing execution context for debugging and observability. It can
+//! optionally emit `tracing::debug!` logs for all graph execution events.
 //!
 //! # Example
 //!
@@ -29,7 +30,18 @@
 //! use polaris_system::server::Server;
 //!
 //! let mut server = Server::new();
-//! server.add_plugins(DevToolsPlugin);
+//! // Default: SystemInfo injection only
+//! server.add_plugins(DevToolsPlugin::default());
+//! ```
+//!
+//! Or with event tracing enabled:
+//!
+//! ```
+//! use polaris_graph::dev::DevToolsPlugin;
+//! use polaris_system::server::Server;
+//!
+//! let mut server = Server::new();
+//! server.add_plugins(DevToolsPlugin::new().with_event_tracing());
 //! ```
 //!
 //! # Validation
@@ -40,7 +52,7 @@
 
 use crate::hooks::HooksAPI;
 use crate::hooks::events::GraphEvent;
-use crate::hooks::schedule::OnSystemStart;
+use crate::hooks::schedule::{AllGraphSchedules, OnSystemStart};
 use crate::node::NodeId;
 use polaris_system::plugin::{Plugin, Version};
 use polaris_system::resource::LocalResource;
@@ -94,6 +106,10 @@ impl SystemInfo {
 /// [`SystemInfo`] resource into the context, making execution metadata
 /// available to systems via `Res<SystemInfo>`.
 ///
+/// When event tracing is enabled via [`with_event_tracing`](Self::with_event_tracing),
+/// it also registers an observer on all graph execution schedules that emits
+/// `tracing::debug!` logs for each event.
+///
 /// # Example
 ///
 /// ```
@@ -101,25 +117,54 @@ impl SystemInfo {
 /// use polaris_system::server::Server;
 ///
 /// let mut server = Server::new();
-/// server.add_plugins(DevToolsPlugin);
+/// server.add_plugins(DevToolsPlugin::new().with_event_tracing());
 /// ```
-pub struct DevToolsPlugin;
+pub struct DevToolsPlugin {
+    /// Whether to register a debug-level tracing observer for all graph events.
+    trace_events: bool,
+}
+
+impl DevToolsPlugin {
+    /// Creates a new `DevToolsPlugin` with event tracing disabled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            trace_events: false,
+        }
+    }
+
+    /// Enables debug-level tracing for all graph execution events.
+    ///
+    /// When enabled, every graph lifecycle event is logged via `tracing::debug!`.
+    #[must_use]
+    pub fn with_event_tracing(mut self) -> Self {
+        self.trace_events = true;
+        self
+    }
+}
+
+impl Default for DevToolsPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Plugin for DevToolsPlugin {
     const ID: &'static str = "polaris::dev_tools";
     const VERSION: Version = Version::new(0, 0, 1);
 
     fn build(&self, server: &mut Server) {
-        // Initialize HooksAPI if not present
         if !server.contains_api::<HooksAPI>() {
             server.insert_api(HooksAPI::new());
         }
 
-        // Register provider hook to inject SystemInfo before each system.
-        server
+        let hooks = server
             .api::<HooksAPI>()
-            .expect("HooksAPI should be present after initialization")
-            .register_provider::<OnSystemStart, SystemInfo, _>(
+            .expect("HooksAPI should be present after initialization");
+
+        // Register provider hook to inject SystemInfo before each system.
+        hooks
+            .register_provider::<OnSystemStart, _, _>(
                 "devtools_system_info",
                 |event: &GraphEvent| {
                     if let GraphEvent::SystemStart {
@@ -134,5 +179,17 @@ impl Plugin for DevToolsPlugin {
                 },
             )
             .expect("DevToolsPlugin hook registration should not fail");
+
+        // Optionally register a debug-level tracing observer for all events.
+        if self.trace_events {
+            hooks
+                .register_observer::<AllGraphSchedules, _>(
+                    "devtools_event_trace",
+                    |event: &GraphEvent| {
+                        tracing::debug!("{event}");
+                    },
+                )
+                .expect("DevToolsPlugin event tracing registration should not fail");
+        }
     }
 }

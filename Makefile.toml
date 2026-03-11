@@ -3,8 +3,8 @@ skip_core_tasks = true
 min_version = "0.37.0"
 
 [tasks.test]
-description = "Run all testing steps (format, clippy, test)"
-dependencies = ["test-format", "test-clippy", "test-workspace", "test-doc"]
+description = "Run all testing steps (format, clippy, markdown lint, test)"
+dependencies = ["test-format", "test-clippy", "test-markdown", "test-doc", "test-workspace"]
 
 [tasks.build]
 description = "Build the project"
@@ -20,6 +20,11 @@ args = ["fmt", "--", "--check"]
 description = "Fix code formatting issues"
 command = "cargo"
 args = ["fmt"]
+
+[tasks.test-markdown]
+description = "Lint markdown files"
+command = "rumdl"
+args = ["check", "."]
 
 [tasks.test-clippy]
 description = "Run clippy lints"

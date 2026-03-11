@@ -24,7 +24,7 @@ pub trait Plugin: Send + Sync + 'static {
     fn tick_schedules(&self) -> Vec<ScheduleId> { Vec::new() }
 
     /// Returns the plugin's name for debugging and dependency resolution.
-    fn name(&self) -> &str { core::any::type_name::<Self>() }
+    fn name(&self) -> &str { std::any::type_name::<Self>() }
 
     /// Declares plugins that must be added before this one.
     /// The server will panic if dependencies are not satisfied.
@@ -42,7 +42,7 @@ The server resolves dependencies before calling any lifecycle methods. It ensure
 
 The server then calls `build()` on each plugin in the order they are registered.
 
-Once all plugins are built, the server then calls `ready()` on each plugin in dependency order. All resources registered during `build()` are available. This method is intended for validation, cross-plugin initialization, and API registration.
+Once all plugins are built, the server then calls `ready()` on each plugin in dependency order. All resources registered during `build()` are available. This method is intended for validation, cross-plugin initialization, and API registration. See [api.md](./api.md) for how plugins expose and consume capabilities through the `API` primitive.
 
 ### Execution
 

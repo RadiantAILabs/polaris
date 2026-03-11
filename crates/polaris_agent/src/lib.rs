@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```
-//! use polaris_agent::{Agent, AgentExt};
+//! use polaris_agent::Agent;
 //! use polaris_graph::Graph;
 //! use polaris_system::system;
 //!
@@ -35,7 +35,7 @@
 //!             .add_system(respond);
 //!     }
 //!
-//!     fn name(&self) -> &str {
+//!     fn name(&self) -> &'static str {
 //!         "SimpleAgent"
 //!     }
 //! }
@@ -46,6 +46,23 @@
 //! ```
 
 use polaris_graph::graph::Graph;
+use polaris_system::param::SystemContext;
+
+/// Error returned by [`Agent::setup`].
+///
+/// Wraps an arbitrary error source so agent implementations remain flexible
+/// in what they report while the framework has a single, named error type
+/// at the trait boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct SetupError(Box<dyn std::error::Error + Send + Sync>);
+
+impl SetupError {
+    /// Creates a new setup error from any error type.
+    pub fn new(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(source))
+    }
+}
 
 /// Defines an agent's behavior as a graph of systems.
 ///
@@ -56,7 +73,7 @@ use polaris_graph::graph::Graph;
 /// # Example
 ///
 /// ```
-/// use polaris_agent::{Agent, AgentExt};
+/// use polaris_agent::Agent;
 /// use polaris_graph::Graph;
 /// use polaris_system::system;
 ///
@@ -76,7 +93,7 @@ use polaris_graph::graph::Graph;
 ///             .add_system(respond);
 ///     }
 ///
-///     fn name(&self) -> &str {
+///     fn name(&self) -> &'static str {
 ///        "SimpleAgent"
 ///     }
 /// }
@@ -100,28 +117,34 @@ pub trait Agent: Send + Sync + 'static {
     /// * `graph` - The graph builder to construct the agent's behavior.
     fn build(&self, graph: &mut Graph);
 
-    /// Returns the agent's name for debugging and tracing.
-    ///
-    /// Defaults to the type name.
-    fn name(&self) -> &str {
-        core::any::type_name::<Self>()
-    }
-}
+    /// Returns a stable, user-defined name for this agent type.
+    fn name(&self) -> &'static str;
 
-/// Extension trait for creating graphs from agents.
-pub trait AgentExt: Agent {
+    /// Initializes session resources before the first turn.
+    ///
+    /// Called automatically by the sessions layer during session creation and
+    /// resume. Implementations can read configuration from `self` or the
+    /// context and insert any resources the agent's systems need.
+    ///
+    /// The default implementation is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetupError`] if initialization fails.
+    fn setup(&self, _ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
+        Ok(())
+    }
+
     /// Builds and returns the agent's graph.
     ///
-    /// Convenience method that creates a new graph and calls `build`.
+    /// Convenience method that creates a new [`Graph`] and calls [`build`](Self::build).
+    /// Callable on trait objects (`dyn Agent`, `Arc<dyn Agent>`).
     fn to_graph(&self) -> Graph {
         let mut graph = Graph::new();
         self.build(&mut graph);
         graph
     }
 }
-
-// Blanket implementation for all agents
-impl<T: Agent> AgentExt for T {}
 
 #[cfg(test)]
 mod tests {
@@ -140,10 +163,6 @@ mod tests {
         3
     }
 
-    async fn single_step() -> String {
-        "step".to_string()
-    }
-
     struct ThreeStepAgent;
 
     impl Agent for ThreeStepAgent {
@@ -154,7 +173,7 @@ mod tests {
                 .add_system(step_three);
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "ThreeStepAgent"
         }
     }
@@ -172,19 +191,5 @@ mod tests {
     fn agent_name() {
         let agent = ThreeStepAgent;
         assert_eq!(agent.name(), "ThreeStepAgent");
-    }
-
-    #[test]
-    fn agent_default_name() {
-        struct UnnamedAgent;
-
-        impl Agent for UnnamedAgent {
-            fn build(&self, graph: &mut Graph) {
-                graph.add_system(single_step);
-            }
-        }
-
-        let agent = UnnamedAgent;
-        assert!(agent.name().contains("UnnamedAgent"));
     }
 }
