@@ -1,8 +1,8 @@
 //! Shared test helpers for provider integration tests.
 
 use polaris_models::llm::{
-    AssistantBlock, GenerationRequest, GenerationResponse, ImageMediaType, Llm, Message, ToolCall,
-    ToolChoice, ToolDefinition, UserBlock,
+    AssistantBlock, ImageMediaType, Llm, LlmRequest, LlmResponse, Message, ToolCall, ToolChoice,
+    ToolDefinition, UserBlock,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ fn weather_tool() -> ToolDefinition {
     }
 }
 
-fn extract_tool_calls(response: &GenerationResponse) -> Vec<&ToolCall> {
+fn extract_tool_calls(response: &LlmResponse) -> Vec<&ToolCall> {
     response
         .content
         .iter()
@@ -82,7 +82,10 @@ pub trait LlmTestExt {
 
 impl LlmTestExt for Llm {
     async fn test_basic_generation(&self) {
-        let request = GenerationRequest::new("Say 'hello' and nothing else.");
+        let request = LlmRequest {
+            messages: vec![Message::user("Say 'hello' and nothing else.")],
+            ..Default::default()
+        };
 
         let response = self
             .generate(request)
@@ -97,10 +100,11 @@ impl LlmTestExt for Llm {
     }
 
     async fn test_system_prompt(&self) {
-        let request = GenerationRequest::with_system(
-            "You are a pirate. Always respond in pirate speak.",
-            "Say hello",
-        );
+        let request = LlmRequest {
+            system: Some("You are a pirate. Always respond in pirate speak.".to_string()),
+            messages: vec![Message::user("Say hello")],
+            ..Default::default()
+        };
 
         let response = self
             .generate(request)
@@ -111,9 +115,12 @@ impl LlmTestExt for Llm {
     }
 
     async fn test_tool_calling(&self) {
-        let request = GenerationRequest::new("What's the weather like in Tokyo?")
-            .tool(weather_tool())
-            .tool_choice(ToolChoice::Required);
+        let request = LlmRequest {
+            messages: vec![Message::user("What's the weather like in Tokyo?")],
+            tools: Some(vec![weather_tool()]),
+            tool_choice: Some(ToolChoice::Required),
+            ..Default::default()
+        };
 
         let response = self
             .generate(request)
@@ -136,9 +143,12 @@ impl LlmTestExt for Llm {
     }
 
     async fn test_structured_output(&self) {
-        let request = GenerationRequest::new(
-            "Extract the person information: John Smith is a 35 year old software engineer.",
-        );
+        let request = LlmRequest {
+            messages: vec![Message::user(
+                "Extract the person information: John Smith is a 35 year old software engineer.",
+            )],
+            ..Default::default()
+        };
 
         let person: Person = self
             .generate_structured(request)
@@ -165,12 +175,9 @@ impl LlmTestExt for Llm {
             ],
         };
 
-        let request = GenerationRequest {
-            system: None,
+        let request = LlmRequest {
             messages: vec![message],
-            tools: None,
-            tool_choice: None,
-            output_schema: None,
+            ..Default::default()
         };
 
         let response = self
@@ -186,7 +193,10 @@ impl LlmTestExt for Llm {
     }
 
     async fn test_invalid_model_error(&self) {
-        let request = GenerationRequest::new("Hello");
+        let request = LlmRequest {
+            messages: vec![Message::user("Hello")],
+            ..Default::default()
+        };
         let result = self.generate(request).await;
 
         assert!(result.is_err(), "should fail with invalid model");

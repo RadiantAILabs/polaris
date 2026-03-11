@@ -7,9 +7,9 @@ use super::types::{
 };
 use async_trait::async_trait;
 use polaris_models::llm::{
-    AssistantBlock, GenerationError, GenerationRequest, GenerationResponse, ImageBlock,
-    ImageMediaType as PolarisImageMediaType, LlmProvider, Message, ToolCall, ToolChoice,
-    ToolFunction, ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
+    AssistantBlock, GenerationError, ImageBlock, ImageMediaType as PolarisImageMediaType,
+    LlmProvider, LlmRequest, LlmResponse, Message, ToolCall, ToolChoice, ToolFunction,
+    ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 
 /// Default maximum tokens for generation requests.
@@ -36,8 +36,8 @@ impl LlmProvider for AnthropicProvider {
     async fn generate(
         &self,
         model: &str,
-        request: GenerationRequest,
-    ) -> Result<GenerationResponse, GenerationError> {
+        request: LlmRequest,
+    ) -> Result<LlmResponse, GenerationError> {
         let anthropic_request = convert_request(model, &request)?;
 
         let response = self.client.create_message(&anthropic_request).await?;
@@ -48,7 +48,7 @@ impl LlmProvider for AnthropicProvider {
 
 fn convert_request(
     model: &str,
-    request: &GenerationRequest,
+    request: &LlmRequest,
 ) -> Result<CreateMessageRequest, GenerationError> {
     let messages = request
         .messages
@@ -208,14 +208,14 @@ fn convert_tool_choice(choice: &ToolChoice) -> ToolChoiceParam {
     }
 }
 
-fn convert_response(response: super::types::MessageResponse) -> GenerationResponse {
+fn convert_response(response: super::types::MessageResponse) -> LlmResponse {
     let content = response
         .content
         .into_iter()
         .filter_map(convert_content_block)
         .collect();
 
-    GenerationResponse {
+    LlmResponse {
         content,
         usage: Usage {
             input_tokens: Some(response.usage.input_tokens),

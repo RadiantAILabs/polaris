@@ -5,6 +5,7 @@
 
 use polaris_system::plugin::{Plugin, PluginGroup, PluginId, Version};
 use polaris_system::prelude::*;
+use std::sync::atomic::AtomicBool;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Test Resources
@@ -65,13 +66,13 @@ impl Plugin for PluginC {
 }
 
 struct ReadyPlugin {
-    ready_called: core::sync::atomic::AtomicBool,
+    ready_called: AtomicBool,
 }
 
 impl Default for ReadyPlugin {
     fn default() -> Self {
         Self {
-            ready_called: core::sync::atomic::AtomicBool::new(false),
+            ready_called: AtomicBool::new(false),
         }
     }
 }
@@ -83,7 +84,7 @@ impl Plugin for ReadyPlugin {
 
     fn ready(&self, server: &mut Server) {
         self.ready_called
-            .store(true, core::sync::atomic::Ordering::SeqCst);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         server.insert_resource(AnotherResource {
             name: "ready".into(),
         });
@@ -326,8 +327,8 @@ fn plugin_group_adds_all_plugins() {
 
 #[test]
 fn cleanup_in_reverse_order() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let cleanup_order = Arc::new(AtomicUsize::new(0));
     let first_cleanup = Arc::new(AtomicUsize::new(0));
@@ -626,8 +627,8 @@ impl Schedule for TestScheduleB {}
 
 #[test]
 fn plugin_registers_for_schedule_gets_ticked() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let tick_count = Arc::new(AtomicUsize::new(0));
 
@@ -666,8 +667,8 @@ fn plugin_registers_for_schedule_gets_ticked() {
 
 #[test]
 fn plugin_not_registered_for_schedule_not_ticked() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let tick_count = Arc::new(AtomicUsize::new(0));
 
@@ -707,8 +708,8 @@ fn plugin_not_registered_for_schedule_not_ticked() {
 
 #[test]
 fn multiple_plugins_same_schedule_all_ticked_in_order() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let order = Arc::new(AtomicUsize::new(0));
     let first_order = Arc::new(AtomicUsize::new(0));
@@ -779,8 +780,8 @@ fn multiple_plugins_same_schedule_all_ticked_in_order() {
 
 #[test]
 fn plugin_multiple_schedules() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let count_a = Arc::new(AtomicUsize::new(0));
     let count_b = Arc::new(AtomicUsize::new(0));
@@ -841,8 +842,8 @@ fn tick_unregistered_schedule_is_noop() {
 
 #[test]
 fn schedule_passed_to_update_matches_triggered() {
-    use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let received_correct_schedule = Arc::new(AtomicBool::new(false));
 
@@ -987,8 +988,8 @@ fn plugin_inserts_api_in_build() {
 
 #[test]
 fn plugin_accesses_api_in_ready() {
-    use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let api_accessed = Arc::new(AtomicBool::new(false));
 
@@ -1036,8 +1037,8 @@ fn plugin_accesses_api_in_ready() {
 
 #[test]
 fn api_with_interior_mutability() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CounterAPI {
         count: Arc<AtomicUsize>,
@@ -1194,8 +1195,8 @@ fn resources_returns_reference() {
 
 #[test]
 fn tick_schedule_uses_schedule_id_directly() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let tick_count = Arc::new(AtomicUsize::new(0));
 
@@ -1277,8 +1278,8 @@ fn update_receives_correct_schedule_id() {
 
 #[test]
 fn plugins_with_no_tick_schedules_never_updated() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let update_count = Arc::new(AtomicUsize::new(0));
 

@@ -165,7 +165,7 @@ async fn single_system_lifecycle() {
     assert!(result.is_ok());
 
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1, .. },
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "success_system" } if *node_id == system_id,
         "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, system_name: "success_system", duration } if *node_id == system_id && !duration.is_zero(),
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 1, duration } if !duration.is_zero(),
@@ -181,7 +181,7 @@ async fn failing_system_lifecycle() {
     assert!(result.is_err());
 
     assert_event_sequence!(log, [
-        "OnGraphStart"    => GraphEvent::GraphStart { node_count: 1 },
+        "OnGraphStart"    => GraphEvent::GraphStart { node_count: 1, .. },
         "OnSystemStart"   => GraphEvent::SystemStart { node_id, system_name: "failing_system" } if *node_id == failing_id,
         "OnSystemError"   => GraphEvent::SystemError { node_id, system_name: "failing_system", error } if *node_id == failing_id && error.contains("intentional failure"),
         "OnGraphFailure"  => GraphEvent::GraphFailure { error } if matches!(error, ExecutionError::SystemError(_)),
@@ -207,7 +207,7 @@ async fn sequential_systems() {
     assert!(result.is_ok());
 
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "sys_a" } if *node_id == sys_a_id,
         "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, system_name: "sys_a", duration } if *node_id == sys_a_id && !duration.is_zero(),
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "sys_b" } if *node_id == sys_b_id,
@@ -221,7 +221,7 @@ async fn error_handler_recovery() {
     let mut graph = Graph::new();
     let failing_id = graph.add_boxed_system(Box::new(FailingSystem));
     let mut handler_id = None;
-    graph.add_error_handler(failing_id.clone(), |g| {
+    graph.add_error_handler_for(failing_id.clone(), |g| {
         handler_id = Some(g.add_boxed_system(Box::new(SuccessSystem)));
     });
     let handler_id = handler_id.unwrap();
@@ -230,7 +230,7 @@ async fn error_handler_recovery() {
     assert!(result.is_ok(), "error handler should recover: {:?}", result);
 
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "failing_system" } if *node_id == failing_id,
         "OnSystemError"     => GraphEvent::SystemError { node_id, system_name: "failing_system", error } if *node_id == failing_id && error.contains("intentional failure"),
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "success_system" } if *node_id == handler_id,
@@ -261,7 +261,7 @@ async fn decision_hooks() {
     assert!(result.is_ok());
 
     assert_event_sequence!(log, [
-        "OnGraphStart"        => GraphEvent::GraphStart { node_count: 4 },
+        "OnGraphStart"        => GraphEvent::GraphStart { node_count: 4, .. },
         "OnSystemStart"       => GraphEvent::SystemStart { node_id, system_name: "decision_system" } if *node_id == decision_sys_id,
         "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, system_name: "decision_system", duration } if *node_id == decision_sys_id && !duration.is_zero(),
         "OnDecisionStart"     => GraphEvent::DecisionStart { node_id, node_name: "test_decision" } if *node_id == decision_id,
@@ -295,7 +295,7 @@ async fn loop_hooks() {
     assert!(result.is_ok());
 
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
         "OnLoopStart"       => GraphEvent::LoopStart {
             node_id,
             loop_name: "test_loop",
@@ -354,7 +354,7 @@ async fn parallel_hooks() {
     assert!(result.is_ok());
 
     assert_event_sequence!(log, [
-        "OnGraphStart"        => GraphEvent::GraphStart { node_count: 4 },
+        "OnGraphStart"        => GraphEvent::GraphStart { node_count: 3, .. },
         "OnParallelStart"     => GraphEvent::ParallelStart {
             node_id,
             node_name: "test_parallel",
@@ -371,7 +371,7 @@ async fn parallel_hooks() {
             total_nodes_executed: 2,
             duration,
         } if *node_id == parallel_id && !duration.is_zero(),
-        "OnGraphComplete"     => GraphEvent::GraphComplete { nodes_executed: 4, duration } if !duration.is_zero(),
+        "OnGraphComplete"     => GraphEvent::GraphComplete { nodes_executed: 3, duration } if !duration.is_zero(),
     ]);
 }
 
@@ -406,7 +406,7 @@ async fn switch_hooks() {
     assert!(result.is_ok());
 
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 4 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 4, .. },
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "switch_key_system" } if *node_id == switch_sys_id,
         "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, system_name: "switch_key_system", duration } if *node_id == switch_sys_id && !duration.is_zero(),
         "OnSwitchStart"     => GraphEvent::SwitchStart {
@@ -449,7 +449,7 @@ async fn marker_fires_for_marked_system() {
 
     // Built-in hooks fire before markers at each lifecycle point.
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1, .. },
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "success_fn"} if *node_id == sys_id,
         "MarkerA"           => GraphEvent::SystemStart { node_id, system_name: "success_fn" } if *node_id == sys_id,
         "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, system_name: "success_fn", duration } if *node_id == sys_id && !duration.is_zero(),
@@ -479,7 +479,7 @@ async fn unmarked_system_does_not_fire_markers() {
 
     // MarkerA only fires for the second (marked) system, not the first.
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "success_system" } if *node_id == unmarked_id,
         "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, system_name: "success_system", duration } if *node_id == unmarked_id && !duration.is_zero(),
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "success_fn" } if *node_id == marked_id,
@@ -508,7 +508,7 @@ async fn multiple_markers_all_fire() {
 
     // Both markers fire in schedule order (A before B) at each lifecycle point.
     assert_event_sequence!(log, [
-        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1 },
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1, .. },
         "OnSystemStart"     => GraphEvent::SystemStart { node_id, system_name: "success_fn" } if *node_id == sys_id,
         "MarkerA"           => GraphEvent::SystemStart { node_id, system_name: "success_fn" } if *node_id == sys_id,
         "MarkerB"           => GraphEvent::SystemStart { node_id, system_name: "success_fn" } if *node_id == sys_id,
@@ -536,7 +536,7 @@ async fn marker_fires_on_system_error() {
     assert!(result.is_err(), "failing system should produce an error");
 
     assert_event_sequence!(log, [
-        "OnGraphStart"    => GraphEvent::GraphStart { node_count: 1 },
+        "OnGraphStart"    => GraphEvent::GraphStart { node_count: 1, .. },
         "OnSystemStart"   => GraphEvent::SystemStart { node_id, system_name: "error_fn" } if *node_id == failing_id,
         "MarkerA"         => GraphEvent::SystemStart { node_id, system_name: "error_fn" } if *node_id == failing_id,
         "OnSystemError"   => GraphEvent::SystemError { node_id, system_name: "error_fn", error } if *node_id == failing_id && error.contains("intentional failure"),

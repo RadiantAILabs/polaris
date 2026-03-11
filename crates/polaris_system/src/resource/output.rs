@@ -6,9 +6,9 @@
 //! Unlike [`Resources`](super::Resources) which store long-lived shared state,
 //! outputs are cleared between agent runs and are immutable once stored.
 
-use core::any::{Any, TypeId};
 use hashbrown::HashMap;
 use parking_lot::{RwLock, RwLockReadGuard};
+use std::any::{Any, TypeId, type_name};
 
 /// Marker trait for types that can be stored as system outputs.
 ///
@@ -163,7 +163,7 @@ impl Outputs {
     /// - [`OutputError::Busy`] if the output is currently being written
     pub fn get<T: Output>(&self) -> Result<OutputRef<T>, OutputError> {
         let id = OutputId::of::<T>();
-        let type_name = core::any::type_name::<T>();
+        let type_name = type_name::<T>();
 
         let entry = self
             .storage
@@ -174,7 +174,7 @@ impl Outputs {
 
         Ok(OutputRef {
             guard,
-            _marker: core::marker::PhantomData,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -219,10 +219,10 @@ impl Outputs {
 /// guard is dropped.
 pub struct OutputRef<'a, T: Output> {
     guard: RwLockReadGuard<'a, Box<dyn Any + Send + Sync>>,
-    _marker: core::marker::PhantomData<&'a T>,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
-impl<T: Output> core::ops::Deref for OutputRef<'_, T> {
+impl<T: Output> std::ops::Deref for OutputRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {

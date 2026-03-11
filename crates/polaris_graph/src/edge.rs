@@ -4,7 +4,7 @@
 //! through the graph.
 
 use crate::node::NodeId;
-use core::fmt;
+use std::fmt;
 use std::sync::Arc;
 
 /// Unique identifier for an edge in the graph.
@@ -21,7 +21,7 @@ impl EdgeId {
     /// Creates a new edge ID with a unique nanoid.
     #[must_use]
     pub fn new() -> Self {
-        Self(nanoid::nanoid!().into())
+        Self(nanoid::nanoid!(8).into())
     }
 
     /// Creates an edge ID from a specific string value.

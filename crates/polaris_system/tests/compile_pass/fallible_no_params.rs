@@ -14,7 +14,7 @@ async fn fallible_no_params() -> Result<MyOutput, SystemError> {
 }
 
 fn main() {
-    use core::any::TypeId;
+    use std::any::TypeId;
     use polaris_system::system::ErasedSystem;
 
     let system = fallible_no_params();

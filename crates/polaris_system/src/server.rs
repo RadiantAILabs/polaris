@@ -62,21 +62,22 @@ use crate::plugin::{DynPlugin, Plugin, PluginId, Plugins, Schedule, ScheduleId};
 use crate::resource::{
     GlobalResource, LocalResource, Resource, ResourceRef, ResourceRefMut, Resources,
 };
-use core::any::TypeId;
 use hashbrown::{HashMap, HashSet};
+use std::any::TypeId;
+use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Server
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Type-erased resource for dynamic storage.
-type BoxedResource = Box<dyn core::any::Any + Send + Sync>;
+type BoxedResource = Box<dyn std::any::Any + Send + Sync>;
 
 /// Factory function that creates a local resource instance.
 type LocalFactory = Box<dyn Fn() -> BoxedResource + Send + Sync>;
 
 /// Type-erased API for dynamic storage.
-type BoxedAPI = Box<dyn core::any::Any + Send + Sync>;
+type BoxedAPI = Box<dyn std::any::Any + Send + Sync>;
 
 /// Represents the build state of the server.
 ///
@@ -102,7 +103,7 @@ pub struct Server {
     ///
     /// Registered via [`insert_global()`](Self::insert_global).
     /// Accessed via `Res<T>` (not `ResMut<T>`).
-    global: Resources,
+    global: Arc<Resources>,
 
     /// Resources field for server-wide mutable storage.
     ///
@@ -124,7 +125,7 @@ pub struct Server {
     ///
     /// Registered via [`insert_api()`](Self::insert_api).
     /// Accessed via [`api()`](Self::api) by plugins during build/ready phases.
-    /// Unlike resources, APIs are not accessed by systems.
+    /// APIs are NOT accessed by systems.
     apis: HashMap<TypeId, BoxedAPI>,
 
     /// Plugins pending build (not yet sorted).
@@ -172,7 +173,7 @@ impl Server {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            global: Resources::new(),
+            global: Arc::new(Resources::new()),
             resources: Resources::new(),
             local_factories: HashMap::new(),
             apis: HashMap::new(),
@@ -348,8 +349,17 @@ impl Server {
     /// async fn my_system(config: Res<Config>) {
     /// }
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if system contexts have already been created, since global
+    /// resources are shared via `Arc` and system contexts hold references
+    /// to the global container. This is a safety measure to prevent mutable
+    /// access to globals after system contexts have been created.
     pub fn insert_global<R: GlobalResource>(&mut self, resource: R) -> Option<R> {
-        self.global.insert(resource)
+        Arc::get_mut(&mut self.global)
+            .expect("cannot insert globals after system contexts have been created")
+            .insert(resource)
     }
 
     /// Returns true if a global resource of type `R` exists.
@@ -411,6 +421,8 @@ impl Server {
     }
 
     /// Creates an execution context with global resources and fresh local resources.
+    /// The returned `SystemContext<'static>` is decoupled from the server's lifetime,
+    /// allowing it to be stored in systems or plugins.
     ///
     /// The returned context:
     /// - Has read-only access to all global resources via `Res<T>`
@@ -440,9 +452,9 @@ impl Server {
     /// let mut memory = ctx.get_resource_mut::<Memory>().unwrap();  // Fresh local instance
     /// ```
     #[must_use]
-    pub fn create_context(&self) -> SystemContext<'_> {
+    pub fn create_context(&self) -> SystemContext<'static> {
         // Create context with access to server's global resources
-        let mut ctx = SystemContext::with_globals(&self.global);
+        let mut ctx = SystemContext::with_globals(Arc::clone(&self.global));
 
         // Instantiate local resources from factories
         for (type_id, factory) in &self.local_factories {
@@ -472,8 +484,7 @@ impl Server {
     /// Inserts an API into the server.
     ///
     /// APIs are build-time capability registries that plugins use for orchestration.
-    /// Unlike resources (accessed by systems), APIs are accessed by plugins during
-    /// the build/ready phases.
+    /// APIs are accessed by plugins during the build/ready phases.
     ///
     /// If an API of this type already exists, it is replaced and the old value
     /// is returned.
@@ -808,7 +819,7 @@ impl Server {
 
         // Extract plugins in sorted order
         // We need to drain pending_plugins while preserving order
-        let mut pending = core::mem::take(&mut self.pending_plugins);
+        let mut pending = std::mem::take(&mut self.pending_plugins);
 
         // Create a mapping from old index to new position
         let mut old_to_new: Vec<Option<usize>> = vec![None; n];

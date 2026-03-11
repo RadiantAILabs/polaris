@@ -18,7 +18,41 @@ graph
 
 The first node added becomes the graph's entry point. Each subsequent call to the builder connects the new node to the previous one via a sequential edge. This implicit chaining means that for linear pipelines, the builder reads as a sequence of steps.
 
-Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches and a join target; loop nodes have a body and termination condition or iteration limit; and join nodes have source nodes. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body, and warning about conflicting output types in parallel branches.
+Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches; and loop nodes have a body and termination condition or iteration limit. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body, and warning about conflicting output types in parallel branches.
+
+## Adding System Nodes
+
+There are three methods for adding a system node to a graph, each suited to a different use case.
+
+**`add_system`** — the most common method. Adds the node and returns `&mut Self` for fluent chaining. Use this for simple linear pipelines where no per-node configuration is needed.
+
+```rust
+graph
+    .add_system(step_a)
+    .add_system(step_b)
+    .add_system(step_c);
+```
+
+**`add_system_node`** — adds the node and returns its `NodeId`. Use this when you need the ID for later reference, such as wiring conditional branches or attaching edges manually.
+
+```rust
+let reason_id = graph.add_system_node(reason);
+let act_id = graph.add_system_node(act);
+```
+
+**`system`** — adds the node and returns a `SystemNodeBuilder` for configuring error handling, timeouts, and retry policies. Call `.done()` to return to `&mut Graph` for continued chaining.
+
+```rust
+graph.system(risky_operation)
+    .with_timeout(Duration::from_secs(30))
+    .with_retry(RetryPolicy::fixed(3, Duration::from_millis(100)))
+    .on_error(|h: &mut Graph| { h.add_system(fallback); })
+    .on_timeout(|h: &mut Graph| { h.add_system(timeout_handler); })
+    .done()
+    .add_system(next_step);
+```
+
+All three methods accept any type implementing `IntoSystemNode`, which includes bare async functions and `(schedule, system)` tuples for attaching custom hook schedules.
 
 ## Construction Patterns
 
@@ -72,7 +106,7 @@ graph
 
 A parallel node forks execution across multiple subgraphs. Each branch receives its own child context. Branches run concurrently — if any branch fails, the remaining branches are cancelled and the error propagates.
 
-A join node is automatically created after the parallel branches. It serves as a synchronization point; execution continues from the join node once all branches complete.
+The parallel node is both the entry and exit point. Once all branches complete and their outputs are merged, execution continues from the parallel node's outgoing sequential edge.
 
 ```rust
 graph
@@ -113,7 +147,6 @@ pub enum Node {
     Switch(SwitchNode),
     Parallel(ParallelNode),
     Loop(LoopNode),
-    Join(JoinNode),
 }
 ```
 
@@ -163,14 +196,28 @@ Subgraph execution (branches, loop bodies, case handlers) is recursive with dept
 
 ## Error Handling
 
+Errors in graph execution fall into two categories with distinct handling semantics.
+
+**Agentic errors** are anticipated failure modes within a system's domain — an LLM refusing a prompt, a tool returning an invalid result, a validation check failing. These are errors the agent is designed to reason about and recover from. Systems signal agentic errors by returning `Result<T, SystemError>` and are marked fallible by the `#[system]` macro (via `is_fallible() = true`). Error handler nodes are part of the agent's own graph and represent recovery logic the agent controls.
+
+**Infrastructure errors** are failures outside the agent's responsibility — a missing resource, a network partition, a misconfigured context. These are not wired to error handler nodes because the agent cannot meaningfully recover from them within its graph. Instead, they propagate as `ExecutionError` from `executor.execute()`, where the agent implementer handles them directly.
+
+This separation is enforced by the builder: `add_error_handler()` only auto-wires nodes where `is_fallible()` returns `true`. Infrastructure failures (e.g., `ParamError` from a missing resource) bypass error handler nodes entirely and escalate to the caller. Manual `System` implementations that can fail with agentic errors must override `is_fallible()` to return `true` for error handler wiring to apply.
+
 ### Error Edges
 
 When a system node fails, the executor checks for an `ErrorEdge` from that node. If one exists, execution continues at the error handler subgraph. If none exists, the error propagates and execution stops.
 
 ```rust
+// Per-node error handler:
 let risky_id = graph.add_system_node(risky_operation);
-graph.add_error_handler(risky_id, |g| {
+graph.add_error_handler_for(risky_id, |g| {
     g.add_system(fallback_operation);
+});
+
+// Global error handler (auto-wires all fallible nodes without an existing error edge):
+graph.add_error_handler(|g| {
+    g.add_system(global_fallback);
 });
 ```
 
@@ -185,6 +232,37 @@ graph.add_timeout_handler(slow_id, |g| {
     g.add_system(timeout_fallback);
 });
 ```
+
+### Retry Policy
+
+A system node can optionally have a retry policy. By default, no retry policy is set — a failed or timed-out system node immediately triggers its error or timeout edge. When a retry policy is configured, the executor retries the system up to `max_retries` additional times before giving up.
+
+Two strategies are available:
+
+- **Fixed** — constant delay between retries.
+- **Exponential** — delay doubles each attempt (`2^attempt * initial_delay`), optionally capped by a maximum delay.
+
+```rust
+use std::time::Duration;
+use polaris_graph::RetryPolicy;
+
+// Fixed: retry up to 3 times with 100ms between attempts
+graph
+    .system(flaky_operation)
+    .with_retry(RetryPolicy::fixed(3, Duration::from_millis(100)))
+    .done();
+
+// Exponential backoff: retry up to 5 times, starting at 50ms, capped at 2s
+graph
+    .system(network_call)
+    .with_retry(
+        RetryPolicy::exponential(5, Duration::from_millis(50))
+            .with_max_delay(Duration::from_secs(2)),
+    )
+    .done();
+```
+
+Both errors and timeouts count as failed attempts. After all retries are exhausted, the final outcome is forwarded to the error or timeout edge as usual.
 
 ## Hooks
 

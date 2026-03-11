@@ -211,3 +211,47 @@ impl Schedule for OnGraphComplete {}
 /// Event data: [`GraphEvent::GraphFailure`](super::events::GraphEvent::GraphFailure)
 pub struct OnGraphFailure;
 impl Schedule for OnGraphFailure {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composite Schedule Type
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Composite type covering all graph execution schedules.
+///
+/// This type can be used with
+/// [`IntoScheduleIds`](polaris_system::plugin::IntoScheduleIds) to register a
+/// hook on every graph lifecycle event at once.
+///
+/// # Example
+///
+/// ```
+/// # use polaris_graph::hooks::schedule::AllGraphSchedules;
+/// # use polaris_graph::hooks::GraphEvent;
+/// # use polaris_graph::hooks::HooksAPI;
+/// # let hooks = HooksAPI::default();
+///
+/// hooks.register_observer::<AllGraphSchedules, _>(
+///     "trace_all",
+///     |event: &GraphEvent| {
+///         tracing::debug!("{event}");
+///     },
+/// )?;
+/// # Ok::<(), polaris_graph::hooks::HookRegistrationError>(())
+/// ```
+pub type AllGraphSchedules = (
+    OnGraphStart,
+    OnGraphComplete,
+    OnGraphFailure,
+    OnSystemStart,
+    OnSystemComplete,
+    OnSystemError,
+    OnDecisionStart,
+    OnDecisionComplete,
+    OnSwitchStart,
+    OnSwitchComplete,
+    OnLoopStart,
+    OnLoopIteration,
+    OnLoopEnd,
+    OnParallelStart,
+    OnParallelComplete,
+);

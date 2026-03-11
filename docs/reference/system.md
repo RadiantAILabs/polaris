@@ -42,6 +42,8 @@ async fn reason(llm: Res<LLM>, memory: Res<Memory>) -> Result<ReasoningResult, S
 
 In the example above, the output type is `ReasoningResult` (not `Result<ReasoningResult, SystemError>`), so downstream systems use `Out<ReasoningResult>`.
 
+The `#[system]` macro sets `is_fallible()` to `true` for these systems automatically. This flag determines whether `add_error_handler()` auto-wires the node to an error handler subgraph. Manual `System` implementations that can fail with agentic errors must override `is_fallible()` to return `true`. See [Graph Execution — Error Handling](graph.md#error-handling) for the full error semantics.
+
 <details>
 <summary>Macro expansion details</summary>
 
@@ -86,6 +88,10 @@ impl System for ReadCounterSystem {
         access.merge(&<Res<Counter> as SystemParam>::access());
         access.merge(&<ResMut<Memory> as SystemParam>::access());
         access
+    }
+
+    fn is_fallible(&self) -> bool {
+        false // true when the return type is Result<T, SystemError>
     }
 }
 

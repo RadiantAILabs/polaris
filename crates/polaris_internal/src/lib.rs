@@ -21,12 +21,18 @@ pub use polaris_models;
 /// Core infrastructure plugins (e.g., time, tracing).
 pub use polaris_core_plugins;
 
+/// Session management and orchestration.
+pub use polaris_sessions;
+
 /// Re-export all common types for easy access.
 pub mod prelude {
-    pub use polaris_agent::{Agent, AgentExt};
+    pub use polaris_agent::Agent;
     pub use polaris_graph::prelude::*;
     pub use polaris_system::prelude::*;
-    pub use polaris_tools::{Tool, ToolError, ToolRegistry, ToolsPlugin, Toolset};
+    pub use polaris_tools::{
+        LlmReasonExt, LlmRequestBuilderExt, ReasonError, Tool, ToolError, ToolRegistry,
+        ToolsPlugin, Toolset,
+    };
 }
 
 /// Re-export all system-related types for easy access.
@@ -58,4 +64,9 @@ pub mod models {
 /// Re-export all core plugin types for easy access.
 pub mod plugins {
     pub use polaris_core_plugins::*;
+}
+
+/// Re-export all session-related types for easy access.
+pub mod sessions {
+    pub use polaris_sessions::*;
 }

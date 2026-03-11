@@ -56,7 +56,7 @@ impl Agent for ReActAgent {
 }
 ```
 
-See [`crates/example`](crates/example) for a full implementation of a file assistant that reasons, selects tools, and acts within a sandboxed directory.
+See [`examples`](examples/README.md) for a full implementation of a file assistant that reasons, selects tools, and acts within a sandboxed directory.
 
 ## Getting Started
 

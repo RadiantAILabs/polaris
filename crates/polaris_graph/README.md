@@ -25,7 +25,6 @@ See the [graph reference](../../docs/reference/graph.md) for detailed constructi
 | `SwitchNode` | Routes flow based on discriminator (multi-way branch) |
 | `ParallelNode` | Executes multiple paths concurrently |
 | `LoopNode` | Repeats subgraph until termination condition |
-| `JoinNode` | Aggregates results from parallel paths |
 
 ### Edge Types
 

@@ -1,36 +1,67 @@
 # Agent Trait
 
-The `polaris_agent` crate defines a minimal abstraction for defining reusable agent behavior patterns. An agent is a type that knows how to build a graph.
+The `polaris_agent` crate defines a minimal abstraction for defining reusable agent behavior patterns. An agent is a type that knows how to build a graph and optionally initialize session resources.
 
 ## Overview
 
-The `Agent` trait has one required method: `build`, which receives a mutable reference to a `Graph` and populates it with systems and control flow. This provides a standard interface for packaging a behavior pattern — such as ReAct, ReWOO, or a custom design — as a self-contained, reusable unit
+The `Agent` trait has two required methods (`build` and `name`) and two optional methods (`setup` and `to_graph`):
 
 ```rust
 pub trait Agent: Send + Sync + 'static {
     fn build(&self, graph: &mut Graph);
 
-    fn name(&self) -> &str {
-        core::any::type_name::<Self>()
+    fn name(&self) -> &'static str;
+
+    fn setup(&self, _ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
+        Ok(()) // default no-op
     }
-}
-```
 
-See [graph.md](./graph.md) for further details on building graphs.
-
-The `AgentExt` extension trait is implemented for all `Agent` types and provides `to_graph()`, which constructs a new `Graph` and passes it to `build()`:
-
-```rust
-pub trait AgentExt: Agent {
     fn to_graph(&self) -> Graph {
         let mut graph = Graph::new();
         self.build(&mut graph);
         graph
     }
 }
-
-impl<T: Agent> AgentExt for T {}
 ```
+
+- **`build`** — Populates a `Graph` with systems and control flow. Called once when the agent is registered.
+- **`name`** — Returns a stable, user-defined name for this agent type.
+- **`setup`** — Initializes session resources before the first turn. Called automatically by the sessions layer during session creation and resume. The default is a no-op.
+- **`to_graph`** — Convenience method that creates a new `Graph` and passes it to `build`.
+
+See [graph.md](./graph.md) for further details on building graphs.
+
+## Setup
+
+`setup` receives `&self` and `&mut SystemContext`, so implementations can read configuration from the agent instance, from the context (injected by the caller's `init` closure), or both. The sessions layer calls `setup` automatically at two points:
+
+1. **Session creation** — after the `init` closure runs
+2. **Session resume** — after persisted resources are deserialized and the `init` closure runs
+
+A separate `setup_session` method on `SessionsAPI` re-runs `setup` on a live session, which is useful after operations like rollback that replace the context and may lose non-persisted resources.
+
+```rust
+impl Agent for ReActAgent {
+    fn setup(&self, ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
+        let model_id = ctx
+            .get_resource::<AgentConfig>()
+            .map_err(SetupError::new)?
+            .model_id
+            .clone();
+        let llm = ctx
+            .get_resource::<ModelRegistry>()
+            .map_err(SetupError::new)?
+            .llm(&model_id)
+            .map_err(SetupError::new)?;
+        ctx.insert(AgentLlm(llm));
+        Ok(())
+    }
+
+    // ...
+}
+```
+
+`SetupError` is a newtype wrapping `Box<dyn Error + Send + Sync>`. Use `SetupError::new(err)` to wrap any error type.
 
 ## Usage
 
@@ -41,30 +72,32 @@ struct ReActAgent;
 
 impl Agent for ReActAgent {
     fn build(&self, graph: &mut Graph) {
-        graph.add_system(init);
+        graph.add_system(receive_user_input);
+        graph.add_system(init_loop);
 
         graph.add_loop::<ReactState, _, _>(
             "react_loop",
             |state| state.is_complete,
             |g| {
-                g.add_system(reason);
-                g.add_conditional_branch::<ReasoningResult, _, _, _>(
-                    "action",
-                    |result| result.action == Action::UseTool,
+                g.add_system(act);
+                g.add_conditional_branch::<LlmResponse, _, _, _>(
+                    "has_tool_calls",
+                    |response| response.has_tool_calls(),
                     |tool_branch| {
-                        tool_branch.add_system(select_tool);
-                        tool_branch.add_system(execute_tool);
-                        tool_branch.add_system(observe);
+                        tool_branch.add_system(execute_tools);
                     },
-                    |respond_branch| {
-                        respond_branch.add_system(respond);
+                    |done_branch| {
+                        done_branch.add_system(finalize);
                     },
                 );
+                g.add_error_handler(|h| {
+                    h.add_system(recover);
+                });
             },
         );
     }
 
-    fn name(&self) -> &str { "ReActAgent" }
+    fn name(&self) -> &'static str { "ReActAgent" }
 }
 ```
 
@@ -85,6 +118,6 @@ executor.execute(&graph, &mut ctx, None).await?;
 
 ## Packaging as Plugins
 
-To deliver a concrete agent implementation as a distributable unit, Agents are packaged as a plugin. The plugin registers the resources the agent's systems depend on (LLM providers, tool registries, memory) and declares its dependencies on other plugins.
+To deliver a concrete agent implementation as a distributable unit, agents are packaged as a plugin. The plugin registers the resources the agent's systems depend on (LLM providers, tool registries, memory) and declares its dependencies on other plugins.
 
-See [plugins.md](./plugins.md) for plugin structure and lifecycle, and `crates/example` for a complete ReAct agent.
+See [plugins.md](./plugins.md) for plugin structure and lifecycle, and `examples/` for a complete ReAct agent.

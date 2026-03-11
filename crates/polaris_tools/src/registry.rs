@@ -27,8 +27,8 @@ pub struct ToolRegistry {
     tools: IndexMap<String, Arc<dyn Tool>>,
 }
 
-impl core::fmt::Debug for ToolRegistry {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::fmt::Debug for ToolRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolRegistry")
             .field("tools", &self.names())
             .finish()

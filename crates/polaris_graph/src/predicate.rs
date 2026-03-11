@@ -32,11 +32,11 @@
 //! assert!(result);
 //! ```
 
-use core::any::TypeId;
-use core::fmt;
-use core::marker::PhantomData;
 use polaris_system::param::SystemContext;
 use polaris_system::resource::Output;
+use std::any::{TypeId, type_name};
+use std::fmt;
+use std::marker::PhantomData;
 
 /// Errors that can occur during predicate evaluation.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl fmt::Display for PredicateError {
     }
 }
 
-impl core::error::Error for PredicateError {}
+impl std::error::Error for PredicateError {}
 
 /// Object-safe trait for type-erased predicates.
 ///
@@ -180,7 +180,7 @@ where
         let output = ctx
             .get_output::<T>()
             .map_err(|_| PredicateError::OutputNotFound {
-                type_name: core::any::type_name::<T>(),
+                type_name: type_name::<T>(),
             })?;
         Ok((self.func)(&output))
     }
@@ -190,14 +190,14 @@ where
     }
 
     fn input_type_name(&self) -> &'static str {
-        core::any::type_name::<T>()
+        type_name::<T>()
     }
 }
 
 impl<T, F> fmt::Debug for Predicate<T, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Predicate")
-            .field("input_type", &core::any::type_name::<T>())
+            .field("input_type", &type_name::<T>())
             .finish()
     }
 }
@@ -253,7 +253,7 @@ where
         let output = ctx
             .get_output::<T>()
             .map_err(|_| PredicateError::OutputNotFound {
-                type_name: core::any::type_name::<T>(),
+                type_name: type_name::<T>(),
             })?;
         Ok((self.func)(&output))
     }
@@ -263,14 +263,14 @@ where
     }
 
     fn input_type_name(&self) -> &'static str {
-        core::any::type_name::<T>()
+        type_name::<T>()
     }
 }
 
 impl<T, F> fmt::Debug for Discriminator<T, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Discriminator")
-            .field("input_type", &core::any::type_name::<T>())
+            .field("input_type", &type_name::<T>())
             .finish()
     }
 }

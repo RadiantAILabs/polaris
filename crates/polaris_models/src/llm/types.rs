@@ -8,8 +8,8 @@ use serde_json::Value;
 // ─────────────────────
 
 /// A generation request to a model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationRequest {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmRequest {
     /// System prompt for the model.
     pub system: Option<String>,
     /// The messages to send to the model.
@@ -25,137 +25,31 @@ pub struct GenerationRequest {
     pub output_schema: Option<Value>,
 }
 
-impl GenerationRequest {
-    /// Creates a new generation request with a user message.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use polaris_models::llm::GenerationRequest;
-    ///
-    /// let request = GenerationRequest::new("What's the weather like?");
-    /// ```
+impl LlmRequest {
+    /// Returns `true` if any message contains a [`ToolCall`] or [`ToolResult`] block.
     #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            system: None,
-            messages: vec![Message::user(message)],
-            tools: None,
-            tool_choice: None,
-            output_schema: None,
-        }
-    }
-
-    /// Creates a new generation request with a system prompt and user message.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use polaris_models::llm::GenerationRequest;
-    ///
-    /// let request = GenerationRequest::with_system(
-    ///     "You are a helpful assistant",
-    ///     "What's the weather like?"
-    /// );
-    /// ```
-    #[must_use]
-    pub fn with_system(system: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            system: Some(system.into()),
-            messages: vec![Message::user(message)],
-            tools: None,
-            tool_choice: None,
-            output_schema: None,
-        }
-    }
-
-    /// Sets the system prompt for the model.
-    #[must_use]
-    pub fn system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
-        self
-    }
-
-    /// Adds conversation history before the current message.
-    ///
-    /// The messages provided will be prepended to the existing messages.
-    #[must_use]
-    pub fn history(mut self, mut messages: Vec<Message>) -> Self {
-        messages.append(&mut self.messages);
-        self.messages = messages;
-        self
-    }
-
-    /// Adds a single tool to the request.
-    ///
-    /// This can be called multiple times to add multiple tools.
-    #[must_use]
-    pub fn tool(mut self, tool: ToolDefinition) -> Self {
-        self.tools.get_or_insert_with(Vec::new).push(tool);
-        self
-    }
-
-    /// Sets all available tools, replacing any previously added tools.
-    #[must_use]
-    pub fn tools(mut self, tools: Vec<ToolDefinition>) -> Self {
-        self.tools = Some(tools);
-        self
-    }
-
-    /// Sets how the model should choose tools.
-    #[must_use]
-    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
-        self.tool_choice = Some(choice);
-        self
-    }
-
-    /// Requires the model to call at least one tool.
-    ///
-    /// Shorthand for `.tool_choice(ToolChoice::Required)`.
-    #[must_use]
-    pub fn require_tool(mut self) -> Self {
-        self.tool_choice = Some(ToolChoice::Required);
-        self
-    }
-
-    /// Requires the model to call a specific tool.
-    ///
-    /// Shorthand for `.tool_choice(ToolChoice::Specific(name))`.
-    #[must_use]
-    pub fn require_tool_named(mut self, name: impl Into<String>) -> Self {
-        self.tool_choice = Some(ToolChoice::Specific(name.into()));
-        self
-    }
-
-    /// Allows the model to decide whether to call tools.
-    ///
-    /// Shorthand for `.tool_choice(ToolChoice::Auto)`.
-    #[must_use]
-    pub fn auto_tool(mut self) -> Self {
-        self.tool_choice = Some(ToolChoice::Auto);
-        self
-    }
-
-    /// Prevents the model from calling any tools.
-    ///
-    /// Shorthand for `.tool_choice(ToolChoice::None)`.
-    #[must_use]
-    pub fn no_tool(mut self) -> Self {
-        self.tool_choice = Some(ToolChoice::None);
-        self
+    pub fn contains_tool_blocks(&self) -> bool {
+        self.messages.iter().any(|msg| match msg {
+            Message::User { content } => content
+                .iter()
+                .any(|b| matches!(b, UserBlock::ToolResult(_))),
+            Message::Assistant { content, .. } => content
+                .iter()
+                .any(|b| matches!(b, AssistantBlock::ToolCall(_))),
+        })
     }
 }
 
 /// A generation response from a model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationResponse {
+pub struct LlmResponse {
     /// The generated content blocks.
     pub content: Vec<AssistantBlock>,
     /// Token usage information.
     pub usage: Usage,
 }
 
-impl GenerationResponse {
+impl LlmResponse {
     /// Returns all text content blocks concatenated into a single string.
     ///
     /// This is a convenience method for the common case of extracting
@@ -173,6 +67,26 @@ impl GenerationResponse {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// Returns `true` if the response contains any tool calls.
+    #[must_use]
+    pub fn has_tool_calls(&self) -> bool {
+        self.content
+            .iter()
+            .any(|block| matches!(block, AssistantBlock::ToolCall(_)))
+    }
+
+    /// Returns all tool calls contained in the response.
+    #[must_use]
+    pub fn tool_calls(&self) -> Vec<&ToolCall> {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                AssistantBlock::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -229,12 +143,30 @@ impl Message {
         }
     }
 
+    /// Creates an assistant reasoning message with the given thought content.
+    #[must_use]
+    pub fn reasoning(thought: impl Into<String>) -> Self {
+        Self::Assistant {
+            id: None,
+            content: vec![AssistantBlock::reasoning(thought)],
+        }
+    }
+
     /// Creates an assistant message with text content and an ID.
     #[must_use]
     pub fn assistant_with_id(id: impl Into<String>, text: impl Into<String>) -> Self {
         Self::Assistant {
             id: Some(id.into()),
             content: vec![AssistantBlock::Text(TextBlock { text: text.into() })],
+        }
+    }
+
+    /// Creates an assistant message with a single tool call.
+    #[must_use]
+    pub fn assistant_tool_call(call: ToolCall) -> Self {
+        Self::Assistant {
+            id: None,
+            content: vec![AssistantBlock::ToolCall(call)],
         }
     }
 
@@ -288,6 +220,20 @@ impl Message {
 pub struct TextBlock {
     /// The text content.
     pub text: String,
+}
+
+impl From<String> for TextBlock {
+    fn from(text: String) -> Self {
+        Self { text }
+    }
+}
+
+impl From<&str> for TextBlock {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+        }
+    }
 }
 
 /// Content that can appear in a user message.
@@ -595,6 +541,26 @@ pub struct ToolCall {
     pub signature: Option<String>,
     /// Provider-specific parameters.
     pub additional_params: Option<Value>,
+}
+
+impl ToolCall {
+    /// Creates a new tool call with the given ID, function name, and arguments.
+    ///
+    /// Provider-specific fields (`call_id`, `signature`, `additional_params`)
+    /// are set to `None`.
+    #[must_use]
+    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            id: id.into(),
+            call_id: None,
+            function: ToolFunction {
+                name: name.into(),
+                arguments,
+            },
+            signature: None,
+            additional_params: None,
+        }
+    }
 }
 
 /// A tool function to be called.

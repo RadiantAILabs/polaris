@@ -13,8 +13,8 @@ use async_openai::types::responses::{
 };
 use async_trait::async_trait;
 use polaris_models::llm::{
-    AssistantBlock, GenerationError, GenerationRequest, GenerationResponse, ImageMediaType,
-    LlmProvider, Message, ReasoningBlock, TextBlock, ToolCall, ToolChoice, ToolFunction,
+    AssistantBlock, GenerationError, ImageMediaType, LlmProvider, LlmRequest, LlmResponse, Message,
+    ReasoningBlock, TextBlock, ToolCall, ToolChoice, ToolFunction,
     ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 
@@ -39,8 +39,8 @@ impl LlmProvider for OpenAiProvider {
     async fn generate(
         &self,
         model: &str,
-        request: GenerationRequest,
-    ) -> Result<GenerationResponse, GenerationError> {
+        request: LlmRequest,
+    ) -> Result<LlmResponse, GenerationError> {
         let create_response = convert_request(model, &request)?;
         let response = self
             .client
@@ -58,7 +58,7 @@ impl LlmProvider for OpenAiProvider {
 
 fn convert_request(
     model: &str,
-    request: &GenerationRequest,
+    request: &LlmRequest,
 ) -> Result<async_openai::types::responses::CreateResponse, GenerationError> {
     let input_items = convert_messages(&request.messages)?;
 
@@ -340,7 +340,7 @@ fn convert_tool_choice(choice: &ToolChoice) -> ToolChoiceParam {
 // Response conversion (OpenAI -> Polaris)
 // ---------------------------------------------------------------------------
 
-fn convert_response(response: Response) -> Result<GenerationResponse, GenerationError> {
+fn convert_response(response: Response) -> Result<LlmResponse, GenerationError> {
     let content = response
         .output
         .into_iter()
@@ -352,7 +352,7 @@ fn convert_response(response: Response) -> Result<GenerationResponse, Generation
 
     let usage = response.usage.map(convert_usage).unwrap_or_default();
 
-    Ok(GenerationResponse { content, usage })
+    Ok(LlmResponse { content, usage })
 }
 
 fn convert_output_item(item: OutputItem) -> Result<Vec<AssistantBlock>, GenerationError> {

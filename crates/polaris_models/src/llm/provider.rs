@@ -1,7 +1,7 @@
 //! The [`LlmProvider`] trait for LLM model providers.
 
 use super::error::GenerationError;
-use super::types::{GenerationRequest, GenerationResponse};
+use super::types::{LlmRequest, LlmResponse};
 use async_trait::async_trait;
 
 /// Trait implemented by LLM providers for text generation.
@@ -18,6 +18,6 @@ pub trait LlmProvider: Send + Sync + 'static {
     async fn generate(
         &self,
         model: &str,
-        request: GenerationRequest,
-    ) -> Result<GenerationResponse, GenerationError>;
+        request: LlmRequest,
+    ) -> Result<LlmResponse, GenerationError>;
 }

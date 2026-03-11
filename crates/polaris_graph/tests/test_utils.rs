@@ -13,11 +13,13 @@ use polaris_graph::dev::{DevToolsPlugin, SystemInfo};
 use polaris_graph::graph::Graph;
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::node::NodeId;
-use polaris_system::param::SystemContext;
+use polaris_graph::{CaughtError, ErrorKind};
+use polaris_system::param::{ParamError, SystemContext};
 use polaris_system::plugin::Plugin;
 use polaris_system::resource::LocalResource;
 use polaris_system::server::Server;
 use polaris_system::system::{BoxFuture, System, SystemError};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -27,7 +29,7 @@ use std::sync::{Arc, Mutex};
 /// Creates a test server with `DevToolsPlugin` enabled.
 pub fn create_test_server() -> Server {
     let mut server = Server::new();
-    DevToolsPlugin.build(&mut server);
+    DevToolsPlugin::default().build(&mut server);
     server
 }
 
@@ -156,11 +158,15 @@ impl System for FailingSystem {
     fn name(&self) -> &'static str {
         "failing_system"
     }
+
+    fn is_fallible(&self) -> bool {
+        true
+    }
 }
 
 /// System that sleeps for a specified duration.
 pub struct SlowSystem {
-    pub duration: core::time::Duration,
+    pub duration: std::time::Duration,
 }
 
 impl System for SlowSystem {
@@ -435,6 +441,119 @@ impl System for InitialStateSystem {
 
     fn name(&self) -> &'static str {
         "initial_state_system"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR KIND CHECKING SYSTEMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// System that fails with a `ParamError` (parameter resolution failure).
+pub struct ParamFailingSystem;
+
+impl System for ParamFailingSystem {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move {
+            Err(SystemError::ParamError(ParamError::ResourceNotFound(
+                "MissingType",
+            )))
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "param_failing_system"
+    }
+}
+
+/// System that records the `ErrorKind` from `CaughtError` via `HandlerLog`.
+pub struct KindCheckingHandler;
+
+impl System for KindCheckingHandler {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move {
+            if let Ok(log) = ctx.get_resource::<HandlerLog>() {
+                log.mark_invoked();
+            }
+            if let Ok(caught) = ctx.get_output::<CaughtError>()
+                && let Ok(kind_log) = ctx.get_resource::<ErrorKindLog>()
+            {
+                kind_log.record(caught.kind);
+            }
+            Ok(())
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "kind_checking_handler"
+    }
+}
+
+/// Resource that records the `ErrorKind` observed by an error handler.
+#[derive(Clone, Default)]
+pub struct ErrorKindLog {
+    kind: Arc<Mutex<Option<ErrorKind>>>,
+}
+
+impl LocalResource for ErrorKindLog {}
+
+impl ErrorKindLog {
+    /// Returns the recorded error kind, if any.
+    pub fn kind(&self) -> Option<ErrorKind> {
+        *self.kind.lock().unwrap()
+    }
+
+    /// Records an error kind.
+    pub fn record(&self, kind: ErrorKind) {
+        *self.kind.lock().unwrap() = Some(kind);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RETRY TEST SYSTEMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A system that fails the first `fail_count` times, then succeeds.
+///
+/// Tracks attempt count via a shared `AtomicU32` so tests can verify
+/// how many times the system was invoked.
+pub struct EventuallySucceedsSystem {
+    /// Number of times to fail before succeeding.
+    pub fail_count: u32,
+    /// Shared counter tracking total invocations.
+    pub attempts: Arc<AtomicU32>,
+}
+
+impl System for EventuallySucceedsSystem {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.fail_count {
+                Err(SystemError::ExecutionError(format!(
+                    "transient failure (attempt {attempt})"
+                )))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "eventually_succeeds_system"
     }
 }
 

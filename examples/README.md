@@ -30,3 +30,7 @@ cargo run -p examples --bin cli -- ./sandbox --session my-session
 - `/history` — Show conversation history
 - `/clear` — Clear conversation history
 - `/exit` or `/quit` — Exit the REPL
+- `/save` — Save session to disk
+- `/info` — Show session info
+- `/sessions` — List all saved sessions
+- `/rollback <turn>` — Rollback to a checkpoint

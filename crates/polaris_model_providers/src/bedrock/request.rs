@@ -6,7 +6,7 @@ use super::types::{
 };
 use crate::schema::normalize_schema_for_strict_mode;
 use aws_sdk_bedrockruntime::types as bedrock;
-use polaris_models::llm::{self as polaris_llm, GenerationError, GenerationRequest};
+use polaris_models::llm::{self as polaris_llm, GenerationError, LlmRequest};
 
 // -----------------------------------------------------------------------------
 // Message conversions
@@ -72,9 +72,21 @@ fn convert_assistant_block(
         polaris_llm::AssistantBlock::ToolCall(call) => {
             Ok(bedrock::ContentBlock::ToolUse(convert_tool_call(call)?))
         }
-        polaris_llm::AssistantBlock::Reasoning(_) => Err(GenerationError::UnsupportedContent(
-            "Reasoning blocks are not supported by Bedrock Converse API".to_string(),
-        )),
+        polaris_llm::AssistantBlock::Reasoning(block) => {
+            let text = block.reasoning.join("\n");
+            let reasoning_text = bedrock::ReasoningTextBlock::builder()
+                .text(text)
+                .set_signature(block.signature.clone())
+                .build()
+                .map_err(|err| {
+                    GenerationError::InvalidRequest(format!(
+                        "failed to build reasoning block: {err}"
+                    ))
+                })?;
+            Ok(bedrock::ContentBlock::ReasoningContent(
+                bedrock::ReasoningContentBlock::ReasoningText(reasoning_text),
+            ))
+        }
     }
 }
 
@@ -168,13 +180,8 @@ fn convert_tool_call(
 
 /// Builds a Bedrock tool configuration from a generation request.
 pub fn build_tool_config(
-    request: &GenerationRequest,
+    request: &LlmRequest,
 ) -> Result<Option<bedrock::ToolConfiguration>, GenerationError> {
-    // If tool_choice is None, skip tools entirely (Bedrock has no "none" option).
-    if matches!(request.tool_choice, Some(polaris_llm::ToolChoice::None)) {
-        return Ok(None);
-    }
-
     let tools = match &request.tools {
         Some(tools) if !tools.is_empty() => tools,
         _ => return Ok(None),
@@ -187,8 +194,10 @@ pub fn build_tool_config(
 
     let mut config_builder = bedrock::ToolConfiguration::builder().set_tools(Some(tool_specs));
 
-    if let Some(choice) = &request.tool_choice {
-        config_builder = config_builder.tool_choice(convert_tool_choice(choice)?);
+    if let Some(choice) = &request.tool_choice
+        && let Some(bedrock_choice) = convert_tool_choice(choice)?
+    {
+        config_builder = config_builder.tool_choice(bedrock_choice);
     }
 
     config_builder.build().map(Some).map_err(|err| {
@@ -215,16 +224,20 @@ fn convert_tool_spec(tool: &polaris_llm::ToolDefinition) -> Result<bedrock::Tool
 }
 
 /// Converts a Polaris tool choice to a Bedrock tool choice.
+///
+/// Returns `Ok(None)` for [`ToolChoice::None`](polaris_llm::ToolChoice::None)
+/// because Bedrock has no equivalent — the caller should omit `tool_choice`
+/// from the configuration, letting the model default to auto.
 fn convert_tool_choice(
     choice: &polaris_llm::ToolChoice,
-) -> Result<bedrock::ToolChoice, GenerationError> {
+) -> Result<Option<bedrock::ToolChoice>, GenerationError> {
     match choice {
-        polaris_llm::ToolChoice::Auto => Ok(bedrock::ToolChoice::Auto(
+        polaris_llm::ToolChoice::Auto => Ok(Some(bedrock::ToolChoice::Auto(
             bedrock::AutoToolChoice::builder().build(),
-        )),
-        polaris_llm::ToolChoice::Required => Ok(bedrock::ToolChoice::Any(
+        ))),
+        polaris_llm::ToolChoice::Required => Ok(Some(bedrock::ToolChoice::Any(
             bedrock::AnyToolChoice::builder().build(),
-        )),
+        ))),
         // Only supported by Anthropic Claude 3 and Amazon Nova models.
         polaris_llm::ToolChoice::Specific(name) => {
             let specific = bedrock::SpecificToolChoice::builder()
@@ -235,14 +248,9 @@ fn convert_tool_choice(
                         "failed to build specific tool choice: {err}"
                     ))
                 })?;
-            Ok(bedrock::ToolChoice::Tool(specific))
+            Ok(Some(bedrock::ToolChoice::Tool(specific)))
         }
-        polaris_llm::ToolChoice::None => {
-            // Bedrock has no "none" option - this is handled in build_tool_config by skipping tools entirely. If we reach here, fall back to Auto.
-            unreachable!(
-                "ToolChoice::None is not supported by Bedrock - this should be handled in build_tool_config by removing tools"
-            );
-        }
+        polaris_llm::ToolChoice::None => Ok(None),
     }
 }
 
@@ -252,7 +260,7 @@ fn convert_tool_choice(
 
 /// Builds a Bedrock output configuration from a generation request.
 pub fn build_output_config(
-    request: &GenerationRequest,
+    request: &LlmRequest,
 ) -> Result<Option<bedrock::OutputConfig>, GenerationError> {
     let Some(schema) = &request.output_schema else {
         return Ok(None);

@@ -29,7 +29,7 @@ async fn fallible_read(counter: Res<Counter>) -> Result<CounterOutput, SystemErr
 }
 
 fn main() {
-    use core::any::TypeId;
+    use std::any::TypeId;
     use polaris_system::system::ErasedSystem;
 
     let system = fallible_read();

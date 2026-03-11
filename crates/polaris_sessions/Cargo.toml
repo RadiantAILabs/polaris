@@ -1,0 +1,31 @@
+[package]
+name = "polaris_sessions"
+version = "0.0.1"
+description = "Session management and orchestration for Polaris agents."
+edition = "2024"
+keywords = []
+
+[lints]
+workspace = true
+
+[features]
+default = ["file-store"]
+file-store = ["tokio/fs"]
+
+[dependencies]
+polaris_system = { path = "../polaris_system" }
+polaris_graph = { path = "../polaris_graph" }
+polaris_agent = { path = "../polaris_agent" }
+polaris_core_plugins = { path = "../polaris_core_plugins" }
+hashbrown = "0.16.1"
+nanoid = "0.4"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

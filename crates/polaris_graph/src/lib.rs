@@ -74,12 +74,15 @@ pub mod prelude {
         TimeoutEdge,
     };
     pub use crate::executor::{
-        ExecutionError, ExecutionResult, GraphExecutor, ResourceValidationError,
+        CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor,
+        ResourceValidationError,
     };
-    pub use crate::graph::{Graph, ValidationError, ValidationWarning};
+    pub use crate::graph::{
+        Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
+    };
     pub use crate::node::{
         DecisionNode, IntoSystemNode, JoinNode, LoopNode, Node, NodeId, NodeMarker, ParallelNode,
-        ScheduledNodeMarker, SwitchNode, SystemNode,
+        RetryPolicy, ScheduledNodeMarker, SwitchNode, SystemNode,
     };
     pub use crate::predicate::{
         BoxedDiscriminator, BoxedPredicate, Discriminator, ErasedDiscriminator, ErasedPredicate,
@@ -89,6 +92,10 @@ pub mod prelude {
 
 // Re-export key types at crate root for convenience
 pub use dev::{DevToolsPlugin, SystemInfo};
-pub use executor::{ExecutionError, ExecutionResult, GraphExecutor, ResourceValidationError};
-pub use graph::{Graph, ValidationError, ValidationWarning};
-pub use node::NodeId;
+pub use executor::{
+    CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor, ResourceValidationError,
+};
+pub use graph::{
+    Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
+};
+pub use node::{NodeId, RetryPolicy};

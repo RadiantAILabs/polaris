@@ -5,7 +5,7 @@
 //! type) wrapped in a [`ScheduleId`]. See [`ScheduleId`] for the layered
 //! architecture and a full example.
 
-use core::any::TypeId;
+use std::any::{TypeId, type_name};
 use variadics_please::all_tuples;
 
 /// Identifier for a tick schedule, derived from a marker type.
@@ -72,7 +72,7 @@ impl ScheduleId {
     pub fn of<S: Schedule + 'static>() -> Self {
         Self {
             type_id: TypeId::of::<S>(),
-            type_name: core::any::type_name::<S>(),
+            type_name: type_name::<S>(),
         }
     }
 

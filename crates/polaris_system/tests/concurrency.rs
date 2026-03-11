@@ -2,12 +2,12 @@
 //!
 //! These tests verify thread-safety and concurrent access patterns.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::time::Duration;
 use polaris_system::resource::{LocalResource, Resources};
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 // Test resource types
 #[derive(Debug, PartialEq, Clone)]

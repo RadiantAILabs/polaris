@@ -10,7 +10,7 @@ publish = false
 missing_docs = "allow"
 
 [dependencies]
-polaris = { path = "..", features = ["bedrock"] }
+polaris = { path = ".." }
 dotenvy = "0.15"
 rustyline = "17.0.2"
 schemars = "1.2"

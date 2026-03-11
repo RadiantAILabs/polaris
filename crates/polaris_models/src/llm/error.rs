@@ -1,6 +1,6 @@
 //! Error types for LLM generation operations.
 
-use core::time::Duration;
+use std::time::Duration;
 
 /// Errors for structured output extraction.
 #[derive(Debug, thiserror::Error)]

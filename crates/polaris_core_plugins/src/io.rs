@@ -80,8 +80,8 @@ pub enum IOError {
     Provider(String),
 }
 
-impl core::fmt::Display for IOError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::fmt::Display for IOError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Closed => write!(f, "I/O channel closed"),
             Self::Timeout => write!(f, "I/O operation timed out"),

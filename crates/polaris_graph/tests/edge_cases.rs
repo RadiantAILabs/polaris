@@ -5,14 +5,18 @@
 
 mod test_utils;
 
-use polaris_graph::executor::{ExecutionError, GraphExecutor};
+use polaris_graph::executor::{ErrorKind, ExecutionError, GraphExecutor};
 use polaris_graph::graph::Graph;
+use polaris_graph::node::RetryPolicy;
+use polaris_system::param::SystemContext;
+use polaris_system::system::{BoxFuture, System, SystemError};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use test_utils::{
-    ConsumerSystem, DecisionOutput, DecisionSystem, FailingSystem, FlagSystem, HandlerLog,
-    HandlerSystem, InitialStateSystem, LoopIterationSystem, LoopState, ProducerOutput,
-    ProducerSystem, SlowSystem, SuccessSystem, SwitchKeySystem, SwitchOutput, branch,
-    create_test_server, get_hooks,
+    ConsumerSystem, DecisionOutput, DecisionSystem, ErrorKindLog, EventuallySucceedsSystem,
+    FailingSystem, FlagSystem, HandlerLog, HandlerSystem, InitialStateSystem, KindCheckingHandler,
+    LoopIterationSystem, LoopState, ParamFailingSystem, ProducerOutput, ProducerSystem, SlowSystem,
+    SuccessSystem, SwitchKeySystem, SwitchOutput, branch, create_test_server, get_hooks,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -28,7 +32,7 @@ async fn error_handler_invoked_on_failure() {
     let failing_id = graph.add_boxed_system(Box::new(FailingSystem));
 
     // Add error handler
-    graph.add_error_handler(failing_id, |g| {
+    graph.add_error_handler_for(failing_id, |g| {
         g.add_boxed_system(Box::new(HandlerSystem));
     });
 
@@ -83,7 +87,7 @@ async fn error_propagates_without_handler() {
 /// Verifies that a timeout edge routes execution to the handler when a system times out.
 #[tokio::test]
 async fn timeout_triggers_handler() {
-    use core::time::Duration;
+    use std::time::Duration;
 
     let mut graph = Graph::new();
 
@@ -123,7 +127,7 @@ async fn timeout_triggers_handler() {
 /// Verifies that timeout returns an error when no timeout handler is present.
 #[tokio::test]
 async fn timeout_error_without_handler() {
-    use core::time::Duration;
+    use std::time::Duration;
 
     let mut graph = Graph::new();
 
@@ -664,7 +668,7 @@ fn validation_fails_without_hooks_for_hook_provided_resources() {
     graph.add_boxed_system(Box::new(LoggingSystem));
 
     // Create context with ExecutionLog but without hooks/DevToolsPlugin
-    let mut ctx = polaris_system::param::SystemContext::new();
+    let mut ctx = SystemContext::new();
     ctx.insert(ExecutionLog::default());
 
     let executor = GraphExecutor::new();
@@ -683,5 +687,250 @@ fn validation_fails_without_hooks_for_hook_provided_resources() {
     assert!(
         error_msg.contains("SystemInfo"),
         "error should mention SystemInfo: {error_msg}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR KIND TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verifies that `CaughtError.kind == ErrorKind::Execution` for `SystemError::ExecutionError`.
+#[tokio::test]
+async fn error_kind_execution_for_execution_error() {
+    let mut graph = Graph::new();
+
+    let failing_id = graph.add_boxed_system(Box::new(FailingSystem));
+    graph.add_error_handler_for(failing_id, |g| {
+        g.add_boxed_system(Box::new(KindCheckingHandler));
+    });
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let log = HandlerLog::default();
+    let kind_log = ErrorKindLog::default();
+    ctx.insert(log.clone());
+    ctx.insert(kind_log.clone());
+
+    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    assert!(result.is_ok(), "execution should succeed via error handler");
+    assert!(log.was_invoked(), "error handler should have been invoked");
+    assert_eq!(
+        kind_log.kind(),
+        Some(ErrorKind::Execution),
+        "error kind should be Execution for ExecutionError"
+    );
+}
+
+/// Verifies that `CaughtError.kind == ErrorKind::ParamResolution` for `SystemError::ParamError`.
+#[tokio::test]
+async fn error_kind_param_resolution_for_param_error() {
+    let mut graph = Graph::new();
+
+    let failing_id = graph.add_boxed_system(Box::new(ParamFailingSystem));
+    graph.add_error_handler_for(failing_id, |g| {
+        g.add_boxed_system(Box::new(KindCheckingHandler));
+    });
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let log = HandlerLog::default();
+    let kind_log = ErrorKindLog::default();
+    ctx.insert(log.clone());
+    ctx.insert(kind_log.clone());
+
+    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    assert!(result.is_ok(), "execution should succeed via error handler");
+    assert!(log.was_invoked(), "error handler should have been invoked");
+    assert_eq!(
+        kind_log.kind(),
+        Some(ErrorKind::ParamResolution),
+        "error kind should be ParamResolution for ParamError"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYSTEM NODE BUILDER INTEGRATION TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verifies that `system_boxed().on_error()` invokes the error handler on failure.
+#[tokio::test]
+async fn system_builder_error_handler_invoked_on_failure() {
+    let mut graph = Graph::new();
+    graph.system_boxed(Box::new(FailingSystem)).on_error(|g| {
+        g.add_boxed_system(Box::new(HandlerSystem));
+    });
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let log = HandlerLog::default();
+    ctx.insert(log.clone());
+
+    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+
+    assert!(result.is_ok(), "execution should succeed via error handler");
+    assert!(log.was_invoked(), "error handler should have been invoked");
+}
+
+/// Verifies that `system_boxed().with_timeout().on_timeout()` invokes the timeout handler.
+#[tokio::test]
+async fn system_builder_timeout_handler_invoked_on_timeout() {
+    use std::time::Duration;
+
+    let mut graph = Graph::new();
+    graph
+        .system_boxed(Box::new(SlowSystem {
+            duration: Duration::from_secs(10),
+        }))
+        .with_timeout(Duration::from_millis(10))
+        .on_timeout(|g| {
+            g.add_boxed_system(Box::new(HandlerSystem));
+        });
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let log = HandlerLog::default();
+    ctx.insert(log.clone());
+
+    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+
+    assert!(
+        result.is_ok(),
+        "execution should succeed via timeout handler"
+    );
+    assert!(
+        log.was_invoked(),
+        "timeout handler should have been invoked"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RETRY POLICY INTEGRATION TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// System with retry succeeds after transient failures.
+#[tokio::test]
+async fn retry_succeeds_after_transient_failures() {
+    let attempts = Arc::new(AtomicU32::new(0));
+    let mut graph = Graph::new();
+
+    // Fails twice, succeeds on 3rd attempt. Policy allows 2 retries.
+    graph
+        .system_boxed(Box::new(EventuallySucceedsSystem {
+            fail_count: 2,
+            attempts: attempts.clone(),
+        }))
+        .with_retry(RetryPolicy::fixed(2, std::time::Duration::from_millis(1)));
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    assert!(result.is_ok(), "should succeed after retries: {result:?}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "should have attempted 3 times"
+    );
+}
+
+/// System with retry exhausted routes to error handler.
+#[tokio::test]
+async fn retry_exhausted_routes_to_error_handler() {
+    let attempts = Arc::new(AtomicU32::new(0));
+    let mut graph = Graph::new();
+
+    // Fails 5 times, but policy only allows 2 retries (3 total attempts).
+    graph
+        .system_boxed(Box::new(EventuallySucceedsSystem {
+            fail_count: 5,
+            attempts: attempts.clone(),
+        }))
+        .with_retry(RetryPolicy::fixed(2, std::time::Duration::from_millis(1)))
+        .on_error(|g| {
+            g.add_boxed_system(Box::new(HandlerSystem));
+        });
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let log = HandlerLog::default();
+    ctx.insert(log.clone());
+
+    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    assert!(result.is_ok(), "should route to error handler");
+    assert!(log.was_invoked(), "error handler should have been invoked");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "should have attempted 3 times before giving up"
+    );
+}
+
+/// System with retry + timeout retries on timeout.
+#[tokio::test]
+async fn retry_with_timeout_retries_on_timeout() {
+    use std::time::Duration;
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_clone = attempts.clone();
+
+    // A system that is slow on first attempt but fast on second
+    struct SlowThenFastSystem {
+        attempts: Arc<AtomicU32>,
+    }
+
+    impl System for SlowThenFastSystem {
+        type Output = ();
+
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a SystemContext<'_>,
+        ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+            Box::pin(async move {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // First attempt: sleep longer than timeout
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                Ok(())
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "slow_then_fast_system"
+        }
+    }
+
+    let mut graph = Graph::new();
+    graph
+        .system_boxed(Box::new(SlowThenFastSystem {
+            attempts: attempts_clone,
+        }))
+        .with_timeout(Duration::from_millis(10))
+        .with_retry(RetryPolicy::fixed(1, Duration::from_millis(1)));
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    assert!(
+        result.is_ok(),
+        "should succeed on second attempt: {result:?}"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "should have attempted twice"
     );
 }

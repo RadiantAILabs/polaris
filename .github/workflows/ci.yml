@@ -33,6 +33,11 @@ jobs:
       - name: Install cargo-make
         uses: taiki-e/install-action@cargo-make
 
+      - name: Install rumdl
+        uses: taiki-e/install-action@v2
+        with:
+          tool: rumdl
+
       - name: Run tests
         run: cargo make test
 

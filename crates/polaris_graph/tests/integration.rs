@@ -560,9 +560,9 @@ async fn parallel_diamond_execution() {
     assert!(result.is_ok(), "Execution failed: {:?}", result.err());
 
     // Verify execution stats
-    // Nodes: entry (1) + parallel (1) + branch_a (1) + branch_b (1) + join (1) + after_join (1) = 6
+    // Nodes: entry (1) + parallel (1) + branch_a (1) + branch_b (1) + after_join (1) = 5
     let stats = result.unwrap();
-    assert_eq!(stats.nodes_executed, 6);
+    assert_eq!(stats.nodes_executed, 5);
 
     // Final output should be from the after_join step
     let output = ctx.get_output::<DiamondResult>().unwrap();

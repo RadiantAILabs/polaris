@@ -29,10 +29,10 @@
 
 use crate::param::{ParamError, SystemAccess, SystemContext};
 use crate::resource::Output;
-use core::any::{Any, TypeId};
-use core::future::Future;
-use core::marker::PhantomData;
-use core::pin::Pin;
+use std::any::{Any, TypeId, type_name};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 
 /// Errors that can occur during system execution.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +76,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// // Automatically implements System via IntoSystem
 /// let system = Box::new(my_system.into_system());
 /// ```
+///
+/// ## Fallible Systems
+///
+/// Systems may return `Result<T, SystemError>` to indicate they can fail.
+/// The `#[system]` macro detects this pattern and sets [`is_fallible`](System::is_fallible)
+/// to `true` automatically. On success, `T` is stored in the context for
+/// downstream `Out<T>` access. On error, the `SystemError` propagates to the
+/// executor, which routes to an error edge or halts the graph.
 pub trait System: Send + Sync + 'static {
     /// The output type produced by this system.
     type Output: Output;
@@ -100,6 +108,15 @@ pub trait System: Send + Sync + 'static {
     /// access (no conflicts).
     fn access(&self) -> SystemAccess {
         SystemAccess::default()
+    }
+
+    /// Returns whether this system can fail with a user-defined error.
+    ///
+    /// Systems that return `Result<T, SystemError>` are considered fallible.
+    /// The `#[system]` macro emits `true` for such systems automatically.
+    /// The default is `false` (infallible).
+    fn is_fallible(&self) -> bool {
+        false
     }
 }
 
@@ -142,6 +159,9 @@ pub trait ErasedSystem: Send + Sync + 'static {
         &'a self,
         ctx: &'a SystemContext<'_>,
     ) -> BoxFuture<'a, Result<Box<dyn Any + Send + Sync>, SystemError>>;
+
+    /// Returns whether this system can fail with a user-defined error.
+    fn is_fallible(&self) -> bool;
 }
 
 /// Boxed type-erased system.
@@ -163,7 +183,7 @@ impl<S: System> ErasedSystem for S {
     }
 
     fn output_type_name(&self) -> &'static str {
-        core::any::type_name::<S::Output>()
+        type_name::<S::Output>()
     }
 
     fn run_erased<'a>(
@@ -174,6 +194,10 @@ impl<S: System> ErasedSystem for S {
             let output = self.run(ctx).await?;
             Ok(Box::new(output) as Box<dyn Any + Send + Sync>)
         })
+    }
+
+    fn is_fallible(&self) -> bool {
+        <Self as System>::is_fallible(self)
     }
 }
 
@@ -246,7 +270,9 @@ where
     type System = FunctionSystem<F, (FunctionMarker,)>;
 
     fn into_system(self) -> Self::System {
-        FunctionSystem::new(self, core::any::type_name::<F>())
+        let full = type_name::<F>();
+        let name = full.rsplit("::").next().unwrap_or(full);
+        FunctionSystem::new(self, name)
     }
 }
 
