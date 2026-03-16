@@ -18,7 +18,7 @@
 //!
 //! let mut ctx = SystemContext::new();
 //! let executor = GraphExecutor::new();
-//! let result = executor.execute(&graph, &mut ctx, None).await?;
+//! let result = executor.execute(&graph, &mut ctx, None, None).await?;
 //!
 //! # Ok(())
 //! # }
@@ -34,7 +34,8 @@ use crate::graph::Graph;
 use crate::hooks::HooksAPI;
 use crate::hooks::events::GraphEvent;
 use crate::hooks::schedule::{OnGraphComplete, OnGraphFailure, OnGraphStart, OnSystemStart};
-use crate::node::Node;
+use crate::middleware::{self, MiddlewareAPI};
+use crate::node::{Node, NodeId};
 use hashbrown::HashSet;
 use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
@@ -42,7 +43,7 @@ use std::any::TypeId;
 use std::time::Duration;
 
 /// Result of executing a graph.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ExecutionResult {
     /// Number of nodes executed during traversal.
     pub nodes_executed: usize,
@@ -169,7 +170,7 @@ impl GraphExecutor {
     /// Validates a single system's access requirements against the context.
     fn validate_system_access(
         &self,
-        node_id: &crate::node::NodeId,
+        node_id: &NodeId,
         system_name: &'static str,
         access: &polaris_system::param::SystemAccess,
         ctx: &SystemContext<'_>,
@@ -229,28 +230,54 @@ impl GraphExecutor {
         graph: &Graph,
         ctx: &mut SystemContext<'_>,
         hooks: Option<&HooksAPI>,
+        middleware: Option<&MiddlewareAPI>,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let default_mw = MiddlewareAPI::default();
+        let mw = middleware.unwrap_or(&default_mw);
+
+        let entry = graph.entry().ok_or(ExecutionError::EmptyGraph)?;
+        let node_count = graph.node_count();
+
+        let middleware_info = middleware::info::GraphInfo { node_count };
+        mw.graph_execution
+            .execute(middleware_info, ctx, |ctx| {
+                let entry = entry.clone();
+                Box::pin(self.execute_graph_body(graph, ctx, entry, node_count, hooks, mw))
+            })
+            .await
+    }
+
+    /// Executes the graph body: invokes lifecycle hooks and runs from the entry point.
+    async fn execute_graph_body(
+        &self,
+        graph: &Graph,
+        ctx: &mut SystemContext<'_>,
+        entry: NodeId,
+        node_count: usize,
+        hooks: Option<&HooksAPI>,
+        middleware: &MiddlewareAPI,
     ) -> Result<ExecutionResult, ExecutionError> {
         let start = std::time::Instant::now();
-        let entry = graph.entry().ok_or(ExecutionError::EmptyGraph)?;
 
-        // Invoke OnGraphStart hook
+        let node_map: Vec<_> = graph
+            .nodes()
+            .iter()
+            .map(|node| (node.id(), node.name()))
+            .collect();
+
         Self::invoke_hook::<OnGraphStart>(
             hooks,
             ctx,
             &GraphEvent::GraphStart {
-                node_count: graph.node_count(),
-                node_map: graph
-                    .nodes()
-                    .iter()
-                    .map(|node| (node.id(), node.name()))
-                    .collect(),
+                node_count,
+                node_map,
             },
         );
 
-        // Execute the graph
-        let result = self.execute_from(graph, ctx, entry, 0, hooks).await;
+        let result = self
+            .execute_from(graph, ctx, entry, 0, hooks, middleware)
+            .await;
 
-        // Invoke OnGraphComplete hook
         let duration = start.elapsed();
         match result {
             Ok(nodes_executed) => {

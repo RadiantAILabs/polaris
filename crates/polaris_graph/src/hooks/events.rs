@@ -9,8 +9,8 @@
 //!
 //! fn handle_event(event: &GraphEvent) {
 //!     match event {
-//!         GraphEvent::SystemStart { node_id, system_name } => {
-//!             println!("System {} starting at {:?}", system_name, node_id);
+//!         GraphEvent::SystemStart { node_id, node_name } => {
+//!             println!("System {} starting at {:?}", node_name, node_id);
 //!         }
 //!         GraphEvent::SystemComplete { duration, .. } => {
 //!             println!("Completed in {:?}", duration);
@@ -64,7 +64,7 @@ pub enum GraphEvent {
         /// The node ID of the executing system.
         node_id: NodeId,
         /// The system's name.
-        system_name: &'static str,
+        node_name: &'static str,
     },
 
     /// Event emitted after a system completes successfully.
@@ -72,7 +72,7 @@ pub enum GraphEvent {
         /// The node ID of the completed system.
         node_id: NodeId,
         /// The system's name.
-        system_name: &'static str,
+        node_name: &'static str,
         /// How long the system took to execute.
         duration: Duration,
     },
@@ -82,7 +82,7 @@ pub enum GraphEvent {
         /// The node ID of the failed system.
         node_id: NodeId,
         /// The system's name.
-        system_name: &'static str,
+        node_name: &'static str,
         /// The error message.
         error: String,
     },
@@ -143,9 +143,9 @@ pub enum GraphEvent {
         /// The node ID of the loop node.
         node_id: NodeId,
         /// The loop's name.
-        loop_name: &'static str,
-        /// The maximum iterations allowed, if set.
-        max_iterations: Option<usize>,
+        node_name: &'static str,
+        /// The maximum iterations allowed.
+        max_iterations: usize,
     },
 
     /// Event emitted at the start of each loop iteration.
@@ -153,7 +153,7 @@ pub enum GraphEvent {
         /// The node ID of the loop node.
         node_id: NodeId,
         /// The loop's name.
-        loop_name: &'static str,
+        node_name: &'static str,
         /// The current iteration number (0-indexed).
         iteration: usize,
     },
@@ -163,7 +163,7 @@ pub enum GraphEvent {
         /// The node ID of the loop node.
         node_id: NodeId,
         /// The loop's name.
-        loop_name: &'static str,
+        node_name: &'static str,
         /// The total number of iterations executed.
         iterations: usize,
         /// Total nodes executed across all iterations.
@@ -282,13 +282,13 @@ impl std::fmt::Display for GraphEvent {
             }
             GraphEvent::SystemStart {
                 node_id,
-                system_name,
+                node_name: system_name,
             } => {
                 write!(f, "SystemStart({} @ {:?})", system_name, node_id)
             }
             GraphEvent::SystemComplete {
                 node_id,
-                system_name,
+                node_name: system_name,
                 duration,
             } => {
                 write!(
@@ -299,7 +299,7 @@ impl std::fmt::Display for GraphEvent {
             }
             GraphEvent::SystemError {
                 node_id,
-                system_name,
+                node_name: system_name,
                 error,
             } => {
                 write!(
@@ -348,18 +348,18 @@ impl std::fmt::Display for GraphEvent {
             }
             GraphEvent::LoopStart {
                 node_id,
-                loop_name,
+                node_name: loop_name,
                 max_iterations,
             } => {
                 write!(
                     f,
-                    "LoopStart({} @ {:?}, max_iterations: {:?})",
+                    "LoopStart({} @ {:?}, max_iterations: {})",
                     loop_name, node_id, max_iterations
                 )
             }
             GraphEvent::LoopIteration {
                 node_id,
-                loop_name,
+                node_name: loop_name,
                 iteration,
             } => {
                 write!(
@@ -370,7 +370,7 @@ impl std::fmt::Display for GraphEvent {
             }
             GraphEvent::LoopEnd {
                 node_id,
-                loop_name,
+                node_name: loop_name,
                 iterations,
                 nodes_executed,
                 duration,

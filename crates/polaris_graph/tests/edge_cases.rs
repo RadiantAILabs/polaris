@@ -44,7 +44,9 @@ async fn error_handler_invoked_on_failure() {
     let log = HandlerLog::default();
     ctx.insert(log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(result.is_ok(), "execution should succeed via error handler");
     assert!(log.was_invoked(), "error handler should have been invoked");
@@ -62,7 +64,9 @@ async fn error_propagates_without_handler() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(
         result.is_err(),
@@ -112,7 +116,9 @@ async fn timeout_triggers_handler() {
     let log = HandlerLog::default();
     ctx.insert(log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(
         result.is_ok(),
@@ -143,7 +149,9 @@ async fn timeout_error_without_handler() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(
         result.is_err(),
@@ -189,7 +197,9 @@ async fn parallel_branch_failure_stops_execution() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(
         result.is_err(),
@@ -241,7 +251,9 @@ async fn decision_takes_false_branch() {
     let log = HandlerLog::default();
     ctx.insert(log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(result.is_ok(), "execution should succeed");
     assert!(
@@ -285,7 +297,7 @@ async fn loop_max_iterations_exceeded_error() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = executor.execute(&graph, &mut ctx, hooks).await;
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
 
     assert!(result.is_err(), "should fail with max iterations exceeded");
     match result {
@@ -331,7 +343,7 @@ async fn loop_predicate_terminates_early() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = executor.execute(&graph, &mut ctx, hooks).await;
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
 
     assert!(result.is_ok(), "execution should succeed");
 
@@ -366,7 +378,9 @@ async fn output_chaining_between_systems() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(result.is_ok(), "execution should succeed");
     assert_eq!(
@@ -407,7 +421,9 @@ async fn output_available_to_predicate() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(result.is_ok(), "execution should succeed");
     assert!(
@@ -465,7 +481,7 @@ async fn recursion_limit_exceeded() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = executor.execute(&graph, &mut ctx, hooks).await;
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
 
     assert!(
         result.is_err(),
@@ -511,7 +527,7 @@ async fn custom_recursion_limit_exceeded() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = executor.execute(&graph, &mut ctx, hooks).await;
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
 
     assert!(
         result.is_err(),
@@ -563,7 +579,9 @@ async fn switch_routes_to_default_when_no_match() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(result.is_ok(), "execution should succeed via default");
     assert!(
@@ -608,7 +626,9 @@ async fn switch_error_when_no_match_and_no_default() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(
         result.is_err(),
@@ -713,7 +733,9 @@ async fn error_kind_execution_for_execution_error() {
     ctx.insert(log.clone());
     ctx.insert(kind_log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
     assert!(result.is_ok(), "execution should succeed via error handler");
     assert!(log.was_invoked(), "error handler should have been invoked");
     assert_eq!(
@@ -742,7 +764,9 @@ async fn error_kind_param_resolution_for_param_error() {
     ctx.insert(log.clone());
     ctx.insert(kind_log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
     assert!(result.is_ok(), "execution should succeed via error handler");
     assert!(log.was_invoked(), "error handler should have been invoked");
     assert_eq!(
@@ -771,7 +795,9 @@ async fn system_builder_error_handler_invoked_on_failure() {
     let log = HandlerLog::default();
     ctx.insert(log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(result.is_ok(), "execution should succeed via error handler");
     assert!(log.was_invoked(), "error handler should have been invoked");
@@ -799,7 +825,9 @@ async fn system_builder_timeout_handler_invoked_on_timeout() {
     let log = HandlerLog::default();
     ctx.insert(log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
 
     assert!(
         result.is_ok(),
@@ -833,7 +861,9 @@ async fn retry_succeeds_after_transient_failures() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
     assert!(result.is_ok(), "should succeed after retries: {result:?}");
     assert_eq!(
         attempts.load(Ordering::SeqCst),
@@ -866,7 +896,9 @@ async fn retry_exhausted_routes_to_error_handler() {
     let log = HandlerLog::default();
     ctx.insert(log.clone());
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
     assert!(result.is_ok(), "should route to error handler");
     assert!(log.was_invoked(), "error handler should have been invoked");
     assert_eq!(
@@ -923,7 +955,9 @@ async fn retry_with_timeout_retries_on_timeout() {
     let hooks = get_hooks(&server);
     let mut ctx = server.create_context();
 
-    let result = GraphExecutor::new().execute(&graph, &mut ctx, hooks).await;
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
     assert!(
         result.is_ok(),
         "should succeed on second attempt: {result:?}"

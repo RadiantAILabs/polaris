@@ -186,6 +186,7 @@ impl GraphExecutor {
         graph: &Graph,
         ctx: &mut SystemContext<'_>,
         hooks: Option<&HooksAPI>,
+        middleware: Option<&MiddlewareAPI>,
     ) -> Result<ExecutionResult, ExecutionError>;
 }
 ```
@@ -316,4 +317,48 @@ graph.add_system(((OnToolCall, OnExpensiveOp), execute_tool));
 async fn my_system(info: Res<SystemInfo>) {
     println!("Running node {:?}: {}", info.node_id(), info.system_name());
 }
+```
+
+## Middleware
+
+Middleware wraps execution units with custom logic.
+
+Each middleware is registered against a target type (`System`, `Loop`, `GraphExecution`, etc.) that determines which execution unit it wraps. The handler receives typed `info` metadata, `&mut SystemContext`, and a `Next` value. Calling `next.run(ctx)` continues the chain; omitting it short-circuits.
+
+```rust
+use polaris_graph::middleware::{MiddlewareAPI, info::SystemInfo};
+
+let mw = MiddlewareAPI::new();
+mw.register_system("timer", |info: SystemInfo, ctx, next| {
+    Box::pin(async move {
+        let start = std::time::Instant::now();
+        let result = next.run(ctx).await;
+        eprintln!("{}: {:?}", info.node_name, start.elapsed());
+        result
+    })
+});
+
+// Pass to the executor:
+executor.execute(&graph, &mut ctx, None, Some(&mw)).await?;
+```
+
+### Targets
+
+| Target | Info type | Scope |
+|--------|-----------|-------|
+| `GraphExecution` | `GraphInfo` | Entire graph run |
+| `System` | `SystemInfo` | Single system node |
+| `Decision` | `DecisionInfo` | Decision node evaluation |
+| `Switch` | `SwitchInfo` | Switch node evaluation |
+| `Loop` | `LoopInfo` | Entire loop node |
+| `LoopIteration` | `LoopIterationInfo` | Single loop iteration |
+| `Parallel` | `ParallelInfo` | Entire parallel node |
+| `ParallelBranch` | `ParallelBranchInfo` | Single parallel branch |
+
+### Layer Ordering
+
+Multiple middlewares on the same target form a chain. The last registered is outermost. Hooks execute inside all middleware layers, between the innermost middleware and the execution unit. If A is registered before B:
+
+```text
+B (enter) → A (enter) → hooks → execute → hooks → A (exit) → B (exit)
 ```

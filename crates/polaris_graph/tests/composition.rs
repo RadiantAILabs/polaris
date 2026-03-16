@@ -332,7 +332,7 @@ async fn run_fragment(fragment: Fragment) -> Result<(ExecutionLog, Vec<NodeId>),
     let log = ExecutionLog::default();
     ctx.insert(log.clone());
     GraphExecutor::new()
-        .execute(&graph, &mut ctx, hooks)
+        .execute(&graph, &mut ctx, hooks, None)
         .await?;
     Ok((log, expected))
 }

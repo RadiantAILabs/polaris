@@ -21,7 +21,7 @@
 //! hooks.register_observer::<(OnSystemStart, OnSystemComplete, OnSystemError), _>(
 //!     "tracker",
 //!     |event: &GraphEvent| match event {
-//!         GraphEvent::SystemStart { system_name, .. } => println!("Start: {}", system_name),
+//!         GraphEvent::SystemStart { node_name, .. } => println!("Start: {}", node_name),
 //!         GraphEvent::SystemComplete { duration, .. } => println!("Done: {:?}", duration),
 //!         GraphEvent::SystemError { error, .. } => println!("Error: {}", error),
 //!         _ => {}
@@ -37,8 +37,8 @@
 //! # use polaris_graph::hooks::schedule::OnSystemStart;
 //! # let hooks = HooksAPI::new();
 //! hooks.register_observer::<OnSystemStart, _>("logger", |event: &GraphEvent| {
-//!     if let GraphEvent::SystemStart { system_name, .. } = event {
-//!         println!("System {} starting", system_name);
+//!     if let GraphEvent::SystemStart { node_name, .. } = event {
+//!         println!("System {} starting", node_name);
 //!     }
 //! })?;
 //! # Ok::<(), polaris_graph::hooks::HookRegistrationError>(())
@@ -53,8 +53,8 @@
 //! # let hooks = HooksAPI::new();
 //! hooks.register_provider::<OnSystemStart, SystemInfo, _>("devtools", |event: &GraphEvent| {
 //!     match event {
-//!         GraphEvent::SystemStart { node_id, system_name } => {
-//!             Some(SystemInfo::new(node_id.clone(), system_name))
+//!         GraphEvent::SystemStart { node_id, node_name } => {
+//!             Some(SystemInfo::new(node_id.clone(), node_name))
 //!         }
 //!         _ => None,
 //!     }
@@ -228,8 +228,8 @@ impl HooksAPI {
     /// # let hooks = HooksAPI::new();
     /// // Single schedule
     /// hooks.register_observer::<OnSystemStart, _>("logger", |event: &GraphEvent| {
-    ///     if let GraphEvent::SystemStart { system_name, .. } = event {
-    ///         println!("System {} starting", system_name);
+    ///     if let GraphEvent::SystemStart { node_name, .. } = event {
+    ///         println!("System {} starting", node_name);
     ///     }
     /// })?;
     ///
@@ -237,7 +237,7 @@ impl HooksAPI {
     /// hooks.register_observer::<(OnSystemStart, OnSystemComplete, OnSystemError), _>(
     ///     "tracker",
     ///     |event: &GraphEvent| match event {
-    ///         GraphEvent::SystemStart { system_name, .. } => println!("Start: {}", system_name),
+    ///         GraphEvent::SystemStart { node_name, .. } => println!("Start: {}", node_name),
     ///         GraphEvent::SystemComplete { duration, .. } => println!("Done: {:?}", duration),
     ///         GraphEvent::SystemError { error, .. } => println!("Error: {}", error),
     ///         _ => {}
@@ -312,8 +312,8 @@ impl HooksAPI {
     ///     "devtools",
     ///     |event: &GraphEvent| {
     ///         match event {
-    ///             GraphEvent::SystemStart { node_id, system_name } => {
-    ///                 Some(SystemInfo::new(node_id.clone(), system_name))
+    ///             GraphEvent::SystemStart { node_id, node_name } => {
+    ///                 Some(SystemInfo::new(node_id.clone(), node_name))
     ///             }
     ///             _ => None,
     ///         }
@@ -482,7 +482,7 @@ mod tests {
         let mut ctx = SystemContext::new();
         let event = GraphEvent::SystemStart {
             node_id: NodeId::new(),
-            system_name: "test",
+            node_name: "test",
         };
 
         api.invoke(schedule, &mut ctx, &event);
@@ -510,7 +510,7 @@ mod tests {
         let mut ctx = SystemContext::new();
         let event = GraphEvent::SystemStart {
             node_id: NodeId::new(),
-            system_name: "test",
+            node_name: "test",
         };
 
         api.invoke(schedule, &mut ctx, &event);
@@ -529,7 +529,7 @@ mod tests {
         let mut ctx = SystemContext::new();
         let event = GraphEvent::SystemStart {
             node_id: NodeId::new(),
-            system_name: "test",
+            node_name: "test",
         };
 
         // Should not panic when no hooks are registered
@@ -556,7 +556,7 @@ mod tests {
         let mut ctx = SystemContext::new();
         let event = GraphEvent::SystemStart {
             node_id: NodeId::new(),
-            system_name: "test",
+            node_name: "test",
         };
 
         // Before invoke, resource should not exist
@@ -693,7 +693,7 @@ mod tests {
         let mut ctx = SystemContext::new();
         let event = GraphEvent::SystemStart {
             node_id: NodeId::new(),
-            system_name: "test",
+            node_name: "test",
         };
 
         api.invoke(schedule, &mut ctx, &event);
@@ -733,7 +733,7 @@ mod tests {
             &mut ctx,
             &GraphEvent::SystemStart {
                 node_id: NodeId::new(),
-                system_name: "test",
+                node_name: "test",
             },
         );
 
@@ -742,7 +742,7 @@ mod tests {
             &mut ctx,
             &GraphEvent::SystemComplete {
                 node_id: NodeId::new(),
-                system_name: "test",
+                node_name: "test",
                 duration: Duration::ZERO,
             },
         );
@@ -760,7 +760,11 @@ mod tests {
         let captured_clone = Arc::clone(&captured);
 
         api.register_observer::<OnSystemStart, _>("capture", move |event: &GraphEvent| {
-            if let GraphEvent::SystemStart { system_name, .. } = event {
+            if let GraphEvent::SystemStart {
+                node_name: system_name,
+                ..
+            } = event
+            {
                 *captured_clone.lock().unwrap() = Some(system_name.to_string());
             }
         })
@@ -772,7 +776,7 @@ mod tests {
             &mut ctx,
             &GraphEvent::SystemStart {
                 node_id: NodeId::new(),
-                system_name: "my_system",
+                node_name: "my_system",
             },
         );
 
