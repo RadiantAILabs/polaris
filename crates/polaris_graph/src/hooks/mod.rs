@@ -32,8 +32,8 @@
 //! # fn example(hooks: &mut HooksAPI) -> Result<(), Box<dyn std::error::Error>> {
 //! // Observer to log events
 //! hooks.register_observer::<OnSystemStart, _>("logger", |event: &GraphEvent| {
-//!     if let GraphEvent::SystemStart { system_name, .. } = event {
-//!         println!("System {} starting", system_name);
+//!     if let GraphEvent::SystemStart { node_name, .. } = event {
+//!         println!("System {} starting", node_name);
 //!     }
 //! })?;
 //!
@@ -41,7 +41,7 @@
 //! hooks.register_observer::<(OnSystemStart, OnSystemComplete, OnSystemError), _>(
 //!     "tracker",
 //!     |event: &GraphEvent| match event {
-//!         GraphEvent::SystemStart { system_name, .. } => println!("Start: {}", system_name),
+//!         GraphEvent::SystemStart { node_name, .. } => println!("Start: {}", node_name),
 //!         GraphEvent::SystemComplete { duration, .. } => println!("Done: {:?}", duration),
 //!         GraphEvent::SystemError { error, .. } => println!("Error: {}", error),
 //!         _ => {}
@@ -54,8 +54,8 @@
 //! # impl SystemInfo { fn new(n: polaris_graph::node::NodeId, s: &'static str) -> Self { Self { node_id: n, name: s } } }
 //! # impl LocalResource for SystemInfo {}
 //! hooks.register_provider::<OnSystemStart, SystemInfo, _>("devtools", |event: &GraphEvent| {
-//!     if let GraphEvent::SystemStart { node_id, system_name } = event {
-//!         Some(SystemInfo::new(node_id.clone(), system_name))
+//!     if let GraphEvent::SystemStart { node_id, node_name } = event {
+//!         Some(SystemInfo::new(node_id.clone(), node_name))
 //!     } else {
 //!         None
 //!     }

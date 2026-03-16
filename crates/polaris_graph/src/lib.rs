@@ -30,7 +30,7 @@
 //!
 //! let mut ctx = SystemContext::new();
 //! let executor = GraphExecutor::new();
-//! let result = executor.execute(&graph, &mut ctx, None).await?;
+//! let result = executor.execute(&graph, &mut ctx, None, None).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -67,6 +67,9 @@ pub mod hooks;
 /// Development tools for graph execution (SystemInfo, DevToolsPlugin).
 pub mod dev;
 
+/// Middleware system for graph execution.
+pub mod middleware;
+
 /// Re-export all common types for easy access.
 pub mod prelude {
     pub use crate::edge::{
@@ -80,8 +83,9 @@ pub mod prelude {
     pub use crate::graph::{
         Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
     };
+    pub use crate::middleware::{MiddlewareAPI, MiddlewareError};
     pub use crate::node::{
-        DecisionNode, IntoSystemNode, JoinNode, LoopNode, Node, NodeId, NodeMarker, ParallelNode,
+        DecisionNode, IntoSystemNode, LoopNode, Node, NodeId, NodeMarker, ParallelNode,
         RetryPolicy, ScheduledNodeMarker, SwitchNode, SystemNode,
     };
     pub use crate::predicate::{
@@ -98,4 +102,5 @@ pub use executor::{
 pub use graph::{
     Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
 };
+pub use middleware::{MiddlewareAPI, MiddlewareError};
 pub use node::{NodeId, RetryPolicy};

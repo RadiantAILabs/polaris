@@ -32,9 +32,9 @@ This layer defines how agent behavior is structured. `polaris_graph` provides th
 
 These primitives define *how agents are structured*. They are fixed building blocks for expressing any agent topology.
 
-**Scope.** Layer 2 owns the `Graph` structure and builder API, node types (system, decision, switch, parallel, loop, join), edge types (sequential, conditional, parallel, loop-back, error, timeout), control flow primitives (`Predicate`, `Discriminator`), the `GraphExecutor`, the hook system (`HooksAPI`, `GraphEvent`, schedule markers), the `Agent` trait, and concrete API definitions for agent orchestration. It does not contain specific agent implementations, tool or LLM abstractions, memory backends, or I/O mechanisms.
+**Scope.** Layer 2 owns the `Graph` structure and builder API, node types (system, decision, switch, parallel, loop), edge types (sequential, conditional, parallel, loop-back, error, timeout), control flow primitives (`Predicate`, `Discriminator`), the `GraphExecutor`, the hook system (`HooksAPI`, `GraphEvent`, schedule markers), the middleware system (`MiddlewareAPI`, targets, `Next`), the `Agent` trait, and concrete API definitions for agent orchestration. It does not contain specific agent implementations, tool or LLM abstractions, memory backends, or I/O mechanisms.
 
-See [graph.md](./reference/graph.md) for graph construction and execution, and [agents.md](./reference/agents.md) for the agent trait.
+See [graph.md](./reference/graph.md) for graph construction, execution, hooks, and middleware, and [agents.md](./reference/agents.md) for the agent trait.
 
 ## Layer 3: Plugin-Provided Abstractions
 
@@ -53,5 +53,5 @@ When adding new functionality, the following process should be followed to deter
 | Question | If yes | Examples |
 |----------|--------|----------|
 | Is it fundamental to how code executes? | **Layer 1** | New `SystemParam` type, new resource access pattern, new conflict detection rule |
-| Is it fundamental to how agents are structured? | **Layer 2** | New node type, new edge type, new hook schedule, graph validation rule |
+| Is it fundamental to how agents are structured? | **Layer 2** | New node type, new edge type, new hook schedule, new middleware target, graph validation rule |
 | Neither of the above? | **Layer 3** (plugin) | New LLM provider, new tool, new agent pattern, new observability feature |

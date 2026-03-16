@@ -505,32 +505,6 @@ impl fmt::Debug for LoopNode {
     }
 }
 
-/// A node that aggregates results from parallel paths.
-///
-/// Join nodes are the counterpart to Parallel nodes, collecting
-/// results from all parallel branches before continuing execution.
-#[derive(Debug)]
-pub struct JoinNode {
-    /// Unique identifier for this node.
-    pub id: NodeId,
-    /// Human-readable name for debugging and tracing.
-    pub name: &'static str,
-    /// Node IDs of the parallel branches being joined.
-    pub sources: Vec<NodeId>,
-}
-
-impl JoinNode {
-    /// Creates a new join node.
-    #[must_use]
-    pub fn new(name: &'static str) -> Self {
-        Self {
-            id: NodeId::new(),
-            name,
-            sources: Vec::new(),
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // IntoSystemNode
 // ─────────────────────────────────────────────────────────────────────────────

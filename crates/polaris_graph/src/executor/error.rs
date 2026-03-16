@@ -63,6 +63,15 @@ pub enum ExecutionError {
         /// The discriminator value that didn't match any case.
         key: &'static str,
     },
+    /// An internal framework invariant was violated.
+    InternalError(String),
+    /// A middleware layer failed.
+    MiddlewareError {
+        /// Registered name of the middleware that failed.
+        middleware: String,
+        /// Description of the failure.
+        message: String,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -102,6 +111,13 @@ impl fmt::Display for ExecutionError {
             }
             ExecutionError::NoMatchingCase { node, key } => {
                 write!(f, "no matching case for key '{key}' on switch node: {node}")
+            }
+            ExecutionError::InternalError(msg) => write!(f, "internal error: {msg}"),
+            ExecutionError::MiddlewareError {
+                middleware,
+                message,
+            } => {
+                write!(f, "middleware '{middleware}' failed: {message}")
             }
         }
     }

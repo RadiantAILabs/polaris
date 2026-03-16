@@ -284,7 +284,7 @@ impl SessionsAPI {
         let hooks = server.api::<HooksAPI>();
         let result = state
             .executor
-            .execute(&state.graph, &mut ctx, hooks)
+            .execute(&state.graph, &mut ctx, hooks, None)
             .await?;
 
         state.turn_number.store(turn + 1, Ordering::Release);

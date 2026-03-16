@@ -11,7 +11,9 @@ use crate::hooks::schedule::{
     OnParallelComplete, OnParallelStart, OnSwitchComplete, OnSwitchStart, OnSystemComplete,
     OnSystemError, OnSystemStart,
 };
+use crate::middleware::{self, MiddlewareAPI};
 use crate::node::{LoopNode, Node, NodeId, ParallelNode, SwitchNode, SystemNode};
+use futures::future::BoxFuture;
 use polaris_system::param::SystemContext;
 
 /// Default case name for switch nodes when no match is found.
@@ -123,15 +125,12 @@ impl GraphExecutor {
         graph: &'a Graph,
         ctx: &'a mut SystemContext<'_>,
         loop_node: &'a LoopNode,
+        max_iterations: usize,
         depth: usize,
         hooks: Option<&'a HooksAPI>,
-    ) -> futures::future::BoxFuture<'a, Result<usize, ExecutionError>> {
+        middleware: &'a MiddlewareAPI,
+    ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
-            let max_iterations = loop_node
-                .max_iterations
-                .or(self.default_max_iterations)
-                .ok_or_else(|| ExecutionError::NoTerminationCondition(loop_node.id.clone()))?;
-
             let mut iterations = 0;
             let mut nodes_executed = 0;
 
@@ -141,8 +140,8 @@ impl GraphExecutor {
                 ctx,
                 &GraphEvent::LoopStart {
                     node_id: loop_node.id.clone(),
-                    loop_name: loop_node.name,
-                    max_iterations: Some(max_iterations),
+                    node_name: loop_node.name,
+                    max_iterations,
                 },
             );
 
@@ -166,20 +165,27 @@ impl GraphExecutor {
                     break;
                 }
 
-                // Invoke OnLoopIteration hook
-                Self::invoke_hook::<OnLoopIteration>(
-                    hooks,
-                    ctx,
-                    &GraphEvent::LoopIteration {
-                        node_id: loop_node.id.clone(),
-                        loop_name: loop_node.name,
-                        iteration: iterations,
-                    },
-                );
-
                 if let Some(body) = &loop_node.body_entry {
-                    let count = self
-                        .execute_from(graph, ctx, body.clone(), depth, hooks)
+                    let iter_info = middleware::info::LoopIterationInfo {
+                        node_id: loop_node.id.clone(),
+                        node_name: loop_node.name,
+                        iteration: iterations,
+                        max_iterations,
+                    };
+                    let count = middleware
+                        .loop_iteration
+                        .execute(iter_info, ctx, |ctx| {
+                            Self::invoke_hook::<OnLoopIteration>(
+                                hooks,
+                                ctx,
+                                &GraphEvent::LoopIteration {
+                                    node_id: loop_node.id.clone(),
+                                    node_name: loop_node.name,
+                                    iteration: iterations,
+                                },
+                            );
+                            self.execute_from(graph, ctx, body.clone(), depth, hooks, middleware)
+                        })
                         .await?;
                     nodes_executed += count;
                 }
@@ -193,7 +199,7 @@ impl GraphExecutor {
                 ctx,
                 &GraphEvent::LoopEnd {
                     node_id: loop_node.id.clone(),
-                    loop_name: loop_node.name,
+                    node_name: loop_node.name,
                     iterations,
                     nodes_executed,
                     duration: loop_start.elapsed(),
@@ -215,7 +221,8 @@ impl GraphExecutor {
         par: &'a ParallelNode,
         depth: usize,
         hooks: Option<&'a HooksAPI>,
-    ) -> futures::future::BoxFuture<'a, Result<usize, ExecutionError>> {
+        middleware: &'a MiddlewareAPI,
+    ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             use futures::future::try_join_all;
 
@@ -237,13 +244,24 @@ impl GraphExecutor {
             let mut child_contexts: Vec<SystemContext<'_>> =
                 par.branches.iter().map(|_| ctx.child()).collect();
 
-            let futures =
-                par.branches
-                    .iter()
-                    .zip(child_contexts.iter_mut())
-                    .map(|(branch, child_ctx)| {
-                        self.execute_from(graph, child_ctx, branch.clone(), depth, hooks)
-                    });
+            let futures = par
+                .branches
+                .iter()
+                .enumerate()
+                .zip(child_contexts.iter_mut())
+                .map(|((branch_index, branch), child_ctx)| {
+                    let branch_info = middleware::info::ParallelBranchInfo {
+                        node_name: par.name,
+                        node_id: par.id.clone(),
+                        branch_index,
+                        branch_count: par.branches.len(),
+                    };
+                    middleware
+                        .parallel_branch
+                        .execute(branch_info, child_ctx, |ctx| {
+                            self.execute_from(graph, ctx, branch.clone(), depth, hooks, middleware)
+                        })
+                });
 
             let results = try_join_all(futures).await?;
             let total_nodes = results.iter().sum();
@@ -276,10 +294,7 @@ impl GraphExecutor {
         })
     }
 
-    /// Executes a switch node, returning the nodes executed and optional next node.
-    ///
-    /// Returns a tuple of `(nodes_executed, next_node)` where `next_node` is the
-    /// sequential continuation after the switch, if any.
+    /// Executes a switch node, returning the number of nodes executed in the selected branch.
     pub(crate) fn execute_switch<'a>(
         &'a self,
         graph: &'a Graph,
@@ -287,7 +302,8 @@ impl GraphExecutor {
         switch_node: &'a SwitchNode,
         depth: usize,
         hooks: Option<&'a HooksAPI>,
-    ) -> futures::future::BoxFuture<'a, Result<(usize, Option<NodeId>), ExecutionError>> {
+        middleware: &'a MiddlewareAPI,
+    ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             // Invoke OnSwitchStart hook
             Self::invoke_hook::<OnSwitchStart>(
@@ -321,7 +337,9 @@ impl GraphExecutor {
                     key,
                 })?;
 
-            let nodes_executed = self.execute_from(graph, ctx, target, depth, hooks).await?;
+            let nodes_executed = self
+                .execute_from(graph, ctx, target, depth, hooks, middleware)
+                .await?;
 
             // Invoke OnSwitchComplete hook
             Self::invoke_hook::<OnSwitchComplete>(
@@ -339,8 +357,7 @@ impl GraphExecutor {
                 },
             );
 
-            let next = self.find_next_sequential(graph, &switch_node.id).ok();
-            Ok((nodes_executed, next))
+            Ok(nodes_executed)
         })
     }
 
@@ -360,6 +377,7 @@ impl GraphExecutor {
     /// * `start` - The node ID to begin execution from
     /// * `depth` - Current recursion depth for nested control flow (safety limit)
     /// * `hooks` - Optional hooks API for lifecycle callbacks
+    /// * `middleware` - Middleware chain for wrapping execution units
     ///
     /// # Returns
     ///
@@ -371,7 +389,8 @@ impl GraphExecutor {
         start: NodeId,
         depth: usize,
         hooks: Option<&'a HooksAPI>,
-    ) -> futures::future::BoxFuture<'a, Result<usize, ExecutionError>> {
+        middleware: &'a MiddlewareAPI,
+    ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             if depth >= self.max_recursion_depth {
                 return Err(ExecutionError::RecursionLimitExceeded {
@@ -392,152 +411,211 @@ impl GraphExecutor {
 
                 match node {
                     Node::System(sys) => {
-                        // Invoke OnSystemStart hook
-                        let start_event = GraphEvent::SystemStart {
+                        let sys_info = middleware::info::SystemInfo {
                             node_id: current.clone(),
-                            system_name: sys.name(),
+                            node_name: sys.name(),
                         };
-                        Self::invoke_hook::<OnSystemStart>(hooks, ctx, &start_event);
-                        Self::invoke_custom_schedules(hooks, ctx, &sys.schedules, &start_event);
 
-                        let system_start = std::time::Instant::now();
+                        let result = middleware
+                            .system
+                            .execute(sys_info, ctx, |ctx| {
+                                Box::pin(async {
+                                    // Invoke OnSystemStart hook
+                                    let start_event = GraphEvent::SystemStart {
+                                        node_id: current.clone(),
+                                        node_name: sys.name(),
+                                    };
+                                    Self::invoke_hook::<OnSystemStart>(hooks, ctx, &start_event);
+                                    Self::invoke_custom_schedules(
+                                        hooks,
+                                        ctx,
+                                        &sys.schedules,
+                                        &start_event,
+                                    );
 
-                        match Self::run_with_retry(sys, ctx).await {
-                            SystemOutcome::Ok(output) => {
-                                ctx.insert_output_boxed(sys.output_type_id(), output);
+                                    let system_start = std::time::Instant::now();
 
-                                // Invoke OnSystemComplete hook
-                                let complete_event = GraphEvent::SystemComplete {
-                                    node_id: current.clone(),
-                                    system_name: sys.name(),
-                                    duration: system_start.elapsed(),
-                                };
-                                Self::invoke_hook::<OnSystemComplete>(hooks, ctx, &complete_event);
-                                Self::invoke_custom_schedules(
-                                    hooks,
-                                    ctx,
-                                    &sys.schedules,
-                                    &complete_event,
-                                );
+                                    match Self::run_with_retry(sys, ctx).await {
+                                        SystemOutcome::Ok(output) => {
+                                            ctx.insert_output_boxed(sys.output_type_id(), output);
 
-                                match self.find_next_sequential(graph, &current) {
-                                    Ok(next) => current = next,
-                                    Err(ExecutionError::NoNextNode(_)) => break,
-                                    Err(err) => return Err(err),
-                                }
-                            }
-                            SystemOutcome::Timeout => {
+                                            // Invoke OnSystemComplete hook
+                                            let complete_event = GraphEvent::SystemComplete {
+                                                node_id: current.clone(),
+                                                node_name: sys.name(),
+                                                duration: system_start.elapsed(),
+                                            };
+                                            Self::invoke_hook::<OnSystemComplete>(
+                                                hooks,
+                                                ctx,
+                                                &complete_event,
+                                            );
+                                            Self::invoke_custom_schedules(
+                                                hooks,
+                                                ctx,
+                                                &sys.schedules,
+                                                &complete_event,
+                                            );
+
+                                            Ok(())
+                                        }
+                                        SystemOutcome::Timeout => Err(ExecutionError::Timeout {
+                                            node: current.clone(),
+                                            timeout: sys
+                                                .timeout
+                                                .expect("timeout set when outcome is Timeout"),
+                                        }),
+                                        SystemOutcome::Err(err) => {
+                                            let kind = match &err {
+                                                polaris_system::system::SystemError::ParamError(
+                                                    _,
+                                                ) => ErrorKind::ParamResolution,
+                                                polaris_system::system::SystemError::ExecutionError(
+                                                    _,
+                                                ) => ErrorKind::Execution,
+                                            };
+                                            let error_string = err.to_string();
+
+                                            // Invoke OnSystemError hook
+                                            let error_event = GraphEvent::SystemError {
+                                                node_id: current.clone(),
+                                                node_name: sys.name(),
+                                                error: error_string.clone(),
+                                            };
+                                            Self::invoke_hook::<OnSystemError>(
+                                                hooks,
+                                                ctx,
+                                                &error_event,
+                                            );
+                                            Self::invoke_custom_schedules(
+                                                hooks,
+                                                ctx,
+                                                &sys.schedules,
+                                                &error_event,
+                                            );
+
+                                            // Store error context for a potential error handler.
+                                            // If no error edge exists, the error propagates and
+                                            // this output is never consumed.
+                                            ctx.outputs_mut().insert(CaughtError {
+                                                message: error_string.clone(),
+                                                system_name: sys.name(),
+                                                node_id: current.clone(),
+                                                duration: system_start.elapsed(),
+                                                kind,
+                                            });
+
+                                            Err(ExecutionError::SystemError(error_string))
+                                        }
+                                    }
+                                })
+                            })
+                            .await;
+
+                        // Control flow routing stays outside middleware
+                        match result {
+                            Ok(()) => match self.find_next_sequential(graph, &current) {
+                                Ok(next) => current = next,
+                                Err(ExecutionError::NoNextNode(_)) => break,
+                                Err(err) => return Err(err),
+                            },
+                            Err(ExecutionError::Timeout { .. }) => {
                                 if let Some(handler) = self.find_timeout_edge(graph, &current) {
                                     current = handler;
                                 } else {
-                                    return Err(ExecutionError::Timeout {
-                                        node: current,
-                                        timeout: sys.timeout.unwrap(),
-                                    });
+                                    return Err(result.unwrap_err());
                                 }
                             }
-                            SystemOutcome::Err(err) => {
-                                let kind = match &err {
-                                    polaris_system::system::SystemError::ParamError(_) => {
-                                        ErrorKind::ParamResolution
-                                    }
-                                    polaris_system::system::SystemError::ExecutionError(_) => {
-                                        ErrorKind::Execution
-                                    }
-                                };
-                                let error_string = err.to_string();
-
-                                // Invoke OnSystemError hook
-                                let error_event = GraphEvent::SystemError {
-                                    node_id: current.clone(),
-                                    system_name: sys.name(),
-                                    error: error_string.clone(),
-                                };
-                                Self::invoke_hook::<OnSystemError>(hooks, ctx, &error_event);
-                                Self::invoke_custom_schedules(
-                                    hooks,
-                                    ctx,
-                                    &sys.schedules,
-                                    &error_event,
-                                );
-
+                            Err(ExecutionError::SystemError(_)) => {
                                 if let Some(handler) = self.find_error_edge(graph, &current) {
-                                    // Store error context as an output
-                                    // for the handler system to consume
-                                    ctx.outputs_mut().insert(CaughtError {
-                                        message: error_string,
-                                        system_name: sys.name(),
-                                        node_id: current.clone(),
-                                        duration: system_start.elapsed(),
-                                        kind,
-                                    });
                                     current = handler;
                                 } else {
-                                    return Err(ExecutionError::SystemError(error_string));
+                                    return Err(result.unwrap_err());
                                 }
                             }
+                            Err(err) => return Err(err),
                         }
                     }
                     Node::Decision(dec) => {
                         let decision_id = current.clone();
-
-                        // Invoke OnDecisionStart hook
-                        Self::invoke_hook::<OnDecisionStart>(
-                            hooks,
-                            ctx,
-                            &GraphEvent::DecisionStart {
-                                node_id: current.clone(),
-                                node_name: dec.name,
-                            },
-                        );
-
-                        let predicate = dec
-                            .predicate
-                            .as_ref()
-                            .ok_or_else(|| ExecutionError::MissingPredicate(current.clone()))?;
-
-                        let result = predicate
-                            .evaluate(ctx)
-                            .map_err(ExecutionError::PredicateError)?;
-
-                        let (branch_entry, selected_branch) = if result {
-                            (
-                                dec.true_branch.clone().ok_or_else(|| {
-                                    ExecutionError::MissingBranch {
-                                        node: current.clone(),
-                                        branch: "true",
-                                    }
-                                })?,
-                                "true",
-                            )
-                        } else {
-                            (
-                                dec.false_branch.clone().ok_or_else(|| {
-                                    ExecutionError::MissingBranch {
-                                        node: current.clone(),
-                                        branch: "false",
-                                    }
-                                })?,
-                                "false",
-                            )
+                        let dec_info = middleware::info::DecisionInfo {
+                            node_id: decision_id.clone(),
+                            node_name: dec.name,
                         };
 
-                        // Execute branch as subgraph (with increased depth)
-                        let branch_count = self
-                            .execute_from(graph, ctx, branch_entry, depth + 1, hooks)
-                            .await?;
-                        nodes_executed += branch_count;
+                        let branch_count = middleware
+                            .decision
+                            .execute(dec_info, ctx, |ctx| {
+                                Box::pin(async {
+                                    // Invoke OnDecisionStart hook
+                                    Self::invoke_hook::<OnDecisionStart>(
+                                        hooks,
+                                        ctx,
+                                        &GraphEvent::DecisionStart {
+                                            node_id: decision_id.clone(),
+                                            node_name: dec.name,
+                                        },
+                                    );
 
-                        // Invoke OnDecisionComplete hook
-                        Self::invoke_hook::<OnDecisionComplete>(
-                            hooks,
-                            ctx,
-                            &GraphEvent::DecisionComplete {
-                                node_id: decision_id.clone(),
-                                node_name: dec.name,
-                                selected_branch,
-                            },
-                        );
+                                    let predicate = dec.predicate.as_ref().ok_or_else(|| {
+                                        ExecutionError::MissingPredicate(decision_id.clone())
+                                    })?;
+
+                                    let result = predicate
+                                        .evaluate(ctx)
+                                        .map_err(ExecutionError::PredicateError)?;
+
+                                    let (branch_entry, selected_branch) = if result {
+                                        (
+                                            dec.true_branch.clone().ok_or_else(|| {
+                                                ExecutionError::MissingBranch {
+                                                    node: decision_id.clone(),
+                                                    branch: "true",
+                                                }
+                                            })?,
+                                            "true",
+                                        )
+                                    } else {
+                                        (
+                                            dec.false_branch.clone().ok_or_else(|| {
+                                                ExecutionError::MissingBranch {
+                                                    node: decision_id.clone(),
+                                                    branch: "false",
+                                                }
+                                            })?,
+                                            "false",
+                                        )
+                                    };
+
+                                    // Execute branch as subgraph (with increased depth)
+                                    let branch_count = self
+                                        .execute_from(
+                                            graph,
+                                            ctx,
+                                            branch_entry,
+                                            depth + 1,
+                                            hooks,
+                                            middleware,
+                                        )
+                                        .await?;
+
+                                    // Invoke OnDecisionComplete hook
+                                    Self::invoke_hook::<OnDecisionComplete>(
+                                        hooks,
+                                        ctx,
+                                        &GraphEvent::DecisionComplete {
+                                            node_id: decision_id.clone(),
+                                            node_name: dec.name,
+                                            selected_branch,
+                                        },
+                                    );
+
+                                    Ok(branch_count)
+                                })
+                            })
+                            .await?;
+
+                        nodes_executed += branch_count;
 
                         match self.find_next_sequential(graph, &decision_id) {
                             Ok(next) => current = next,
@@ -546,8 +624,30 @@ impl GraphExecutor {
                         }
                     }
                     Node::Loop(loop_node) => {
-                        let loop_count = self
-                            .execute_loop(graph, ctx, loop_node, depth + 1, hooks)
+                        let resolved_max = loop_node
+                            .max_iterations
+                            .or(self.default_max_iterations)
+                            .ok_or_else(|| {
+                                ExecutionError::NoTerminationCondition(current.clone())
+                            })?;
+                        let loop_info = middleware::info::LoopInfo {
+                            node_id: current.clone(),
+                            node_name: loop_node.name,
+                            max_iterations: resolved_max,
+                        };
+                        let loop_count = middleware
+                            .loop_node
+                            .execute(loop_info, ctx, |ctx| {
+                                self.execute_loop(
+                                    graph,
+                                    ctx,
+                                    loop_node,
+                                    resolved_max,
+                                    depth + 1,
+                                    hooks,
+                                    middleware,
+                                )
+                            })
                             .await?;
                         nodes_executed += loop_count;
 
@@ -558,8 +658,16 @@ impl GraphExecutor {
                         }
                     }
                     Node::Parallel(par) => {
-                        let parallel_count = self
-                            .execute_parallel(graph, ctx, par, depth + 1, hooks)
+                        let par_info = middleware::info::ParallelInfo {
+                            node_id: current.clone(),
+                            node_name: par.name,
+                            branch_count: par.branches.len(),
+                        };
+                        let parallel_count = middleware
+                            .parallel_node
+                            .execute(par_info, ctx, |ctx| {
+                                self.execute_parallel(graph, ctx, par, depth + 1, hooks, middleware)
+                            })
                             .await?;
                         nodes_executed += parallel_count;
 
@@ -570,13 +678,31 @@ impl GraphExecutor {
                         }
                     }
                     Node::Switch(switch_node) => {
-                        let (switch_count, next) = self
-                            .execute_switch(graph, ctx, switch_node, depth + 1, hooks)
+                        let switch_info = middleware::info::SwitchInfo {
+                            node_id: current.clone(),
+                            node_name: switch_node.name,
+                            case_count: switch_node.cases.len(),
+                            has_default: switch_node.default.is_some(),
+                        };
+                        let switch_count = middleware
+                            .switch
+                            .execute(switch_info, ctx, |ctx| {
+                                self.execute_switch(
+                                    graph,
+                                    ctx,
+                                    switch_node,
+                                    depth + 1,
+                                    hooks,
+                                    middleware,
+                                )
+                            })
                             .await?;
                         nodes_executed += switch_count;
-                        match next {
-                            Some(n) => current = n,
-                            None => break,
+
+                        match self.find_next_sequential(graph, &current) {
+                            Ok(next) => current = next,
+                            Err(ExecutionError::NoNextNode(_)) => break,
+                            Err(err) => return Err(err),
                         }
                     }
                 }
