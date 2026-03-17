@@ -14,7 +14,7 @@ use async_openai::types::responses::{
 use async_trait::async_trait;
 use polaris_models::llm::{
     AssistantBlock, GenerationError, ImageMediaType, LlmProvider, LlmRequest, LlmResponse, Message,
-    ReasoningBlock, TextBlock, ToolCall, ToolChoice, ToolFunction,
+    ReasoningBlock, StopReason, TextBlock, ToolCall, ToolChoice, ToolFunction,
     ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 
@@ -36,6 +36,10 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn name(&self) -> &'static str {
+        "openai"
+    }
+
     async fn generate(
         &self,
         model: &str,
@@ -348,11 +352,33 @@ fn convert_response(response: Response) -> Result<LlmResponse, GenerationError> 
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
-        .collect();
+        .collect::<Vec<_>>();
 
     let usage = response.usage.map(convert_usage).unwrap_or_default();
 
-    Ok(LlmResponse { content, usage })
+    // The Responses API has no top-level finish_reason. Use
+    // `incomplete_details.reason` when present, then fall back to
+    // content-based inference.
+    let finish_reason = if let Some(details) = response.incomplete_details {
+        match details.reason.as_str() {
+            "max_output_tokens" => StopReason::MaxOutputTokens,
+            "content_filter" => StopReason::ContentFilter,
+            other => StopReason::Other(other.to_string()),
+        }
+    } else if content
+        .iter()
+        .any(|b| matches!(b, AssistantBlock::ToolCall(_)))
+    {
+        StopReason::ToolUse
+    } else {
+        StopReason::EndTurn
+    };
+
+    Ok(LlmResponse {
+        content,
+        usage,
+        stop_reason: finish_reason,
+    })
 }
 
 fn convert_output_item(item: OutputItem) -> Result<Vec<AssistantBlock>, GenerationError> {

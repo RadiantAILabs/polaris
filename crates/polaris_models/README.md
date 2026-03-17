@@ -145,12 +145,21 @@ use polaris_models::{ModelRegistry, ModelsPlugin};
 use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::server::Server;
 use async_trait::async_trait;
-use std::sync::Arc;
 
 pub struct MyProvider { /* ... */ }
 
+impl MyProvider {
+    pub fn new() -> Self {
+        MyProvider { /* ... */ }
+    }
+}
+
 #[async_trait]
 impl LlmProvider for MyProvider {
+    fn name(&self) -> &'static str {
+        "my_provider"
+    }
+
     async fn generate(
         &self,
         model: &str,
@@ -172,7 +181,7 @@ impl Plugin for MyProviderPlugin {
 
         let mut registry = server.get_resource_mut::<ModelRegistry>()
             .expect("ModelsPlugin must be added first");
-        registry.register_llm_provider("myprovider", Arc::new(MyProvider { /* ... */ }));
+        registry.register_llm_provider(MyProvider::new());
     }
 
     fn ready(&self, _server: &mut Server) {}

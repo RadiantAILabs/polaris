@@ -24,7 +24,7 @@ use polaris_system::server::Server;
 ///
 /// Consumers can then obtain model handles via the registry using provider/model
 /// identifiers (e.g., `"anthropic/claude-sonnet-4-20250514"`). See [`ModelRegistry`] for details.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ModelsPlugin;
 
 impl Plugin for ModelsPlugin {

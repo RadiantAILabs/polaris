@@ -230,3 +230,136 @@ impl<'a> LlmRequestBuilder<'a, Empty> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::{AssistantBlock, StopReason, Usage};
+    use async_trait::async_trait;
+
+    struct MockProvider;
+
+    #[async_trait]
+    impl crate::llm::provider::LlmProvider for MockProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn generate(
+            &self,
+            _model: &str,
+            request: LlmRequest,
+        ) -> Result<LlmResponse, GenerationError> {
+            let text = request.system.unwrap_or_else(|| "no-system".to_string());
+            Ok(LlmResponse {
+                content: vec![AssistantBlock::Text(text.into())],
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            })
+        }
+    }
+
+    fn mock_llm() -> Llm {
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(MockProvider);
+        registry.llm("mock/test").unwrap()
+    }
+
+    fn make_tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("A {name} tool"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[test]
+    fn builder_accumulates_definitions() {
+        let llm = mock_llm();
+        let builder = llm
+            .builder()
+            .with_definitions(vec![make_tool_def("a")])
+            .with_definitions(vec![make_tool_def("b"), make_tool_def("c")]);
+
+        assert_eq!(builder.tool_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn send_passes_tools_and_system() {
+        struct MockProvider;
+
+        #[async_trait]
+        impl crate::llm::provider::LlmProvider for MockProvider {
+            fn name(&self) -> &'static str {
+                "mock"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                assert_eq!(request.system.as_deref(), Some("Be helpful"));
+                assert!(request.tools.is_some());
+                let tools = request.tools.as_ref().unwrap();
+                assert_eq!(tools.len(), 2);
+                assert_eq!(tools[0].name, "search");
+                assert_eq!(tools[1].name, "calc");
+                assert_eq!(request.messages.len(), 1);
+
+                Ok(LlmResponse {
+                    content: vec![AssistantBlock::Text("ok".into())],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                })
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(MockProvider);
+        let llm = registry.llm("mock/test").unwrap();
+        let response = llm
+            .builder()
+            .with_definitions(vec![make_tool_def("search"), make_tool_def("calc")])
+            .system("Be helpful")
+            .user("What's the weather?")
+            .generate()
+            .await
+            .unwrap();
+
+        assert_eq!(response.text(), "ok");
+    }
+
+    #[tokio::test]
+    async fn send_without_tools_sets_none() {
+        struct MockProvider;
+
+        #[async_trait]
+        impl crate::llm::provider::LlmProvider for MockProvider {
+            fn name(&self) -> &'static str {
+                "mock"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                assert!(request.tools.is_none());
+
+                Ok(LlmResponse {
+                    content: vec![AssistantBlock::Text("hello".into())],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                })
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(MockProvider);
+        let llm = registry.llm("mock/test").unwrap();
+        let response = llm.builder().user("Hello").generate().await.unwrap();
+
+        assert_eq!(response.text(), "hello");
+    }
+}

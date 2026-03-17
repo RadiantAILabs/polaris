@@ -4,7 +4,6 @@ use super::provider::AnthropicProvider;
 use polaris_models::{ModelRegistry, ModelsPlugin};
 use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::server::Server;
-use std::sync::Arc;
 
 /// Plugin providing support for Anthropic models.
 ///
@@ -51,6 +50,6 @@ impl Plugin for AnthropicPlugin {
             );
         };
 
-        registry.register_llm_provider("anthropic", Arc::new(provider));
+        registry.register_llm_provider(provider);
     }
 }

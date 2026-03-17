@@ -2,14 +2,15 @@
 
 use super::client::AnthropicClient;
 use super::types::{
-    ContentBlock, ContentBlockParam, CreateMessageRequest, ImageMediaType, ImageSource,
-    MessageParam, OutputFormat, Role, ToolChoiceParam, ToolDef, ToolResultBlock, ToolResultContent,
+    self as anthropic_types, ContentBlock, ContentBlockParam, CreateMessageRequest, ImageMediaType,
+    ImageSource, MessageParam, OutputFormat, Role, ToolChoiceParam, ToolDef, ToolResultBlock,
+    ToolResultContent,
 };
 use crate::schema::normalize_schema_for_strict_mode;
 use async_trait::async_trait;
 use polaris_models::llm::{
     AssistantBlock, GenerationError, ImageBlock, ImageMediaType as PolarisImageMediaType,
-    LlmProvider, LlmRequest, LlmResponse, Message, ToolCall, ToolChoice, ToolFunction,
+    LlmProvider, LlmRequest, LlmResponse, Message, StopReason, ToolCall, ToolChoice, ToolFunction,
     ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 
@@ -34,6 +35,10 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn name(&self) -> &'static str {
+        "anthropic"
+    }
+
     async fn generate(
         &self,
         model: &str,
@@ -210,6 +215,8 @@ fn convert_tool_choice(choice: &ToolChoice) -> ToolChoiceParam {
 }
 
 fn convert_response(response: super::types::MessageResponse) -> LlmResponse {
+    let stop_reason = convert_stop_reason(response.stop_reason);
+
     let content = response
         .content
         .into_iter()
@@ -223,6 +230,18 @@ fn convert_response(response: super::types::MessageResponse) -> LlmResponse {
             output_tokens: Some(response.usage.output_tokens),
             total_tokens: Some(response.usage.input_tokens + response.usage.output_tokens),
         },
+        stop_reason,
+    }
+}
+
+fn convert_stop_reason(stop_reason: anthropic_types::StopReason) -> StopReason {
+    match stop_reason {
+        anthropic_types::StopReason::MaxTokens => StopReason::MaxOutputTokens,
+        anthropic_types::StopReason::StopSequence => StopReason::StopSequence,
+        anthropic_types::StopReason::ToolUse => StopReason::ToolUse,
+        anthropic_types::StopReason::Refusal => StopReason::ContentFilter,
+        anthropic_types::StopReason::PauseTurn => StopReason::Other("pause_turn".to_string()),
+        anthropic_types::StopReason::EndTurn => StopReason::EndTurn,
     }
 }
 

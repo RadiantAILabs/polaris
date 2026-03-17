@@ -62,7 +62,9 @@
 //!
 //! For `OpenAI`, provide an API key via environment variable:
 //!
-//! ```ignore
+//! ```no_run
+//! # #[cfg(feature = "openai")]
+//! # {
 //! use polaris_model_providers::OpenAiPlugin;
 //! use polaris_models::ModelsPlugin;
 //! use polaris_system::server::Server;
@@ -70,6 +72,7 @@
 //! let mut server = Server::new();
 //! server.add_plugins(ModelsPlugin);
 //! server.add_plugins(OpenAiPlugin::from_env("OPENAI_API_KEY"));
+//! # }
 //! ```
 
 mod schema;

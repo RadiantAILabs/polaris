@@ -25,8 +25,6 @@ use std::sync::Arc;
 /// # use polaris_models::{ModelRegistry, ModelsPlugin};
 /// # use polaris_models::llm::{LlmProvider, LlmRequest, LlmResponse, GenerationError};
 /// # use async_trait::async_trait;
-/// # use std::sync::Arc;
-///
 /// # struct MyProviderPlugin;
 /// # struct MyProvider;
 ///
@@ -34,6 +32,7 @@ use std::sync::Arc;
 ///
 /// # #[async_trait]
 /// # impl LlmProvider for MyProvider {
+/// #   fn name(&self) -> &'static str { "my_provider" }
 /// #   async fn generate(&self, _model: &str, _request: LlmRequest) -> Result<LlmResponse, GenerationError> {
 /// #     unimplemented!()
 /// #   }
@@ -54,7 +53,7 @@ use std::sync::Arc;
 ///             .get_resource_mut::<ModelRegistry>()
 ///             .expect("ModelsPlugin must be added before provider plugins");
 ///
-///         registry.register_llm_provider("my_provider", Arc::new(provider));
+///         registry.register_llm_provider(provider);
 ///     }
 /// }
 /// ```
@@ -108,31 +107,24 @@ impl ModelRegistry {
 
     /// Registers an LLM provider.
     ///
+    /// The provider's [`LlmProvider::name()`] is used as the registry key
+    /// (e.g., `"openai"` for `"openai/gpt-4o"`).
+    ///
     /// This method may only be called during the `build()` phase when the registry is
     /// available as a mutable resource via [`Server::get_resource_mut`]. After the
     /// `ready()` phase, the registry becomes an immutable global and registration is
     /// no longer possible.
     ///
-    /// # Arguments
-    ///
-    /// * `name` - Provider name used in identifiers (e.g., `"openai"` for `"openai/gpt-4o"`)
-    /// * `provider` - The provider implementation
-    ///
     /// # Panics
     ///
     /// Panics if a provider with the same name is already registered.
-    pub fn register_llm_provider<P: LlmProvider>(
-        &mut self,
-        name: impl Into<String>,
-        provider: Arc<P>,
-    ) {
-        let name = name.into();
+    pub fn register_llm_provider(&mut self, provider: impl LlmProvider) {
+        let name = provider.name().to_string();
         assert!(
             !self.llm_providers.contains_key(&name),
             "LLM provider '{name}' is already registered"
         );
-        self.llm_providers
-            .insert(name, provider as Arc<dyn LlmProvider>);
+        self.llm_providers.insert(name, Arc::new(provider));
     }
 
     /// Returns a provider by name.

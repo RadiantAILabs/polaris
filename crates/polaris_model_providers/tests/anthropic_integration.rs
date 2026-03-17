@@ -24,7 +24,7 @@ fn get_llm(model_id: &str) -> Llm {
     init_env();
 
     let mut server = Server::new();
-    server.add_plugins(ModelsPlugin);
+    server.add_plugins(ModelsPlugin::default());
     server.add_plugins(AnthropicPlugin::from_env("ANTHROPIC_API_KEY"));
     server.finish();
 

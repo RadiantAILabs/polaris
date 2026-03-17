@@ -115,14 +115,12 @@ mod tests {
     use async_trait::async_trait;
     use polaris_models::ModelRegistry;
     use polaris_models::llm::{
-        AssistantBlock, GenerationError, Llm, LlmProvider, LlmRequest, LlmResponse, ToolCall,
-        ToolFunction, Usage,
+        AssistantBlock, GenerationError, Llm, LlmProvider, LlmRequest, LlmResponse, StopReason,
+        ToolCall, ToolFunction, Usage,
     };
     use serde_json::json;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
-
     // ── Helpers ──
 
     fn make_tool_call(id: &str, name: &str) -> ToolCall {
@@ -181,6 +179,10 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for ToolCallProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
         async fn generate(
             &self,
             _model: &str,
@@ -189,13 +191,14 @@ mod tests {
             Ok(LlmResponse {
                 content: vec![AssistantBlock::ToolCall(make_tool_call("1", "search"))],
                 usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
             })
         }
     }
 
     fn mock_llm() -> Llm {
         let mut registry = ModelRegistry::new();
-        registry.register_llm_provider("mock", Arc::new(ToolCallProvider));
+        registry.register_llm_provider(ToolCallProvider);
         registry.llm("mock/test").unwrap()
     }
 

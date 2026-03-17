@@ -9,6 +9,11 @@ use async_trait::async_trait;
 /// Provider plugins implement this trait to handle generation requests.
 #[async_trait]
 pub trait LlmProvider: Send + Sync + 'static {
+    /// Returns the provider name (e.g., `"openai"`, `"anthropic"`).
+    ///
+    /// This name is used as the registry key.
+    fn name(&self) -> &'static str;
+
     /// Sends a generation request to the provider.
     ///
     /// # Arguments

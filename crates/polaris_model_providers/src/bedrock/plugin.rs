@@ -86,6 +86,6 @@ impl Plugin for BedrockPlugin {
             panic!("ModelRegistry not found. Make sure to add ModelsPlugin before BedrockPlugin.");
         };
 
-        registry.register_llm_provider("bedrock", Arc::new(provider));
+        registry.register_llm_provider(provider);
     }
 }

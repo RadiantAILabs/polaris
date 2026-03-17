@@ -17,7 +17,7 @@ pub enum ExtractionError {
     #[error("failed to serialize schema: {0}")]
     SchemaSerializationError(String),
 
-    /// Underlying generation request failed.
+    /// Underlying [`GenerationError`] from the generation request.
     #[error("generation failed: {0}")]
     GenerationError(#[from] GenerationError),
 }
@@ -56,7 +56,14 @@ pub enum GenerationError {
     #[error("unsupported content: {0}")]
     UnsupportedContent(String),
 
-    /// The model refused to fulfill the request (e.g. content policy).
+    /// The model refused to fulfill the request (e.g. content policy) and generated
+    /// no content.
+    ///
+    /// Where the model returned a partial response but a content filter
+    /// stopped generation [`StopReason::ContentFilter`] may be returned
+    /// instead of this error.
+    ///
+    /// [`StopReason::ContentFilter`]: super::StopReason::ContentFilter
     #[error("model refused the request: {0}")]
     Refusal(String),
 
@@ -71,4 +78,22 @@ pub enum GenerationError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+}
+
+impl GenerationError {
+    /// Returns a low-cardinality error type string.
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Http(_) => "http",
+            Self::Json(_) => "json",
+            Self::Auth(_) => "auth",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::InvalidResponse(_) => "invalid_response",
+            Self::UnsupportedContent(_) => "unsupported_content",
+            Self::Refusal(_) => "refusal",
+            Self::Provider { .. } => "provider",
+        }
+    }
 }
