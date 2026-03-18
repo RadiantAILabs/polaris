@@ -11,7 +11,6 @@ use async_openai::types::responses::{
     SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceFunction,
     ToolChoiceOptions, ToolChoiceParam,
 };
-use async_trait::async_trait;
 use polaris_models::llm::{
     AssistantBlock, GenerationError, ImageMediaType, LlmProvider, LlmRequest, LlmResponse, Message,
     ReasoningBlock, StopReason, TextBlock, ToolCall, ToolChoice, ToolFunction,
@@ -34,7 +33,6 @@ impl OpenAiProvider {
     }
 }
 
-#[async_trait]
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &'static str {
         "openai"

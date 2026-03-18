@@ -7,7 +7,6 @@ use super::types::{
     ToolResultContent,
 };
 use crate::schema::normalize_schema_for_strict_mode;
-use async_trait::async_trait;
 use polaris_models::llm::{
     AssistantBlock, GenerationError, ImageBlock, ImageMediaType as PolarisImageMediaType,
     LlmProvider, LlmRequest, LlmResponse, Message, StopReason, ToolCall, ToolChoice, ToolFunction,
@@ -33,7 +32,6 @@ impl AnthropicProvider {
     }
 }
 
-#[async_trait]
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &'static str {
         "anthropic"

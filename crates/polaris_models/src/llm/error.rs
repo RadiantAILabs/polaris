@@ -24,6 +24,7 @@ pub enum ExtractionError {
 
 /// Errors for LLM generation operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GenerationError {
     /// Http error (e.g.: connection error, timeout, etc.)
     #[error("http error: {0}")]
@@ -67,6 +68,10 @@ pub enum GenerationError {
     #[error("model refused the request: {0}")]
     Refusal(String),
 
+    /// The requested operation is not supported by this provider.
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(String),
+
     /// Error returned by the model provider.
     #[error("provider error: {message}")]
     Provider {
@@ -94,6 +99,7 @@ impl GenerationError {
             Self::UnsupportedContent(_) => "unsupported_content",
             Self::Refusal(_) => "refusal",
             Self::Provider { .. } => "provider",
+            Self::UnsupportedOperation(_) => "unsupported_operation",
         }
     }
 }

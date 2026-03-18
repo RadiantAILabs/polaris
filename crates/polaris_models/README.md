@@ -144,7 +144,6 @@ use polaris_models::llm::{LlmProvider, LlmRequest, LlmResponse, GenerationError}
 use polaris_models::{ModelRegistry, ModelsPlugin};
 use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::server::Server;
-use async_trait::async_trait;
 
 pub struct MyProvider { /* ... */ }
 
@@ -154,7 +153,6 @@ impl MyProvider {
     }
 }
 
-#[async_trait]
 impl LlmProvider for MyProvider {
     fn name(&self) -> &'static str {
         "my_provider"

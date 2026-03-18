@@ -1,7 +1,7 @@
 //! Model provider registry.
 
 use crate::error::CreateModelError;
-use crate::llm::{Llm, LlmProvider};
+use crate::llm::{ErasedLlmProvider, Llm, LlmProvider};
 use polaris_system::resource::GlobalResource;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,13 +24,11 @@ use std::sync::Arc;
 /// # use polaris_system::server::Server;
 /// # use polaris_models::{ModelRegistry, ModelsPlugin};
 /// # use polaris_models::llm::{LlmProvider, LlmRequest, LlmResponse, GenerationError};
-/// # use async_trait::async_trait;
 /// # struct MyProviderPlugin;
 /// # struct MyProvider;
 ///
 /// # impl MyProvider { fn new() -> Self { MyProvider } }
 ///
-/// # #[async_trait]
 /// # impl LlmProvider for MyProvider {
 /// #   fn name(&self) -> &'static str { "my_provider" }
 /// #   async fn generate(&self, _model: &str, _request: LlmRequest) -> Result<LlmResponse, GenerationError> {
@@ -60,7 +58,7 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct ModelRegistry {
     // Maps provider names to implementations.
-    llm_providers: HashMap<String, Arc<dyn LlmProvider>>,
+    llm_providers: HashMap<String, Arc<dyn ErasedLlmProvider>>,
 }
 
 impl std::fmt::Debug for ModelRegistry {
@@ -129,7 +127,7 @@ impl ModelRegistry {
 
     /// Returns a provider by name.
     #[must_use]
-    pub fn get_llm_provider(&self, name: impl AsRef<str>) -> Option<Arc<dyn LlmProvider>> {
+    fn get_llm_provider(&self, name: impl AsRef<str>) -> Option<Arc<dyn ErasedLlmProvider>> {
         self.llm_providers.get(name.as_ref()).cloned()
     }
 
