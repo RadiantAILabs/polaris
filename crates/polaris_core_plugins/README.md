@@ -10,7 +10,8 @@ This crate provides foundational plugins that most Polaris applications need.
 |--------|-----------|-------|---------|
 | `ServerInfoPlugin` | `ServerInfo` | Global | Server metadata (version, debug mode) |
 | `TimePlugin` | `Clock`, `Stopwatch` | Global, Local | Time utilities with mockable clock |
-| `TracingPlugin` | `TracingConfig` | Global | Logging and observability via `tracing` |
+| `TracingPlugin` | `TracingConfig`, `TracingLayersApi` | Global, Build-time | Logging, observability, and instrumentation via `tracing` |
+| `OpenTelemetryPlugin` | — | — | OTLP trace export via `tracing-opentelemetry` |
 | `IOPlugin` | `UserIO` | Local | Abstracted IO for user interaction and tool integration |
 
 Each plugin may be added individually, or altogether through the `DefaultPlugins` plugin group:
@@ -88,22 +89,43 @@ mock.advance(Duration::from_secs(60));
 
 ### TracingPlugin
 
-Configures a `tracing` subscriber with multiple output formats:
+Registers a shared `tracing` subscriber. No output layers are included by default — call `with_fmt` to add console output, or use `DefaultPlugins` which enables fmt automatically.
+
+Other plugins (e.g., `OpenTelemetryPlugin`) can push additional layers via `TracingLayersApi` during their `build()` phase. The subscriber is installed once in `TracingPlugin::ready()` with all accumulated layers.
 
 ```rust
-use polaris_core_plugins::{TracingPlugin, TracingFormat};
+use polaris_core_plugins::{TracingPlugin, FmtConfig, TracingFormat};
 use tracing::Level;
 
 // Development: colored pretty output
 let dev = TracingPlugin::default()
     .with_level(Level::DEBUG)
-    .with_format(TracingFormat::Pretty);
+    .with_fmt(FmtConfig::default());
 
 // Production: JSON for log aggregation
 let prod = TracingPlugin::default()
     .with_level(Level::INFO)
-    .with_format(TracingFormat::Json)
-    .with_env_filter("polaris=info,hyper=warn");
+    .with_fmt(
+        FmtConfig::default()
+            .format(TracingFormat::Json)
+            .env_filter("polaris=info,hyper=warn")
+    );
+```
+
+When the `models_tracing` or `tools_tracing` features are enabled, `TracingPlugin` also instruments LLM and tool calls with OpenTelemetry semantic convention spans. Enable `with_capture_genai_content(true)` to record full request/response content on those spans.
+
+### OpenTelemetryPlugin
+
+Exports `tracing` spans as OpenTelemetry traces via OTLP. Depends on `TracingPlugin`.
+
+```rust
+use polaris_core_plugins::OpenTelemetryPlugin;
+
+OpenTelemetryPlugin::new("http://localhost:4318/v1/traces")
+    .with_service_name("my-agent")
+    .with_env_filter("polaris=debug,hyper=warn")
+    .with_resource_attribute("deployment.environment.name", "production")
+    .with_export_header("x-api-key", api_key);
 ```
 
 ### IOPlugin
@@ -128,6 +150,9 @@ async fn interact(mut io: ResMut<UserIO>) {
 | Feature | Description |
 |---------|-------------|
 | `test-utils` | Enables `MockClock` and `MockIOProvider` for library consumers |
+| `graph_tracing` | Enables graph execution span instrumentation (node, loop, parallel, decision, switch) |
+| `models_tracing` | Enables LLM call instrumentation (adds `polaris_models` dependency) |
+| `tools_tracing` | Enables tool call instrumentation (adds `polaris_tools` dependency, implies `models_tracing`) |
 
 ## License
 
