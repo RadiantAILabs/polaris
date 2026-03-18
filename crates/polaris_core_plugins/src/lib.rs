@@ -66,7 +66,8 @@ pub use tracing_plugin::{TracingFormat, TracingPlugin};
 
 // Re-export IO types
 pub use io::{
-    IOContent, IOError, IOMessage, IOProvider, IOSource, InputBuffer, OutputBuffer, UserIO,
+    IOContent, IOError, IOMessage, IOProvider, IOSource, IOStream, InputBuffer, OutputBuffer,
+    UserIO,
 };
 
 // Re-export test utilities

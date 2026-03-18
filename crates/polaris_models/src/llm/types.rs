@@ -1,7 +1,9 @@
 //! Core types for LLM generation requests and responses.
 
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::pin::Pin;
 
 // ─────────────────────
 // Request / Response
@@ -126,7 +128,7 @@ impl LlmResponse {
 }
 
 /// Token usage information.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     /// Number of tokens in the input.
     pub input_tokens: Option<u64>,
@@ -640,3 +642,112 @@ pub enum ToolResultContent {
     /// Image result.
     Image(ImageBlock),
 }
+
+// ─────────────────────
+// Streaming
+// ─────────────────────
+
+/// Information about a content block when it starts streaming.
+///
+/// Only carries metadata known at block open time. Content arrives
+/// via [`ContentBlockDelta`] events after this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ContentBlockStartData {
+    /// A text content block.
+    Text,
+    /// A tool call block.
+    ToolCall {
+        /// Unique identifier for this tool call.
+        id: String,
+        /// Provider-specific call identifier (e.g., for `OpenAI` function calling).
+        call_id: Option<String>,
+        /// The name of the tool being invoked.
+        name: String,
+    },
+    /// A reasoning/thinking block.
+    Reasoning,
+}
+
+/// An incremental content block payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ContentBlockDelta {
+    /// A chunk of generated text.
+    Text(String),
+    /// A fragment of tool call arguments as partial JSON.
+    ///
+    /// Accumulate across deltas and parse on [`StreamEvent::ContentBlockStop`].
+    /// Corresponds to [`ToolFunction::arguments`] in the non-streaming response.
+    ToolCall {
+        /// A fragment of the JSON arguments string.
+        arguments: String,
+    },
+    /// An incremental update to a reasoning block.
+    Reasoning(String),
+}
+
+impl ContentBlockDelta {
+    /// Returns a human-readable label for the variant.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::ToolCall { .. } => "tool_call",
+            Self::Reasoning(_) => "reasoning",
+        }
+    }
+}
+
+/// A single incremental event from a streaming LLM response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum StreamEvent {
+    /// A new content block has started.
+    ContentBlockStart {
+        /// Index of the content block.
+        index: u32,
+        /// The type of block and its associated metadata.
+        block: ContentBlockStartData,
+    },
+
+    /// An incremental update to the content block at `index`.
+    ContentBlockDelta {
+        /// Index of the content block.
+        index: u32,
+        /// The typed delta payload.
+        delta: ContentBlockDelta,
+    },
+
+    /// The content block at `index` is complete.
+    ///
+    /// For tool calls, this signals that the accumulated JSON arguments
+    /// are complete and safe to parse.
+    ContentBlockStop {
+        /// Index of the content block.
+        index: u32,
+    },
+
+    /// A usage update. May be emitted more than once as the
+    /// stream progresses. Each emission reflects totals up to that point.
+    ///
+    /// Not all providers may emit this event.
+    ///
+    /// Consumers that only need final usage should use
+    /// [`StreamEvent::MessageStop`] and ignore this event.
+    MessageDelta {
+        /// Cumulative token usage at this point in the stream.
+        usage: Usage,
+    },
+
+    /// Stream completion.
+    MessageStop {
+        /// Reason model stopped generating.
+        stop_reason: StopReason,
+        /// Final token counts for the complete request.
+        usage: Usage,
+    },
+}
+
+/// A boxed stream of [`StreamEvent`]s.
+///
+/// Returned by streaming methods on [`LlmProvider`](super::provider::LlmProvider),
+/// [`Llm`](super::model::Llm), and [`LlmRequestBuilder`](super::builder::LlmRequestBuilder).
+pub type LlmStream =
+    Pin<Box<dyn Stream<Item = Result<StreamEvent, super::error::GenerationError>> + Send>>;

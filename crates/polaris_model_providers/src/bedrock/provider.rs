@@ -2,7 +2,6 @@
 
 use super::request::{build_output_config, build_tool_config, convert_message};
 use super::response::convert_response;
-use async_trait::async_trait;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::types as bedrock;
 use polaris_models::llm::{GenerationError, LlmProvider, LlmRequest, LlmResponse};
@@ -21,7 +20,6 @@ impl BedrockProvider {
     }
 }
 
-#[async_trait]
 impl LlmProvider for BedrockProvider {
     fn name(&self) -> &'static str {
         "aws.bedrock"

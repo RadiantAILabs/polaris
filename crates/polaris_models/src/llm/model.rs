@@ -2,8 +2,8 @@
 
 use super::builder::LlmRequestBuilder;
 use super::error::{ExtractionError, GenerationError};
-use super::provider::LlmProvider;
-use super::types::{LlmRequest, LlmResponse};
+use super::provider::ErasedLlmProvider;
+use super::types::{LlmRequest, LlmResponse, LlmStream};
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -13,14 +13,14 @@ use std::sync::Arc;
 /// Created via [`ModelRegistry::llm()`](crate::ModelRegistry::llm).
 #[derive(Clone)]
 pub struct Llm {
-    provider: Arc<dyn LlmProvider>,
+    provider: Arc<dyn ErasedLlmProvider>,
     model: String,
 }
 
 impl Llm {
     /// Creates a new LLM handle from a provider and model name.
     #[must_use]
-    pub(crate) fn new(provider: Arc<dyn LlmProvider>, model: String) -> Self {
+    pub(crate) fn new(provider: Arc<dyn ErasedLlmProvider>, model: String) -> Self {
         Self { provider, model }
     }
 
@@ -66,6 +66,18 @@ impl Llm {
 
         // Parse as structured data
         Ok(serde_json::from_str(&text)?)
+    }
+
+    /// Sends a streaming generation request to the model.
+    ///
+    /// Returns an [`LlmStream`] of incremental [`StreamEvent`](super::types::StreamEvent) events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GenerationError`] if the provider does not support streaming
+    /// or if the request fails.
+    pub async fn stream(&self, request: LlmRequest) -> Result<LlmStream, GenerationError> {
+        self.provider.stream(&self.model, request).await
     }
 
     /// Creates a builder for a single-shot LLM request.

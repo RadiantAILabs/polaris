@@ -69,8 +69,9 @@ use std::sync::Mutex;
 
 /// Errors that can occur during I/O operations.
 ///
-/// Returned by [`IOProvider::send`] and [`IOProvider::receive`].
+/// Returned by [`IOProvider::send`], [`IOProvider::receive`], and [`IOProvider::stream`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IOError {
     /// The connection or channel is closed.
     Closed,
@@ -78,6 +79,8 @@ pub enum IOError {
     Timeout,
     /// A provider-specific error.
     Provider(String),
+    /// The operation is not supported by this provider.
+    Unsupported(String),
 }
 
 impl std::fmt::Display for IOError {
@@ -86,11 +89,18 @@ impl std::fmt::Display for IOError {
             Self::Closed => write!(f, "I/O channel closed"),
             Self::Timeout => write!(f, "I/O operation timed out"),
             Self::Provider(msg) => write!(f, "I/O provider error: {}", msg),
+            Self::Unsupported(msg) => write!(f, "I/O operation unsupported: {}", msg),
         }
     }
 }
 
 impl std::error::Error for IOError {}
+
+/// A continuous stream of [`IOMessage`]s from an [`IOProvider`].
+///
+/// Returned by [`UserIO::stream`].
+pub type IOStream =
+    std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<IOMessage, IOError>> + Send>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Message Types
@@ -232,6 +242,11 @@ pub trait IOProvider: Send + Sync + 'static {
     /// Concrete implementations control the blocking behavior (polling,
     /// channel recv, stdin read, etc.).
     fn receive(&self) -> impl Future<Output = Result<IOMessage, IOError>> + Send + '_;
+
+    /// Returns a continuous stream of messages from this provider.
+    fn stream(&self) -> impl Future<Output = Result<IOStream, IOError>> + Send + '_ {
+        async { Err(IOError::Unsupported("streaming not supported".into())) }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -253,6 +268,11 @@ trait ErasedProvider: Send + Sync + 'static {
     fn receive_erased(
         &self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<IOMessage, IOError>> + Send + '_>>;
+
+    /// Returns a continuous stream of messages (type-erased).
+    fn stream_erased(
+        &self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<IOStream, IOError>> + Send + '_>>;
 }
 
 /// Automatically implement object safe trait `ErasedProvider` for any `IOProvider`.
@@ -270,6 +290,12 @@ impl<T: IOProvider> ErasedProvider for T {
         &self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<IOMessage, IOError>> + Send + '_>> {
         Box::pin(self.receive())
+    }
+
+    fn stream_erased(
+        &self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<IOStream, IOError>> + Send + '_>> {
+        Box::pin(self.stream())
     }
 }
 
@@ -343,6 +369,15 @@ impl UserIO {
     /// Returns [`IOError`] if the receive operation fails.
     pub async fn receive(&self) -> Result<IOMessage, IOError> {
         self.provider.receive_erased().await
+    }
+
+    /// Returns a continuous stream of messages from the underlying provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IOError::Unsupported`] if the provider does not support streaming.
+    pub async fn stream(&self) -> Result<IOStream, IOError> {
+        self.provider.stream_erased().await
     }
 }
 
@@ -892,6 +927,10 @@ mod tests {
         assert_eq!(
             IOError::Provider("custom".into()).to_string(),
             "I/O provider error: custom"
+        );
+        assert_eq!(
+            IOError::Unsupported("feature".into()).to_string(),
+            "I/O operation unsupported: feature"
         );
     }
 }

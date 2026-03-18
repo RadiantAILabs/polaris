@@ -25,7 +25,7 @@
 
 use super::error::{ExtractionError, GenerationError};
 use super::model::Llm;
-use super::types::{LlmRequest, LlmResponse, Message, ToolChoice, ToolDefinition};
+use super::types::{LlmRequest, LlmResponse, LlmStream, Message, ToolChoice, ToolDefinition};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -195,6 +195,17 @@ impl<'a> LlmRequestBuilder<'a, Ready> {
         llm.generate(request).await
     }
 
+    /// Sends a streaming generation request and returns an [`LlmStream`] of events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError`] if the provider does not support streaming
+    /// or if the request fails.
+    pub async fn stream(self) -> Result<LlmStream, GenerationError> {
+        let (llm, request) = self.build();
+        llm.stream(request).await
+    }
+
     /// Sends the request and extracts a typed value from the response.
     ///
     /// Automatically injects the JSON schema for `T` into the request
@@ -234,12 +245,10 @@ impl<'a> LlmRequestBuilder<'a, Empty> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{AssistantBlock, StopReason, Usage};
-    use async_trait::async_trait;
+    use crate::llm::types::{AssistantBlock, StopReason, Usage, UserBlock};
 
     struct MockProvider;
 
-    #[async_trait]
     impl crate::llm::provider::LlmProvider for MockProvider {
         fn name(&self) -> &'static str {
             "mock"
@@ -288,7 +297,6 @@ mod tests {
     async fn send_passes_tools_and_system() {
         struct MockProvider;
 
-        #[async_trait]
         impl crate::llm::provider::LlmProvider for MockProvider {
             fn name(&self) -> &'static str {
                 "mock"
@@ -334,7 +342,6 @@ mod tests {
     async fn send_without_tools_sets_none() {
         struct MockProvider;
 
-        #[async_trait]
         impl crate::llm::provider::LlmProvider for MockProvider {
             fn name(&self) -> &'static str {
                 "mock"
@@ -361,5 +368,210 @@ mod tests {
         let response = llm.builder().user("Hello").generate().await.unwrap();
 
         assert_eq!(response.text(), "hello");
+    }
+
+    // ── Streaming tests ──
+
+    mod stream_helpers {
+        use crate::llm::error::GenerationError;
+        use crate::llm::types::StreamEvent;
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// A synchronous stream built from a `Vec` of items for testing.
+        pub struct EventStream(pub Vec<Result<StreamEvent, GenerationError>>);
+
+        impl Stream for EventStream {
+            type Item = Result<StreamEvent, GenerationError>;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                if self.0.is_empty() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(self.0.remove(0)))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_default_returns_unsupported() {
+        // MockProvider (module-level) does NOT override stream(),
+        // so the default returns UnsupportedOperation.
+        let llm = mock_llm();
+        let result = llm.builder().user("Hello").stream().await;
+
+        assert!(
+            matches!(result, Err(GenerationError::UnsupportedOperation(_))),
+            "expected UnsupportedOperation error"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_mock_provider() {
+        use crate::llm::collector::StreamEventExt;
+        use crate::llm::types::{ContentBlockDelta, ContentBlockStartData, StreamEvent, Usage};
+
+        struct StreamingProvider;
+
+        impl crate::llm::provider::LlmProvider for StreamingProvider {
+            fn name(&self) -> &'static str {
+                "streaming_mock"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                _request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                Err(GenerationError::UnsupportedOperation("use stream()".into()))
+            }
+
+            async fn stream(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmStream, GenerationError> {
+                // Echo the first user message back as a streaming text block.
+                let user_text = request
+                    .messages
+                    .first()
+                    .map(|m| match m {
+                        Message::User { content } => content
+                            .first()
+                            .map(|b| match b {
+                                UserBlock::Text(t) => t.text.clone(),
+                                _ => String::new(),
+                            })
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+
+                let events = vec![
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        block: ContentBlockStartData::Text,
+                    }),
+                    Ok(StreamEvent::ContentBlockDelta {
+                        index: 0,
+                        delta: ContentBlockDelta::Text(user_text),
+                    }),
+                    Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                        usage: Usage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            total_tokens: Some(15),
+                        },
+                    }),
+                ];
+
+                Ok(Box::pin(stream_helpers::EventStream(events)))
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(StreamingProvider);
+        let llm = registry.llm("streaming_mock/test").unwrap();
+
+        // Test Llm::stream() directly
+        let request = LlmRequest {
+            system: None,
+            messages: vec![Message::user("Hello stream")],
+            tools: None,
+            tool_choice: None,
+            output_schema: None,
+        };
+        let stream = llm.stream(request).await.unwrap();
+        let response = stream.collect_response().await.unwrap();
+        assert_eq!(response.text(), "Hello stream");
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.usage.input_tokens, Some(10));
+
+        // Test LlmRequestBuilder::stream()
+        let stream = llm
+            .builder()
+            .system("Be brief")
+            .user("Builder stream")
+            .stream()
+            .await
+            .unwrap();
+        let response = stream.collect_response().await.unwrap();
+        assert_eq!(response.text(), "Builder stream");
+    }
+
+    #[tokio::test]
+    async fn stream_passes_request_fields() {
+        use crate::llm::types::{ContentBlockDelta, ContentBlockStartData, StreamEvent, Usage};
+
+        struct AssertingStreamProvider;
+
+        impl crate::llm::provider::LlmProvider for AssertingStreamProvider {
+            fn name(&self) -> &'static str {
+                "asserting_stream"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                _request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                unreachable!("should call stream(), not generate()");
+            }
+
+            async fn stream(
+                &self,
+                model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmStream, GenerationError> {
+                // Verify request fields are passed through correctly
+                assert_eq!(model, "test");
+                assert_eq!(request.system.as_deref(), Some("Test system"));
+                assert!(request.tools.is_some());
+                assert_eq!(request.tools.as_ref().unwrap().len(), 1);
+                assert_eq!(request.messages.len(), 1);
+
+                let events = vec![
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        block: ContentBlockStartData::Text,
+                    }),
+                    Ok(StreamEvent::ContentBlockDelta {
+                        index: 0,
+                        delta: ContentBlockDelta::Text("ok".into()),
+                    }),
+                    Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                        usage: Usage::default(),
+                    }),
+                ];
+
+                Ok(Box::pin(stream_helpers::EventStream(events)))
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(AssertingStreamProvider);
+        let llm = registry.llm("asserting_stream/test").unwrap();
+
+        let stream = llm
+            .builder()
+            .system("Test system")
+            .with_definitions(vec![make_tool_def("search")])
+            .user("Hello")
+            .stream()
+            .await
+            .unwrap();
+
+        use crate::llm::collector::StreamEventExt;
+        let response = stream.collect_response().await.unwrap();
+        assert_eq!(response.text(), "ok");
     }
 }

@@ -112,14 +112,12 @@ impl LlmReasonExt for LlmRequestBuilder<'_, polaris_models::llm::Ready> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use polaris_models::ModelRegistry;
     use polaris_models::llm::{
         AssistantBlock, GenerationError, Llm, LlmProvider, LlmRequest, LlmResponse, StopReason,
         ToolCall, ToolFunction, Usage,
     };
     use serde_json::json;
-    use std::future::Future;
     use std::pin::Pin;
     // ── Helpers ──
 
@@ -177,7 +175,6 @@ mod tests {
 
     struct ToolCallProvider;
 
-    #[async_trait]
     impl LlmProvider for ToolCallProvider {
         fn name(&self) -> &'static str {
             "mock"
