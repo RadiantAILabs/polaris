@@ -41,5 +41,6 @@ TRYBUILD = "overwrite"
 
 [tasks.test-doc]
 description = "Run doc tests"
+workspace = false
 command = "cargo"
 args = ["test", "--doc", "--workspace", "--all-features"]

@@ -31,7 +31,7 @@ use polaris::sessions::{
 use polaris::{
     graph::{DevToolsPlugin, GraphExecutor},
     models::ModelsPlugin,
-    plugins::{IOPlugin, ServerInfoPlugin, TracingPlugin},
+    plugins::{FmtConfig, IOPlugin, ServerInfoPlugin, TracingPlugin},
     system::server::Server,
     tools::ToolsPlugin,
 };
@@ -179,7 +179,10 @@ async fn main() {
     // Build server
     let mut server = Server::new();
     server
-        .add_plugins(TracingPlugin::default().with_env_filter("polaris=debug,rustyline=warn"))
+        .add_plugins(
+            TracingPlugin::default()
+                .with_fmt(FmtConfig::default().env_filter("polaris=debug,rustyline=warn")),
+        )
         .add_plugins(ServerInfoPlugin)
         .add_plugins(IOPlugin)
         .add_plugins(TerminalIOPlugin)

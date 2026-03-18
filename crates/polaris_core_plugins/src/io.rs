@@ -549,7 +549,7 @@ impl Default for OutputBuffer {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use polaris_system::server::Server;
 /// use polaris_core_plugins::{ServerInfoPlugin, IOPlugin};
 ///
