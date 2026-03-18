@@ -40,6 +40,39 @@ impl LlmRequest {
     }
 }
 
+/// The reason generation stopped.
+///
+/// All variants represent a successful generation: a [`LlmResponse`]
+/// was produced and [`content`](LlmResponse::content) may be usable.
+///
+/// Some providers may return additional provider-specific reasons which do not
+/// fall under the existing classification in the [`Other`](Self::Other) variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The model reached a natural stopping point.
+    EndTurn,
+    /// Output was truncated because `max_tokens` was reached.
+    MaxOutputTokens,
+    /// A caller-provided stop sequence was generated.
+    StopSequence,
+    /// The model invoked one or more tools.
+    ToolUse,
+    /// Output was interrupted by a safety or content filter.
+    ///
+    /// Partial content may still be present in
+    /// [`LlmResponse::content`].
+    ///
+    /// When the provider rejects the request entirely and produces no content,
+    /// [`GenerationError::Refusal`] should be used instead.
+    ///
+    /// [`GenerationError::Refusal`]: super::GenerationError::Refusal
+    ContentFilter,
+    /// A provider-specific reason (e.g. `"pause_turn"`).
+    #[serde(untagged)]
+    Other(String),
+}
+
 /// A generation response from a model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
@@ -47,6 +80,8 @@ pub struct LlmResponse {
     pub content: Vec<AssistantBlock>,
     /// Token usage information.
     pub usage: Usage,
+    /// The reason generation stopped.
+    pub stop_reason: StopReason,
 }
 
 impl LlmResponse {

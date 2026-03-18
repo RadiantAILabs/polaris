@@ -129,7 +129,7 @@ fn tools_plugin_lifecycle() {
     use polaris_system::server::Server;
 
     let mut server = Server::new();
-    let plugin = ToolsPlugin;
+    let plugin = ToolsPlugin::default();
 
     // build: inserts mutable resource
     plugin.build(&mut server);

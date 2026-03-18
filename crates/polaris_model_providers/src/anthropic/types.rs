@@ -231,7 +231,7 @@ pub struct MessageResponse {
     /// Model used.
     pub model: String,
     /// Reason generation stopped.
-    pub stop_reason: Option<StopReason>,
+    pub stop_reason: StopReason,
     /// Stop sequence if applicable.
     pub stop_sequence: Option<String>,
     /// Token usage.

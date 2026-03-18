@@ -4,11 +4,15 @@ use super::provider::OpenAiProvider;
 use polaris_models::{ModelRegistry, ModelsPlugin};
 use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::server::Server;
-use std::sync::Arc;
 
 /// Plugin providing support for `OpenAI` models via the Responses API.
 ///
-/// ```ignore
+/// ```no_run
+/// # use polaris_model_providers::OpenAiPlugin;
+/// # use polaris_models::ModelsPlugin;
+/// # use polaris_system::server::Server;
+/// # let mut server = Server::new();
+/// # server.add_plugins(ModelsPlugin);
 /// server.add_plugins(OpenAiPlugin::from_env("OPENAI_API_KEY"));
 /// ```
 pub struct OpenAiPlugin {
@@ -45,6 +49,6 @@ impl Plugin for OpenAiPlugin {
             panic!("ModelRegistry not found. Make sure to add ModelsPlugin before OpenAiPlugin.");
         };
 
-        registry.register_llm_provider("openai", Arc::new(provider));
+        registry.register_llm_provider(provider);
     }
 }

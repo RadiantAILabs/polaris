@@ -117,7 +117,7 @@ impl ToolRegistry {
 }
 
 /// Plugin that provides the [`ToolRegistry`] global resource.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ToolsPlugin;
 
 impl Plugin for ToolsPlugin {

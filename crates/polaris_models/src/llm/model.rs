@@ -18,7 +18,7 @@ pub struct Llm {
 }
 
 impl Llm {
-    /// Creates a new LLM handle from provider and model name.
+    /// Creates a new LLM handle from a provider and model name.
     #[must_use]
     pub(crate) fn new(provider: Arc<dyn LlmProvider>, model: String) -> Self {
         Self { provider, model }

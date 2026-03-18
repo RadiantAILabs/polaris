@@ -22,8 +22,30 @@ pub fn convert_response(response: ConverseOutput) -> Result<LlmResponse, Generat
     };
 
     let usage = convert_usage(response.usage);
+    let stop_reason = convert_stop_reason(response.stop_reason)?;
 
-    Ok(LlmResponse { content, usage })
+    Ok(LlmResponse {
+        content,
+        usage,
+        stop_reason,
+    })
+}
+
+fn convert_stop_reason(
+    stop_reason: bedrock::StopReason,
+) -> Result<polaris_llm::StopReason, GenerationError> {
+    match stop_reason {
+        bedrock::StopReason::EndTurn => Ok(polaris_llm::StopReason::EndTurn),
+        bedrock::StopReason::StopSequence => Ok(polaris_llm::StopReason::StopSequence),
+        bedrock::StopReason::MaxTokens | bedrock::StopReason::ModelContextWindowExceeded => {
+            Ok(polaris_llm::StopReason::MaxOutputTokens)
+        }
+        bedrock::StopReason::ToolUse => Ok(polaris_llm::StopReason::ToolUse),
+        bedrock::StopReason::ContentFiltered | bedrock::StopReason::GuardrailIntervened => {
+            Ok(polaris_llm::StopReason::ContentFilter)
+        }
+        other => Ok(polaris_llm::StopReason::Other(other.as_str().to_string())),
+    }
 }
 
 /// Converts a Bedrock content block to a Polaris assistant block.

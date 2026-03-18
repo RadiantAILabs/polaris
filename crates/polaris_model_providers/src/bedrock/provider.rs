@@ -23,6 +23,10 @@ impl BedrockProvider {
 
 #[async_trait]
 impl LlmProvider for BedrockProvider {
+    fn name(&self) -> &'static str {
+        "aws.bedrock"
+    }
+
     async fn generate(
         &self,
         model: &str,
