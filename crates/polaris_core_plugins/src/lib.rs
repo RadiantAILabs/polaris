@@ -75,6 +75,7 @@ pub use tracing_plugin::{
 
 // Re-export IO types
 pub use io::{
+    CONFIRMED, CONFIRMED_FALSE, CONFIRMED_TRUE, ConfirmResponse, IO_TYPE, IO_TYPE_CONFIRM,
     IOContent, IOError, IOMessage, IOProvider, IOSource, IOStream, InputBuffer, OutputBuffer,
     UserIO,
 };

@@ -1,0 +1,25 @@
+[package]
+name = "polaris_shell"
+version = "0.0.1"
+description = "Shell command execution for Polaris agents"
+edition = "2024"
+keywords = ["polaris", "shell", "execution", "agents"]
+
+[lints]
+workspace = true
+
+[dependencies]
+dirs = "6.0"
+polaris_system = { path = "../polaris_system" }
+polaris_tools = { path = "../polaris_tools" }
+polaris_models = { path = "../polaris_models" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["process", "time", "io-util"] }
+tracing = "0.1"
+names = { version = "0.14.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.15"
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }

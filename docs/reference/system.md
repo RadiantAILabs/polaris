@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/System-327afe2e695d80679a9ad06058224db0
+title: System Primitives
+---
+
 # System Primitives
 
 ## Overview

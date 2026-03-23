@@ -24,6 +24,9 @@ pub use polaris_core_plugins;
 /// Session management and orchestration.
 pub use polaris_sessions;
 
+/// Shell command execution.
+pub use polaris_shell;
+
 /// Re-export all common types for easy access.
 pub mod prelude {
     pub use polaris_agent::Agent;
@@ -69,4 +72,9 @@ pub mod plugins {
 /// Re-export all session-related types for easy access.
 pub mod sessions {
     pub use polaris_sessions::*;
+}
+
+/// Re-export all shell-related types for easy access.
+pub mod shell {
+    pub use polaris_shell::*;
 }

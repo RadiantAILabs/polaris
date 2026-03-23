@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/API-327afe2e695d80469571dfdd84f99e98
+title: API Primitive
+---
+
 # API Primitive
 
 The `API` trait is a Layer 1 primitive that enables plugins to expose capabilities to other plugins during the build phase.

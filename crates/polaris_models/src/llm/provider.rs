@@ -1,10 +1,9 @@
 //! The [`LlmProvider`] trait for LLM model providers.
 
-use std::future::Future;
-use std::pin::Pin;
-
 use super::error::GenerationError;
 use super::types::{LlmRequest, LlmResponse, LlmStream};
+use std::future::Future;
+use std::pin::Pin;
 
 /// Trait implemented by LLM providers for text generation.
 ///

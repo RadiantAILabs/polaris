@@ -50,7 +50,7 @@ use polaris::system::prelude::SystemError;
 use polaris::system::resource::LocalResource;
 use polaris::system::server::Server;
 use polaris::system::system;
-use polaris::tools::{LlmReasonExt, LlmRequestBuilderExt, ToolRegistry};
+use polaris::tools::{LlmReasonExt, LlmRequestBuilderExt, ToolPermission, ToolRegistry};
 use std::ops::Deref;
 
 /// Wrapper for the current LLM instance used by the agent.
@@ -178,6 +178,11 @@ async fn act(
 /// All tool results are collected into a single user message with multiple
 /// content blocks. The API requires every tool_use block in an assistant
 /// message to have a corresponding toolResult in the next user message.
+///
+/// Permission enforcement:
+/// - [`ToolPermission::Allow`] — execute immediately
+/// - [`ToolPermission::Confirm`] — prompt the user via [`UserIO::confirm`]
+/// - [`ToolPermission::Deny`] — reject without execution
 #[system]
 async fn execute_tools(
     decision: Out<LlmResponse>,
@@ -188,22 +193,52 @@ async fn execute_tools(
     let mut result_blocks = Vec::new();
 
     for tool_call in decision.tool_calls() {
-        let block = match tool_registry
-            .execute(&tool_call.function.name, &tool_call.function.arguments)
-            .await
-        {
-            Ok(value) => {
-                let output = value
-                    .as_str()
-                    .map(String::from)
-                    .unwrap_or_else(|| value.to_string());
-                send_trace(&user_io, format!("\n[Observation] {output}")).await;
-                UserBlock::tool_result(&tool_call.id, ToolResultContent::Text(output))
+        let name = &tool_call.function.name;
+        let permission = tool_registry
+            .permission(name)
+            .unwrap_or(ToolPermission::Deny);
+
+        // Check permission before execution
+        let denied_reason = match permission {
+            ToolPermission::Deny => {
+                Some(format!("Permission denied: tool '{name}' is not allowed"))
             }
-            Err(err) => {
-                let output = err.to_string();
-                send_error(&user_io, format!("\n[Tool Error] {output}")).await;
-                UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(output))
+            ToolPermission::Confirm => {
+                // For write_file, read current content for diff display
+                let current =
+                    read_current_content(name, &tool_call.function.arguments, &tool_registry).await;
+                let prompt =
+                    build_confirm_prompt(name, &tool_call.function.arguments, current.as_deref());
+                match user_io.confirm(prompt).await {
+                    Ok(response) if response.confirmed => None,
+                    Ok(_) => Some(format!("User denied execution of tool '{name}'")),
+                    Err(err) => Some(format!("Confirmation failed: {err}")),
+                }
+            }
+            ToolPermission::Allow => None,
+        };
+
+        let block = if let Some(reason) = denied_reason {
+            send_error(&user_io, format!("\n[Denied] {reason}")).await;
+            UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(reason))
+        } else {
+            match tool_registry
+                .execute(name, &tool_call.function.arguments)
+                .await
+            {
+                Ok(value) => {
+                    let output = value
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| value.to_string());
+                    send_trace(&user_io, format!("\n[Observation] {output}")).await;
+                    UserBlock::tool_result(&tool_call.id, ToolResultContent::Text(output))
+                }
+                Err(err) => {
+                    let output = err.to_string();
+                    send_error(&user_io, format!("\n[Tool Error] {output}")).await;
+                    UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(output))
+                }
             }
         };
         result_blocks.push(block);
@@ -216,6 +251,112 @@ async fn execute_tools(
     });
 
     Ok(())
+}
+
+/// If the tool is `write_file`, reads the current file content via `read_file`
+/// for diff display. Returns `None` for other tools or on read failure (new file).
+async fn read_current_content(
+    tool_name: &str,
+    args: &serde_json::Value,
+    tool_registry: &ToolRegistry,
+) -> Option<String> {
+    if tool_name != "write_file" {
+        return None;
+    }
+    let path = args.get("path")?;
+    let read_args = serde_json::json!({ "path": path });
+    tool_registry
+        .execute("read_file", &read_args)
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+}
+
+// ANSI style constants for diff display.
+const DIFF_DIM: &str = "\x1b[2m";
+const DIFF_GREEN: &str = "\x1b[32m";
+const DIFF_RED: &str = "\x1b[31m";
+const DIFF_RESET: &str = "\x1b[0m";
+
+/// Maximum diff lines before truncation kicks in.
+const MAX_DIFF_LINES: usize = 60;
+
+/// Builds a human-readable confirmation prompt for a tool invocation.
+///
+/// For `write_file`, shows a colored diff (red = removed, green = added,
+/// gray = unchanged) with truncation for large files.
+/// For other tools, shows the tool name and raw arguments.
+fn build_confirm_prompt(
+    tool_name: &str,
+    args: &serde_json::Value,
+    current_content: Option<&str>,
+) -> String {
+    match tool_name {
+        "write_file" => {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            let new_content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+            let diff_display = match current_content {
+                Some(old) => format_diff(old, new_content),
+                None => format_new_file(new_content),
+            };
+
+            format!("Write to '{path}':\n{diff_display}\n\nAllow this file write?")
+        }
+        _ => format!("Tool '{tool_name}' requires confirmation.\nArgs: {args}\n\nProceed?"),
+    }
+}
+
+/// Formats a colored diff between old and new content.
+fn format_diff(old: &str, new: &str) -> String {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_lines(old, new);
+    let lines: Vec<String> = diff
+        .iter_all_changes()
+        .map(|change| {
+            let text = change.value().trim_end_matches('\n');
+            match change.tag() {
+                ChangeTag::Equal => format!("{DIFF_DIM}  {text}{DIFF_RESET}"),
+                ChangeTag::Insert => format!("{DIFF_GREEN}+ {text}{DIFF_RESET}"),
+                ChangeTag::Delete => format!("{DIFF_RED}- {text}{DIFF_RESET}"),
+            }
+        })
+        .collect();
+
+    truncate_lines(lines)
+}
+
+/// Formats new file content with line numbers (all lines are additions).
+fn format_new_file(content: &str) -> String {
+    let lines: Vec<String> = content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{DIFF_GREEN}{:>4} | {line}{DIFF_RESET}", i + 1))
+        .collect();
+
+    truncate_lines(lines)
+}
+
+/// Joins lines, truncating the middle if they exceed [`MAX_DIFF_LINES`].
+fn truncate_lines(lines: Vec<String>) -> String {
+    if lines.len() <= MAX_DIFF_LINES {
+        return lines.join("\n");
+    }
+
+    let half = MAX_DIFF_LINES / 2;
+    let head = &lines[..half];
+    let tail = &lines[lines.len() - half..];
+    let omitted = lines.len() - MAX_DIFF_LINES;
+
+    format!(
+        "{}\n{DIFF_DIM}  ... ({omitted} lines omitted) ...{DIFF_RESET}\n{}",
+        head.join("\n"),
+        tail.join("\n"),
+    )
 }
 
 /// Output the final text response to the user.
