@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/Agents-327afe2e695d80728126da236a9b52df
+title: Agent Trait
+---
+
 # Agent Trait
 
 The `polaris_agent` crate defines a minimal abstraction for defining reusable agent behavior patterns. An agent is a type that knows how to build a graph and optionally initialize session resources.

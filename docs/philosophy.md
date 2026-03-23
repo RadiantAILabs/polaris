@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/Philosophy-327afe2e695d808db6c0dc5021adf1bb
+title: Polaris Core Philosophy
+---
+
 # Polaris Core Philosophy
 
 ## Why Polaris Exists

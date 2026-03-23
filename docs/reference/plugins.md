@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/Plugins-327afe2e695d80cdaa48fa1cb9c63f67
+title: Plugin System
+---
+
 # Plugin System
 
 Plugins are the fundamental unit of composition in Polaris. Every piece of functionality, from core infrastructure like logging and tracing to agent-specific features like tools and memory, is delivered through plugins. This makes the framework extensible while keeping the core minimal.

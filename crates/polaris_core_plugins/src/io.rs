@@ -64,37 +64,32 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Error Type
+// Interaction Metadata Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Errors that can occur during I/O operations.
+/// Metadata key for the interaction type (set on request messages).
 ///
-/// Returned by [`IOProvider::send`], [`IOProvider::receive`], and [`IOProvider::stream`].
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum IOError {
-    /// The connection or channel is closed.
-    Closed,
-    /// The operation timed out.
-    Timeout,
-    /// A provider-specific error.
-    Provider(String),
-    /// The operation is not supported by this provider.
-    Unsupported(String),
-}
+/// [`IOProvider`] implementations inspect this to determine how to render
+/// the request and what response format to use.
+pub const IO_TYPE: &str = "io_type";
 
-impl std::fmt::Display for IOError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Closed => write!(f, "I/O channel closed"),
-            Self::Timeout => write!(f, "I/O operation timed out"),
-            Self::Provider(msg) => write!(f, "I/O provider error: {}", msg),
-            Self::Unsupported(msg) => write!(f, "I/O operation unsupported: {}", msg),
-        }
-    }
-}
+/// [`IO_TYPE`] value for confirmation interactions.
+///
+/// Signals the provider that a yes/no answer is expected.
+/// Used by [`UserIO::confirm`].
+pub const IO_TYPE_CONFIRM: &str = "confirm";
 
-impl std::error::Error for IOError {}
+/// Metadata key for the confirmation result (set on response messages).
+///
+/// Providers set this to [`CONFIRMED_TRUE`] or [`CONFIRMED_FALSE`]
+/// after interpreting the user's response.
+pub const CONFIRMED: &str = "confirmed";
+
+/// Affirmative value for the [`CONFIRMED`] metadata key.
+pub const CONFIRMED_TRUE: &str = "true";
+
+/// Negative value for the [`CONFIRMED`] metadata key.
+pub const CONFIRMED_FALSE: &str = "false";
 
 /// A continuous stream of [`IOMessage`]s from an [`IOProvider`].
 ///
@@ -371,6 +366,73 @@ impl UserIO {
         self.provider.receive_erased().await
     }
 
+    /// Sends a confirmation prompt and returns whether the user accepted.
+    ///
+    /// This is the standard mechanism for enforcing [`ToolPermission::Confirm`] —
+    /// when a tool's permission resolves to `Confirm`, the executor calls this
+    /// method to obtain user approval before proceeding.
+    ///
+    /// Sends the `prompt` as a system text message with
+    /// [`IO_TYPE`]: [`IO_TYPE_CONFIRM`] metadata, then awaits the provider's
+    /// response. The `io_type` metadata convention lets [`IOProvider`]
+    /// implementations render the appropriate UI (terminal `[y/N]` prompt,
+    /// GUI dialog, etc.).
+    ///
+    /// [`ToolPermission::Confirm`]: polaris_tools::ToolPermission::Confirm
+    ///
+    /// Returns a [`ConfirmResponse`] containing both the parsed boolean result
+    /// and the full response [`IOMessage`], so the caller can access any
+    /// additional data the provider attached.
+    ///
+    /// # Provider Contract
+    ///
+    /// The [`IO_TYPE`]: [`IO_TYPE_CONFIRM`] metadata signals the [`IOProvider`]
+    /// that a yes/no answer is expected. The provider is responsible for:
+    ///
+    /// 1. Rendering the prompt appropriately (terminal `[y/N]`, GUI dialog, etc.)
+    /// 2. Interpreting the user's response (text, button click, voice, etc.)
+    /// 3. Setting [`CONFIRMED`]: [`CONFIRMED_TRUE`] or [`CONFIRMED`]: [`CONFIRMED_FALSE`]
+    ///    in the response message's [`metadata`](IOMessage::metadata)
+    ///
+    /// The response content ([`IOContent`]) is unconstrained — providers may
+    /// include the raw user input, structured data, or anything else alongside
+    /// the [`CONFIRMED`] metadata.
+    ///
+    /// If [`CONFIRMED`] metadata is absent, it is treated as denial (safe default).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IOError`] if sending the prompt or receiving the response fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polaris_core_plugins::UserIO;
+    /// # async fn example(user_io: &UserIO) {
+    /// let response = user_io.confirm("Allow shell command `rm -rf build/`?").await.unwrap();
+    /// if response.confirmed {
+    ///     // proceed with execution
+    ///     // optionally inspect response.message for extra context
+    /// } else {
+    ///     // abort
+    /// }
+    /// # }
+    /// ```
+    pub async fn confirm(&self, prompt: impl Into<String>) -> Result<ConfirmResponse, IOError> {
+        let message = IOMessage::system_text(prompt).with_metadata(IO_TYPE, IO_TYPE_CONFIRM);
+        self.send(message).await?;
+
+        let response = self.receive().await?;
+        let confirmed = response
+            .metadata
+            .get(CONFIRMED)
+            .is_some_and(|v| v == CONFIRMED_TRUE);
+        Ok(ConfirmResponse {
+            confirmed,
+            message: response,
+        })
+    }
+
     /// Returns a continuous stream of messages from the underlying provider.
     ///
     /// # Errors
@@ -379,6 +441,22 @@ impl UserIO {
     pub async fn stream(&self) -> Result<IOStream, IOError> {
         self.provider.stream_erased().await
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Confirm Response
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Response from a [`UserIO::confirm`] call.
+///
+/// Contains the parsed boolean result and the full response message,
+/// allowing callers to access any additional data the provider attached.
+#[derive(Debug, Clone)]
+pub struct ConfirmResponse {
+    /// Whether the user confirmed the action.
+    pub confirmed: bool,
+    /// The full response message from the user/provider.
+    pub message: IOMessage,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -574,6 +652,37 @@ impl Plugin for IOPlugin {
         vec![PluginId::of::<ServerInfoPlugin>()]
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error Type
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returned by [`IOProvider::send`], [`IOProvider::receive`], and [`IOProvider::stream`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum IOError {
+    /// The connection or channel is closed.
+    Closed,
+    /// The operation timed out.
+    Timeout,
+    /// A provider-specific error.
+    Provider(String),
+    /// The operation is not supported by this provider.
+    Unsupported(String),
+}
+
+impl std::fmt::Display for IOError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => write!(f, "I/O channel closed"),
+            Self::Timeout => write!(f, "I/O operation timed out"),
+            Self::Provider(msg) => write!(f, "I/O provider error: {}", msg),
+            Self::Unsupported(msg) => write!(f, "I/O operation unsupported: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for IOError {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MockIOProvider for Testing
@@ -916,6 +1025,74 @@ mod tests {
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<InputBuffer>());
         assert!(ctx.contains_resource::<OutputBuffer>());
+    }
+
+    // -- UserIO::confirm tests --
+
+    /// Helper to create a mock that responds to confirm with the given metadata.
+    fn confirm_mock(confirmed: &str) -> (UserIO, Arc<MockIOProvider>) {
+        let mock = Arc::new(MockIOProvider::new());
+        mock.enqueue_receive(IOMessage::user_text("response").with_metadata(CONFIRMED, confirmed));
+        (UserIO::new(mock.clone()), mock)
+    }
+
+    #[tokio::test]
+    async fn confirm_returns_true_when_confirmed() {
+        let (user_io, mock) = confirm_mock(CONFIRMED_TRUE);
+
+        let response = user_io.confirm("Allow?").await.unwrap();
+        assert!(response.confirmed);
+
+        // Verify the sent message has correct metadata
+        let sent = mock.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].metadata.get(IO_TYPE).unwrap(), IO_TYPE_CONFIRM);
+    }
+
+    #[tokio::test]
+    async fn confirm_returns_false_when_denied() {
+        let (user_io, _mock) = confirm_mock(CONFIRMED_FALSE);
+
+        let response = user_io.confirm("Allow?").await.unwrap();
+        assert!(!response.confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirm_returns_false_when_metadata_absent() {
+        let mock = Arc::new(MockIOProvider::new());
+        mock.enqueue_receive(IOMessage::user_text("whatever"));
+        let user_io = UserIO::new(mock.clone());
+
+        let response = user_io.confirm("Allow?").await.unwrap();
+        assert!(!response.confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirm_preserves_response_message() {
+        let mock = Arc::new(MockIOProvider::new());
+        mock.enqueue_receive(
+            IOMessage::user_text("I approve")
+                .with_metadata(CONFIRMED, CONFIRMED_TRUE)
+                .with_metadata("reason", "looks safe"),
+        );
+        let user_io = UserIO::new(mock.clone());
+
+        let response = user_io.confirm("Allow?").await.unwrap();
+        assert!(response.confirmed);
+        assert_eq!(
+            response.message.metadata.get("reason").unwrap(),
+            "looks safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_propagates_receive_error() {
+        let mock = Arc::new(MockIOProvider::new());
+        // No messages enqueued — receive returns IOError::Closed
+        let user_io = UserIO::new(mock);
+
+        let result = user_io.confirm("Allow?").await;
+        assert!(result.is_err());
     }
 
     // -- IOError tests --

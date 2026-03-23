@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/Graph-327afe2e695d80ffb941f98a5ec6d3ee
+title: Graph Execution
+---
+
 # Graph Execution
 
 Agent logic in Polaris is expressed as a directed graph of systems and control flow constructs. The `polaris_graph` crate provides the graph structure, a builder API for constructing it, and an executor for running it.

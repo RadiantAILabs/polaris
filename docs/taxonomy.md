@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/Taxonomy-327afe2e695d80f3b502ca5118f5316a
+title: Polaris Taxonomy
+---
+
 # Polaris Taxonomy
 
 This document defines the conceptual layers and core abstractions in Polaris. For the design philosophy behind these decisions, see [philosophy.md](./philosophy.md).

@@ -2,7 +2,7 @@
 
 use polaris::system::plugin::{Plugin, PluginId, Version};
 use polaris::system::server::Server;
-use polaris::tools::{ToolError, ToolRegistry, ToolsPlugin, toolset};
+use polaris::tools::{ToolError, ToolPermission, ToolRegistry, ToolsPlugin, toolset};
 use std::path::PathBuf;
 
 /// Configuration for file tools with sandboxed working directory.
@@ -159,6 +159,9 @@ impl Plugin for FileToolsPlugin {
             .get_resource_mut::<ToolRegistry>()
             .expect("ToolsPlugin must be added before FileToolsPlugin");
         registry.register_toolset(FileTools::new(self.config.clone()));
+        registry
+            .set_permission("write_file", ToolPermission::Confirm)
+            .expect("write_file should be registered by FileTools toolset");
     }
 }
 
