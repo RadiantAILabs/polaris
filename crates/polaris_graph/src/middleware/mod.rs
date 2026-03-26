@@ -54,9 +54,9 @@
 //! # let mw = MiddlewareAPI::new();
 //! mw.register_system("logger", |info: SystemInfo, ctx, next| {
 //!     Box::pin(async move {
-//!         eprintln!("before system: {}", info.node_name);
+//!         tracing::info!("before system: {}", info.node_name);
 //!         let result = next.run(ctx).await;
-//!         eprintln!("after system: {}", info.node_name);
+//!         tracing::info!("after system: {}", info.node_name);
 //!         result
 //!     })
 //! });

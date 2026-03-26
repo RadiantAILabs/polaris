@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```bash
-//! cargo run -p examples --bin cli -- <working_dir> [--session <id>]
+//! cargo run -p examples --bin cli -- <working_dir> [--session <id>] [--otel <endpoint>] [--capture-content]
 //! ```
 //!
 //! # Commands
@@ -24,6 +24,8 @@ use examples::plugins::{FileToolsConfig, FileToolsPlugin, TerminalIOPlugin};
 use examples::react_agent::{AgentConfig, ContextManager, ReActAgent, ReActPlugin, ReactState};
 use polaris::models::AnthropicPlugin;
 use polaris::models::llm::{AssistantBlock, Message, UserBlock};
+#[cfg(feature = "otel")]
+use polaris::plugins::OpenTelemetryPlugin;
 use polaris::plugins::{IOMessage, InputBuffer, PersistenceAPI, PersistencePlugin};
 use polaris::sessions::{
     AgentTypeId, FileStore, SessionId, SessionInfo, SessionsAPI, SessionsPlugin,
@@ -41,6 +43,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use tracing::Instrument;
 
 // ANSI style constants
 const STYLE_DIM: &str = "\x1b[2m";
@@ -155,7 +158,9 @@ async fn main() {
     // Parse arguments: <working_dir> [--session <id>]
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: cli <working_dir> [--session <id>]");
+        eprintln!(
+            "Usage: cli <working_dir> [--session <id>] [--otel <endpoint>] [--capture-content]"
+        );
         std::process::exit(1);
     }
 
@@ -173,16 +178,27 @@ async fn main() {
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
+    #[cfg(feature = "otel")]
+    let otel_endpoint = args
+        .iter()
+        .position(|a| a == "--otel")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    let capture_content = args.iter().any(|a| a == "--capture-content");
+
     let agent_config = AgentConfig::new("anthropic/claude-sonnet-4-6");
     let file_tools_config = FileToolsConfig::new(&working_dir);
 
     // Build server
     let mut server = Server::new();
+    let mut tracing_plugin =
+        TracingPlugin::default().with_fmt(FmtConfig::default().env_filter("polaris=debug,warn"));
+    if capture_content {
+        tracing_plugin = tracing_plugin.with_capture_genai_content();
+    }
     server
-        .add_plugins(
-            TracingPlugin::default()
-                .with_fmt(FmtConfig::default().env_filter("polaris=debug,rustyline=warn")),
-        )
+        .add_plugins(tracing_plugin)
         .add_plugins(ServerInfoPlugin)
         .add_plugins(IOPlugin)
         .add_plugins(TerminalIOPlugin)
@@ -194,6 +210,11 @@ async fn main() {
         .add_plugins(ReActPlugin)
         .add_plugins(SessionsPlugin::new(Arc::new(FileStore::new("data"))))
         .add_plugins(DevToolsPlugin::new().with_event_tracing());
+
+    #[cfg(feature = "otel")]
+    if let Some(endpoint) = &otel_endpoint {
+        server.add_plugins(OpenTelemetryPlugin::new(endpoint));
+    }
 
     server.finish();
 
@@ -382,15 +403,24 @@ async fn main() {
 
                 // Execute a turn with spinner
                 let spinner = spawn_spinner();
-                let result = sessions
-                    .process_turn_with(&server, &session_id, |ctx| {
-                        ctx.get_resource_mut::<InputBuffer>()
-                            .expect("InputBuffer missing")
-                            .push(IOMessage::user_text(trimmed));
-                        ctx.insert(ReactState::default());
-                        ctx.clear_outputs();
-                    })
-                    .await;
+                let turn_span = tracing::info_span!(
+                    "polaris.turn",
+                    session = %session_id_str,
+                    input = trimmed,
+                );
+                let result = async {
+                    sessions
+                        .process_turn_with(&server, &session_id, |ctx| {
+                            ctx.get_resource_mut::<InputBuffer>()
+                                .expect("InputBuffer missing")
+                                .push(IOMessage::user_text(trimmed));
+                            ctx.insert(ReactState::default());
+                            ctx.clear_outputs();
+                        })
+                        .await
+                }
+                .instrument(turn_span)
+                .await;
                 drop(spinner);
                 // Yield briefly so the spinner task clears the line
                 tokio::task::yield_now().await;

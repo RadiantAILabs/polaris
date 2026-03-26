@@ -91,8 +91,13 @@ unused_qualifications = "warn"
 
 [features]
 default = []
+anthropic = ["polaris_internal/anthropic"]
 bedrock = ["polaris_internal/bedrock"]
 openai = ["polaris_internal/openai"]
+graph_tracing = ["polaris_internal/graph_tracing"]
+models_tracing = ["polaris_internal/models_tracing"]
+tools_tracing = ["polaris_internal/tools_tracing"]
+otel = ["polaris_internal/otel"]
 
 [dependencies]
 polaris_internal = { path = "crates/polaris_internal", version = "0.0.1" }

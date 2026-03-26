@@ -12,6 +12,9 @@
 //! # Feature Flags
 //!
 //! - `otel` - Enables [`OpenTelemetryPlugin`] for OTLP trace export
+//! - `graph_tracing` - Enables tracing spans around graph node execution
+//! - `models_tracing` - Enables LLM provider tracing via [`TracingPlugin`]
+//! - `tools_tracing` - Enables tool tracing via [`TracingPlugin`] (independent of `models_tracing`)
 //! - `test-utils` - Enables [`MockClock`] and [`MockIOProvider`] for testing
 //!
 //! # Example
@@ -21,9 +24,13 @@
 //! use polaris_system::plugin::PluginGroup;
 //! use polaris_core_plugins::DefaultPlugins;
 //!
-//! Server::new()
-//!     .add_plugins(DefaultPlugins::new().build())
-//!     .run();
+//! let mut server = Server::new();
+//! # #[cfg(feature = "models_tracing")]
+//! # server.add_plugins(polaris_models::ModelsPlugin);
+//! # #[cfg(feature = "tools_tracing")]
+//! # server.add_plugins(polaris_tools::ToolsPlugin);
+//! server.add_plugins(DefaultPlugins::new().build());
+//! server.run();
 //! ```
 //!
 //! # Individual Plugin Usage
@@ -35,15 +42,19 @@
 //! use polaris_core_plugins::{ServerInfoPlugin, TimePlugin, TracingPlugin, FmtConfig};
 //! use tracing::Level;
 //!
-//! Server::new()
-//!     .add_plugins(ServerInfoPlugin)
-//!     .add_plugins(TimePlugin::default())
-//!     .add_plugins(
-//!         TracingPlugin::default()
-//!             .with_level(Level::DEBUG)
-//!             .with_fmt(FmtConfig::default())
-//!     )
-//!     .run();
+//! let mut server = Server::new();
+//! server.add_plugins(ServerInfoPlugin);
+//! # #[cfg(feature = "models_tracing")]
+//! # server.add_plugins(polaris_models::ModelsPlugin);
+//! # #[cfg(feature = "tools_tracing")]
+//! # server.add_plugins(polaris_tools::ToolsPlugin);
+//! server.add_plugins(TimePlugin::default());
+//! server.add_plugins(
+//!     TracingPlugin::default()
+//!         .with_level(Level::DEBUG)
+//!         .with_fmt(FmtConfig::default())
+//! );
+//! server.run();
 //! ```
 //!
 //! # Architecture
@@ -115,9 +126,13 @@ use tracing::Level;
 /// use polaris_system::plugin::PluginGroup;
 /// use polaris_core_plugins::DefaultPlugins;
 ///
-/// Server::new()
-///     .add_plugins(DefaultPlugins::new().build())
-///     .run();
+/// let mut server = Server::new();
+/// # #[cfg(feature = "models_tracing")]
+/// # server.add_plugins(polaris_models::ModelsPlugin);
+/// # #[cfg(feature = "tools_tracing")]
+/// # server.add_plugins(polaris_tools::ToolsPlugin);
+/// server.add_plugins(DefaultPlugins::new().build());
+/// server.run();
 /// ```
 ///
 /// # Customization
@@ -130,18 +145,22 @@ use tracing::Level;
 /// use polaris_core_plugins::{DefaultPlugins, FmtConfig, TracingFormat};
 /// use tracing::Level;
 ///
-/// Server::new()
-///     .add_plugins(
-///         DefaultPlugins::new()
-///             .with_log_level(Level::DEBUG)
-///             .with_fmt(
-///                 FmtConfig::default()
-///                     .format(TracingFormat::Json)
-///                     .env_filter("polaris=debug,hyper=warn")
-///             )
-///             .build()
-///     )
-///     .run();
+/// let mut server = Server::new();
+/// # #[cfg(feature = "models_tracing")]
+/// # server.add_plugins(polaris_models::ModelsPlugin);
+/// # #[cfg(feature = "tools_tracing")]
+/// # server.add_plugins(polaris_tools::ToolsPlugin);
+/// server.add_plugins(
+///     DefaultPlugins::new()
+///         .with_log_level(Level::DEBUG)
+///         .with_fmt(
+///             FmtConfig::default()
+///                 .format(TracingFormat::Json)
+///                 .env_filter("polaris=debug,hyper=warn")
+///         )
+///         .build()
+/// );
+/// server.run();
 /// ```
 ///
 /// Add `OTel` export alongside console logging (requires the `otel` feature):
@@ -153,7 +172,12 @@ use tracing::Level;
 /// use polaris_system::plugin::PluginGroup;
 /// use polaris_core_plugins::{DefaultPlugins, OpenTelemetryPlugin};
 ///
-/// Server::new()
+/// let mut server = Server::new();
+/// # #[cfg(feature = "models_tracing")]
+/// # server.add_plugins(polaris_models::ModelsPlugin);
+/// # #[cfg(feature = "tools_tracing")]
+/// # server.add_plugins(polaris_tools::ToolsPlugin);
+/// server
 ///     .add_plugins(DefaultPlugins::new().build())
 ///     .add_plugins(OpenTelemetryPlugin::new("http://localhost:4318/v1/traces"))
 ///     .run();

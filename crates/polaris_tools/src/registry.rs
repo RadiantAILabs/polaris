@@ -125,8 +125,7 @@ impl ToolRegistry {
         let tool = self.tools.get(name).cloned();
         let args = args.clone();
         Box::pin(async move {
-            let tool =
-                tool.ok_or_else(|| ToolError::registry_error(format!("Unknown tool: {name}")))?;
+            let tool = tool.ok_or_else(|| ToolError::unknown_tool(name))?;
             tool.execute(args).await
         })
     }
@@ -141,6 +140,42 @@ impl ToolRegistry {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(AsRef::as_ref)
+    }
+
+    /// Returns a shared handle to a tool by name.
+    ///
+    /// This is the primary way decorator plugins (e.g., `TracingPlugin`) access
+    /// tools when rebuilding a registry with wrapped implementations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// assert!(registry.to_arc("nonexistent").is_none());
+    /// ```
+    #[must_use]
+    pub fn to_arc(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
+    }
+
+    /// Returns the permission overrides set via [`set_permission`](Self::set_permission).
+    ///
+    /// Used by decorator plugins to preserve user-configured permissions
+    /// when rebuilding a registry with wrapped tool implementations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// assert!(registry.permission_overrides().is_empty());
+    /// ```
+    #[must_use]
+    pub fn permission_overrides(&self) -> &IndexMap<String, ToolPermission> {
+        &self.permission_overrides
     }
 
     /// Returns whether a tool with the given name is registered.

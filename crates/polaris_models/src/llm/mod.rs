@@ -19,7 +19,7 @@ pub use builder::{Empty, LlmRequestBuilder, Ready};
 pub use collector::StreamEventExt;
 pub use error::{ExtractionError, GenerationError};
 pub use model::Llm;
-pub(crate) use provider::ErasedLlmProvider;
+pub use provider::DynLlmProvider;
 pub use provider::LlmProvider;
 pub use types::{
     AssistantBlock, AudioBlock, AudioMediaType, ContentBlockDelta, ContentBlockStartData,

@@ -13,7 +13,7 @@
 //!
 //! #[system]
 //! async fn my_system(info: Res<SystemInfo>) {
-//!     eprintln!(
+//!     tracing::info!(
 //!         "Executing system '{}' on node {:?}",
 //!         info.system_name(),
 //!         info.node_id()

@@ -52,8 +52,63 @@ pub trait LlmProvider: Send + Sync + 'static {
 // Erased trait for object safety
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Type-erased provider trait for object safety.
-pub(crate) trait ErasedLlmProvider: Send + Sync + 'static {
+/// Object-safe version of [`LlmProvider`].
+///
+/// This trait boxes the futures returned by [`LlmProvider`] so that providers
+/// can be stored as `dyn DynLlmProvider`. A blanket implementation is provided
+/// for all `T: LlmProvider`.
+///
+/// ## When to implement each trait
+///
+/// - **Implement [`LlmProvider`]** when creating an actual LLM backend (e.g., an
+///   `OpenAI` or `Anthropic` adapter). The framework provides the `DynLlmProvider`
+///   blanket impl automatically.
+/// - **Implement `DynLlmProvider` directly** only when building decorator/wrapper
+///   types that hold an `Arc<dyn DynLlmProvider>` and cannot use the
+///   `impl Future` return types on [`LlmProvider`].
+///
+/// # Examples
+///
+/// A decorator that logs before delegating to the inner provider:
+///
+/// ```no_run
+/// use std::pin::Pin;
+/// use std::future::Future;
+/// use std::sync::Arc;
+/// use polaris_models::llm::{
+///     DynLlmProvider, LlmRequest, LlmResponse, LlmStream, GenerationError,
+/// };
+/// use tracing::info;
+///
+/// struct LoggingProvider {
+///     inner: Arc<dyn DynLlmProvider>,
+/// }
+///
+/// impl DynLlmProvider for LoggingProvider {
+///     fn name(&self) -> &'static str { self.inner.name() }
+///
+///     fn generate<'a>(
+///         &'a self,
+///         model: &'a str,
+///         request: LlmRequest,
+///     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, GenerationError>> + Send + 'a>> {
+///         info!("generating with {model}...");
+///         self.inner.generate(model, request)
+///     }
+///
+///     fn stream<'a>(
+///         &'a self,
+///         model: &'a str,
+///         request: LlmRequest,
+///     ) -> Pin<Box<dyn Future<Output = Result<LlmStream, GenerationError>> + Send + 'a>> {
+///         self.inner.stream(model, request)
+///     }
+/// }
+/// ```
+pub trait DynLlmProvider: Send + Sync + 'static {
+    /// Returns the provider name.
+    fn name(&self) -> &'static str;
+
     /// Sends a generation request.
     fn generate<'a>(
         &'a self,
@@ -69,7 +124,11 @@ pub(crate) trait ErasedLlmProvider: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<LlmStream, GenerationError>> + Send + 'a>>;
 }
 
-impl<T: LlmProvider> ErasedLlmProvider for T {
+impl<T: LlmProvider> DynLlmProvider for T {
+    fn name(&self) -> &'static str {
+        LlmProvider::name(self)
+    }
+
     fn generate<'a>(
         &'a self,
         model: &'a str,

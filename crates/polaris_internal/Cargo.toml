@@ -7,8 +7,13 @@ keywords = []
 
 [features]
 default = []
+anthropic = ["polaris_model_providers/anthropic"]
 openai = ["polaris_model_providers/openai"]
 bedrock = ["polaris_model_providers/bedrock"]
+graph_tracing = ["polaris_core_plugins/graph_tracing"]
+models_tracing = ["polaris_core_plugins/models_tracing"]
+tools_tracing = ["polaris_core_plugins/tools_tracing"]
+otel = ["polaris_core_plugins/otel"]
 
 [dependencies]
 polaris_system = { path = "../polaris_system" }
