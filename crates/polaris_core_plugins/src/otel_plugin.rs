@@ -15,6 +15,10 @@
 //!
 //! let mut server = Server::new();
 //! server.add_plugins(ServerInfoPlugin);
+//! # #[cfg(feature = "models_tracing")]
+//! # server.add_plugins(polaris_models::ModelsPlugin);
+//! # #[cfg(feature = "tools_tracing")]
+//! # server.add_plugins(polaris_tools::ToolsPlugin);
 //! server.add_plugins(TracingPlugin::default());
 //! server.add_plugins(
 //!     OpenTelemetryPlugin::new("http://localhost:4318/v1/traces")

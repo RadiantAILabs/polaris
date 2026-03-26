@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 polaris_system = { path = "../polaris_system" }
+polaris_graph = { path = "../polaris_graph" }
+polaris_models = { path = "../polaris_models", optional = true }
+polaris_tools = { path = "../polaris_tools", optional = true }
 persistence_macros = { path = "persistence_macros" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -19,7 +22,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = { version = "0.31", optional = true }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+opentelemetry_sdk = { version = "0.31", features = [
+    "rt-tokio",
+], optional = true }
 opentelemetry-otlp = { version = "0.31", optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
 
@@ -29,5 +34,13 @@ tokio-test = "0.4"
 
 [features]
 default = []
-otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
+otel = [
+    "opentelemetry",
+    "opentelemetry_sdk",
+    "opentelemetry-otlp",
+    "tracing-opentelemetry",
+]
 test-utils = []
+graph_tracing = []
+models_tracing = ["dep:polaris_models"]
+tools_tracing = ["dep:polaris_tools", "dep:polaris_models"]

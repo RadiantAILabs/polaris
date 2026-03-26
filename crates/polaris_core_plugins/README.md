@@ -112,7 +112,7 @@ let prod = TracingPlugin::default()
     );
 ```
 
-When the `models_tracing` or `tools_tracing` features are enabled, `TracingPlugin` also instruments LLM and tool calls with OpenTelemetry semantic convention spans. Enable `with_capture_genai_content(true)` to record full request/response content on those spans.
+When the `models_tracing` or `tools_tracing` features are enabled, `TracingPlugin` also instruments LLM and tool calls with OpenTelemetry semantic convention spans. Enable `.with_capture_genai_content()` to record full request/response content on those spans.
 
 ### OpenTelemetryPlugin
 

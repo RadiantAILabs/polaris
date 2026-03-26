@@ -2,7 +2,7 @@
 
 use super::builder::LlmRequestBuilder;
 use super::error::{ExtractionError, GenerationError};
-use super::provider::ErasedLlmProvider;
+use super::provider::DynLlmProvider;
 use super::types::{LlmRequest, LlmResponse, LlmStream};
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
@@ -13,14 +13,14 @@ use std::sync::Arc;
 /// Created via [`ModelRegistry::llm()`](crate::ModelRegistry::llm).
 #[derive(Clone)]
 pub struct Llm {
-    provider: Arc<dyn ErasedLlmProvider>,
+    provider: Arc<dyn DynLlmProvider>,
     model: String,
 }
 
 impl Llm {
     /// Creates a new LLM handle from a provider and model name.
     #[must_use]
-    pub(crate) fn new(provider: Arc<dyn ErasedLlmProvider>, model: String) -> Self {
+    pub(crate) fn new(provider: Arc<dyn DynLlmProvider>, model: String) -> Self {
         Self { provider, model }
     }
 

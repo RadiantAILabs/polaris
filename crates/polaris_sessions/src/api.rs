@@ -11,6 +11,7 @@ use hashbrown::HashMap;
 use parking_lot::RwLock;
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin, ResourceSerializer};
+use polaris_graph::MiddlewareAPI;
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::{ExecutionResult, Graph, GraphExecutor};
 use polaris_system::api::API;
@@ -282,9 +283,10 @@ impl SessionsAPI {
         setup(&mut ctx);
 
         let hooks = server.api::<HooksAPI>();
+        let middleware = server.api::<MiddlewareAPI>();
         let result = state
             .executor
-            .execute(&state.graph, &mut ctx, hooks, None)
+            .execute(&state.graph, &mut ctx, hooks, middleware)
             .await?;
 
         state.turn_number.store(turn + 1, Ordering::Release);

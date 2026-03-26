@@ -1,7 +1,7 @@
 //! Model provider registry.
 
 use crate::error::CreateModelError;
-use crate::llm::{ErasedLlmProvider, Llm, LlmProvider};
+use crate::llm::{DynLlmProvider, Llm};
 use polaris_system::resource::GlobalResource;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,7 +58,7 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct ModelRegistry {
     // Maps provider names to implementations.
-    llm_providers: HashMap<String, Arc<dyn ErasedLlmProvider>>,
+    llm_providers: HashMap<String, Arc<dyn DynLlmProvider>>,
 }
 
 impl std::fmt::Debug for ModelRegistry {
@@ -97,7 +97,7 @@ impl ModelRegistry {
             .ok_or_else(|| CreateModelError::InvalidModelId(model_id.to_string()))?;
 
         let provider = self
-            .get_llm_provider(provider_name)
+            .llm_provider(provider_name)
             .ok_or_else(|| CreateModelError::UnknownProvider(provider_name.to_string()))?;
 
         Ok(Llm::new(provider, model_name.to_string()))
@@ -116,7 +116,7 @@ impl ModelRegistry {
     /// # Panics
     ///
     /// Panics if a provider with the same name is already registered.
-    pub fn register_llm_provider(&mut self, provider: impl LlmProvider) {
+    pub fn register_llm_provider(&mut self, provider: impl DynLlmProvider) {
         let name = provider.name().to_string();
         assert!(
             !self.llm_providers.contains_key(&name),
@@ -126,8 +126,17 @@ impl ModelRegistry {
     }
 
     /// Returns a provider by name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::ModelRegistry;
+    ///
+    /// let registry = ModelRegistry::new();
+    /// assert!(registry.llm_provider("openai").is_none());
+    /// ```
     #[must_use]
-    fn get_llm_provider(&self, name: impl AsRef<str>) -> Option<Arc<dyn ErasedLlmProvider>> {
+    pub fn llm_provider(&self, name: impl AsRef<str>) -> Option<Arc<dyn DynLlmProvider>> {
         self.llm_providers.get(name.as_ref()).cloned()
     }
 

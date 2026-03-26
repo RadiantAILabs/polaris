@@ -158,7 +158,7 @@ impl<'a, T, F> TerminalFn<'a, T> for F where
 ///     Box::pin(async move {
 ///         let start = std::time::Instant::now();
 ///         let result = next.run(ctx).await;
-///         eprintln!("{}: {:?}", info.node_name, start.elapsed());
+///         tracing::info!("{}: {:?}", info.node_name, start.elapsed());
 ///         result
 ///     })
 /// });
@@ -356,7 +356,7 @@ impl MiddlewareAPI {
     ///     Box::pin(async move {
     ///         let start = std::time::Instant::now();
     ///         let result = next.run(ctx).await;
-    ///         eprintln!("{}: {:?}", info.node_name, start.elapsed());
+    ///         tracing::info!("{}: {:?}", info.node_name, start.elapsed());
     ///         result
     ///     })
     /// });

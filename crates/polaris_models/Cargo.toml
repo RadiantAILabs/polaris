@@ -19,3 +19,4 @@ futures-core = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
