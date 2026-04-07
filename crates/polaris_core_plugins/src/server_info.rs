@@ -22,7 +22,9 @@
 //! // Set up the server with the plugin
 //! let mut server = Server::new();
 //! server.add_plugins(ServerInfoPlugin);
-//! server.finish();
+//! # tokio_test::block_on(async {
+//! server.finish().await;
+//! # });
 //!
 //! // Access ServerInfo from a context
 //! let ctx = server.create_context();
@@ -119,7 +121,9 @@ impl Default for ServerInfo {
 /// // Register the plugin
 /// let mut server = Server::new();
 /// server.add_plugins(ServerInfoPlugin);
-/// server.finish();
+/// # tokio_test::block_on(async {
+/// server.finish().await;
+/// # });
 /// ```
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ServerInfoPlugin;
@@ -143,11 +147,11 @@ mod tests {
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
     }
 
-    #[test]
-    fn server_info_plugin_registers_resource() {
+    #[tokio::test]
+    async fn server_info_plugin_registers_resource() {
         let mut server = Server::new();
         server.add_plugins(ServerInfoPlugin);
-        server.finish();
+        server.finish().await;
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<ServerInfo>());

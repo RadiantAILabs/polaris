@@ -24,8 +24,11 @@ polaris_models = { path = "../polaris_models" }
 polaris_system = { path = "../polaris_system" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.13.1", features = ["json"] }
+reqwest = { version = "0.13.1", features = ["json", "stream"] }
 tracing = "0.1"
+futures-core = "0.3"
+bytes = "1"
+simdutf8 = "0.1"
 
 # OpenAI dependencies
 async-openai = { version = "0.33", optional = true, default-features = false, features = [

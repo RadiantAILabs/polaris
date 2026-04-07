@@ -61,3 +61,57 @@ The `--capture-content` flag records `gen_ai.*` content attributes on LLM and to
 - `/info` — Show session info
 - `/sessions` — List all saved sessions
 - `/rollback <turn>` — Rollback to a checkpoint
+
+---
+
+## ReAct Agent HTTP Server
+
+Serves the same ReAct agent over HTTP using `polaris_app`. Demonstrates `AppPlugin` route registration, Tower middleware, and the plugin-based HTTP architecture.
+
+### Features
+
+- Shared HTTP server runtime via `AppPlugin`
+- Plugin-based route registration via `HttpRouter` API
+- Tower middleware (CORS, request tracing, `x-request-id`)
+- Health check and agent info endpoints
+- Pre-configured demo session with ReAct agent
+
+### Running
+
+```bash
+cargo run -p examples --bin http -- <working_dir> [--port <port>]
+
+# Example
+cargo run -p examples --bin http -- ./sandbox
+cargo run -p examples --bin http -- ./sandbox --port 8080
+```
+
+### Endpoints
+
+```bash
+# Health check
+curl http://localhost:3000/healthz
+
+# Agent info
+curl http://localhost:3000/v1/info
+
+
+# Create a session
+curl -X POST http://localhost:3000/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_type": "react"}'
+
+# List sessions
+curl http://localhost:3000/v1/sessions
+
+# Get session info
+curl http://localhost:3000/v1/sessions/{id}
+
+# Send a turn (using the pre-loaded "demo" session)
+curl -X POST http://localhost:3000/v1/sessions/demo/turns \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "What files are in the current directory?"}'
+
+# Delete a session
+curl -X DELETE http://localhost:3000/v1/sessions/{id}
+```

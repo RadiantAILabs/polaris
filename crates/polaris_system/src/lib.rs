@@ -40,9 +40,12 @@
 //!     }
 //! }
 //!
+//! # tokio_test::block_on(async {
 //! Server::new()
 //!     .add_plugins(MyPlugin)
-//!     .run();
+//!     .run()
+//!     .await;
+//! # });
 //! ```
 
 // Self-reference so `#[system]` macro-generated code can use `polaris_system::` paths

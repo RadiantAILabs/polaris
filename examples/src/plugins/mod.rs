@@ -7,4 +7,4 @@ mod file_tools;
 mod terminal_io;
 
 pub use file_tools::{FileToolsConfig, FileToolsPlugin};
-pub use terminal_io::TerminalIOPlugin;
+pub use terminal_io::{TerminalIO, TerminalIOPlugin};

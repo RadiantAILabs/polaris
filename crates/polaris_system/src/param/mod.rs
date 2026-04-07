@@ -398,6 +398,70 @@ impl<'parent> SystemContext<'parent> {
         self.globals.as_deref()
     }
 
+    /// Clones a local resource by its [`TypeId`], returning a new boxed value.
+    ///
+    /// Returns `None` if the resource does not exist in the local scope or
+    /// has no clone function registered via [`register_clone_fn`](Self::register_clone_fn).
+    /// Only examines the current context's local resources — does not walk the
+    /// parent chain or check globals.
+    ///
+    /// The returned box can be inserted into another context via
+    /// [`insert_boxed`](Self::insert_boxed).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::param::SystemContext;
+    /// use polaris_system::resource::LocalResource;
+    /// use std::any::TypeId;
+    ///
+    /// #[derive(Clone)]
+    /// struct Counter { value: i32 }
+    /// impl LocalResource for Counter {}
+    ///
+    /// let mut ctx = SystemContext::new().with(Counter { value: 5 });
+    /// ctx.register_clone_fn::<Counter>();
+    ///
+    /// let cloned = ctx.clone_local_resource(TypeId::of::<Counter>());
+    /// assert!(cloned.is_some());
+    /// ```
+    #[must_use]
+    pub fn clone_local_resource(&self, type_id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
+        self.resources.clone_by_type_id(type_id)
+    }
+
+    /// Registers a clone function for a local resource type.
+    ///
+    /// This must be called before [`clone_local_resource`](Self::clone_local_resource)
+    /// can clone resources of type `T`. The resource must already exist in
+    /// local scope.
+    ///
+    /// Returns `true` if the clone function was registered, or `false` if the
+    /// resource does not exist in local scope.
+    ///
+    /// # Ordering constraint
+    ///
+    /// [`insert`](Self::insert) and [`insert_boxed`](Self::insert_boxed) replace
+    /// the entire resource entry, discarding any previously registered clone
+    /// function. Always call `register_clone_fn` **after** the final insertion.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::param::SystemContext;
+    /// use polaris_system::resource::LocalResource;
+    ///
+    /// #[derive(Clone)]
+    /// struct Settings { retries: u32 }
+    /// impl LocalResource for Settings {}
+    ///
+    /// let mut ctx = SystemContext::new().with(Settings { retries: 3 });
+    /// assert!(ctx.register_clone_fn::<Settings>());
+    /// ```
+    pub fn register_clone_fn<T: LocalResource + Clone>(&mut self) -> bool {
+        self.resources.register_clone_fn::<T>()
+    }
+
     /// Returns `true` if a resource with the given `TypeId` exists in this scope,
     /// any parent, or globals.
     ///
@@ -1410,5 +1474,36 @@ mod tests {
         assert_eq!(access.outputs[0].mode, AccessMode::Read);
         assert!(access.outputs[0].type_name.contains("TestError"));
         assert_eq!(access.context_requirements, vec![ERROR_CONTEXT]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // clone_local_resource tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Cloneable {
+        value: i32,
+    }
+    impl LocalResource for Cloneable {}
+
+    #[test]
+    fn clone_local_resource_roundtrip() {
+        // Insert a resource and register its clone function
+        let mut ctx = SystemContext::new().with(Cloneable { value: 77 });
+        ctx.register_clone_fn::<Cloneable>();
+
+        // Clone the resource by TypeId
+        let type_id = TypeId::of::<Cloneable>();
+        let cloned_box = ctx
+            .clone_local_resource(type_id)
+            .expect("clone should succeed");
+
+        // Insert the cloned box into a second context
+        let mut ctx2 = SystemContext::new();
+        ctx2.insert_boxed(type_id, cloned_box);
+
+        // Resolve via Res<T> and verify the value matches
+        let res = Res::<Cloneable>::fetch(&ctx2).unwrap();
+        assert_eq!(res.value, 77);
     }
 }

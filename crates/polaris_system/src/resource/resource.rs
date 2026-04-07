@@ -177,6 +177,9 @@ pub enum ResourceError {
 struct ResourceEntry {
     /// Type-erased resource data protected by `RwLock`.
     data: RwLock<Box<dyn Any + Send + Sync>>,
+    /// Optional clone function for type-erased cloning.
+    /// Registered via [`Resources::register_clone_fn`] for types that implement `Clone`.
+    clone_fn: Option<fn(&dyn Any) -> Box<dyn Any + Send + Sync>>,
 }
 
 impl ResourceEntry {
@@ -184,6 +187,7 @@ impl ResourceEntry {
     fn new<T: Resource>(resource: T) -> Self {
         Self {
             data: RwLock::new(Box::new(resource)),
+            clone_fn: None,
         }
     }
 
@@ -191,6 +195,7 @@ impl ResourceEntry {
     fn new_boxed(data: Box<dyn Any + Send + Sync>) -> Self {
         Self {
             data: RwLock::new(data),
+            clone_fn: None,
         }
     }
 
@@ -399,6 +404,97 @@ impl Resources {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.storage.is_empty()
+    }
+
+    /// Registers a clone function for a resource type that implements `Clone`.
+    ///
+    /// This enables [`clone_by_type_id`](Self::clone_by_type_id) for the given
+    /// type. The resource must already exist in the container; if it does not,
+    /// this method is a no-op.
+    ///
+    /// The bound here is `Resource + Clone` (any resource). [`SystemContext::register_clone_fn`]
+    /// narrows this to `LocalResource + Clone` to match its local-only semantics.
+    ///
+    /// [`SystemContext::register_clone_fn`]: crate::param::SystemContext::register_clone_fn
+    ///
+    /// # Ordering constraint
+    ///
+    /// [`insert`](Self::insert) and [`insert_boxed`](Self::insert_boxed) replace
+    /// the entire resource entry, discarding any previously registered clone
+    /// function. Always call `register_clone_fn` **after** the final insertion
+    /// of the resource.
+    ///
+    /// Returns `true` if the clone function was registered, or `false` if the
+    /// resource does not exist in the container.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::resource::Resources;
+    ///
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct Counter { value: i32 }
+    ///
+    /// let mut resources = Resources::new();
+    /// resources.insert(Counter { value: 42 });
+    /// assert!(resources.register_clone_fn::<Counter>());
+    ///
+    /// let cloned = resources.clone_by_type_id(std::any::TypeId::of::<Counter>());
+    /// assert!(cloned.is_some());
+    /// ```
+    pub fn register_clone_fn<T: Resource + Clone>(&mut self) -> bool {
+        let id = ResourceId::of::<T>();
+        if let Some(entry) = self.storage.get_mut(&id) {
+            entry.clone_fn = Some(|any: &dyn Any| -> Box<dyn Any + Send + Sync> {
+                let val = any
+                    .downcast_ref::<T>()
+                    .expect("type mismatch in clone_fn (this is a bug)");
+                Box::new(val.clone())
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clones a resource by its [`TypeId`], returning a new boxed value.
+    ///
+    /// Returns `None` in three cases:
+    /// - The resource does not exist in the container.
+    /// - The resource exists but no clone function was registered via
+    ///   [`register_clone_fn`](Self::register_clone_fn).
+    /// - The resource is currently borrowed mutably.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal type mismatch is detected in the registered clone
+    /// function. This indicates a bug — the clone function was registered for a
+    /// different type than what is stored under the same [`TypeId`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::resource::Resources;
+    /// use std::any::TypeId;
+    ///
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct Counter { value: i32 }
+    ///
+    /// let mut resources = Resources::new();
+    /// resources.insert(Counter { value: 10 });
+    /// resources.register_clone_fn::<Counter>();
+    ///
+    /// let cloned = resources.clone_by_type_id(TypeId::of::<Counter>()).unwrap();
+    /// let counter = cloned.downcast_ref::<Counter>().unwrap();
+    /// assert_eq!(counter.value, 10);
+    /// ```
+    #[must_use]
+    pub fn clone_by_type_id(&self, type_id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
+        let id = ResourceId(type_id);
+        let entry = self.storage.get(&id)?;
+        let clone_fn = entry.clone_fn?;
+        let guard = entry.try_read()?;
+        Some(clone_fn(&**guard))
     }
 }
 
@@ -674,5 +770,76 @@ mod tests {
 
         // Different types have different ids
         assert_ne!(id.type_id(), name_id.type_id());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // clone_by_type_id tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Cloneable {
+        value: i32,
+    }
+
+    #[test]
+    fn clone_registered_resource() {
+        let mut resources = Resources::new();
+        resources.insert(Cloneable { value: 42 });
+        resources.register_clone_fn::<Cloneable>();
+
+        let cloned = resources
+            .clone_by_type_id(TypeId::of::<Cloneable>())
+            .expect("clone should succeed");
+
+        let cloned_val = cloned
+            .downcast_ref::<Cloneable>()
+            .expect("should downcast to Cloneable");
+        assert_eq!(cloned_val.value, 42);
+    }
+
+    #[test]
+    fn clone_unregistered_resource() {
+        let mut resources = Resources::new();
+        resources.insert(Cloneable { value: 42 });
+        // Deliberately NOT registering clone fn
+
+        let result = resources.clone_by_type_id(TypeId::of::<Cloneable>());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn clone_nonexistent_resource() {
+        let resources = Resources::new();
+
+        let result = resources.clone_by_type_id(TypeId::of::<Cloneable>());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut resources = Resources::new();
+        resources.insert(Cloneable { value: 10 });
+        resources.register_clone_fn::<Cloneable>();
+
+        // Clone while original is 10
+        let cloned = resources
+            .clone_by_type_id(TypeId::of::<Cloneable>())
+            .expect("clone should succeed");
+
+        // Mutate the original
+        {
+            let mut guard = resources.get_mut::<Cloneable>().unwrap();
+            guard.value = 999;
+        }
+
+        // Clone should retain the original value
+        let cloned_val = cloned
+            .downcast_ref::<Cloneable>()
+            .expect("should downcast to Cloneable");
+        assert_eq!(cloned_val.value, 10);
+
+        // Original should be mutated
+        let original = resources.get::<Cloneable>().unwrap();
+        assert_eq!(original.value, 999);
     }
 }

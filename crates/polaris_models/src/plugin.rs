@@ -35,7 +35,7 @@ impl Plugin for ModelsPlugin {
         server.insert_resource(ModelRegistry::new());
     }
 
-    fn ready(&self, server: &mut Server) {
+    async fn ready(&self, server: &mut Server) {
         let model_registry = server.remove_resource::<ModelRegistry>().unwrap();
         server.insert_global(model_registry);
     }

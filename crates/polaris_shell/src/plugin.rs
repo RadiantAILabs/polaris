@@ -19,7 +19,8 @@ use std::time::{Duration, SystemTime};
 ///
 /// # Example
 ///
-/// ```
+/// ```no_run
+/// # async fn example() {
 /// use polaris_system::server::Server;
 /// use polaris_tools::ToolsPlugin;
 /// use polaris_shell::{ShellPlugin, ShellConfig};
@@ -33,7 +34,8 @@ use std::time::{Duration, SystemTime};
 ///         .with_denied_commands(vec!["rm -rf *".into()])
 ///         .with_allowed_dirs(vec!["/home/user/project".into()])
 /// ));
-/// server.finish();
+/// server.finish().await;
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct ShellPlugin {
@@ -76,7 +78,7 @@ impl Plugin for ShellPlugin {
         registry.register_toolset(ShellTools::new(executor));
     }
 
-    fn cleanup(&self, _server: &mut Server) {
+    async fn cleanup(&self, _server: &mut Server) {
         let Some(cache_dir) = &self.config.cache_dir else {
             return;
         };

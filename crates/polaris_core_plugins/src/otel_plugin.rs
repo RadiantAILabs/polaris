@@ -24,7 +24,9 @@
 //!     OpenTelemetryPlugin::new("http://localhost:4318/v1/traces")
 //!         .with_service_name("my-agent")
 //! );
-//! server.finish();
+//! # tokio_test::block_on(async {
+//! server.finish().await;
+//! # });
 //! ```
 
 use crate::TracingLayersApi;
@@ -213,7 +215,7 @@ impl Plugin for OpenTelemetryPlugin {
         );
     }
 
-    fn ready(&self, _server: &mut Server) {
+    async fn ready(&self, _server: &mut Server) {
         tracing::info!(
             endpoint = %self.endpoint,
             service_name = %self.service_name,
@@ -221,7 +223,7 @@ impl Plugin for OpenTelemetryPlugin {
         );
     }
 
-    fn cleanup(&self, _server: &mut Server) {
+    async fn cleanup(&self, _server: &mut Server) {
         tracing::debug!("OpenTelemetryPlugin shutting down, flushing spans");
         if let Some(provider) = self.provider.lock().take()
             && let Err(otel_err) = provider.shutdown()

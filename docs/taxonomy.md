@@ -25,7 +25,7 @@ The foundation of Polaris. This layer provides the ECS-inspired primitives that 
 
 These primitives define *how code is organized and executed*. They are fixed and changing them would mean using a different framework.
 
-**Scope.** Layer 1 owns the core traits (`System`, `Resource`, `SystemParam`, `Plugin`, `API`, `IntoSystem`), the `SystemContext` hierarchy, resource containers, access descriptors and conflict detection, schedule identifiers, and the `Server` implementation. It does not contain anything agent-specific (graphs, LLMs, tools), domain-specific (memory backends, model providers), or optional.
+**Scope.** Layer 1 owns the core traits (`System`, `Resource`, `SystemParam`, `Plugin`, `API`, `IntoSystem`), the `SystemContext` hierarchy, resource containers, access descriptors and conflict detection, schedule identifiers, the `Server` implementation, and the `ContextFactory` for creating execution contexts outside of direct server access. It does not contain anything agent-specific (graphs, LLMs, tools), domain-specific (memory backends, model providers), or optional.
 
 See [system.md](./reference/system.md) for system primitives and parameters, [plugins.md](./reference/plugins.md) for the plugin system, and [api.md](./reference/api.md) for the API primitive.
 

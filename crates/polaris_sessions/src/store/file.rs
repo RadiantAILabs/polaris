@@ -271,6 +271,7 @@ mod tests {
         let data = SessionData {
             agent_type: "TestAgent".into(),
             turn_number: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
             resources: vec![],
         };
 
@@ -304,6 +305,7 @@ mod tests {
         let data = SessionData {
             agent_type: "TestAgent".into(),
             turn_number: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
             resources: vec![],
         };
 
@@ -334,6 +336,7 @@ mod tests {
         let data = SessionData {
             agent_type: "TestAgent".into(),
             turn_number: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
             resources: vec![],
         };
 
@@ -361,6 +364,7 @@ mod tests {
         let data = SessionData {
             agent_type: "TestAgent".into(),
             turn_number: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
             resources: vec![],
         };
 

@@ -63,7 +63,7 @@ impl fmt::Display for SessionId {
 /// Identifies an agent type by its stable, user-defined name.
 ///
 /// Wraps the `&'static str` returned by [`Agent::name`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct AgentTypeId(&'static str);
 
 impl AgentTypeId {
@@ -85,6 +85,16 @@ impl fmt::Display for AgentTypeId {
         f.write_str(self.0)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TurnNumber
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A turn number within a session.
+///
+/// Alias for `u32` to distinguish turn counts from other numeric quantities
+/// such as node counts, durations, or resource indices.
+pub type TurnNumber = u32;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ResourceEntry / SessionData
@@ -109,7 +119,9 @@ pub struct SessionData {
     /// The type name of the agent that owns this session.
     pub agent_type: String,
     /// The turn number at the time of serialization.
-    pub turn_number: u32,
+    pub turn_number: TurnNumber,
+    /// ISO 8601 timestamp of when the session was originally created.
+    pub created_at: String,
     /// Serialized resources from the session context.
     pub resources: Vec<ResourceEntry>,
 }

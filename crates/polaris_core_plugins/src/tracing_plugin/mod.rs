@@ -79,7 +79,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// server.add_plugins(TracingPlugin::new());
 /// server.add_plugins(MyPlugin);
-/// server.run_once();
+/// # tokio_test::block_on(async {
+/// server.run_once().await;
+/// # });
 /// ```
 pub struct TracingLayersApi {
     layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>>,
@@ -198,7 +200,9 @@ impl GlobalResource for TracingConfig {}
 ///         .with_level(Level::DEBUG)
 ///         .with_fmt(FmtConfig::default().format(TracingFormat::Json))
 /// );
-/// server.run();
+/// # tokio_test::block_on(async {
+/// server.run().await;
+/// # });
 /// ```
 #[derive(Debug, Clone)]
 pub struct TracingPlugin {
@@ -294,7 +298,7 @@ impl Plugin for TracingPlugin {
         self.register_instrumentation(server);
     }
 
-    fn ready(&self, server: &mut Server) {
+    async fn ready(&self, server: &mut Server) {
         if let Some(api) = server.remove_resource::<TracingLayersApi>() {
             api.install()
                 .expect("a global tracing subscriber is already set");
@@ -401,8 +405,8 @@ mod tests {
     use super::*;
     use polaris_system::server::Server;
 
-    #[test]
-    fn build_registers_config_and_layers_api() {
+    #[tokio::test]
+    async fn build_registers_config_and_layers_api() {
         let mut server = Server::new();
         server.add_plugins(ServerInfoPlugin);
         #[cfg(feature = "models_tracing")]
@@ -410,7 +414,7 @@ mod tests {
         #[cfg(feature = "tools_tracing")]
         server.add_plugins(polaris_tools::ToolsPlugin);
         server.add_plugins(TracingPlugin::default());
-        server.finish();
+        server.finish().await;
 
         let ctx = server.create_context();
         assert!(
@@ -462,8 +466,8 @@ mod tests {
             }
         }
 
-        #[test]
-        fn decoration_preserves_permission_overrides() {
+        #[tokio::test]
+        async fn decoration_preserves_permission_overrides() {
             let mut server = Server::new();
 
             let tools = ToolsPlugin;
@@ -480,7 +484,7 @@ mod tests {
                     .unwrap();
             }
 
-            tools.ready(&mut server);
+            tools.ready(&mut server).await;
 
             let tracing = TracingPlugin::default();
             tracing.decorate_tool_registry(&mut server);

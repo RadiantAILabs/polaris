@@ -683,6 +683,12 @@ pub enum ContentBlockDelta {
     },
     /// An incremental update to a reasoning block.
     Reasoning(String),
+    /// A cryptographic signature for a reasoning block.
+    ///
+    /// Some providers (e.g. Anthropic) attach signatures to thinking blocks
+    /// for tamper verification. The signature must be preserved and sent back
+    /// when round-tripping thinking blocks in multi-turn conversations.
+    Signature(String),
 }
 
 impl ContentBlockDelta {
@@ -692,6 +698,7 @@ impl ContentBlockDelta {
             Self::Text(_) => "text",
             Self::ToolCall { .. } => "tool_call",
             Self::Reasoning(_) => "reasoning",
+            Self::Signature(_) => "signature",
         }
     }
 }

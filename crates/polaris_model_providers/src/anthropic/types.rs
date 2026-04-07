@@ -38,6 +38,9 @@ pub struct CreateMessageRequest {
     /// Structured output format (beta).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_format: Option<OutputFormat>,
+    /// Whether to stream the response via SSE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 /// Message role.
@@ -304,4 +307,166 @@ pub struct UsageResponse {
     #[serde(default)]
     #[expect(dead_code, reason = "field used for deserialization completeness")]
     pub cache_read_input_tokens: u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming Event Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A raw SSE event from the Anthropic streaming API.
+///
+/// These are deserialized from the `data:` field of each SSE frame and then
+/// converted into Polaris [`StreamEvent`](polaris_models::llm::StreamEvent)s.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum RawStreamEvent {
+    /// Initial message metadata and input usage.
+    #[serde(rename = "message_start")]
+    MessageStart {
+        /// Partial message with usage information.
+        message: MessageStartPayload,
+    },
+    /// A new content block begins.
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        /// Block index.
+        index: u32,
+        /// Block type and metadata.
+        content_block: StreamContentBlock,
+    },
+    /// Incremental content for a block.
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta {
+        /// Block index.
+        index: u32,
+        /// The delta payload.
+        delta: StreamDelta,
+    },
+    /// A content block is complete.
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop {
+        /// Block index.
+        index: u32,
+    },
+    /// Message-level delta with stop reason and output usage.
+    #[serde(rename = "message_delta")]
+    MessageDelta {
+        /// Stop reason and related metadata.
+        delta: MessageDeltaPayload,
+        /// Output token count at this point. May be absent in some API responses.
+        usage: Option<MessageDeltaUsage>,
+    },
+    /// Stream is complete.
+    #[serde(rename = "message_stop")]
+    MessageStop,
+    /// Keep-alive ping.
+    #[serde(rename = "ping")]
+    Ping,
+    /// Server-side error.
+    #[serde(rename = "error")]
+    Error {
+        /// Error details.
+        error: StreamErrorInfo,
+    },
+}
+
+/// Payload for the `message_start` event.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MessageStartPayload {
+    /// Token usage for the input.
+    pub(crate) usage: UsageResponse,
+}
+
+/// Content block types that can appear in streaming responses.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum StreamContentBlock {
+    /// Text block.
+    #[serde(rename = "text")]
+    Text {
+        /// Initial text (usually empty).
+        #[expect(dead_code, reason = "field used for deserialization completeness")]
+        text: String,
+    },
+    /// Tool use block.
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        /// Tool call ID.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Initial input (usually empty string or empty object).
+        #[expect(dead_code, reason = "field used for deserialization completeness")]
+        input: Value,
+    },
+    /// Thinking block.
+    #[serde(rename = "thinking")]
+    Thinking {
+        /// Initial thinking text (usually empty).
+        #[expect(dead_code, reason = "field used for deserialization completeness")]
+        thinking: String,
+    },
+    /// Redacted thinking block.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        /// Redacted data.
+        #[expect(dead_code, reason = "field used for deserialization completeness")]
+        data: String,
+    },
+}
+
+/// Delta payload variants for `content_block_delta` events.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum StreamDelta {
+    /// Text content fragment.
+    #[serde(rename = "text_delta")]
+    Text {
+        /// The text fragment.
+        text: String,
+    },
+    /// Tool call input JSON fragment.
+    #[serde(rename = "input_json_delta")]
+    InputJson {
+        /// Partial JSON string for tool arguments.
+        partial_json: String,
+    },
+    /// Thinking content fragment.
+    #[serde(rename = "thinking_delta")]
+    Thinking {
+        /// The thinking text fragment.
+        thinking: String,
+    },
+    /// Signature for thinking block verification.
+    ///
+    /// Sent just before `content_block_stop` for thinking blocks.
+    #[serde(rename = "signature_delta")]
+    Signature {
+        /// The verification signature.
+        signature: String,
+    },
+}
+
+/// Payload for the `message_delta` event.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MessageDeltaPayload {
+    /// Reason the model stopped generating.
+    pub(crate) stop_reason: StopReason,
+}
+
+/// Usage information in the `message_delta` event.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MessageDeltaUsage {
+    /// Output tokens generated so far.
+    pub(crate) output_tokens: u64,
+}
+
+/// Error information from a streaming error event.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StreamErrorInfo {
+    /// Error type (e.g. `overloaded_error`).
+    #[serde(rename = "type")]
+    pub(crate) error_type: String,
+    /// Human-readable error message.
+    pub(crate) message: String,
 }

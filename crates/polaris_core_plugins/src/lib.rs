@@ -5,7 +5,7 @@
 //! - [`ServerInfoPlugin`] - Server metadata and runtime information
 //! - [`TimePlugin`] - Time utilities with mockable clock for testing
 //! - [`TracingPlugin`] - Tracing subscriber, console logging, and instrumentation
-//! - [`IOPlugin`] - I/O abstractions for agent communication (opt-in)
+//! - I/O abstractions ([`IOProvider`], [`UserIO`]) for agent communication
 //! - [`persistence::PersistencePlugin`] - Persistence registry for storable resources
 //! - [`DefaultPlugins`] - Convenient bundle of all infrastructure plugins
 //!
@@ -30,7 +30,9 @@
 //! # #[cfg(feature = "tools_tracing")]
 //! # server.add_plugins(polaris_tools::ToolsPlugin);
 //! server.add_plugins(DefaultPlugins::new().build());
-//! server.run();
+//! # tokio_test::block_on(async {
+//! server.run().await;
+//! # });
 //! ```
 //!
 //! # Individual Plugin Usage
@@ -54,7 +56,9 @@
 //!         .with_level(Level::DEBUG)
 //!         .with_fmt(FmtConfig::default())
 //! );
-//! server.run();
+//! # tokio_test::block_on(async {
+//! server.run().await;
+//! # });
 //! ```
 //!
 //! # Architecture
@@ -77,7 +81,6 @@ mod time;
 mod tracing_plugin;
 
 // Re-export plugins
-pub use io::IOPlugin;
 pub use server_info::ServerInfoPlugin;
 pub use time::{Clock, ClockProvider, Stopwatch, TimePlugin};
 pub use tracing_plugin::{
@@ -87,8 +90,7 @@ pub use tracing_plugin::{
 // Re-export IO types
 pub use io::{
     CONFIRMED, CONFIRMED_FALSE, CONFIRMED_TRUE, ConfirmResponse, IO_TYPE, IO_TYPE_CONFIRM,
-    IOContent, IOError, IOMessage, IOProvider, IOSource, IOStream, InputBuffer, OutputBuffer,
-    UserIO,
+    IOContent, IOError, IOMessage, IOProvider, IOSource, IOStream, UserIO,
 };
 
 // Re-export test utilities
@@ -132,7 +134,9 @@ use tracing::Level;
 /// # #[cfg(feature = "tools_tracing")]
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// server.add_plugins(DefaultPlugins::new().build());
-/// server.run();
+/// # tokio_test::block_on(async {
+/// server.run().await;
+/// # });
 /// ```
 ///
 /// # Customization
@@ -160,7 +164,9 @@ use tracing::Level;
 ///         )
 ///         .build()
 /// );
-/// server.run();
+/// # tokio_test::block_on(async {
+/// server.run().await;
+/// # });
 /// ```
 ///
 /// Add `OTel` export alongside console logging (requires the `otel` feature):
@@ -177,10 +183,12 @@ use tracing::Level;
 /// # server.add_plugins(polaris_models::ModelsPlugin);
 /// # #[cfg(feature = "tools_tracing")]
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
+/// # tokio_test::block_on(async {
 /// server
 ///     .add_plugins(DefaultPlugins::new().build())
 ///     .add_plugins(OpenTelemetryPlugin::new("http://localhost:4318/v1/traces"))
-///     .run();
+///     .run().await;
+/// # });
 /// # }
 /// ```
 pub struct DefaultPlugins {
@@ -252,9 +260,11 @@ impl PluginGroup for DefaultPlugins {
 /// use polaris_system::plugin::PluginGroup;
 /// use polaris_core_plugins::MinimalPlugins;
 ///
+/// # tokio_test::block_on(async {
 /// Server::new()
 ///     .add_plugins(MinimalPlugins.build())
-///     .run();
+///     .run().await;
+/// # });
 /// ```
 pub struct MinimalPlugins;
 
@@ -297,11 +307,11 @@ mod tests {
         assert_eq!(builder.len(), 2);
     }
 
-    #[test]
-    fn server_with_minimal_plugins() {
+    #[tokio::test]
+    async fn server_with_minimal_plugins() {
         let mut server = Server::new();
         server.add_plugins(MinimalPlugins.build());
-        server.finish();
+        server.finish().await;
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<ServerInfo>());

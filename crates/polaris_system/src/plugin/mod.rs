@@ -40,15 +40,20 @@
 //!     }
 //! }
 //!
+//! # tokio_test::block_on(async {
 //! Server::new()
 //!     .add_plugins(TracingPlugin)
 //!     .add_plugins(MyPlugin { config: "test".into() })
-//!     .run();
+//!     .run()
+//!     .await;
+//! # });
 //! ```
 
 mod schedule;
 
 use crate::server::Server;
+use core::future::Future;
+use core::pin::Pin;
 pub use schedule::{IntoScheduleIds, Schedule, ScheduleId};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,13 +205,13 @@ impl std::fmt::Display for PluginId {
 ///         server.insert_resource(MetricsCollector::new(self.collect_interval));
 ///     }
 ///
-///     fn ready(&self, server: &mut Server) {
+///     async fn ready(&self, server: &mut Server) {
 ///         // Validate required resources exist
 ///         let _config = server.get_resource::<GlobalConfig>()
 ///             .expect("MetricsPlugin requires GlobalConfig");
 ///     }
 ///
-///     fn cleanup(&self, server: &mut Server) {
+///     async fn cleanup(&self, server: &mut Server) {
 ///         // Flush any buffered metrics
 ///         if let Some(collector) = server.get_resource::<MetricsCollector>() {
 ///             collector.flush();
@@ -243,7 +248,9 @@ pub trait Plugin: Send + Sync + 'static {
     /// - Validation that required resources exist
     /// - One-time initialization that depends on other plugins
     /// - Establishing connections (databases, APIs, etc.)
-    fn ready(&self, _server: &mut Server) {}
+    fn ready(&self, _server: &mut Server) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// Called when a schedule this plugin registered for is triggered.
     ///
@@ -263,7 +270,9 @@ pub trait Plugin: Send + Sync + 'static {
     /// - Cleanup of external resources
     ///
     /// Called in **reverse** dependency order (dependents cleanup before dependencies).
-    fn cleanup(&self, _server: &mut Server) {}
+    fn cleanup(&self, _server: &mut Server) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// Declares which schedules this plugin wants to receive updates on.
     ///
@@ -320,10 +329,10 @@ pub trait Plugin: Send + Sync + 'static {
     ///     fn build(&self, _: &mut Server) {}
     /// }
     ///
-    /// struct IOPlugin;
+    /// struct ToolsPlugin;
     ///
-    /// impl Plugin for IOPlugin {
-    ///     const ID: &'static str = "io";
+    /// impl Plugin for ToolsPlugin {
+    ///     const ID: &'static str = "tools";
     ///     const VERSION: Version = Version::new(0, 0, 1);
     ///     fn build(&self, _: &mut Server) {}
     ///
@@ -358,11 +367,15 @@ pub(crate) trait DynPlugin: Send + Sync + 'static {
     /// See [`Plugin::build`].
     fn build(&self, server: &mut Server);
     /// See [`Plugin::ready`].
-    fn ready(&self, server: &mut Server);
+    fn ready<'a>(&'a self, server: &'a mut Server)
+    -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
     /// See [`Plugin::update`].
     fn update(&self, server: &mut Server, schedule: ScheduleId);
     /// See [`Plugin::cleanup`].
-    fn cleanup(&self, server: &mut Server);
+    fn cleanup<'a>(
+        &'a self,
+        server: &'a mut Server,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
     /// See [`Plugin::tick_schedules`].
     fn tick_schedules(&self) -> Vec<ScheduleId>;
     /// See [`Plugin::dependencies`].
@@ -379,14 +392,20 @@ impl<T: Plugin> DynPlugin for T {
     fn build(&self, server: &mut Server) {
         Plugin::build(self, server);
     }
-    fn ready(&self, server: &mut Server) {
-        Plugin::ready(self, server);
+    fn ready<'a>(
+        &'a self,
+        server: &'a mut Server,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(Plugin::ready(self, server))
     }
     fn update(&self, server: &mut Server, schedule: ScheduleId) {
         Plugin::update(self, server, schedule);
     }
-    fn cleanup(&self, server: &mut Server) {
-        Plugin::cleanup(self, server);
+    fn cleanup<'a>(
+        &'a self,
+        server: &'a mut Server,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(Plugin::cleanup(self, server))
     }
     fn tick_schedules(&self) -> Vec<ScheduleId> {
         Plugin::tick_schedules(self)
@@ -455,9 +474,9 @@ impl Plugins for PluginGroupBuilder {
 /// #     const VERSION: Version = Version::new(0,0,1);
 /// #     fn build(&self, _: &mut Server) {}
 /// # }
-/// # struct IOPlugin;
-/// # impl Plugin for IOPlugin {
-/// #     const ID: &'static str = "io";
+/// # struct TimePlugin;
+/// # impl Plugin for TimePlugin {
+/// #     const ID: &'static str = "time";
 /// #     const VERSION: Version = Version::new(0,0,1);
 /// #     fn build(&self, _: &mut Server) {}
 /// # }
@@ -468,16 +487,19 @@ impl Plugins for PluginGroupBuilder {
 ///         PluginGroupBuilder::new()
 ///             .add(CorePlugin)
 ///             .add(TracingPlugin::default())
-///             .add(IOPlugin)
+///             .add(TimePlugin)
 ///     }
 /// }
 ///
+/// # tokio_test::block_on(async {
 /// Server::new()
 ///     .add_plugins(
 ///         DefaultPlugins
 ///             .build()
 ///     )
-///     .finish();
+///     .finish()
+///     .await;
+/// # });
 /// ```
 pub trait PluginGroup {
     /// Returns the plugins in this group.

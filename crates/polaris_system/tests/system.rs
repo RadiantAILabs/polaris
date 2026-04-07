@@ -82,7 +82,7 @@ impl Plugin for ReadyPlugin {
     const VERSION: Version = Version::new(0, 0, 1);
     fn build(&self, _server: &mut Server) {}
 
-    fn ready(&self, server: &mut Server) {
+    async fn ready(&self, server: &mut Server) {
         self.ready_called
             .store(true, std::sync::atomic::Ordering::SeqCst);
         server.insert_resource(AnotherResource {
@@ -99,7 +99,7 @@ impl Plugin for CleanupPlugin {
         server.insert_resource(TestResource { value: 100 });
     }
 
-    fn cleanup(&self, server: &mut Server) {
+    async fn cleanup(&self, server: &mut Server) {
         // Remove the resource during cleanup
         server.remove_resource::<TestResource>();
     }
@@ -149,35 +149,35 @@ fn server_remove_resource() {
     assert!(!server.contains_resource::<TestResource>());
 }
 
-#[test]
-fn plugin_build_inserts_resource() {
+#[tokio::test]
+async fn plugin_build_inserts_resource() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.finish();
+    server.finish().await;
 
     let res = server.get_resource::<TestResource>().unwrap();
     assert_eq!(res.value, 1);
 }
 
-#[test]
-fn plugins_build_in_dependency_order() {
+#[tokio::test]
+async fn plugins_build_in_dependency_order() {
     let mut server = Server::new();
     // Add in reverse dependency order
     server.add_plugins(PluginC);
     server.add_plugins(PluginA);
     server.add_plugins(PluginB);
-    server.finish();
+    server.finish().await;
 
     // A sets to 1, B adds 10 (=11), C multiplies by 2 (=22)
     let res = server.get_resource::<TestResource>().unwrap();
     assert_eq!(res.value, 22);
 }
 
-#[test]
-fn plugin_ready_is_called() {
+#[tokio::test]
+async fn plugin_ready_is_called() {
     let mut server = Server::new();
     server.add_plugins(ReadyPlugin::default());
-    server.finish();
+    server.finish().await;
 
     // Ready should have inserted the resource
     assert!(server.contains_resource::<AnotherResource>());
@@ -185,36 +185,36 @@ fn plugin_ready_is_called() {
     assert_eq!(res.name, "ready");
 }
 
-#[test]
-fn plugin_cleanup_is_called() {
+#[tokio::test]
+async fn plugin_cleanup_is_called() {
     let mut server = Server::new();
     server.add_plugins(CleanupPlugin);
-    server.finish();
+    server.finish().await;
 
     // Resource exists after build
     assert!(server.contains_resource::<TestResource>());
 
-    server.cleanup();
+    server.cleanup().await;
 
     // Resource removed during cleanup
     assert!(!server.contains_resource::<TestResource>());
 }
 
-#[test]
-fn server_run_calls_finish() {
+#[tokio::test]
+async fn server_run_calls_finish() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.run();
+    server.run().await;
 
     assert!(server.is_built());
     assert!(server.contains_resource::<TestResource>());
 }
 
-#[test]
-fn server_run_once_calls_finish() {
+#[tokio::test]
+async fn server_run_once_calls_finish() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.run_once();
+    server.run_once().await;
 
     assert!(server.is_built());
     assert!(server.contains_resource::<TestResource>());
@@ -237,17 +237,17 @@ fn duplicate_unique_plugin_panics() {
     server.add_plugins(PluginA); // Should panic
 }
 
-#[test]
+#[tokio::test]
 #[should_panic(expected = "requires")]
-fn missing_dependency_panics() {
+async fn missing_dependency_panics() {
     let mut server = Server::new();
     server.add_plugins(PluginB); // Requires PluginA
-    server.finish(); // Should panic
+    server.finish().await; // Should panic
 }
 
-#[test]
+#[tokio::test]
 #[should_panic(expected = "Circular dependency")]
-fn circular_dependency_panics() {
+async fn circular_dependency_panics() {
     // Create plugins with circular dependency
     struct CycleA;
     impl Plugin for CycleA {
@@ -272,20 +272,20 @@ fn circular_dependency_panics() {
     let mut server = Server::new();
     server.add_plugins(CycleA);
     server.add_plugins(CycleB);
-    server.finish(); // Should panic
+    server.finish().await; // Should panic
 }
 
-#[test]
+#[tokio::test]
 #[should_panic(expected = "already called")]
-fn double_finish_panics() {
+async fn double_finish_panics() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.finish();
-    server.finish(); // Should panic
+    server.finish().await;
+    server.finish().await; // Should panic
 }
 
-#[test]
-fn sub_plugin_added_during_build() {
+#[tokio::test]
+async fn sub_plugin_added_during_build() {
     struct ParentPlugin;
     impl Plugin for ParentPlugin {
         const ID: &'static str = "test::parent";
@@ -298,7 +298,7 @@ fn sub_plugin_added_during_build() {
 
     let mut server = Server::new();
     server.add_plugins(ParentPlugin);
-    server.finish();
+    server.finish().await;
 
     // PluginA should have been built
     assert!(server.contains_resource::<TestResource>());
@@ -314,19 +314,19 @@ impl PluginGroup for TestPluginGroup {
     }
 }
 
-#[test]
-fn plugin_group_adds_all_plugins() {
+#[tokio::test]
+async fn plugin_group_adds_all_plugins() {
     let mut server = Server::new();
     server.add_plugins(TestPluginGroup.build());
-    server.finish();
+    server.finish().await;
 
     // Both plugins should have run
     let res = server.get_resource::<TestResource>().unwrap();
     assert_eq!(res.value, 11); // A sets 1, B adds 10
 }
 
-#[test]
-fn cleanup_in_reverse_order() {
+#[tokio::test]
+async fn cleanup_in_reverse_order() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -342,7 +342,7 @@ fn cleanup_in_reverse_order() {
         const ID: &'static str = "test::ordered_cleanup_a";
         const VERSION: Version = Version::new(0, 0, 1);
         fn build(&self, _server: &mut Server) {}
-        fn cleanup(&self, _server: &mut Server) {
+        async fn cleanup(&self, _server: &mut Server) {
             let n = self.order.fetch_add(1, Ordering::SeqCst);
             self.my_order.store(n, Ordering::SeqCst);
         }
@@ -356,7 +356,7 @@ fn cleanup_in_reverse_order() {
         const ID: &'static str = "test::ordered_cleanup_b";
         const VERSION: Version = Version::new(0, 0, 1);
         fn build(&self, _server: &mut Server) {}
-        fn cleanup(&self, _server: &mut Server) {
+        async fn cleanup(&self, _server: &mut Server) {
             let n = self.order.fetch_add(1, Ordering::SeqCst);
             self.my_order.store(n, Ordering::SeqCst);
         }
@@ -374,8 +374,8 @@ fn cleanup_in_reverse_order() {
         order: cleanup_order.clone(),
         my_order: second_cleanup.clone(),
     });
-    server.finish();
-    server.cleanup();
+    server.finish().await;
+    server.cleanup().await;
 
     // B depends on A, so B should be cleaned up first (reverse order)
     // B is at index 1 in sorted order, A is at index 0
@@ -625,8 +625,8 @@ struct TestScheduleB;
 impl Schedule for TestScheduleA {}
 impl Schedule for TestScheduleB {}
 
-#[test]
-fn plugin_registers_for_schedule_gets_ticked() {
+#[tokio::test]
+async fn plugin_registers_for_schedule_gets_ticked() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -654,7 +654,7 @@ fn plugin_registers_for_schedule_gets_ticked() {
     server.add_plugins(TickCountingPlugin {
         count: tick_count.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     assert_eq!(tick_count.load(Ordering::SeqCst), 0);
 
@@ -665,8 +665,8 @@ fn plugin_registers_for_schedule_gets_ticked() {
     assert_eq!(tick_count.load(Ordering::SeqCst), 2);
 }
 
-#[test]
-fn plugin_not_registered_for_schedule_not_ticked() {
+#[tokio::test]
+async fn plugin_not_registered_for_schedule_not_ticked() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -695,7 +695,7 @@ fn plugin_not_registered_for_schedule_not_ticked() {
     server.add_plugins(SelectivePlugin {
         count: tick_count.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     // Tick with ScheduleB - plugin should NOT be ticked
     server.tick::<TestScheduleB>();
@@ -706,8 +706,8 @@ fn plugin_not_registered_for_schedule_not_ticked() {
     assert_eq!(tick_count.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn multiple_plugins_same_schedule_all_ticked_in_order() {
+#[tokio::test]
+async fn multiple_plugins_same_schedule_all_ticked_in_order() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -769,7 +769,7 @@ fn multiple_plugins_same_schedule_all_ticked_in_order() {
         order: order.clone(),
         my_order: first_order.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     server.tick::<TestScheduleA>();
 
@@ -778,8 +778,8 @@ fn multiple_plugins_same_schedule_all_ticked_in_order() {
     assert_eq!(second_order.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn plugin_multiple_schedules() {
+#[tokio::test]
+async fn plugin_multiple_schedules() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -817,7 +817,7 @@ fn plugin_multiple_schedules() {
         count_a: count_a.clone(),
         count_b: count_b.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     server.tick::<TestScheduleA>();
     assert_eq!(count_a.load(Ordering::SeqCst), 1);
@@ -828,20 +828,20 @@ fn plugin_multiple_schedules() {
     assert_eq!(count_b.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn tick_unregistered_schedule_is_noop() {
+#[tokio::test]
+async fn tick_unregistered_schedule_is_noop() {
     // Just verify it doesn't panic
     let mut server = Server::new();
     server.add_plugins(PluginA); // PluginA doesn't register for any schedules
-    server.finish();
+    server.finish().await;
 
     // This should be a no-op (no plugins registered for this schedule)
     server.tick::<TestScheduleA>();
     server.tick::<TestScheduleB>();
 }
 
-#[test]
-fn schedule_passed_to_update_matches_triggered() {
+#[tokio::test]
+async fn schedule_passed_to_update_matches_triggered() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -871,7 +871,7 @@ fn schedule_passed_to_update_matches_triggered() {
     server.add_plugins(ScheduleCheckPlugin {
         correct: received_correct_schedule.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     server.tick::<TestScheduleA>();
 
@@ -965,8 +965,8 @@ fn multiple_api_types() {
     assert_eq!(another_api.value, 42);
 }
 
-#[test]
-fn plugin_inserts_api_in_build() {
+#[tokio::test]
+async fn plugin_inserts_api_in_build() {
     struct APIProviderPlugin;
     impl Plugin for APIProviderPlugin {
         const ID: &'static str = "test::api_provider";
@@ -980,14 +980,14 @@ fn plugin_inserts_api_in_build() {
 
     let mut server = Server::new();
     server.add_plugins(APIProviderPlugin);
-    server.finish();
+    server.finish().await;
 
     let api = server.api::<TestAPI>().unwrap();
     assert_eq!(api.name, "from-plugin");
 }
 
-#[test]
-fn plugin_accesses_api_in_ready() {
+#[tokio::test]
+async fn plugin_accesses_api_in_ready() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1012,7 +1012,7 @@ fn plugin_accesses_api_in_ready() {
         const VERSION: Version = Version::new(0, 0, 1);
         fn build(&self, _server: &mut Server) {}
 
-        fn ready(&self, server: &mut Server) {
+        async fn ready(&self, server: &mut Server) {
             if let Some(api) = server.api::<TestAPI>()
                 && api.name == "provided"
             {
@@ -1030,7 +1030,7 @@ fn plugin_accesses_api_in_ready() {
     server.add_plugins(APIConsumerPlugin {
         accessed: api_accessed.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     assert!(api_accessed.load(Ordering::SeqCst));
 }
@@ -1193,8 +1193,8 @@ fn resources_returns_reference() {
 // Schedule Integration Tests
 // ─────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn tick_schedule_uses_schedule_id_directly() {
+#[tokio::test]
+async fn tick_schedule_uses_schedule_id_directly() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1222,7 +1222,7 @@ fn tick_schedule_uses_schedule_id_directly() {
     server.add_plugins(ScheduleIdPlugin {
         count: tick_count.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     // Use tick_schedule with ScheduleId directly
     let schedule_id = ScheduleId::of::<TestScheduleA>();
@@ -1231,8 +1231,8 @@ fn tick_schedule_uses_schedule_id_directly() {
     assert_eq!(tick_count.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn update_receives_correct_schedule_id() {
+#[tokio::test]
+async fn update_receives_correct_schedule_id() {
     use parking_lot::Mutex;
     use std::sync::Arc;
 
@@ -1263,7 +1263,7 @@ fn update_receives_correct_schedule_id() {
     server.add_plugins(ScheduleTrackingPlugin {
         received: received_schedules.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     server.tick::<TestScheduleA>();
     server.tick::<TestScheduleB>();
@@ -1276,8 +1276,8 @@ fn update_receives_correct_schedule_id() {
     assert_eq!(received[2], ScheduleId::of::<TestScheduleA>());
 }
 
-#[test]
-fn plugins_with_no_tick_schedules_never_updated() {
+#[tokio::test]
+async fn plugins_with_no_tick_schedules_never_updated() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1304,7 +1304,7 @@ fn plugins_with_no_tick_schedules_never_updated() {
     server.add_plugins(NoSchedulePlugin {
         count: update_count.clone(),
     });
-    server.finish();
+    server.finish().await;
 
     // Tick various schedules
     server.tick::<TestScheduleA>();
@@ -1312,4 +1312,75 @@ fn plugins_with_no_tick_schedules_never_updated() {
 
     // Plugin should never have been updated
     assert_eq!(update_count.load(Ordering::SeqCst), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Deferred ContextFactory
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Calling `context_factory()` during `ready()` must not prevent a later
+/// plugin from calling `insert_global()`.
+#[tokio::test]
+async fn context_factory_during_ready_does_not_block_insert_global() {
+    use polaris_system::server::ContextFactory;
+    use std::sync::{Arc, OnceLock};
+
+    /// Global resource registered by PluginLate.
+    #[derive(Debug, PartialEq)]
+    struct LateGlobal {
+        value: i32,
+    }
+    impl GlobalResource for LateGlobal {}
+
+    /// Captures a `ContextFactory` during `ready()`.
+    struct EarlyPlugin {
+        factory: Arc<OnceLock<ContextFactory>>,
+    }
+    impl Plugin for EarlyPlugin {
+        const ID: &'static str = "test::early";
+        const VERSION: Version = Version::new(0, 0, 1);
+        fn build(&self, _server: &mut Server) {}
+
+        async fn ready(&self, server: &mut Server) {
+            // Grab a factory while the server is still building.
+            self.factory
+                .set(server.context_factory())
+                .unwrap_or_else(|_| panic!("factory already set"));
+        }
+    }
+
+    /// Inserts a global resource during `ready()` — runs *after* EarlyPlugin.
+    struct LatePlugin;
+    impl Plugin for LatePlugin {
+        const ID: &'static str = "test::late";
+        const VERSION: Version = Version::new(0, 0, 1);
+        fn build(&self, _server: &mut Server) {}
+
+        async fn ready(&self, server: &mut Server) {
+            // This must NOT panic even though EarlyPlugin already called
+            // context_factory().
+            server.insert_global(LateGlobal { value: 42 });
+        }
+
+        fn dependencies(&self) -> Vec<PluginId> {
+            vec![PluginId::of::<EarlyPlugin>()]
+        }
+    }
+
+    let factory_holder: Arc<OnceLock<ContextFactory>> = Arc::new(OnceLock::new());
+    let mut server = Server::new();
+    server
+        .add_plugins(EarlyPlugin {
+            factory: Arc::clone(&factory_holder),
+        })
+        .add_plugins(LatePlugin);
+    server.finish().await;
+
+    // The deferred factory should now be usable.
+    let factory = factory_holder.get().expect("factory was not set");
+    let ctx = factory.create_context();
+    let late = ctx
+        .get_resource::<LateGlobal>()
+        .expect("LateGlobal missing");
+    assert_eq!(late.value, 42);
 }
