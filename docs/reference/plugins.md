@@ -17,13 +17,13 @@ pub trait Plugin: Send + Sync + 'static {
     fn build(&self, server: &mut Server);
 
     /// Called after all plugins have been built.
-    fn ready(&self, _server: &mut Server) {}
+    async fn ready(&self, _server: &mut Server) {}
 
     /// Called when a schedule this plugin registered for is triggered.
     fn update(&self, _server: &mut Server, _schedule: ScheduleId) {}
 
     /// Called when the server is shutting down.
-    fn cleanup(&self, _server: &mut Server) {}
+    async fn cleanup(&self, _server: &mut Server) {}
 
     /// Declares which schedules this plugin wants to receive updates on.
     fn tick_schedules(&self) -> Vec<ScheduleId> { Vec::new() }
@@ -70,7 +70,7 @@ impl Plugin for ToolsPlugin {
     fn dependencies(&self) -> Vec<PluginId> {
         vec![
             PluginId::of::<TracingPlugin>(),
-            PluginId::of::<IOPlugin>(),
+            PluginId::of::<ServerInfoPlugin>(),
         ]
     }
 }
@@ -276,19 +276,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plugin_registers_resources() {
+    #[tokio::test]
+    async fn plugin_registers_resources() {
         let mut server = Server::new();
         server.add_plugins(MinimalPlugins.build());
         server.add_plugins(MyPlugin { api_key: "test".into() });
-        server.finish();
+        server.finish().await;
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<MyConfig>());
     }
 
-    #[test]
-    fn agent_with_mock_llm() {
+    #[tokio::test]
+    async fn agent_with_mock_llm() {
         let mut server = Server::new();
         server
             .add_plugins(MinimalPlugins.build())

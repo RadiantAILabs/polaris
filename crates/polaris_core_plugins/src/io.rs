@@ -1,31 +1,22 @@
-//! I/O plugin for agent communication.
+//! I/O abstractions for agent communication.
 //!
-//! Provides [`IOPlugin`] which registers per-agent I/O buffer resources, and defines
-//! the [`IOProvider`] trait for concrete communication implementations.
+//! Defines the [`IOProvider`] trait and [`UserIO`] resource for concrete
+//! communication implementations (terminal, HTTP, WebSocket, MCP, etc.).
 //!
 //! # Architecture
 //!
-//! [`IOPlugin`] is a **base abstraction layer**. It defines the contract (traits, message
-//! types, buffer resources) that concrete communication plugins can be built on top of.
-//! It does **not** implement any actual communication channels itself — that is the role of
-//! concrete plugins (e.g., terminal, WebSocket, MCP, HTTP).
+//! This module defines the contract (traits, message types) that concrete
+//! communication plugins build on. It does **not** implement any actual
+//! communication channels — that is the role of concrete plugins.
 //!
-//! # Resources Provided
-//!
-//! | Resource | Scope | Description |
-//! |----------|-------|-------------|
-//! | [`InputBuffer`] | Local | Per-agent buffer for incoming messages |
-//! | [`OutputBuffer`] | Local | Per-agent buffer for outgoing messages |
-//!
-//! [`UserIO`] is **not** registered by [`IOPlugin`] — concrete communication plugins
-//! register it via [`Server::register_local`] with a factory that captures their
-//! [`IOProvider`] implementation:
+//! Concrete plugins register [`UserIO`] via [`Server::register_local`]
+//! with a factory that captures their [`IOProvider`] implementation:
 //!
 //! ```
 //! # use std::sync::Arc;
 //! # use polaris_system::server::Server;
 //! # use polaris_system::plugin::{Plugin, PluginId, Version};
-//! # use polaris_core_plugins::{ServerInfoPlugin, IOPlugin, IOProvider, IOMessage, IOError, UserIO};
+//! # use polaris_core_plugins::{ServerInfoPlugin, IOProvider, IOMessage, IOError, UserIO};
 //!
 //! struct TerminalProvider;
 //!
@@ -51,10 +42,8 @@
 //! }
 //! ```
 
-use crate::ServerInfoPlugin;
-use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::resource::LocalResource;
-use polaris_system::server::Server;
+use serde::Serialize;
 use std::collections::HashMap;
 #[cfg(any(test, feature = "test-utils"))]
 use std::collections::VecDeque;
@@ -102,7 +91,7 @@ pub type IOStream =
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Source of an I/O message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum IOSource {
     /// From a human user.
     User,
@@ -115,7 +104,7 @@ pub enum IOSource {
 }
 
 /// Content of an I/O message, supporting multiple modalities.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum IOContent {
     /// Plain text content.
     Text(String),
@@ -145,7 +134,7 @@ pub enum IOContent {
 /// let data = serde_json::json!({"result": 42});
 /// let msg = IOMessage::from_agent("planner", IOContent::Structured(data));
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IOMessage {
     /// Message content — supports multiple modalities.
     pub content: IOContent,
@@ -306,8 +295,8 @@ impl<T: IOProvider> ErasedProvider for T {
 /// Each agent context gets its own `UserIO` instance, enabling per-agent
 /// I/O isolation while optionally sharing the underlying provider via `Arc`.
 ///
-/// Registered by concrete communication plugins (not by [`IOPlugin`] itself)
-/// using [`Server::register_local`] with a factory that captures a shared
+/// Registered by concrete communication plugins using
+/// [`Server::register_local`] with a factory that captures a shared
 /// provider. See the [module-level documentation](self) for a full example.
 ///
 /// # Example
@@ -457,200 +446,6 @@ pub struct ConfirmResponse {
     pub confirmed: bool,
     /// The full response message from the user/provider.
     pub message: IOMessage,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// InputBuffer Resource
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Per-agent buffer for incoming messages.
-///
-/// Local resource that systems use to buffer received messages.
-/// Each agent context gets its own isolated buffer.
-///
-/// # Example
-///
-/// ```
-/// use polaris_system::param::ResMut;
-/// use polaris_system::system;
-/// use polaris_core_plugins::{InputBuffer, IOMessage};
-///
-/// #[system]
-/// async fn process_inputs(mut input: ResMut<'_, InputBuffer>) {
-///     for msg in input.drain() {
-///         // Process each buffered message
-///         # let _ = msg;
-///     }
-/// }
-/// ```
-#[derive(Debug)]
-pub struct InputBuffer {
-    messages: Vec<IOMessage>,
-}
-
-impl LocalResource for InputBuffer {}
-
-impl InputBuffer {
-    /// Creates a new empty input buffer.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-        }
-    }
-
-    /// Pushes a message into the buffer.
-    pub fn push(&mut self, message: IOMessage) {
-        self.messages.push(message);
-    }
-
-    /// Drains all messages from the buffer, returning them.
-    pub fn drain(&mut self) -> Vec<IOMessage> {
-        std::mem::take(&mut self.messages)
-    }
-
-    /// Clears the buffer, discarding all messages.
-    pub fn clear(&mut self) {
-        self.messages.clear();
-    }
-
-    /// Returns the number of buffered messages.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
-    /// Returns `true` if the buffer is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-}
-
-impl Default for InputBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OutputBuffer Resource
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Per-agent buffer for outgoing messages.
-///
-/// Local resource that systems use to buffer messages for sending.
-/// Each agent context gets its own isolated buffer.
-///
-/// # Example
-///
-/// ```
-/// use polaris_system::param::ResMut;
-/// use polaris_system::system;
-/// use polaris_core_plugins::{OutputBuffer, IOMessage, IOContent};
-///
-/// #[system]
-/// async fn prepare_response(mut output: ResMut<'_, OutputBuffer>) {
-///     output.push(IOMessage::system_text("Processing complete."));
-/// }
-/// ```
-#[derive(Debug)]
-pub struct OutputBuffer {
-    messages: Vec<IOMessage>,
-}
-
-impl LocalResource for OutputBuffer {}
-
-impl OutputBuffer {
-    /// Creates a new empty output buffer.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-        }
-    }
-
-    /// Pushes a message into the buffer.
-    pub fn push(&mut self, message: IOMessage) {
-        self.messages.push(message);
-    }
-
-    /// Drains all messages from the buffer, returning them.
-    pub fn drain(&mut self) -> Vec<IOMessage> {
-        std::mem::take(&mut self.messages)
-    }
-
-    /// Clears the buffer, discarding all messages.
-    pub fn clear(&mut self) {
-        self.messages.clear();
-    }
-
-    /// Returns the number of buffered messages.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
-    /// Returns `true` if the buffer is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-}
-
-impl Default for OutputBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// IOPlugin
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// I/O plugin providing per-agent message buffers.
-///
-/// Registers [`InputBuffer`] and [`OutputBuffer`] as local resources.
-/// Does **not** register [`UserIO`] — that is the responsibility of concrete
-/// communication plugins that implement [`IOProvider`].
-///
-/// # Resources Provided
-///
-/// | Resource | Scope | Description |
-/// |----------|-------|-------------|
-/// | [`InputBuffer`] | Local | Per-agent incoming message buffer |
-/// | [`OutputBuffer`] | Local | Per-agent outgoing message buffer |
-///
-/// # Dependencies
-///
-/// - [`ServerInfoPlugin`]
-///
-/// # Example
-///
-/// ```
-/// use polaris_system::server::Server;
-/// use polaris_core_plugins::{ServerInfoPlugin, IOPlugin};
-///
-/// let mut server = Server::new();
-/// server.add_plugins(ServerInfoPlugin);
-/// server.add_plugins(IOPlugin);
-/// server.finish();
-/// ```
-#[derive(Debug, Default, Clone, Copy)]
-pub struct IOPlugin;
-
-impl Plugin for IOPlugin {
-    const ID: &'static str = "polaris::io";
-    const VERSION: Version = Version::new(0, 0, 1);
-
-    fn build(&self, server: &mut Server) {
-        server.register_local(InputBuffer::new);
-        server.register_local(OutputBuffer::new);
-    }
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<ServerInfoPlugin>()]
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -865,56 +660,6 @@ mod tests {
         }
     }
 
-    // -- InputBuffer tests --
-
-    #[test]
-    fn input_buffer_push_and_drain() {
-        let mut buf = InputBuffer::new();
-        assert!(buf.is_empty());
-        assert_eq!(buf.len(), 0);
-
-        buf.push(IOMessage::user_text("msg1"));
-        buf.push(IOMessage::user_text("msg2"));
-        assert_eq!(buf.len(), 2);
-        assert!(!buf.is_empty());
-
-        let drained = buf.drain();
-        assert_eq!(drained.len(), 2);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn input_buffer_clear() {
-        let mut buf = InputBuffer::new();
-        buf.push(IOMessage::user_text("msg"));
-        buf.clear();
-        assert!(buf.is_empty());
-    }
-
-    // -- OutputBuffer tests --
-
-    #[test]
-    fn output_buffer_push_and_drain() {
-        let mut buf = OutputBuffer::new();
-        assert!(buf.is_empty());
-
-        buf.push(IOMessage::system_text("response1"));
-        buf.push(IOMessage::system_text("response2"));
-        assert_eq!(buf.len(), 2);
-
-        let drained = buf.drain();
-        assert_eq!(drained.len(), 2);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn output_buffer_clear() {
-        let mut buf = OutputBuffer::new();
-        buf.push(IOMessage::system_text("msg"));
-        buf.clear();
-        assert!(buf.is_empty());
-    }
-
     // -- MockIOProvider tests --
 
     #[tokio::test]
@@ -1011,20 +756,6 @@ mod tests {
         io_a.send(IOMessage::system_text("from A")).await.unwrap();
         io_b.send(IOMessage::system_text("from B")).await.unwrap();
         assert_eq!(shared.sent_count(), 2);
-    }
-
-    // -- IOPlugin tests --
-
-    #[test]
-    fn io_plugin_registers_buffers() {
-        let mut server = Server::new();
-        server.add_plugins(ServerInfoPlugin);
-        server.add_plugins(IOPlugin);
-        server.finish();
-
-        let ctx = server.create_context();
-        assert!(ctx.contains_resource::<InputBuffer>());
-        assert!(ctx.contains_resource::<OutputBuffer>());
     }
 
     // -- UserIO::confirm tests --

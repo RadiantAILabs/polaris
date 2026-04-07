@@ -239,7 +239,8 @@ impl GraphExecutor {
         let node_count = graph.node_count();
 
         let middleware_info = middleware::info::GraphInfo { node_count };
-        mw.graph_execution
+        mw.inner
+            .graph_execution
             .execute(middleware_info, ctx, |ctx| {
                 let entry = entry.clone();
                 Box::pin(self.execute_graph_body(graph, ctx, entry, node_count, hooks, mw))

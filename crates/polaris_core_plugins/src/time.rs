@@ -32,7 +32,9 @@
 //! let mut server = Server::new();
 //! server.add_plugins(ServerInfoPlugin);
 //! server.add_plugins(TimePlugin::default());
-//! server.finish();
+//! # tokio_test::block_on(async {
+//! server.finish().await;
+//! # });
 //! ```
 
 use crate::ServerInfoPlugin;
@@ -284,7 +286,9 @@ impl Default for Stopwatch {
 /// let mut server = Server::new();
 /// server.add_plugins(ServerInfoPlugin);
 /// server.add_plugins(TimePlugin::default());
-/// server.finish();
+/// # tokio_test::block_on(async {
+/// server.finish().await;
+/// # });
 /// ```
 ///
 /// # Testing with Mock Clock
@@ -306,7 +310,9 @@ impl Default for Stopwatch {
 /// let mut server = Server::new();
 /// server.add_plugins(ServerInfoPlugin);
 /// server.add_plugins(plugin);
-/// server.finish();
+/// # tokio_test::block_on(async {
+/// server.finish().await;
+/// # });
 ///
 /// // Advance time in tests without waiting
 /// mock.advance(Duration::from_secs(60));
@@ -517,15 +523,15 @@ mod tests {
         assert_eq!(mock.current(), target);
     }
 
-    #[test]
-    fn time_plugin_with_mock_clock() {
+    #[tokio::test]
+    async fn time_plugin_with_mock_clock() {
         let mock = Arc::new(MockClock::new(Instant::now()));
         let plugin = TimePlugin::with_clock(mock.clone());
 
         let mut server = Server::new();
         server.add_plugins(ServerInfoPlugin);
         server.add_plugins(plugin);
-        server.finish();
+        server.finish().await;
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<Clock>());

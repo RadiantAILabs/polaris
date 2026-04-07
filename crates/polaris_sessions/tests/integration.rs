@@ -45,12 +45,12 @@ impl Agent for CounterAgent {
 }
 
 /// Builds a server with persistence + sessions (auto-checkpoint disabled).
-fn test_server(store: Arc<InMemoryStore>) -> Server {
+async fn test_server(store: Arc<InMemoryStore>) -> Server {
     let mut server = Server::new();
     server
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(store).without_auto_checkpoint());
-    server.finish();
+    server.finish().await;
 
     let persistence = server.api::<PersistenceAPI>().unwrap();
     persistence.register::<Counter>("test");
@@ -65,9 +65,14 @@ fn test_server(store: Arc<InMemoryStore>) -> Server {
 fn create_test_session(server: &Server, id: &SessionId) {
     let sessions = server.api::<SessionsAPI>().unwrap();
     sessions
-        .create_session_with(server, id, &AgentTypeId::from_name("CounterAgent"), |ctx| {
-            ctx.insert(Counter::default());
-        })
+        .create_session_with(
+            server.create_context(),
+            id,
+            &AgentTypeId::from_name("CounterAgent"),
+            |ctx| {
+                ctx.insert(Counter::default());
+            },
+        )
         .unwrap();
 }
 
@@ -91,14 +96,14 @@ async fn read_counter(store: &InMemoryStore, id: &SessionId) -> u32 {
 #[tokio::test]
 async fn multi_turn_and_save() {
     let store = Arc::new(InMemoryStore::new());
-    let server = test_server(Arc::clone(&store));
+    let server = test_server(Arc::clone(&store)).await;
     let sessions = server.api::<SessionsAPI>().unwrap();
     let id = SessionId::new();
 
     create_test_session(&server, &id);
 
     for _ in 0..3 {
-        sessions.process_turn(&server, &id).await.unwrap();
+        sessions.process_turn(&id).await.unwrap();
     }
 
     sessions.save_session(&id).await.unwrap();
@@ -109,20 +114,20 @@ async fn multi_turn_and_save() {
 #[tokio::test]
 async fn checkpoint_and_rollback() {
     let store = Arc::new(InMemoryStore::new());
-    let server = test_server(Arc::clone(&store));
+    let server = test_server(Arc::clone(&store)).await;
     let sessions = server.api::<SessionsAPI>().unwrap();
     let id = SessionId::new();
 
     create_test_session(&server, &id);
 
     // Turn 0 → counter = 1.
-    sessions.process_turn(&server, &id).await.unwrap();
+    sessions.process_turn(&id).await.unwrap();
     let cp_turn = sessions.checkpoint(&id).await.unwrap();
     assert_eq!(cp_turn, 1);
 
     // Two more turns → counter = 3.
     for turn in 0..2 {
-        sessions.process_turn(&server, &id).await.unwrap();
+        sessions.process_turn(&id).await.unwrap();
 
         // Verify counter value after each turn (should be 2, then 3).
         sessions.save_session(&id).await.unwrap();
@@ -145,12 +150,12 @@ async fn save_and_resume() {
 
     // First "process lifetime": run 2 turns and save.
     {
-        let server = test_server(Arc::clone(&store));
+        let server = test_server(Arc::clone(&store)).await;
         let sessions = server.api::<SessionsAPI>().unwrap();
         create_test_session(&server, &id);
 
         for _ in 0..2 {
-            sessions.process_turn(&server, &id).await.unwrap();
+            sessions.process_turn(&id).await.unwrap();
         }
 
         // Verify counter value is 2 before saving.
@@ -160,11 +165,14 @@ async fn save_and_resume() {
 
     // Second "process lifetime": fresh server, same store.
     {
-        let server = test_server(Arc::clone(&store));
+        let server = test_server(Arc::clone(&store)).await;
         let sessions = server.api::<SessionsAPI>().unwrap();
 
-        sessions.resume_session(&server, &id).await.unwrap();
-        sessions.process_turn(&server, &id).await.unwrap();
+        sessions
+            .resume_session(server.create_context(), &id)
+            .await
+            .unwrap();
+        sessions.process_turn(&id).await.unwrap();
 
         sessions.save_session(&id).await.unwrap();
         assert_eq!(read_counter(&store, &id).await, 3);
@@ -175,7 +183,7 @@ async fn save_and_resume() {
 #[tokio::test]
 async fn session_isolation() {
     let store = Arc::new(InMemoryStore::new());
-    let server = test_server(Arc::clone(&store));
+    let server = test_server(Arc::clone(&store)).await;
     let sessions = server.api::<SessionsAPI>().unwrap();
 
     let id_a = SessionId::new();
@@ -184,9 +192,9 @@ async fn session_isolation() {
     create_test_session(&server, &id_b);
 
     for _ in 0..3 {
-        sessions.process_turn(&server, &id_a).await.unwrap();
+        sessions.process_turn(&id_a).await.unwrap();
     }
-    sessions.process_turn(&server, &id_b).await.unwrap();
+    sessions.process_turn(&id_b).await.unwrap();
 
     sessions.save_session(&id_a).await.unwrap();
     sessions.save_session(&id_b).await.unwrap();
@@ -199,12 +207,12 @@ async fn session_isolation() {
 #[tokio::test]
 async fn unregistered_agent_errors() {
     let store = Arc::new(InMemoryStore::new());
-    let server = test_server(Arc::clone(&store));
+    let server = test_server(Arc::clone(&store)).await;
     let sessions = server.api::<SessionsAPI>().unwrap();
 
     let err = sessions
         .create_session(
-            &server,
+            server.create_context(),
             &SessionId::new(),
             &AgentTypeId::from_name("UnknownAgent"),
         )

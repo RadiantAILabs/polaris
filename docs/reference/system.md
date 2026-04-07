@@ -201,6 +201,27 @@ async fn plan(memory: Res<Memory>, llm: Res<LLM>) -> PlannerOutput {
 }
 ```
 
+## ContextFactory
+
+`ContextFactory` is a clonable handle that creates fresh `SystemContext` instances outside of direct `Server` access. It captures the server's global resources and local resource factories, enabling context creation from HTTP handlers, background tasks, or any code that does not hold a `&Server` reference.
+
+```rust
+let factory = server.context_factory();
+
+// Move factory to another thread, create contexts freely
+let ctx = factory.create_context();
+```
+
+Each call to `create_context()` produces a `SystemContext<'static>` with a shared reference to global resources and fresh instances of all registered local resources.
+
+### Deferred Binding
+
+`ContextFactory` uses deferred binding when created during the plugin `ready()` phase. This is necessary because `Server::insert_global()` requires exclusive access to the global resource `Arc` (via `Arc::get_mut`). A direct `Arc::clone` during `ready()` would bump the reference count and prevent any downstream plugin from registering global resources.
+
+When `context_factory()` is called during `ready()`, the factory stores a deferred handle instead of a direct `Arc` reference. The handle is resolved at the end of `Server::finish()`, after all plugins have completed their `ready()` phase and all global resources are registered. Calling `create_context()` before `finish()` completes will panic.
+
+Outside of the `ready()` phase (before `finish()` starts or after it completes), `context_factory()` returns a direct reference with no deferred resolution.
+
 ## Examples
 
 A read-only system that computes a value from shared state:

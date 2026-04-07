@@ -203,7 +203,7 @@ impl Plugin for ToolsPlugin {
         server.insert_resource(ToolRegistry::new());
     }
 
-    fn ready(&self, server: &mut Server) {
+    async fn ready(&self, server: &mut Server) {
         let registry = server
             .remove_resource::<ToolRegistry>()
             .expect("ToolRegistry should exist from build phase");

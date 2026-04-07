@@ -8,13 +8,16 @@ publish = false
 
 [features]
 default = []
-otel = ["polaris/otel"]
+otel = ["polaris/otel", "polaris_app/otel"]
 
 [lints.rust]
 missing_docs = "allow"
 
 [dependencies]
 polaris = { path = ".." }
+polaris_app = { path = "../crates/polaris_app" }
+polaris_sessions = { path = "../crates/polaris_sessions", features = ["http"] }
+axum = "0.8"
 dotenvy = "0.15"
 rustyline = "17.0.2"
 schemars = "1.2"

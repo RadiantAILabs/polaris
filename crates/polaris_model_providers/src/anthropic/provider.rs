@@ -3,13 +3,17 @@
 use super::client::AnthropicClient;
 use super::types::{
     self as anthropic_types, ContentBlock, ContentBlockParam, CreateMessageRequest, ImageMediaType,
-    ImageSource, MessageParam, OutputFormat, Role, ToolChoiceParam, ToolDef, ToolResultBlock,
-    ToolResultContent,
+    ImageSource, MessageParam, OutputFormat, RawStreamEvent, Role, StreamContentBlock, StreamDelta,
+    ToolChoiceParam, ToolDef, ToolResultBlock, ToolResultContent,
 };
 use crate::schema::normalize_schema_for_strict_mode;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+use futures_core::Stream;
 use polaris_models::llm::{
-    AssistantBlock, GenerationError, ImageBlock, ImageMediaType as PolarisImageMediaType,
-    LlmProvider, LlmRequest, LlmResponse, Message, StopReason, ToolCall, ToolChoice, ToolFunction,
+    AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, ImageBlock,
+    ImageMediaType as PolarisImageMediaType, LlmProvider, LlmRequest, LlmResponse, LlmStream,
+    Message, StopReason, StreamEvent, ToolCall, ToolChoice, ToolFunction,
     ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 
@@ -48,7 +52,180 @@ impl LlmProvider for AnthropicProvider {
 
         Ok(convert_response(response))
     }
+
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::Auth`] if the API key is not valid UTF-8.
+    /// Returns [`GenerationError::Http`] if the HTTP request fails to send.
+    /// Returns [`GenerationError::Provider`] if the server responds with a non-2xx
+    /// status code.
+    /// Returns [`GenerationError::InvalidResponse`] if an SSE frame contains
+    /// invalid UTF-8 or unparseable JSON.
+    async fn stream(&self, model: &str, request: LlmRequest) -> Result<LlmStream, GenerationError> {
+        let anthropic_request = convert_request(model, &request)?;
+
+        let raw_stream = self.client.create_message_stream(anthropic_request).await?;
+
+        Ok(Box::pin(AnthropicStreamAdapter::new(raw_stream)))
+    }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream Adapter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Converts a stream of Anthropic [`RawStreamEvent`]s into Polaris [`StreamEvent`]s.
+///
+/// Tracks input token usage from `message_start` and combines it with output
+/// tokens from `message_delta` to produce complete [`Usage`] values.
+struct AnthropicStreamAdapter<S> {
+    inner: S,
+    /// Input tokens from the `message_start` event.
+    input_tokens: Option<u64>,
+    /// Output tokens from the latest `message_delta` event.
+    output_tokens: Option<u64>,
+    /// Stop reason from the `message_delta` event, held until `message_stop`.
+    stop_reason: Option<StopReason>,
+    /// Block indices whose `ContentBlockStart` was filtered (e.g. redacted
+    /// thinking). Subsequent deltas and stop events for these indices are
+    /// also suppressed so the collector never sees an orphaned stop.
+    filtered_indices: Vec<u32>,
+}
+
+impl<S> AnthropicStreamAdapter<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            input_tokens: None,
+            output_tokens: None,
+            stop_reason: None,
+            filtered_indices: Vec::new(),
+        }
+    }
+
+    fn build_usage(&self) -> Usage {
+        let input = self.input_tokens.unwrap_or(0);
+        let output = self.output_tokens.unwrap_or(0);
+        Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_tokens: Some(input + output),
+        }
+    }
+
+    fn convert_event(
+        &mut self,
+        raw: RawStreamEvent,
+    ) -> Option<Result<StreamEvent, GenerationError>> {
+        match raw {
+            RawStreamEvent::MessageStart { message } => {
+                self.input_tokens = Some(message.usage.input_tokens);
+                None
+            }
+            RawStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                let block = match content_block {
+                    StreamContentBlock::Text { .. } => ContentBlockStartData::Text,
+                    StreamContentBlock::ToolUse { id, name, .. } => {
+                        ContentBlockStartData::ToolCall {
+                            id,
+                            call_id: None,
+                            name,
+                        }
+                    }
+                    StreamContentBlock::Thinking { .. } => ContentBlockStartData::Reasoning,
+                    StreamContentBlock::RedactedThinking { .. } => {
+                        self.filtered_indices.push(index);
+                        return None;
+                    }
+                };
+                Some(Ok(StreamEvent::ContentBlockStart { index, block }))
+            }
+            RawStreamEvent::ContentBlockDelta { index, delta } => {
+                if self.filtered_indices.contains(&index) {
+                    return None;
+                }
+                let delta = match delta {
+                    StreamDelta::Text { text } => ContentBlockDelta::Text(text),
+                    StreamDelta::InputJson { partial_json } => ContentBlockDelta::ToolCall {
+                        arguments: partial_json,
+                    },
+                    StreamDelta::Thinking { thinking } => ContentBlockDelta::Reasoning(thinking),
+                    StreamDelta::Signature { signature } => ContentBlockDelta::Signature(signature),
+                };
+                Some(Ok(StreamEvent::ContentBlockDelta { index, delta }))
+            }
+            RawStreamEvent::ContentBlockStop { index } => {
+                if self.filtered_indices.contains(&index) {
+                    return None;
+                }
+                Some(Ok(StreamEvent::ContentBlockStop { index }))
+            }
+            RawStreamEvent::MessageDelta { delta, usage } => {
+                if let Some(usage) = usage {
+                    self.output_tokens = Some(usage.output_tokens);
+                }
+                self.stop_reason = Some(convert_stop_reason(delta.stop_reason));
+                Some(Ok(StreamEvent::MessageDelta {
+                    usage: self.build_usage(),
+                }))
+            }
+            RawStreamEvent::MessageStop => {
+                let stop_reason = match self.stop_reason.take() {
+                    Some(reason) => reason,
+                    None => {
+                        tracing::warn!(
+                            "message_stop received without a preceding message_delta; \
+                             defaulting to EndTurn"
+                        );
+                        StopReason::EndTurn
+                    }
+                };
+                Some(Ok(StreamEvent::MessageStop {
+                    stop_reason,
+                    usage: self.build_usage(),
+                }))
+            }
+            RawStreamEvent::Ping => None,
+            RawStreamEvent::Error { error } => Some(Err(GenerationError::Provider {
+                status: None,
+                message: format!("{}: {}", error.error_type, error.message),
+                source: None,
+            })),
+        }
+    }
+}
+
+impl<S> Stream for AnthropicStreamAdapter<S>
+where
+    S: Stream<Item = Result<RawStreamEvent, GenerationError>> + Unpin,
+{
+    type Item = Result<StreamEvent, GenerationError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(raw))) => {
+                    if let Some(event) = this.convert_event(raw) {
+                        return Poll::Ready(Some(event));
+                    }
+                    // Event was filtered (ping, message_start, redacted thinking) — poll again.
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request/Response Conversion
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn convert_request(
     model: &str,
@@ -89,6 +266,7 @@ fn convert_request(
         temperature: None,
         stop_sequences: None,
         output_format,
+        stream: None,
     })
 }
 
@@ -269,5 +447,306 @@ fn convert_content_block(block: ContentBlock) -> Option<AssistantBlock> {
             },
         )),
         ContentBlock::RedactedThinking { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::{
+        MessageDeltaPayload, MessageDeltaUsage, MessageStartPayload, StreamErrorInfo, UsageResponse,
+    };
+    use super::*;
+
+    #[test]
+    fn converts_text_stream() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+
+        let events = vec![
+            RawStreamEvent::MessageStart {
+                message: MessageStartPayload {
+                    usage: UsageResponse {
+                        input_tokens: 10,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                },
+            },
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: StreamContentBlock::Text {
+                    text: String::new(),
+                },
+            },
+            RawStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::Text {
+                    text: "Hello".to_string(),
+                },
+            },
+            RawStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::Text {
+                    text: " world".to_string(),
+                },
+            },
+            RawStreamEvent::ContentBlockStop { index: 0 },
+            RawStreamEvent::MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: anthropic_types::StopReason::EndTurn,
+                },
+                usage: Some(MessageDeltaUsage { output_tokens: 5 }),
+            },
+            RawStreamEvent::MessageStop,
+        ];
+
+        let converted: Vec<_> = events
+            .into_iter()
+            .filter_map(|raw| adapter.convert_event(raw))
+            .collect();
+
+        // 7 raw events: MessageStart(None), ContentBlockStart, delta, delta,
+        // ContentBlockStop, MessageDelta, MessageStop = 6 converted events.
+        assert_eq!(converted.len(), 6);
+
+        assert!(matches!(
+            converted[0].as_ref().unwrap(),
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStartData::Text
+            }
+        ));
+        assert!(matches!(
+            converted[1].as_ref().unwrap(),
+            StreamEvent::ContentBlockDelta { index: 0, delta: ContentBlockDelta::Text(t) } if t == "Hello"
+        ));
+        assert!(matches!(
+            converted[2].as_ref().unwrap(),
+            StreamEvent::ContentBlockDelta { index: 0, delta: ContentBlockDelta::Text(t) } if t == " world"
+        ));
+        assert!(matches!(
+            converted[3].as_ref().unwrap(),
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
+        assert!(matches!(
+            converted[4].as_ref().unwrap(),
+            StreamEvent::MessageDelta { .. }
+        ));
+        assert!(matches!(
+            converted[5].as_ref().unwrap(),
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn converts_tool_use_stream() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+
+        let events = vec![
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: StreamContentBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::Value::Object(serde_json::Map::new()),
+                },
+            },
+            RawStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::InputJson {
+                    partial_json: r#"{"city""#.to_string(),
+                },
+            },
+            RawStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::InputJson {
+                    partial_json: r#":"London"}"#.to_string(),
+                },
+            },
+            RawStreamEvent::ContentBlockStop { index: 0 },
+        ];
+
+        let converted: Vec<_> = events
+            .into_iter()
+            .filter_map(|raw| adapter.convert_event(raw))
+            .collect();
+
+        assert_eq!(converted.len(), 4);
+
+        assert!(matches!(
+            converted[0].as_ref().unwrap(),
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStartData::ToolCall { id, name, .. }
+            } if id == "tool_1" && name == "get_weather"
+        ));
+
+        assert!(matches!(
+            converted[1].as_ref().unwrap(),
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::ToolCall { arguments }
+            } if arguments == r#"{"city""#
+        ));
+    }
+
+    #[test]
+    fn converts_thinking_stream() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+
+        let events = vec![
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: StreamContentBlock::Thinking {
+                    thinking: String::new(),
+                },
+            },
+            RawStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::Thinking {
+                    thinking: "Let me think...".to_string(),
+                },
+            },
+            RawStreamEvent::ContentBlockStop { index: 0 },
+        ];
+
+        let converted: Vec<_> = events
+            .into_iter()
+            .filter_map(|raw| adapter.convert_event(raw))
+            .collect();
+
+        assert_eq!(converted.len(), 3);
+        assert!(matches!(
+            converted[0].as_ref().unwrap(),
+            StreamEvent::ContentBlockStart {
+                block: ContentBlockStartData::Reasoning,
+                ..
+            }
+        ));
+        assert!(matches!(
+            converted[1].as_ref().unwrap(),
+            StreamEvent::ContentBlockDelta { delta: ContentBlockDelta::Reasoning(t), .. } if t == "Let me think..."
+        ));
+    }
+
+    #[test]
+    fn usage_tracks_across_events() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+
+        adapter.convert_event(RawStreamEvent::MessageStart {
+            message: MessageStartPayload {
+                usage: UsageResponse {
+                    input_tokens: 25,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+            },
+        });
+
+        let msg_delta = adapter.convert_event(RawStreamEvent::MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: anthropic_types::StopReason::EndTurn,
+            },
+            usage: Some(MessageDeltaUsage { output_tokens: 15 }),
+        });
+
+        let delta_event = msg_delta.unwrap().unwrap();
+        assert!(matches!(
+            &delta_event,
+            StreamEvent::MessageDelta { usage } if usage.input_tokens == Some(25) && usage.output_tokens == Some(15)
+        ));
+
+        let msg_stop = adapter
+            .convert_event(RawStreamEvent::MessageStop)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &msg_stop,
+            StreamEvent::MessageStop { stop_reason: StopReason::EndTurn, usage }
+                if usage.input_tokens == Some(25) && usage.output_tokens == Some(15) && usage.total_tokens == Some(40)
+        ));
+    }
+
+    #[test]
+    fn error_event_maps_to_generation_error() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+
+        let result = adapter.convert_event(RawStreamEvent::Error {
+            error: StreamErrorInfo {
+                error_type: "overloaded_error".to_string(),
+                message: "Overloaded".to_string(),
+            },
+        });
+
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn ping_is_filtered() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+        assert!(adapter.convert_event(RawStreamEvent::Ping).is_none());
+    }
+
+    #[test]
+    fn redacted_thinking_is_filtered() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+        let result = adapter.convert_event(RawStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: StreamContentBlock::RedactedThinking {
+                data: "redacted".to_string(),
+            },
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn redacted_thinking_filters_entire_block() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+
+        // ContentBlockStart for redacted thinking should be filtered.
+        let start = adapter.convert_event(RawStreamEvent::ContentBlockStart {
+            index: 1,
+            content_block: StreamContentBlock::RedactedThinking {
+                data: "redacted".to_string(),
+            },
+        });
+        assert!(start.is_none(), "redacted start should be filtered");
+
+        // ContentBlockStop for the same index should also be filtered.
+        let stop = adapter.convert_event(RawStreamEvent::ContentBlockStop { index: 1 });
+        assert!(
+            stop.is_none(),
+            "stop for redacted block should also be filtered"
+        );
+
+        // A stop for a non-filtered index should still pass through.
+        let other_stop = adapter.convert_event(RawStreamEvent::ContentBlockStop { index: 0 });
+        assert!(
+            other_stop.is_some(),
+            "stop for other index should pass through"
+        );
+    }
+
+    #[test]
+    fn signature_delta_is_preserved() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+        let result = adapter.convert_event(RawStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: StreamDelta::Signature {
+                signature: "EqQBCgIYAhIM...".to_string(),
+            },
+        });
+        let event = result.expect("signature should not be filtered").unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::Signature(s)
+            } if s == "EqQBCgIYAhIM..."
+        ));
     }
 }

@@ -9,9 +9,12 @@
 //! # struct DefaultPlugins;
 //! # impl Plugin for DefaultPlugins { const ID: &'static str = "default"; const VERSION: Version = Version::new(0,0,1); fn build(&self, _: &mut Server) {} }
 //!
+//! # tokio_test::block_on(async {
 //! Server::new()
 //!     .add_plugins(DefaultPlugins)
-//!     .run();
+//!     .run()
+//!     .await;
+//! # });
 //! ```
 //!
 //! # Resource Scoping
@@ -64,7 +67,7 @@ use crate::resource::{
 };
 use hashbrown::{HashMap, HashSet};
 use std::any::TypeId;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Server
@@ -74,7 +77,7 @@ use std::sync::Arc;
 type BoxedResource = Box<dyn std::any::Any + Send + Sync>;
 
 /// Factory function that creates a local resource instance.
-type LocalFactory = Box<dyn Fn() -> BoxedResource + Send + Sync>;
+type LocalFactory = Arc<dyn Fn() -> BoxedResource + Send + Sync>;
 
 /// Type-erased API for dynamic storage.
 type BoxedAPI = Box<dyn std::any::Any + Send + Sync>;
@@ -147,6 +150,13 @@ pub struct Server {
     ///
     /// Progresses linearly: `NotStarted` → `Building` → `Built`.
     build_state: BuildState,
+
+    /// Shared handle for deferred global binding in [`ContextFactory`].
+    ///
+    /// Filled at the end of [`finish()`](Self::finish) so that factories created
+    /// during the `ready()` phase can resolve globals without bumping the
+    /// `Arc` reference count on [`global`](Self::global) prematurely.
+    deferred_globals: Arc<OnceLock<Arc<Resources>>>,
 }
 
 /// Internal entry for a registered plugin.
@@ -182,6 +192,7 @@ impl Server {
             plugin_ids: HashSet::new(),
             schedule_registry: HashMap::new(),
             build_state: BuildState::NotStarted,
+            deferred_globals: Arc::new(OnceLock::new()),
         }
     }
 
@@ -411,7 +422,7 @@ impl Server {
         factory: impl Fn() -> R + Send + Sync + 'static,
     ) {
         self.local_factories
-            .insert(TypeId::of::<R>(), Box::new(move || Box::new(factory())));
+            .insert(TypeId::of::<R>(), Arc::new(move || Box::new(factory())));
     }
 
     /// Returns true if a local resource factory for type `R` is registered.
@@ -469,6 +480,47 @@ impl Server {
     #[must_use]
     pub fn global_resources(&self) -> &Resources {
         &self.global
+    }
+
+    /// Returns a clonable factory that creates fresh [`SystemContext`] instances.
+    ///
+    /// The factory captures the current global resources and local resource
+    /// factories, enabling context creation outside of direct `Server` access
+    /// (e.g., from HTTP handlers).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::server::Server;
+    /// # use polaris_system::resource::LocalResource;
+    /// # struct Memory;
+    /// # impl LocalResource for Memory {}
+    /// # impl Memory { fn new() -> Self { Self } }
+    /// # let mut server = Server::new();
+    /// # server.register_local(Memory::new);
+    /// let factory = server.context_factory();
+    /// let ctx = factory.create_context();
+    /// ```
+    #[must_use]
+    pub fn context_factory(&self) -> ContextFactory {
+        let globals = match self.build_state {
+            // During the ready() phase, return a deferred handle so we don't
+            // bump the Arc ref count on `self.global` (which would break
+            // Arc::get_mut in downstream insert_global calls).
+            BuildState::Building => {
+                ContextFactoryGlobals::Deferred(Arc::clone(&self.deferred_globals))
+            }
+            // Before or after finish(), clone the Arc directly.
+            _ => ContextFactoryGlobals::Direct(Arc::clone(&self.global)),
+        };
+        ContextFactory {
+            globals,
+            local_factories: self
+                .local_factories
+                .iter()
+                .map(|(k, v)| (*k, Arc::clone(v)))
+                .collect(),
+        }
     }
 
     /// Returns whether the server has been built (i.e., `finish()` has been called).
@@ -618,7 +670,7 @@ impl Server {
     /// - If a plugin's dependency is not satisfied
     /// - If there is a circular dependency between plugins
     /// - If called more than once
-    pub fn finish(&mut self) {
+    pub async fn finish(&mut self) {
         if self.build_state != BuildState::NotStarted {
             panic!("Server::finish() was already called. Cannot build twice.");
         }
@@ -643,12 +695,16 @@ impl Server {
             // pointer remains valid. The plugin's ready() may add resources but
             // shouldn't modify built_plugins.
             unsafe {
-                (*plugin_ptr).ready(self);
+                (*plugin_ptr).ready(self).await;
             }
         }
 
         // Phase 4: Build schedule registry from plugin tick_schedules()
         self.build_schedule_registry();
+
+        // Phase 5: Bind deferred globals so any ContextFactory created during
+        // ready() can now resolve.
+        let _ = self.deferred_globals.set(Arc::clone(&self.global));
 
         self.build_state = BuildState::Built;
     }
@@ -679,8 +735,8 @@ impl Server {
     /// # Panics
     ///
     /// Same as [`finish()`](Self::finish).
-    pub fn run(&mut self) {
-        self.finish();
+    pub async fn run(&mut self) {
+        self.finish().await;
         // Run loop will be added in Layer 2
     }
 
@@ -703,29 +759,29 @@ impl Server {
     /// #         server.insert_resource(MyResource);
     /// #     }
     /// # }
-    /// fn test_plugin() {
-    ///     let mut server = Server::new();
-    ///     server.add_plugins(MyPlugin);
-    ///     server.run_once();
+    /// # tokio_test::block_on(async {
+    /// let mut server = Server::new();
+    /// server.add_plugins(MyPlugin);
+    /// server.run_once().await;
     ///
-    ///     assert!(server.contains_resource::<MyResource>());
-    /// }
+    /// assert!(server.contains_resource::<MyResource>());
+    /// # });
     /// ```
-    pub fn run_once(&mut self) {
-        self.finish();
+    pub async fn run_once(&mut self) {
+        self.finish().await;
     }
 
     /// Cleans up all plugins in reverse dependency order.
     ///
     /// Call this when shutting down the server to allow plugins to
     /// gracefully release resources.
-    pub fn cleanup(&mut self) {
+    pub async fn cleanup(&mut self) {
         // Cleanup in reverse order (dependents before dependencies)
         for i in (0..self.built_plugins.len()).rev() {
             let plugin_ptr = &self.built_plugins[i].plugin as *const Box<dyn DynPlugin>;
             // SAFETY: Same as ready() - we don't modify built_plugins during cleanup
             unsafe {
-                (*plugin_ptr).cleanup(self);
+                (*plugin_ptr).cleanup(self).await;
             }
         }
     }
@@ -836,5 +892,88 @@ impl Server {
         }
 
         result.into_iter().flatten().collect()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ContextFactory
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Internal strategy for how a [`ContextFactory`] resolves global resources.
+#[derive(Clone)]
+enum ContextFactoryGlobals {
+    /// Direct reference — used before `finish()` starts or after it completes.
+    Direct(Arc<Resources>),
+    /// Deferred binding — used during the `ready()` phase so that no extra
+    /// `Arc` reference count is held on the server's global resource map
+    /// (which would block [`Server::insert_global`] via `Arc::get_mut`).
+    /// The [`OnceLock`] is filled at the end of [`Server::finish()`].
+    Deferred(Arc<OnceLock<Arc<Resources>>>),
+}
+
+/// A clonable factory that creates fresh [`SystemContext`] instances.
+///
+/// Captures the server's global resources and local resource factories,
+/// enabling context creation outside of direct [`Server`] access (e.g.,
+/// from HTTP handlers running on background tasks).
+///
+/// Created via [`Server::context_factory()`]. Safe to call during the
+/// plugin `ready()` phase — the factory uses deferred binding internally
+/// so it does not block [`Server::insert_global()`] in downstream plugins.
+///
+/// # Example
+///
+/// ```
+/// # use polaris_system::server::Server;
+/// # use polaris_system::resource::LocalResource;
+/// # struct Memory;
+/// # impl LocalResource for Memory {}
+/// # impl Memory { fn new() -> Self { Self } }
+/// # let mut server = Server::new();
+/// # server.register_local(Memory::new);
+/// let factory = server.context_factory();
+///
+/// // Move factory to another thread, create contexts freely
+/// let ctx = factory.create_context();
+/// ```
+#[derive(Clone)]
+pub struct ContextFactory {
+    globals: ContextFactoryGlobals,
+    local_factories: Vec<(TypeId, Arc<dyn Fn() -> BoxedResource + Send + Sync>)>,
+}
+
+impl std::fmt::Debug for ContextFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextFactory")
+            .field("local_factory_count", &self.local_factories.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContextFactory {
+    /// Creates a new [`SystemContext`] with global resources and fresh local
+    /// resource instances.
+    ///
+    /// Equivalent to [`Server::create_context()`] but does not require a
+    /// `&Server` reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the factory was created during the `ready()` phase and
+    /// [`Server::finish()`] has not yet completed.
+    #[must_use]
+    pub fn create_context(&self) -> SystemContext<'static> {
+        let globals = match &self.globals {
+            ContextFactoryGlobals::Direct(arc) => Arc::clone(arc),
+            ContextFactoryGlobals::Deferred(once) => Arc::clone(
+                once.get()
+                    .expect("cannot create context: Server::finish() has not completed"),
+            ),
+        };
+        let mut ctx = SystemContext::with_globals(globals);
+        for (type_id, factory) in &self.local_factories {
+            ctx.insert_boxed(*type_id, factory());
+        }
+        ctx
     }
 }

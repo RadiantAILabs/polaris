@@ -12,7 +12,7 @@ This crate provides foundational plugins that most Polaris applications need.
 | `TimePlugin` | `Clock`, `Stopwatch` | Global, Local | Time utilities with mockable clock |
 | `TracingPlugin` | `TracingConfig`, `TracingLayersApi` | Global, Build-time | Logging, observability, and instrumentation via `tracing` |
 | `OpenTelemetryPlugin` | — | — | OTLP trace export via `tracing-opentelemetry` |
-| `IOPlugin` | `UserIO` | Local | Abstracted IO for user interaction and tool integration |
+| I/O abstractions | `UserIO`, `IOProvider` | Local | Abstracted IO for user interaction and tool integration |
 
 Each plugin may be added individually, or altogether through the `DefaultPlugins` plugin group:
 
@@ -128,12 +128,12 @@ OpenTelemetryPlugin::new("http://localhost:4318/v1/traces")
     .with_export_header("x-api-key", api_key);
 ```
 
-### IOPlugin
+### I/O Abstractions
 
-Provides an abstracted `UserIO` resource for user interaction, which can be implemented by different providers (e.g., terminal, web):
+Provides the `IOProvider` trait and `UserIO` resource for agent communication. Concrete plugins (terminal, HTTP, WebSocket) implement `IOProvider` and register `UserIO` via `Server::register_local`:
 
 ```rust
-use polaris_core_plugins::{IOPlugin, UserIO, IOMessage};
+use polaris_core_plugins::{UserIO, IOMessage};
 use polaris_system::param::ResMut;
 
 #[system]

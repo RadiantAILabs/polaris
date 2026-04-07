@@ -98,7 +98,10 @@ enum BlockAccumulator {
         name: String,
         arguments: String,
     },
-    Reasoning(String),
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
 }
 
 impl BlockAccumulator {
@@ -111,7 +114,10 @@ impl BlockAccumulator {
                 name,
                 arguments: String::new(),
             },
-            ContentBlockStartData::Reasoning => Self::Reasoning(String::new()),
+            ContentBlockStartData::Reasoning => Self::Reasoning {
+                text: String::new(),
+                signature: None,
+            },
         }
     }
 
@@ -119,21 +125,20 @@ impl BlockAccumulator {
         match self {
             Self::Text(_) => "text",
             Self::ToolCall { .. } => "tool_call",
-            Self::Reasoning(_) => "reasoning",
+            Self::Reasoning { .. } => "reasoning",
         }
     }
 
     fn apply_delta(&mut self, delta: ContentBlockDelta) -> Result<(), GenerationError> {
-        #[expect(
-            clippy::match_same_arms,
-            reason = "arms enforce variant-to-variant pairing"
-        )]
         match (self, &delta) {
             (Self::Text(buf), ContentBlockDelta::Text(s)) => buf.push_str(s),
             (Self::ToolCall { arguments, .. }, ContentBlockDelta::ToolCall { arguments: s }) => {
                 arguments.push_str(s);
             }
-            (Self::Reasoning(buf), ContentBlockDelta::Reasoning(s)) => buf.push_str(s),
+            (Self::Reasoning { text, .. }, ContentBlockDelta::Reasoning(s)) => text.push_str(s),
+            (Self::Reasoning { signature, .. }, ContentBlockDelta::Signature(s)) => {
+                *signature = Some(s.clone());
+            }
             (acc, _) => {
                 return Err(GenerationError::InvalidResponse(format!(
                     "delta type {delta_kind} does not match block type {block_kind}",
@@ -168,10 +173,10 @@ impl BlockAccumulator {
                     additional_params: None,
                 }))
             }
-            Self::Reasoning(reasoning) => Ok(AssistantBlock::Reasoning(ReasoningBlock {
+            Self::Reasoning { text, signature } => Ok(AssistantBlock::Reasoning(ReasoningBlock {
                 id: None,
-                reasoning: vec![reasoning],
-                signature: None,
+                reasoning: vec![text],
+                signature,
             })),
         }
     }

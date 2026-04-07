@@ -204,7 +204,7 @@ impl PersistenceAPI {
     ///         server.insert_resource(Memory { messages: vec![] });
     ///     }
     ///
-    ///     fn ready(&self, server: &mut Server) {
+    ///     async fn ready(&self, server: &mut Server) {
     ///         // Register the resource type for persistence
     ///         let api = server.api::<PersistenceAPI>()
     ///             .expect("PersistenceAPI should be available");
@@ -293,8 +293,8 @@ mod tests {
         assert_eq!(Notes::schema_version(), "2.0.0");
     }
 
-    #[test]
-    fn round_trip_via_serializer() {
+    #[tokio::test]
+    async fn round_trip_via_serializer() {
         let api = PersistenceAPI::new();
         api.register::<Memory>("test.plugin");
 
@@ -303,7 +303,7 @@ mod tests {
         };
 
         let mut server = Server::new();
-        server.finish();
+        server.finish().await;
         let mut ctx = server.create_context();
         ctx.insert(original.clone());
 
@@ -341,13 +341,13 @@ mod tests {
         assert_eq!(serializer.schema_version(), "1.0.0");
     }
 
-    #[test]
-    fn save_missing_resource_returns_none() {
+    #[tokio::test]
+    async fn save_missing_resource_returns_none() {
         let api = PersistenceAPI::new();
         api.register::<Memory>("test.plugin");
 
         let mut server = Server::new();
-        server.finish();
+        server.finish().await;
         let ctx = server.create_context();
 
         let serializers = api.serializers();

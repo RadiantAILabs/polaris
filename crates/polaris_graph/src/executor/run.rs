@@ -173,6 +173,7 @@ impl GraphExecutor {
                         max_iterations,
                     };
                     let count = middleware
+                        .inner
                         .loop_iteration
                         .execute(iter_info, ctx, |ctx| {
                             Self::invoke_hook::<OnLoopIteration>(
@@ -257,6 +258,7 @@ impl GraphExecutor {
                         branch_count: par.branches.len(),
                     };
                     middleware
+                        .inner
                         .parallel_branch
                         .execute(branch_info, child_ctx, |ctx| {
                             self.execute_from(graph, ctx, branch.clone(), depth, hooks, middleware)
@@ -417,6 +419,7 @@ impl GraphExecutor {
                         };
 
                         let result = middleware
+                            .inner
                             .system
                             .execute(sys_info, ctx, |ctx| {
                                 Box::pin(async {
@@ -544,6 +547,7 @@ impl GraphExecutor {
                         };
 
                         let branch_count = middleware
+                            .inner
                             .decision
                             .execute(dec_info, ctx, |ctx| {
                                 Box::pin(async {
@@ -636,6 +640,7 @@ impl GraphExecutor {
                             max_iterations: resolved_max,
                         };
                         let loop_count = middleware
+                            .inner
                             .loop_node
                             .execute(loop_info, ctx, |ctx| {
                                 self.execute_loop(
@@ -664,6 +669,7 @@ impl GraphExecutor {
                             branch_count: par.branches.len(),
                         };
                         let parallel_count = middleware
+                            .inner
                             .parallel_node
                             .execute(par_info, ctx, |ctx| {
                                 self.execute_parallel(graph, ctx, par, depth + 1, hooks, middleware)
@@ -685,6 +691,7 @@ impl GraphExecutor {
                             has_default: switch_node.default.is_some(),
                         };
                         let switch_count = middleware
+                            .inner
                             .switch
                             .execute(switch_info, ctx, |ctx| {
                                 self.execute_switch(

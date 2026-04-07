@@ -10,10 +10,12 @@
 
 use polaris::plugins::{
     CONFIRMED, CONFIRMED_FALSE, CONFIRMED_TRUE, IO_TYPE, IO_TYPE_CONFIRM, IOContent, IOError,
-    IOMessage, IOPlugin, IOProvider, IOSource, UserIO,
+    IOMessage, IOProvider, IOSource, UserIO,
 };
-use polaris::system::plugin::{Plugin, PluginId, Version};
+use polaris::system::api::API;
+use polaris::system::plugin::{Plugin, Version};
 use polaris::system::server::Server;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 // ANSI style constants
@@ -38,10 +40,13 @@ const STYLE_RESET: &str = "\x1b[0m";
 /// multiple agents sharing the same provider will produce incorrect results.
 /// Use a per-agent provider or a queue-based implementation for multi-agent
 /// scenarios.
+#[derive(Debug)]
 pub struct TerminalIOProvider {
     /// Tracks the `io_type` from the last `send()` so `receive()` can
     /// format the response appropriately.
     last_io_type: Mutex<Option<String>>,
+    /// Pre-loaded messages returned before falling back to stdin.
+    queue: Mutex<VecDeque<IOMessage>>,
 }
 
 impl TerminalIOProvider {
@@ -49,7 +54,20 @@ impl TerminalIOProvider {
     pub fn new() -> Self {
         Self {
             last_io_type: Mutex::new(None),
+            queue: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Enqueues a message to be returned by the next [`IOProvider::receive`] call.
+    ///
+    /// Messages in the queue are drained first, before falling back to stdin.
+    /// This allows external code (e.g., the CLI REPL) to inject user messages
+    /// through the same [`UserIO`] protocol the agent uses.
+    pub fn push(&self, message: IOMessage) {
+        self.queue
+            .lock()
+            .expect("TerminalIOProvider lock poisoned")
+            .push_back(message);
     }
 }
 
@@ -98,6 +116,15 @@ impl IOProvider for TerminalIOProvider {
     }
 
     async fn receive(&self) -> Result<IOMessage, IOError> {
+        // Drain queued messages first (e.g., user input injected by the CLI).
+        {
+            let mut queue = self.queue.lock().expect("TerminalIOProvider lock poisoned");
+            if let Some(message) = queue.pop_front() {
+                return Ok(message);
+            }
+        }
+
+        // No queued messages — fall back to stdin (for confirmations, etc.).
         let io_type = self
             .last_io_type
             .lock()
@@ -140,9 +167,27 @@ impl IOProvider for TerminalIOProvider {
     }
 }
 
-/// Plugin that registers [`TerminalIOProvider`] as the [`UserIO`] local resource.
+/// API handle for pushing messages into the [`TerminalIOProvider`] queue.
 ///
-/// Depends on [`IOPlugin`].
+/// Registered by [`TerminalIOPlugin`] and accessed via
+/// [`Server::api::<TerminalIO>()`](polaris::system::server::Server::api).
+#[derive(Debug)]
+pub struct TerminalIO {
+    provider: Arc<TerminalIOProvider>,
+}
+
+impl API for TerminalIO {}
+
+impl TerminalIO {
+    /// Push a message into the provider's queue for the next
+    /// [`IOProvider::receive`] call.
+    pub fn push(&self, message: IOMessage) {
+        self.provider.push(message);
+    }
+}
+
+/// Plugin that registers [`TerminalIOProvider`] as the [`UserIO`] local
+/// resource and exposes a [`TerminalIO`] API for injecting messages.
 pub struct TerminalIOPlugin;
 
 impl Plugin for TerminalIOPlugin {
@@ -151,10 +196,8 @@ impl Plugin for TerminalIOPlugin {
 
     fn build(&self, server: &mut Server) {
         let provider = Arc::new(TerminalIOProvider::new());
-        server.register_local(move || UserIO::new(provider.clone()));
-    }
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<IOPlugin>()]
+        let provider_for_factory = provider.clone();
+        server.register_local(move || UserIO::new(provider_for_factory.clone()));
+        server.insert_api(TerminalIO { provider });
     }
 }

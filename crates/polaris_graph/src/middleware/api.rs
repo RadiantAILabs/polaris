@@ -308,10 +308,22 @@ impl<I: Clone + Send + Sync + 'static> Chain<I> {
 
 /// Registry for middleware chains.
 ///
+/// # Cloning
+///
+/// `MiddlewareAPI` is cheaply cloneable (`Arc`-backed). Clones share the
+/// same underlying chains, so middleware registered on one clone is visible
+/// to all.
+///
 /// See the [module-level docs](super) for an overview of targets and layer
 /// ordering.
-#[derive(Default)]
+#[derive(Clone)]
 pub struct MiddlewareAPI {
+    pub(crate) inner: Arc<MiddlewareInner>,
+}
+
+/// Shared state backing [`MiddlewareAPI`].
+#[derive(Default)]
+pub(crate) struct MiddlewareInner {
     pub(crate) graph_execution: Chain<GraphInfo>,
     pub(crate) system: Chain<SystemInfo>,
     pub(crate) loop_node: Chain<LoopInfo>,
@@ -320,6 +332,20 @@ pub struct MiddlewareAPI {
     pub(crate) switch: Chain<SwitchInfo>,
     pub(crate) loop_iteration: Chain<LoopIterationInfo>,
     pub(crate) parallel_branch: Chain<ParallelBranchInfo>,
+}
+
+impl fmt::Debug for MiddlewareAPI {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MiddlewareAPI").finish_non_exhaustive()
+    }
+}
+
+impl Default for MiddlewareAPI {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(MiddlewareInner::default()),
+        }
+    }
 }
 
 impl API for MiddlewareAPI {}
@@ -339,7 +365,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<GraphInfo>,
     ) -> &Self {
-        self.graph_execution.push(name, handler);
+        self.inner.graph_execution.push(name, handler);
         self
     }
 
@@ -366,7 +392,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<SystemInfo>,
     ) -> &Self {
-        self.system.push(name, handler);
+        self.inner.system.push(name, handler);
         self
     }
 
@@ -378,7 +404,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<LoopInfo>,
     ) -> &Self {
-        self.loop_node.push(name, handler);
+        self.inner.loop_node.push(name, handler);
         self
     }
 
@@ -390,7 +416,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<ParallelInfo>,
     ) -> &Self {
-        self.parallel_node.push(name, handler);
+        self.inner.parallel_node.push(name, handler);
         self
     }
 
@@ -402,7 +428,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<DecisionInfo>,
     ) -> &Self {
-        self.decision.push(name, handler);
+        self.inner.decision.push(name, handler);
         self
     }
 
@@ -414,7 +440,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<SwitchInfo>,
     ) -> &Self {
-        self.switch.push(name, handler);
+        self.inner.switch.push(name, handler);
         self
     }
 
@@ -426,7 +452,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<LoopIterationInfo>,
     ) -> &Self {
-        self.loop_iteration.push(name, handler);
+        self.inner.loop_iteration.push(name, handler);
         self
     }
 
@@ -438,7 +464,7 @@ impl MiddlewareAPI {
         name: impl Into<String>,
         handler: impl MiddlewareHandler<ParallelBranchInfo>,
     ) -> &Self {
-        self.parallel_branch.push(name, handler);
+        self.inner.parallel_branch.push(name, handler);
         self
     }
 }
@@ -465,14 +491,14 @@ mod tests {
     #[test]
     fn register_and_count() {
         let api = MiddlewareAPI::new();
-        assert_eq!(api.system.len(), 0, "initial count should be zero");
+        assert_eq!(api.inner.system.len(), 0, "initial count should be zero");
 
         api.register_system("first", |_info, _ctx, next| {
             Box::pin(async move { next.run(_ctx).await })
         });
 
         assert_eq!(
-            api.system.len(),
+            api.inner.system.len(),
             1,
             "count should be 1 after first register"
         );
@@ -482,7 +508,7 @@ mod tests {
         });
 
         assert_eq!(
-            api.system.len(),
+            api.inner.system.len(),
             2,
             "count should be 2 after second register"
         );
@@ -502,6 +528,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         let result = api
+            .inner
             .system
             .execute(mock_system_info(), &mut ctx, &terminal)
             .await;
@@ -538,6 +565,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         let result = api
+            .inner
             .system
             .execute(mock_system_info(), &mut ctx, &terminal)
             .await;
@@ -579,7 +607,8 @@ mod tests {
             };
 
         let mut ctx = SystemContext::new();
-        api.system
+        api.inner
+            .system
             .execute(mock_system_info(), &mut ctx, &terminal)
             .await
             .unwrap();
@@ -616,7 +645,11 @@ mod tests {
             node_id: NodeId::new(),
         };
 
-        api.system.execute(info, &mut ctx, &terminal).await.unwrap();
+        api.inner
+            .system
+            .execute(info, &mut ctx, &terminal)
+            .await
+            .unwrap();
 
         assert_eq!(
             *captured_name.lock(),
@@ -636,7 +669,7 @@ mod tests {
             Box::pin(async move { next.run(_ctx).await })
         });
 
-        assert_eq!(api.system.len(), 2);
+        assert_eq!(api.inner.system.len(), 2);
     }
 
     #[tokio::test]
@@ -654,6 +687,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         let result = api
+            .inner
             .system
             .execute(mock_system_info(), &mut ctx, &terminal)
             .await;
@@ -690,6 +724,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         let result = api
+            .inner
             .system
             .execute(mock_system_info(), &mut ctx, &terminal)
             .await;
@@ -720,6 +755,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         let result = api
+            .inner
             .system
             .execute(mock_system_info(), &mut ctx, terminal)
             .await;
@@ -747,6 +783,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         let result = api
+            .inner
             .system
             .execute(mock_system_info(), &mut ctx, terminal)
             .await;

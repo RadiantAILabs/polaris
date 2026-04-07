@@ -10,12 +10,12 @@ use serde_json::{Value, json};
 // Plugin registration
 // ─────────────────────────────────────────────────────────────────────
 
-#[test]
-fn plugin_registers_run_command_tool() {
+#[tokio::test]
+async fn plugin_registers_run_command_tool() {
     let mut server = Server::new();
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(ShellConfig::new()));
-    server.finish();
+    server.finish().await;
 
     let ctx = server.create_context();
     let registry = Res::<ToolRegistry>::fetch(&ctx).expect("ToolRegistry should be accessible");
@@ -31,12 +31,12 @@ fn plugin_registers_run_command_tool() {
 // Tool definition schema
 // ─────────────────────────────────────────────────────────────────────
 
-#[test]
-fn tool_definition_has_correct_schema() {
+#[tokio::test]
+async fn tool_definition_has_correct_schema() {
     let mut server = Server::new();
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(ShellConfig::new()));
-    server.finish();
+    server.finish().await;
 
     let ctx = server.create_context();
     let registry = Res::<ToolRegistry>::fetch(&ctx).unwrap();
@@ -100,7 +100,7 @@ async fn tool_execution_via_registry() {
             .with_allowed_commands(vec!["echo *".into()])
             .disable_sandbox(),
     ));
-    server.finish();
+    server.finish().await;
 
     let ctx = server.create_context();
     let registry = Res::<ToolRegistry>::fetch(&ctx).unwrap();
@@ -131,7 +131,7 @@ async fn tool_returns_error_on_denied_command() {
     server.add_plugins(ShellPlugin::new(
         ShellConfig::new().with_denied_commands(vec!["rm *".into()]),
     ));
-    server.finish();
+    server.finish().await;
 
     let ctx = server.create_context();
     let registry = Res::<ToolRegistry>::fetch(&ctx).unwrap();
@@ -154,7 +154,7 @@ async fn tool_returns_confirmation_required_for_unconfirmed_command() {
     server.add_plugins(ToolsPlugin);
     // No allowed or denied patterns — everything requires confirmation
     server.add_plugins(ShellPlugin::new(ShellConfig::new()));
-    server.finish();
+    server.finish().await;
 
     let ctx = server.create_context();
     let registry = Res::<ToolRegistry>::fetch(&ctx).unwrap();
@@ -175,14 +175,14 @@ async fn tool_returns_confirmation_required_for_unconfirmed_command() {
 // ShellExecutor registered as global resource
 // ─────────────────────────────────────────────────────────────────────
 
-#[test]
-fn shell_executor_accessible_as_global_resource() {
+#[tokio::test]
+async fn shell_executor_accessible_as_global_resource() {
     use polaris_shell::ShellExecutor;
 
     let mut server = Server::new();
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(ShellConfig::new().with_timeout(60)));
-    server.finish();
+    server.finish().await;
 
     let ctx = server.create_context();
     let executor = Res::<ShellExecutor>::fetch(&ctx)

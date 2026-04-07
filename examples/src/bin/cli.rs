@@ -20,20 +20,20 @@
 //! - `/rollback <turn>` — Rollback to a checkpoint
 //! - `/exit` or `/quit` — Exit the REPL
 
-use examples::plugins::{FileToolsConfig, FileToolsPlugin, TerminalIOPlugin};
+use examples::plugins::{FileToolsConfig, FileToolsPlugin, TerminalIO, TerminalIOPlugin};
 use examples::react_agent::{AgentConfig, ContextManager, ReActAgent, ReActPlugin, ReactState};
 use polaris::models::AnthropicPlugin;
 use polaris::models::llm::{AssistantBlock, Message, UserBlock};
 #[cfg(feature = "otel")]
 use polaris::plugins::OpenTelemetryPlugin;
-use polaris::plugins::{IOMessage, InputBuffer, PersistenceAPI, PersistencePlugin};
+use polaris::plugins::{IOMessage, PersistenceAPI, PersistencePlugin};
 use polaris::sessions::{
     AgentTypeId, FileStore, SessionId, SessionInfo, SessionsAPI, SessionsPlugin,
 };
 use polaris::{
     graph::{DevToolsPlugin, GraphExecutor},
     models::ModelsPlugin,
-    plugins::{FmtConfig, IOPlugin, ServerInfoPlugin, TracingPlugin},
+    plugins::{FmtConfig, ServerInfoPlugin, TracingPlugin},
     system::server::Server,
     tools::ToolsPlugin,
 };
@@ -188,7 +188,6 @@ async fn main() {
     let capture_content = args.iter().any(|a| a == "--capture-content");
 
     let agent_config = AgentConfig::new("anthropic/claude-sonnet-4-6");
-    let file_tools_config = FileToolsConfig::new(&working_dir);
 
     // Build server
     let mut server = Server::new();
@@ -200,12 +199,11 @@ async fn main() {
     server
         .add_plugins(tracing_plugin)
         .add_plugins(ServerInfoPlugin)
-        .add_plugins(IOPlugin)
         .add_plugins(TerminalIOPlugin)
         .add_plugins(ModelsPlugin)
         .add_plugins(AnthropicPlugin::from_env("ANTHROPIC_API_KEY"))
         .add_plugins(ToolsPlugin)
-        .add_plugins(FileToolsPlugin::new(file_tools_config))
+        .add_plugins(FileToolsPlugin::new(FileToolsConfig::new(&working_dir)))
         .add_plugins(PersistencePlugin)
         .add_plugins(ReActPlugin)
         .add_plugins(SessionsPlugin::new(Arc::new(FileStore::new("data"))))
@@ -216,11 +214,14 @@ async fn main() {
         server.add_plugins(OpenTelemetryPlugin::new(endpoint));
     }
 
-    server.finish();
+    server.finish().await;
 
     // Set serializers after all plugins have registered their resources.
     let persistence = server.api::<PersistenceAPI>().unwrap();
     let sessions = server.api::<SessionsAPI>().unwrap();
+    let terminal_io = server
+        .api::<TerminalIO>()
+        .expect("TerminalIOPlugin must be added");
     sessions.set_serializers(persistence.serializers());
     if let Err(err) = sessions.register_agent(ReActAgent) {
         eprintln!("{STYLE_RED}{err}{STYLE_RESET}");
@@ -232,9 +233,14 @@ async fn main() {
     let agent_type = AgentTypeId::from_name(ReActAgent::NAME);
 
     match sessions
-        .resume_session_with_executor(&server, &session_id, make_executor(), |ctx| {
-            ctx.insert(agent_config.clone());
-        })
+        .resume_session_with_executor(
+            server.create_context(),
+            &session_id,
+            make_executor(),
+            |ctx| {
+                ctx.insert(agent_config.clone());
+            },
+        )
         .await
     {
         Ok(()) => {
@@ -243,7 +249,7 @@ async fn main() {
         Err(_) => {
             sessions
                 .create_session_with_executor(
-                    &server,
+                    server.create_context(),
                     &session_id,
                     &agent_type,
                     make_executor(),
@@ -408,12 +414,10 @@ async fn main() {
                     session = %session_id_str,
                     input = trimmed,
                 );
+                terminal_io.push(IOMessage::user_text(trimmed));
                 let result = async {
                     sessions
-                        .process_turn_with(&server, &session_id, |ctx| {
-                            ctx.get_resource_mut::<InputBuffer>()
-                                .expect("InputBuffer missing")
-                                .push(IOMessage::user_text(trimmed));
+                        .process_turn_with(&session_id, |ctx| {
                             ctx.insert(ReactState::default());
                             ctx.clear_outputs();
                         })

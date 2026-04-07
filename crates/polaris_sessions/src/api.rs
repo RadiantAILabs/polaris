@@ -5,9 +5,9 @@
 //! and accessed via `server.api::<SessionsAPI>()`.
 
 use crate::error::SessionError;
-use crate::info::SessionInfo;
-use crate::store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore};
-use hashbrown::HashMap;
+use crate::info::{SessionInfo, SessionMetadata, SessionStatus};
+use crate::store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber};
+use hashbrown::{HashMap, hash_map::Entry};
 use parking_lot::RwLock;
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin, ResourceSerializer};
@@ -17,8 +17,9 @@ use polaris_graph::{ExecutionResult, Graph, GraphExecutor};
 use polaris_system::api::API;
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::{Plugin, PluginId, Version};
-use polaris_system::server::Server;
+use polaris_system::server::{ContextFactory, Server};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// A snapshot of session resources at a specific turn.
 struct Checkpoint {
-    turn_number: u32,
+    turn_number: TurnNumber,
     data: SessionData,
 }
 
@@ -47,16 +48,35 @@ struct SessionState {
     agent_type: AgentTypeId,
     turn_number: AtomicU32,
     checkpoints: parking_lot::Mutex<Vec<Checkpoint>>,
+    created_at: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SessionsAPI
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Internal state shared by all clones of a [`SessionsAPI`].
+struct SessionsInner {
+    store: Arc<dyn SessionStore>,
+    serializers: RwLock<Arc<Vec<Arc<dyn ResourceSerializer>>>>,
+    agents: RwLock<HashMap<AgentTypeId, Arc<dyn Agent>>>,
+    sessions: RwLock<HashMap<SessionId, Arc<SessionState>>>,
+    auto_checkpoint: AtomicBool,
+    hooks: OnceLock<HooksAPI>,
+    middleware: OnceLock<MiddlewareAPI>,
+    context_factory: OnceLock<ContextFactory>,
+}
+
 /// Server API for session lifecycle management.
 ///
 /// Provides methods to register agents, create/resume sessions, execute turns,
 /// checkpoint/rollback state, and persist sessions to a [`SessionStore`].
+///
+/// # Cloning
+///
+/// `SessionsAPI` is cheaply cloneable (backed by `Arc`). Clones share
+/// the same underlying state, making it suitable for use as shared state
+/// in HTTP handlers.
 ///
 /// # Auto-Checkpoint
 ///
@@ -70,12 +90,18 @@ struct SessionState {
 /// # Interior Mutability
 ///
 /// All methods take `&self` and use internal locks for thread safety.
+#[derive(Clone)]
 pub struct SessionsAPI {
-    store: Arc<dyn SessionStore>,
-    serializers: RwLock<Vec<Arc<dyn ResourceSerializer>>>,
-    agents: RwLock<HashMap<AgentTypeId, Arc<dyn Agent>>>,
-    sessions: RwLock<HashMap<SessionId, Arc<SessionState>>>,
-    auto_checkpoint: AtomicBool,
+    inner: Arc<SessionsInner>,
+}
+
+impl std::fmt::Debug for SessionsAPI {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let session_count = self.inner.sessions.read().len();
+        f.debug_struct("SessionsAPI")
+            .field("session_count", &session_count)
+            .finish_non_exhaustive()
+    }
 }
 
 impl API for SessionsAPI {}
@@ -86,11 +112,16 @@ impl SessionsAPI {
     /// Auto-checkpoint is enabled by default.
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
         Self {
-            store,
-            serializers: RwLock::new(Vec::new()),
-            agents: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
-            auto_checkpoint: AtomicBool::new(true),
+            inner: Arc::new(SessionsInner {
+                store,
+                serializers: RwLock::new(Arc::new(Vec::new())),
+                agents: RwLock::new(HashMap::new()),
+                sessions: RwLock::new(HashMap::new()),
+                auto_checkpoint: AtomicBool::new(true),
+                hooks: OnceLock::new(),
+                middleware: OnceLock::new(),
+                context_factory: OnceLock::new(),
+            }),
         }
     }
 
@@ -98,12 +129,66 @@ impl SessionsAPI {
     ///
     /// Called during the plugin ready phase.
     pub fn set_serializers(&self, serializers: Vec<Arc<dyn ResourceSerializer>>) {
-        *self.serializers.write() = serializers;
+        *self.inner.serializers.write() = Arc::new(serializers);
     }
 
     /// Sets whether auto-checkpoint is enabled.
     pub fn set_auto_checkpoint(&self, enabled: bool) {
-        self.auto_checkpoint.store(enabled, Ordering::Relaxed);
+        self.inner.auto_checkpoint.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Stores the graph execution APIs (hooks and middleware) for use
+    /// during turn processing.
+    ///
+    /// Called during the plugin ready phase.
+    ///
+    /// # Panics
+    ///
+    /// Panics if hooks or middleware have already been set.
+    pub fn set_graph_apis(&self, hooks: Option<HooksAPI>, middleware: Option<MiddlewareAPI>) {
+        if let Some(hooks) = hooks {
+            self.inner
+                .hooks
+                .set(hooks)
+                .unwrap_or_else(|_| panic!("hooks already set"));
+        }
+        if let Some(middleware) = middleware {
+            self.inner
+                .middleware
+                .set(middleware)
+                .unwrap_or_else(|_| panic!("middleware already set"));
+        }
+    }
+
+    /// Sets the context factory used to create fresh system contexts.
+    ///
+    /// Called automatically by [`SessionsPlugin::ready()`]. Only call this
+    /// manually if you are not using `SessionsPlugin`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a factory has already been set.
+    pub fn set_context_factory(&self, factory: ContextFactory) {
+        self.inner
+            .context_factory
+            .set(factory)
+            .unwrap_or_else(|_| panic!("context factory already set"));
+    }
+
+    /// Creates a fresh [`SystemContext`] using the stored
+    /// [`ContextFactory`](polaris_system::server::ContextFactory).
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`set_context_factory`](Self::set_context_factory) has not
+    /// been called.
+    #[must_use]
+    pub fn create_context(&self) -> SystemContext<'static> {
+        self.inner
+            .context_factory
+            .get()
+            .expect("context factory not set — call set_context_factory() after server.finish()")
+            .create_context()
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -137,8 +222,32 @@ impl SessionsAPI {
         };
 
         let id = AgentTypeId::from_name(agent.name());
-        self.agents.write().insert(id, Arc::new(agent));
+        self.inner.agents.write().insert(id, Arc::new(agent));
         Ok(())
+    }
+
+    /// Returns the names of all registered agent types.
+    #[must_use]
+    pub fn registered_agents(&self) -> Vec<&'static str> {
+        self.inner
+            .agents
+            .read()
+            .keys()
+            .map(AgentTypeId::as_str)
+            .collect()
+    }
+
+    /// Finds the [`AgentTypeId`] for a registered agent by name.
+    ///
+    /// Returns `None` if no agent with that name has been registered.
+    #[must_use]
+    pub fn find_agent_type(&self, name: &str) -> Option<AgentTypeId> {
+        self.inner
+            .agents
+            .read()
+            .keys()
+            .find(|k| k.as_str() == name)
+            .copied()
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -147,17 +256,21 @@ impl SessionsAPI {
 
     /// Creates a new session for the given agent type.
     ///
+    /// The caller provides a pre-built [`SystemContext`], typically via
+    /// [`Server::create_context()`] or
+    /// [`ContextFactory::create_context()`](polaris_system::server::ContextFactory::create_context).
+    ///
     /// # Errors
     ///
     /// Returns [`SessionError::AgentNotFound`] if the agent type has not
     /// been registered.
     pub fn create_session(
         &self,
-        server: &Server,
+        ctx: SystemContext<'static>,
         id: &SessionId,
         agent_type: &AgentTypeId,
     ) -> Result<(), SessionError> {
-        self.create_session_with(server, id, agent_type, |_| {})
+        self.create_session_with(ctx, id, agent_type, |_| {})
     }
 
     /// Creates a new session for the given agent type with an initializer.
@@ -172,12 +285,12 @@ impl SessionsAPI {
     /// been registered.
     pub fn create_session_with(
         &self,
-        server: &Server,
+        ctx: SystemContext<'static>,
         id: &SessionId,
         agent_type: &AgentTypeId,
         init: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<(), SessionError> {
-        self.create_session_with_executor(server, id, agent_type, GraphExecutor::new(), init)
+        self.create_session_with_executor(ctx, id, agent_type, GraphExecutor::new(), init)
     }
 
     /// Creates a new session with a custom [`GraphExecutor`].
@@ -191,13 +304,14 @@ impl SessionsAPI {
     /// been registered.
     pub fn create_session_with_executor(
         &self,
-        server: &Server,
+        mut ctx: SystemContext<'static>,
         id: &SessionId,
         agent_type: &AgentTypeId,
         executor: GraphExecutor,
         init: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<(), SessionError> {
         let agent = self
+            .inner
             .agents
             .read()
             .get(agent_type)
@@ -205,7 +319,6 @@ impl SessionsAPI {
             .ok_or_else(|| SessionError::AgentNotFound(agent_type.to_string()))?;
 
         let graph = agent.to_graph();
-        let mut ctx = server.create_context();
         init(&mut ctx);
 
         agent
@@ -222,9 +335,13 @@ impl SessionsAPI {
             agent_type: *agent_type,
             turn_number: AtomicU32::new(0),
             checkpoints: parking_lot::Mutex::new(Vec::new()),
+            created_at: utc_now_iso8601(),
         });
 
-        self.sessions.write().insert(id.clone(), state);
+        match self.inner.sessions.write().entry(id.clone()) {
+            Entry::Occupied(_) => return Err(SessionError::SessionAlreadyExists(id.clone())),
+            Entry::Vacant(entry) => entry.insert(state),
+        };
         Ok(())
     }
 
@@ -233,20 +350,16 @@ impl SessionsAPI {
     /// [`SessionInfo`] is injected into the context before execution.
     /// The turn number is incremented after execution completes.
     ///
-    /// When auto-checkpoint is enabled, a background task serializes the
-    /// context state after the turn completes. This does not block the
-    /// return of the execution result.
+    /// When auto-checkpoint is enabled, the context state is serialized
+    /// after the turn completes. This does not block the return of the
+    /// execution result.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist,
     /// or [`SessionError::Execution`] if the graph execution fails.
-    pub async fn process_turn(
-        &self,
-        server: &Server,
-        id: &SessionId,
-    ) -> Result<ExecutionResult, SessionError> {
-        self.process_turn_with(server, id, |_| {}).await
+    pub async fn process_turn(&self, id: &SessionId) -> Result<ExecutionResult, SessionError> {
+        self.process_turn_with(id, |_| {}).await
     }
 
     /// Executes a single turn for the session with a setup closure.
@@ -255,9 +368,9 @@ impl SessionsAPI {
     /// the `setup` closure is called to prepare turn-specific resources.
     /// The turn number is incremented after execution completes.
     ///
-    /// When auto-checkpoint is enabled, a background task serializes the
-    /// context state after the turn completes. This does not block the
-    /// return of the execution result.
+    /// When auto-checkpoint is enabled, the context state is serialized
+    /// after the turn completes. This does not block the return of the
+    /// execution result.
     ///
     /// # Errors
     ///
@@ -265,13 +378,62 @@ impl SessionsAPI {
     /// or [`SessionError::Execution`] if the graph execution fails.
     pub async fn process_turn_with(
         &self,
-        server: &Server,
         id: &SessionId,
         setup: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<ExecutionResult, SessionError> {
         let state = self.get_state(id)?;
-
         let mut ctx = state.ctx.lock().await;
+        self.execute_turn(id, &state, &mut ctx, setup).await
+    }
+
+    /// Attempts to execute a single turn without waiting for the lock.
+    ///
+    /// Identical to [`process_turn`](Self::process_turn) but returns
+    /// [`SessionError::SessionBusy`] immediately if the session is
+    /// already executing a turn, instead of waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionBusy`] if the session context lock
+    /// is held, [`SessionError::SessionNotFound`] if the session does not
+    /// exist, or [`SessionError::Execution`] if graph execution fails.
+    pub async fn try_process_turn(&self, id: &SessionId) -> Result<ExecutionResult, SessionError> {
+        self.try_process_turn_with(id, |_| {}).await
+    }
+
+    /// Attempts to execute a single turn with a setup closure, without
+    /// waiting for the lock.
+    ///
+    /// Identical to [`process_turn_with`](Self::process_turn_with) but returns
+    /// [`SessionError::SessionBusy`] immediately if the session is
+    /// already executing a turn, instead of waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionBusy`] if the session context lock
+    /// is held, [`SessionError::SessionNotFound`] if the session does not
+    /// exist, or [`SessionError::Execution`] if graph execution fails.
+    pub async fn try_process_turn_with(
+        &self,
+        id: &SessionId,
+        setup: impl FnOnce(&mut SystemContext<'static>),
+    ) -> Result<ExecutionResult, SessionError> {
+        let state = self.get_state(id)?;
+        let mut ctx = state
+            .ctx
+            .try_lock()
+            .map_err(|_| SessionError::SessionBusy(id.clone()))?;
+        self.execute_turn(id, &state, &mut ctx, setup).await
+    }
+
+    /// Shared turn execution logic used by both blocking and try-lock variants.
+    async fn execute_turn(
+        &self,
+        id: &SessionId,
+        state: &SessionState,
+        ctx: &mut SystemContext<'static>,
+        setup: impl FnOnce(&mut SystemContext<'static>),
+    ) -> Result<ExecutionResult, SessionError> {
         let turn = state.turn_number.load(Ordering::Acquire);
 
         // Inject session metadata.
@@ -280,13 +442,14 @@ impl SessionsAPI {
             turn_number: turn,
         });
 
-        setup(&mut ctx);
+        setup(ctx);
 
-        let hooks = server.api::<HooksAPI>();
-        let middleware = server.api::<MiddlewareAPI>();
+        let hooks = self.inner.hooks.get();
+        let middleware = self.inner.middleware.get();
+
         let result = state
             .executor
-            .execute(&state.graph, &mut ctx, hooks, middleware)
+            .execute(&state.graph, ctx, hooks, middleware)
             .await?;
 
         state.turn_number.store(turn + 1, Ordering::Release);
@@ -296,9 +459,9 @@ impl SessionsAPI {
         // to avoid any potential latency impact on the turn result.
         // Get profiling data to see if this is actually a problem
         // worth optimizing.
-        if self.auto_checkpoint.load(Ordering::Relaxed) {
-            let serializers = self.serializers.read().clone();
-            match serialize_context(&serializers, state.agent_type, turn, &ctx) {
+        if self.inner.auto_checkpoint.load(Ordering::Relaxed) {
+            let serializers = Arc::clone(&self.inner.serializers.read());
+            match serialize_context(&serializers, state.agent_type, turn, &state.created_at, ctx) {
                 Ok(data) => {
                     state.checkpoints.lock().push(Checkpoint {
                         turn_number: turn,
@@ -329,19 +492,38 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::SessionNotFound`] or a persistence error
     /// if serialization fails.
-    pub async fn checkpoint(&self, id: &SessionId) -> Result<u32, SessionError> {
+    pub async fn checkpoint(&self, id: &SessionId) -> Result<TurnNumber, SessionError> {
         let state = self.get_state(id)?;
         let ctx = state.ctx.lock().await;
         let turn = state.turn_number.load(Ordering::Acquire);
 
-        let serializers = self.serializers.read().clone();
-        let data = serialize_context(&serializers, state.agent_type, turn, &ctx)?;
+        let serializers = Arc::clone(&self.inner.serializers.read());
+        let data = serialize_context(
+            &serializers,
+            state.agent_type,
+            turn,
+            &state.created_at,
+            &ctx,
+        )?;
 
         state.checkpoints.lock().push(Checkpoint {
             turn_number: turn,
             data,
         });
         Ok(turn)
+    }
+
+    /// Returns the turn numbers of all checkpoints for the session.
+    ///
+    /// The returned list is ordered by creation time (oldest first).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionNotFound`] if the session does not exist.
+    pub fn list_checkpoints(&self, id: &SessionId) -> Result<Vec<TurnNumber>, SessionError> {
+        let state = self.get_state(id)?;
+        let checkpoints = state.checkpoints.lock();
+        Ok(checkpoints.iter().map(|cp| cp.turn_number).collect())
     }
 
     /// Rolls back the session to a previously checkpointed turn.
@@ -353,7 +535,7 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionNotFound`] if the session does not
     /// exist, [`SessionError::TurnNotFound`] if no checkpoint exists for
     /// the given turn, or a persistence error on deserialization.
-    pub async fn rollback(&self, id: &SessionId, turn: u32) -> Result<(), SessionError> {
+    pub async fn rollback(&self, id: &SessionId, turn: TurnNumber) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
         let mut ctx = state.ctx.lock().await;
 
@@ -363,7 +545,7 @@ impl SessionsAPI {
             .find(|cp| cp.turn_number == turn)
             .ok_or(SessionError::TurnNotFound(turn))?;
 
-        let serializers = self.serializers.read().clone();
+        let serializers = Arc::clone(&self.inner.serializers.read());
         deserialize_into_context(&serializers, &checkpoint.data, &mut ctx)?;
 
         state
@@ -390,13 +572,23 @@ impl SessionsAPI {
         let ctx = state.ctx.lock().await;
         let turn = state.turn_number.load(Ordering::Acquire);
 
-        let serializers = self.serializers.read().clone();
-        let data = serialize_context(&serializers, state.agent_type, turn, &ctx)?;
+        let serializers = Arc::clone(&self.inner.serializers.read());
+        let data = serialize_context(
+            &serializers,
+            state.agent_type,
+            turn,
+            &state.created_at,
+            &ctx,
+        )?;
 
-        self.store.save(id, &data).await
+        self.inner.store.save(id, &data).await
     }
 
     /// Loads a session from the backing store with the default executor.
+    ///
+    /// The caller provides a pre-built [`SystemContext`], typically via
+    /// [`Server::create_context()`] or
+    /// [`ContextFactory::create_context()`](polaris_system::server::ContextFactory::create_context).
     ///
     /// # Errors
     ///
@@ -405,10 +597,10 @@ impl SessionsAPI {
     /// the stored data has not been registered, or a [`SessionError::Persistence`].
     pub async fn resume_session(
         &self,
-        server: &Server,
+        ctx: SystemContext<'static>,
         id: &SessionId,
     ) -> Result<(), SessionError> {
-        self.resume_session_with(server, id, |_| {}).await
+        self.resume_session_with(ctx, id, |_| {}).await
     }
 
     /// Loads a session from the backing store with an initializer.
@@ -423,11 +615,11 @@ impl SessionsAPI {
     /// the stored data has not been registered, or a persistence error.
     pub async fn resume_session_with(
         &self,
-        server: &Server,
+        ctx: SystemContext<'static>,
         id: &SessionId,
         init: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<(), SessionError> {
-        self.resume_session_with_executor(server, id, GraphExecutor::new(), init)
+        self.resume_session_with_executor(ctx, id, GraphExecutor::new(), init)
             .await
     }
 
@@ -443,12 +635,13 @@ impl SessionsAPI {
     /// the stored data has not been registered, or a persistence error.
     pub async fn resume_session_with_executor(
         &self,
-        server: &Server,
+        mut ctx: SystemContext<'static>,
         id: &SessionId,
         executor: GraphExecutor,
         init: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<(), SessionError> {
         let data = self
+            .inner
             .store
             .load(id)
             .await?
@@ -456,7 +649,7 @@ impl SessionsAPI {
 
         // Find the registered agent whose type name matches the stored data.
         let (agent_type, agent) = {
-            let agents = self.agents.read();
+            let agents = self.inner.agents.read();
             agents
                 .iter()
                 .find(|(k, _)| k.as_str() == data.agent_type)
@@ -465,9 +658,8 @@ impl SessionsAPI {
         };
 
         let graph = agent.to_graph();
-        let mut ctx = server.create_context();
 
-        let serializers = self.serializers.read().clone();
+        let serializers = Arc::clone(&self.inner.serializers.read());
         deserialize_into_context(&serializers, &data, &mut ctx)?;
 
         init(&mut ctx);
@@ -486,9 +678,10 @@ impl SessionsAPI {
             agent_type,
             turn_number: AtomicU32::new(data.turn_number),
             checkpoints: parking_lot::Mutex::new(Vec::new()),
+            created_at: data.created_at.clone(),
         });
 
-        self.sessions.write().insert(id.clone(), state);
+        self.inner.sessions.write().insert(id.clone(), state);
         Ok(())
     }
 
@@ -504,6 +697,7 @@ impl SessionsAPI {
     pub async fn setup_session(&self, id: &SessionId) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
         let agent = self
+            .inner
             .agents
             .read()
             .get(&state.agent_type)
@@ -526,8 +720,8 @@ impl SessionsAPI {
     ///
     /// Returns a store error on failure.
     pub async fn delete_session(&self, id: &SessionId) -> Result<(), SessionError> {
-        self.sessions.write().remove(id);
-        self.store.delete(id).await
+        self.inner.sessions.write().remove(id);
+        self.inner.store.delete(id).await
     }
 
     /// Lists all session IDs known to the backing store.
@@ -536,7 +730,53 @@ impl SessionsAPI {
     ///
     /// Returns a store error on failure.
     pub async fn list_sessions(&self) -> Result<Vec<SessionId>, SessionError> {
-        self.store.list().await
+        self.inner.store.list().await
+    }
+
+    /// Lists all live session IDs currently held in memory.
+    #[must_use]
+    pub fn list_live_sessions(&self) -> Vec<SessionId> {
+        self.inner.sessions.read().keys().cloned().collect()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Session info
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Returns metadata for a live session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionNotFound`] if the session does not exist.
+    pub fn session_info(&self, id: &SessionId) -> Result<SessionMetadata, SessionError> {
+        let state = self.get_state(id)?;
+        Ok(SessionMetadata {
+            session_id: id.clone(),
+            agent_type: state.agent_type,
+            turn_number: state.turn_number.load(Ordering::Acquire),
+            created_at: state.created_at.clone(),
+            status: SessionStatus::Active,
+        })
+    }
+
+    /// Returns metadata for all live sessions.
+    ///
+    /// Holds the session lock once for the full scan, avoiding per-session
+    /// lock acquisition.
+    #[must_use]
+    pub fn list_session_metadata(&self) -> Vec<SessionMetadata> {
+        self.inner
+            .sessions
+            .read()
+            .iter()
+            .map(|(id, state)| SessionMetadata {
+                session_id: id.clone(),
+                agent_type: state.agent_type,
+                turn_number: state.turn_number.load(Ordering::Acquire),
+                created_at: state.created_at.clone(),
+                status: SessionStatus::Active,
+            })
+            .collect()
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -567,12 +807,18 @@ impl SessionsAPI {
 
     /// Looks up a live session by ID.
     fn get_state(&self, id: &SessionId) -> Result<Arc<SessionState>, SessionError> {
-        self.sessions
+        self.inner
+            .sessions
             .read()
             .get(id)
             .cloned()
             .ok_or_else(|| SessionError::SessionNotFound(id.clone()))
     }
+}
+
+/// Returns the current UTC time formatted as ISO 8601 (e.g. `2026-03-31T12:00:00Z`).
+fn utc_now_iso8601() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -583,7 +829,8 @@ impl SessionsAPI {
 fn serialize_context(
     serializers: &[Arc<dyn ResourceSerializer>],
     agent_type: AgentTypeId,
-    turn_number: u32,
+    turn_number: TurnNumber,
+    created_at: &str,
     ctx: &SystemContext<'_>,
 ) -> Result<SessionData, SessionError> {
     let mut resources = Vec::new();
@@ -600,6 +847,7 @@ fn serialize_context(
     Ok(SessionData {
         agent_type: agent_type.as_str().to_owned(),
         turn_number,
+        created_at: created_at.to_owned(),
         resources,
     })
 }
@@ -670,7 +918,7 @@ impl Plugin for SessionsPlugin {
         server.insert_api(api);
     }
 
-    fn ready(&self, server: &mut Server) {
+    async fn ready(&self, server: &mut Server) {
         let persistence = server
             .api::<PersistenceAPI>()
             .expect("SessionsPlugin requires PersistencePlugin");
@@ -678,6 +926,11 @@ impl Plugin for SessionsPlugin {
             .api::<SessionsAPI>()
             .expect("SessionsAPI should be present after build");
         sessions.set_serializers(persistence.serializers());
+        sessions.set_graph_apis(
+            server.api::<HooksAPI>().cloned(),
+            server.api::<MiddlewareAPI>().cloned(),
+        );
+        sessions.set_context_factory(server.context_factory());
     }
 
     fn dependencies(&self) -> Vec<PluginId> {

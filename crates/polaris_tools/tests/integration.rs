@@ -123,8 +123,8 @@ fn registry_duplicate_registration_panics() {
 // 4. ToolsPlugin lifecycle
 // ─────────────────────────────────────────────────────────────────────
 
-#[test]
-fn tools_plugin_lifecycle() {
+#[tokio::test]
+async fn tools_plugin_lifecycle() {
     use polaris_system::plugin::Plugin;
     use polaris_system::server::Server;
 
@@ -141,7 +141,7 @@ fn tools_plugin_lifecycle() {
     }
 
     // ready: moves to global
-    plugin.ready(&mut server);
+    plugin.ready(&mut server).await;
 
     // After ready, it should be a global resource
     let ctx = server.create_context();

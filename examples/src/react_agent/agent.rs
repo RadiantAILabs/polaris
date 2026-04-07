@@ -42,7 +42,7 @@ use polaris::graph::{CaughtError, Graph};
 use polaris::models::ModelRegistry;
 use polaris::models::llm::LlmResponse;
 use polaris::models::llm::{Llm, Message, ToolResultContent, UserBlock};
-use polaris::plugins::{IOContent, IOMessage, IOSource, InputBuffer, PersistenceAPI, UserIO};
+use polaris::plugins::{IOContent, IOMessage, IOSource, PersistenceAPI, UserIO};
 use polaris::prelude::Out;
 use polaris::system::param::{ErrOut, Res, ResMut, SystemContext};
 use polaris::system::plugin::{Plugin, Version};
@@ -79,7 +79,7 @@ impl Plugin for ReActPlugin {
         server.register_local(ReactState::default);
     }
 
-    fn ready(&self, server: &mut Server) {
+    async fn ready(&self, server: &mut Server) {
         // If a PersistenceAPI is available, register ContextManager for persistence.
         if let Some(api) = server.api::<PersistenceAPI>() {
             api.register::<ContextManager>(Self::ID);
@@ -112,15 +112,17 @@ async fn send_error(user_io: &UserIO, text: impl Into<String>) {
     let _ = user_io.send(msg).await;
 }
 
-/// Receive user input from the input buffer and add to conversation history.
+/// Receive user input via [`UserIO`] and add to conversation history.
 #[system]
-async fn receive_user_input(
-    mut input_buffer: ResMut<InputBuffer>,
-    mut context: ResMut<ContextManager>,
-) {
-    for message in input_buffer.drain() {
-        if let IOContent::Text(text) = message.content {
-            context.push(Message::user(text));
+async fn receive_user_input(user_io: Res<UserIO>, mut context: ResMut<ContextManager>) {
+    match user_io.receive().await {
+        Ok(message) => {
+            if let IOContent::Text(text) = message.content {
+                context.push(Message::user(text));
+            }
+        }
+        Err(err) => {
+            tracing::error!("Failed to receive user input: {err}");
         }
     }
 }

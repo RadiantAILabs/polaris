@@ -22,21 +22,27 @@
 //!     .add_plugins(MinimalPlugins.build())
 //!     .add_plugins(PersistencePlugin)
 //!     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
-//! server.run();
+//! # tokio_test::block_on(async {
+//! server.run().await;
+//! # });
 //!
 //! let sessions = server.api::<SessionsAPI>().unwrap();
 //! ```
 
 pub mod api;
 pub mod error;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod info;
 pub mod store;
 
 pub use api::{SessionsAPI, SessionsPlugin};
 pub use error::SessionError;
-pub use info::SessionInfo;
+#[cfg(feature = "http")]
+pub use http::HttpPlugin;
+pub use info::{SessionInfo, SessionMetadata};
 pub use store::memory::InMemoryStore;
-pub use store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore};
+pub use store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber};
 
 #[cfg(feature = "file-store")]
 pub use store::file::FileStore;
@@ -47,9 +53,11 @@ pub mod prelude {
 
     pub use crate::api::{SessionsAPI, SessionsPlugin};
     pub use crate::error::SessionError;
-    pub use crate::info::SessionInfo;
+    pub use crate::info::{SessionInfo, SessionMetadata};
     pub use crate::store::memory::InMemoryStore;
-    pub use crate::store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore};
+    pub use crate::store::{
+        AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber,
+    };
 
     #[cfg(feature = "file-store")]
     pub use crate::store::file::FileStore;

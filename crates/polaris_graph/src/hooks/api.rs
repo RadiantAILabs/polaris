@@ -184,14 +184,19 @@ struct HookEntry {
 /// The `HooksAPI` uses interior mutability via [`RwLock`] to allow concurrent
 /// registration during the build phase and concurrent invocation during execution.
 ///
+/// # Cloning
+///
+/// `HooksAPI` is cheaply cloneable (`Arc`-backed). Clones share the same
+/// underlying registry, so hooks registered on one clone are visible to all.
+///
 /// # Observer vs Provider
 ///
 /// Use [`register_observer`](Self::register_observer) for hooks that only react to events.
 /// Use [`register_provider`](Self::register_provider) for hooks that inject resources.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct HooksAPI {
     /// Maps schedule ID to a list of hook entries.
-    hooks: RwLock<HashMap<ScheduleId, Vec<HookEntry>>>,
+    hooks: Arc<RwLock<HashMap<ScheduleId, Vec<HookEntry>>>>,
 }
 
 impl API for HooksAPI {}
@@ -201,7 +206,7 @@ impl HooksAPI {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            hooks: RwLock::new(HashMap::new()),
+            hooks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

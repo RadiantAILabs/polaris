@@ -54,7 +54,7 @@
 ///
 ///     fn build(&self, _server: &mut Server) {}
 ///
-///     fn ready(&self, server: &mut Server) {
+///     async fn ready(&self, server: &mut Server) {
 ///         let api = server.api::<MyAPI>()
 ///             .expect("MyAPI required");
 ///         api.register("key", 42);
