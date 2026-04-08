@@ -1,6 +1,6 @@
 [package]
 name = "polaris-ai"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 categories = ["asynchronous", "development-tools"]
 description = "A unified agent runtime where agent patterns are first-class, composable, and optimizable abstractions."
@@ -9,6 +9,7 @@ homepage = "https://getradiant.ai"
 keywords = ["ai", "agents", "ecs", "async", "framework"]
 license = "Apache-2.0"
 readme = "README.md"
+documentation = "https://docs.rs/polaris-ai"
 repository = "https://github.com/RadiantAILabs/polaris"
 rust-version = "1.93.0"
 autoexamples = false

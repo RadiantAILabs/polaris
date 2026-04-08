@@ -1,9 +1,11 @@
 # Polaris
 
+[![Crates.io](https://img.shields.io/crates/v/polaris-ai.svg)](https://crates.io/crates/polaris-ai)
+[![docs.rs](https://docs.rs/polaris-ai/badge.svg)](https://docs.rs/polaris-ai)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/rust-1.93.0%2B-orange.svg)](https://www.rust-lang.org/)
 
-> **Pre-Alpha** — Core APIs are stabilizing but may change between releases. See [Project Status](#project-status).
+> **Alpha** — Core APIs are stabilizing but may change between releases. See [Project Status](#project-status).
 
 A Rust framework for building AI agents as composable directed graphs.
 
@@ -60,11 +62,9 @@ See [`examples`](examples/README.md) for a full implementation of a file assista
 
 ## Getting Started
 
-> Not yet published to crates.io — install from git.
-
 ```toml
 [dependencies]
-polaris = { git = "https://github.com/RadiantAILabs/polaris" }
+polaris-ai = "0.0.3"
 ```
 
 Requires **Rust 1.93.0+** (Edition 2024). Run `cargo make test` for the full test suite.
@@ -83,8 +83,8 @@ Architecture, design patterns, and API reference are available in the [docs](doc
 | Model Registry and Providers | **Implemented** |
 | Tool Registry | **Implemented** |
 | IO Plugin | **Implemented** |
-| Agent Plugins | Planned |
-| Sessions, Groups, CLI/HTTP Interfaces | Planned |
+| Agent Plugins | **Implemented** |
+| Sessions, Groups, CLI/HTTP Interfaces | **Implemented** |
 
 ## License
 
