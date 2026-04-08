@@ -5,6 +5,7 @@ description = "Shared HTTP server runtime for Polaris products."
 edition = "2024"
 keywords = ["polaris-ai", "http", "axum", "server"]
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/RadiantAILabs/polaris"
 categories = ["web-programming::http-server", "asynchronous"]
 rust-version = "1.93.0"

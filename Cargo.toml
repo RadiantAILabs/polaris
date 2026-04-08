@@ -8,6 +8,7 @@ exclude = ["assets/", "tools/", ".github/", "crates/"]
 homepage = "https://getradiant.ai"
 keywords = ["ai", "agents", "ecs", "async", "framework"]
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/RadiantAILabs/polaris"
 rust-version = "1.93.0"
 autoexamples = false

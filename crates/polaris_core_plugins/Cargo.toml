@@ -5,6 +5,7 @@ description = "Core infrastructure plugins for Polaris."
 edition = "2024"
 keywords = ["polaris-ai", "plugin", "infrastructure"]
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/RadiantAILabs/polaris"
 rust-version = "1.93.0"
 

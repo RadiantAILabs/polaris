@@ -5,6 +5,7 @@ description = "Agent trait for defining reusable behavior patterns in Polaris."
 edition = "2024"
 keywords = []
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/RadiantAILabs/polaris"
 rust-version = "1.93.0"
 
