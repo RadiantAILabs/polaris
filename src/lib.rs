@@ -29,42 +29,6 @@
 //! // Add plugins, agents, and run...
 //! ```
 
-/// Layer 1: ECS-inspired system framework.
-#[doc(inline)]
-pub use polaris_internal::polaris_system as system_crate;
-
-/// Layer 2: Graph-based execution primitives.
-#[doc(inline)]
-pub use polaris_internal::polaris_graph as graph_crate;
-
-/// Layer 2: Agent pattern definition.
-#[doc(inline)]
-pub use polaris_internal::polaris_agent as agent_crate;
-
-/// Tool framework for LLM-callable functions.
-#[doc(inline)]
-pub use polaris_internal::polaris_tools as tools_crate;
-
-/// Model provider implementations.
-#[doc(inline)]
-pub use polaris_internal::polaris_model_providers as model_providers_crate;
-
-/// Model provider interface and registry.
-#[doc(inline)]
-pub use polaris_internal::polaris_models as models_crate;
-
-/// Core infrastructure plugins (e.g., time, tracing).
-#[doc(inline)]
-pub use polaris_internal::polaris_core_plugins as core_plugins_crate;
-
-/// Session management and orchestration.
-#[doc(inline)]
-pub use polaris_internal::polaris_sessions as sessions_crate;
-
-/// Shell command execution.
-#[doc(inline)]
-pub use polaris_internal::polaris_shell as shell_crate;
-
 // Re-export crates under their original names so proc-macro-generated code
 // can resolve `polaris::polaris_tools`, `polaris::polaris_system`, etc.
 #[doc(hidden)]
