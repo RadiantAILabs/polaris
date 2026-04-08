@@ -1,6 +1,6 @@
 [package]
 name = "polaris-ai"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 categories = ["asynchronous", "development-tools"]
 description = "A unified agent runtime where agent patterns are first-class, composable, and optimizable abstractions."

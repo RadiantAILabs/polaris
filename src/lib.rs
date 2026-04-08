@@ -65,6 +65,17 @@ pub use polaris_internal::polaris_sessions as sessions_crate;
 #[doc(inline)]
 pub use polaris_internal::polaris_shell as shell_crate;
 
+// Re-export crates under their original names so proc-macro-generated code
+// can resolve `polaris::polaris_tools`, `polaris::polaris_system`, etc.
+#[doc(hidden)]
+pub use polaris_internal::polaris_core_plugins;
+#[doc(hidden)]
+pub use polaris_internal::polaris_models;
+#[doc(hidden)]
+pub use polaris_internal::polaris_system;
+#[doc(hidden)]
+pub use polaris_internal::polaris_tools;
+
 /// Re-export all common types for easy access.
 pub mod prelude {
     pub use polaris_internal::prelude::*;
