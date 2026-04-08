@@ -17,6 +17,7 @@
 //! | [`plugins`] | `polaris_core_plugins` | Core infrastructure plugins (time, tracing, persistence) |
 //! | [`sessions`] | `polaris_sessions` | Session management and orchestration |
 //! | [`shell`] | `polaris_shell` | Shell command execution with permission model |
+//! | [`app`] | `polaris_app` | HTTP server runtime with plugin integration |
 //!
 //! # Quick Start
 //!
@@ -91,4 +92,10 @@ pub mod sessions {
 pub mod shell {
     #[doc(inline)]
     pub use polaris_internal::shell::*;
+}
+
+/// HTTP server runtime with plugin integration.
+pub mod app {
+    #[doc(inline)]
+    pub use polaris_internal::app::*;
 }

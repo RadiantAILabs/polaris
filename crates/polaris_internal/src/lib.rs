@@ -27,6 +27,9 @@ pub use polaris_sessions;
 /// Shell command execution.
 pub use polaris_shell;
 
+/// HTTP server runtime.
+pub use polaris_app;
+
 /// Re-export all common types for easy access.
 pub mod prelude {
     pub use polaris_agent::Agent;
@@ -77,4 +80,9 @@ pub mod sessions {
 /// Re-export all shell-related types for easy access.
 pub mod shell {
     pub use polaris_shell::*;
+}
+
+/// Re-export all app-related types for easy access.
+pub mod app {
+    pub use polaris_app::*;
 }
