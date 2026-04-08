@@ -1,5 +1,5 @@
 [package]
-name = "polaris"
+name = "polaris-ai"
 version = "0.0.1"
 edition = "2024"
 categories = ["asynchronous", "development-tools"]

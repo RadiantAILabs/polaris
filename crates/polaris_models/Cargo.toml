@@ -3,12 +3,15 @@ name = "polaris_models"
 version = "0.0.1"
 description = "Model provider interface and registry for Polaris"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lints]
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system" }
+polaris_system = { path = "../polaris_system", version = "0.0.2" }
 thiserror = "2.0"
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }

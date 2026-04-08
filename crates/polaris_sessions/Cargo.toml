@@ -4,6 +4,9 @@ version = "0.0.1"
 description = "Session management and orchestration for Polaris agents."
 edition = "2024"
 keywords = []
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lints]
 workspace = true
@@ -14,10 +17,10 @@ file-store = ["tokio/fs"]
 http = ["dep:polaris_app", "dep:axum"]
 
 [dependencies]
-polaris_system = { path = "../polaris_system" }
-polaris_graph = { path = "../polaris_graph" }
-polaris_agent = { path = "../polaris_agent" }
-polaris_core_plugins = { path = "../polaris_core_plugins" }
+polaris_system = { path = "../polaris_system", version = "0.0.2" }
+polaris_graph = { path = "../polaris_graph", version = "0.0.1" }
+polaris_agent = { path = "../polaris_agent", version = "0.0.1" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.1" }
 hashbrown = "0.16.1"
 nanoid = "0.4"
 parking_lot = "0.12"
@@ -29,7 +32,7 @@ tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
 
 # Optional HTTP dependencies (enabled by `http` feature)
-polaris_app = { path = "../polaris_app", optional = true }
+polaris_app = { path = "../polaris_app", version = "0.0.1", optional = true }
 axum = { version = "0.8", features = ["tokio"], optional = true }
 
 [dev-dependencies]

@@ -3,10 +3,11 @@ name = "polaris_app"
 version = "0.0.1"
 description = "Shared HTTP server runtime for Polaris products."
 edition = "2024"
-keywords = ["polaris", "http", "axum", "server"]
+keywords = ["polaris-ai", "http", "axum", "server"]
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris"
 categories = ["web-programming::http-server", "asynchronous"]
+rust-version = "1.93.0"
 
 [features]
 default = []
@@ -16,8 +17,8 @@ otel = []
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system" }
-polaris_core_plugins = { path = "../polaris_core_plugins" }
+polaris_system = { path = "../polaris_system", version = "0.0.2" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.1" }
 axum = { version = "0.8", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "sync", "net", "signal", "macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util", "propagate-header"] }

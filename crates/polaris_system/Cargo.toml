@@ -1,15 +1,18 @@
 [package]
 name = "polaris_system"
-version = "0.0.1"
+version = "0.0.2"
 description = "A lightweight ECS-inspired system framework for Polaris."
 edition = "2024"
 keywords = []
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lints]
 workspace = true
 
 [dependencies]
-polaris_system_macros = { path = "system_macros", version = "0.0.1" }
+polaris_system_macros = { path = "system_macros", version = "0.0.2" }
 downcast-rs = "2.0.2"
 parking_lot = { version = "0.12.5", features = ["send_guard"] }
 thiserror = "2.0.17"

@@ -14,7 +14,7 @@ otel = ["polaris/otel", "polaris_app/otel"]
 missing_docs = "allow"
 
 [dependencies]
-polaris = { path = ".." }
+polaris = { path = "..", package = "polaris-ai" }
 polaris_app = { path = "../crates/polaris_app" }
 polaris_sessions = { path = "../crates/polaris_sessions", features = ["http"] }
 axum = "0.8"

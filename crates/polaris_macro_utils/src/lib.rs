@@ -51,7 +51,7 @@ pub fn resolve_crate_path(krate: PolarisCrate) -> TokenStream {
             let ident = format_ident!("{}", found);
             quote!(#ident)
         }
-        Err(_) => match crate_name("polaris") {
+        Err(_) => match crate_name("polaris-ai") {
             Ok(FoundCrate::Name(found)) => {
                 let polaris = format_ident!("{}", found);
                 let ident = format_ident!("{}", name);

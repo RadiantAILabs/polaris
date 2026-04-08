@@ -3,17 +3,20 @@ name = "polaris_core_plugins"
 version = "0.0.1"
 description = "Core infrastructure plugins for Polaris."
 edition = "2024"
-keywords = ["polaris", "plugin", "infrastructure"]
+keywords = ["polaris-ai", "plugin", "infrastructure"]
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lints]
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system" }
-polaris_graph = { path = "../polaris_graph" }
-polaris_models = { path = "../polaris_models", optional = true }
-polaris_tools = { path = "../polaris_tools", optional = true }
-persistence_macros = { path = "persistence_macros" }
+polaris_system = { path = "../polaris_system", version = "0.0.2" }
+polaris_graph = { path = "../polaris_graph", version = "0.0.1" }
+polaris_models = { path = "../polaris_models", version = "0.0.1", optional = true }
+polaris_tools = { path = "../polaris_tools", version = "0.0.1", optional = true }
+persistence_macros = { path = "persistence_macros", version = "0.0.1" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

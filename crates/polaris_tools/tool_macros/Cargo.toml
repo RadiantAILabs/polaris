@@ -3,6 +3,9 @@ name = "tool_macros"
 version = "0.0.1"
 description = "Procedural macros for Polaris tool framework"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lints]
 workspace = true

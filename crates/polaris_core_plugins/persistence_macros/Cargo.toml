@@ -4,6 +4,9 @@ version = "0.0.1"
 description = "Derive macros for polaris_core_plugins persistence."
 edition = "2024"
 keywords = []
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lib]
 proc-macro = true

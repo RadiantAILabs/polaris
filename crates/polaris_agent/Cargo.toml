@@ -4,11 +4,14 @@ version = "0.0.1"
 description = "Agent trait for defining reusable behavior patterns in Polaris."
 edition = "2024"
 keywords = []
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lints]
 workspace = true
 
 [dependencies]
-polaris_graph = { path = "../polaris_graph" }
-polaris_system = { path = "../polaris_system" }
+polaris_graph = { path = "../polaris_graph", version = "0.0.1" }
+polaris_system = { path = "../polaris_system", version = "0.0.2" }
 thiserror = "2"

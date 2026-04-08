@@ -3,16 +3,19 @@ name = "polaris_shell"
 version = "0.0.1"
 description = "Shell command execution for Polaris agents"
 edition = "2024"
-keywords = ["polaris", "shell", "execution", "agents"]
+keywords = ["polaris-ai", "shell", "execution", "agents"]
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lints]
 workspace = true
 
 [dependencies]
 dirs = "6.0"
-polaris_system = { path = "../polaris_system" }
-polaris_tools = { path = "../polaris_tools" }
-polaris_models = { path = "../polaris_models" }
+polaris_system = { path = "../polaris_system", version = "0.0.2" }
+polaris_tools = { path = "../polaris_tools", version = "0.0.1" }
+polaris_models = { path = "../polaris_models", version = "0.0.1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

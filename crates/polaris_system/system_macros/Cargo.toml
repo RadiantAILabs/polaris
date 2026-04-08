@@ -1,9 +1,12 @@
 [package]
 name = "polaris_system_macros"
-version = "0.0.1"
+version = "0.0.2"
 description = "Macros for polaris_system crate."
 edition = "2024"
 keywords = []
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [lib]
 proc-macro = true
