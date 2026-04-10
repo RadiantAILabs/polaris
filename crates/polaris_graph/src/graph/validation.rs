@@ -945,7 +945,7 @@ impl std::error::Error for MergeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{ContextPolicy, Node, ScopeNode, SystemNode};
+    use crate::node::{ContextPolicy, Node, SystemNode};
     use polaris_system::system::IntoSystem;
 
     async fn dummy() -> i32 {
