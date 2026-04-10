@@ -398,6 +398,15 @@ impl<'parent> SystemContext<'parent> {
         self.globals.as_deref()
     }
 
+    /// Returns a clone of the global resources `Arc`, if any.
+    ///
+    /// This is useful for creating isolated child contexts that share
+    /// global infrastructure resources without a parent chain.
+    #[must_use]
+    pub fn globals_arc(&self) -> Option<Arc<Resources>> {
+        self.globals.clone()
+    }
+
     /// Clones a local resource by its [`TypeId`], returning a new boxed value.
     ///
     /// Returns `None` if the resource does not exist in the local scope or
@@ -428,6 +437,24 @@ impl<'parent> SystemContext<'parent> {
     #[must_use]
     pub fn clone_local_resource(&self, type_id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
         self.resources.clone_by_type_id(type_id)
+    }
+
+    /// Clones a local resource using an externally-provided clone function.
+    ///
+    /// Unlike [`clone_local_resource`](Self::clone_local_resource), this does not
+    /// require [`register_clone_fn`](Self::register_clone_fn) to have been called.
+    /// The clone function is supplied by the caller — typically captured at
+    /// compile time in a [`ResourceForward`](crate::ResourceForward).
+    ///
+    /// Returns `None` if the resource does not exist in the local scope or is
+    /// currently write-locked.
+    #[must_use]
+    pub fn clone_local_resource_with(
+        &self,
+        type_id: TypeId,
+        clone_fn: fn(&dyn Any) -> Option<Box<dyn Any + Send + Sync>>,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        self.resources.clone_by_type_id_with(type_id, clone_fn)
     }
 
     /// Registers a clone function for a local resource type.
@@ -1505,5 +1532,72 @@ mod tests {
         // Resolve via Res<T> and verify the value matches
         let res = Res::<Cloneable>::fetch(&ctx2).unwrap();
         assert_eq!(res.value, 77);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // clone_local_resource_with tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn cloneable_clone_fn(any: &dyn Any) -> Option<Box<dyn Any + Send + Sync>> {
+        Some(Box::new(any.downcast_ref::<Cloneable>()?.clone()))
+    }
+
+    #[test]
+    fn clone_local_resource_with_external_fn() {
+        let ctx = SystemContext::new().with(Cloneable { value: 42 });
+
+        let cloned = ctx
+            .clone_local_resource_with(TypeId::of::<Cloneable>(), cloneable_clone_fn)
+            .expect("clone_with should succeed");
+
+        let val = cloned.downcast_ref::<Cloneable>().expect("should downcast");
+        assert_eq!(val.value, 42);
+    }
+
+    #[test]
+    fn clone_local_resource_with_missing_returns_none() {
+        let ctx = SystemContext::new();
+
+        let result = ctx.clone_local_resource_with(TypeId::of::<Cloneable>(), cloneable_clone_fn);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn clone_local_resource_with_does_not_walk_parent() {
+        let parent = SystemContext::new().with(Cloneable { value: 99 });
+        let child = parent.child();
+
+        // clone_local_resource_with only checks local scope, not parent
+        let result = child.clone_local_resource_with(TypeId::of::<Cloneable>(), cloneable_clone_fn);
+        assert!(result.is_none(), "should not find resource in parent chain");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // globals_arc tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn globals_arc_none_without_globals() {
+        let ctx = SystemContext::new();
+        assert!(ctx.globals_arc().is_none());
+    }
+
+    #[test]
+    fn globals_arc_some_with_globals() {
+        let globals = Arc::new(Resources::new());
+        let ctx = SystemContext::with_globals(globals.clone());
+
+        let arc = ctx.globals_arc().expect("should return Some");
+        assert!(Arc::ptr_eq(&arc, &globals));
+    }
+
+    #[test]
+    fn globals_arc_inherited_by_child() {
+        let globals = Arc::new(Resources::new());
+        let parent = SystemContext::with_globals(globals.clone());
+        let child = parent.child();
+
+        let arc = child.globals_arc().expect("child should inherit globals");
+        assert!(Arc::ptr_eq(&arc, &globals));
     }
 }

@@ -5,6 +5,7 @@
 //! middleware handlers registered via [`MiddlewareAPI::register_system`](super::MiddlewareAPI::register_system).
 
 use crate::NodeId;
+use crate::node::ContextMode;
 
 /// Metadata passed to [`GraphExecution`](super::GraphExecution) middleware.
 #[derive(Debug, Clone)]
@@ -90,4 +91,17 @@ pub struct ParallelBranchInfo {
     pub branch_index: usize,
     /// Total number of branches.
     pub branch_count: usize,
+}
+
+/// Metadata passed to [`Scope`](super::Scope) middleware.
+#[derive(Debug, Clone)]
+pub struct ScopeInfo {
+    /// The node ID of the scope node.
+    pub node_id: NodeId,
+    /// The scope node's name.
+    pub node_name: &'static str,
+    /// The context mode for the scope.
+    pub context_mode: ContextMode,
+    /// Number of nodes in the embedded graph.
+    pub inner_node_count: usize,
 }

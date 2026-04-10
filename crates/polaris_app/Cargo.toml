@@ -19,7 +19,7 @@ otel = []
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.0.2" }
+polaris_system = { path = "../polaris_system", version = "0.0.3" }
 polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.1" }
 axum = { version = "0.8", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "sync", "net", "signal", "macros"] }

@@ -471,6 +471,38 @@ impl Graph {
                     }
                 }
             }
+
+            // Scope nodes: validate the embedded graph recursively
+            Node::Scope(scope) => {
+                if scope.graph.is_empty() {
+                    errors.push(ValidationError::EmptyScopeGraph {
+                        node: scope.id.clone(),
+                        name: scope.name,
+                    });
+                } else {
+                    if scope.graph.entry().is_none() {
+                        errors.push(ValidationError::ScopeGraphNoEntryPoint {
+                            node: scope.id.clone(),
+                            name: scope.name,
+                        });
+                    }
+                    let inner_result = scope.graph.validate();
+                    for inner_err in inner_result.errors {
+                        errors.push(ValidationError::ScopeGraphInvalid {
+                            node: scope.id.clone(),
+                            name: scope.name,
+                            inner: Box::new(inner_err),
+                        });
+                    }
+                    for inner_warn in inner_result.warnings {
+                        warnings.push(ValidationWarning::ScopeGraphWarning {
+                            node: scope.id.clone(),
+                            name: scope.name,
+                            inner: Box::new(inner_warn),
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -548,6 +580,7 @@ impl fmt::Display for ValidationResult {
 /// Warnings indicate potential issues that won't prevent execution but may
 /// cause unexpected behavior at runtime.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ValidationWarning {
     /// Two or more parallel branches produce the same output type.
     /// The last branch in declaration order will win at merge time.
@@ -558,6 +591,15 @@ pub enum ValidationWarning {
         name: &'static str,
         /// The conflicting output type name.
         output_type: &'static str,
+    },
+    /// A scope node's embedded graph has a validation warning.
+    ScopeGraphWarning {
+        /// The scope node ID.
+        node: NodeId,
+        /// The scope node name.
+        name: &'static str,
+        /// The inner validation warning from the embedded graph.
+        inner: Box<ValidationWarning>,
     },
 }
 
@@ -574,6 +616,12 @@ impl fmt::Display for ValidationWarning {
                     "parallel node '{name}' ({node}) has multiple branches producing output type '{output_type}'; last branch wins"
                 )
             }
+            ValidationWarning::ScopeGraphWarning { node, name, inner } => {
+                write!(
+                    f,
+                    "scope node '{name}' ({node}) embedded graph warning: {inner}"
+                )
+            }
         }
     }
 }
@@ -585,6 +633,7 @@ impl std::error::Error for ValidationWarning {}
 /// These errors are detected at build time (when calling [`Graph::validate`])
 /// before the graph is executed, allowing early detection of structural issues.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ValidationError {
     /// The graph has no entry point.
     NoEntryPoint,
@@ -709,6 +758,29 @@ pub enum ValidationError {
         /// A human-readable description of the required edge type.
         requirement: &'static str,
     },
+    /// A scope node contains an empty graph.
+    EmptyScopeGraph {
+        /// The scope node ID.
+        node: NodeId,
+        /// The scope node name.
+        name: &'static str,
+    },
+    /// A scope node's embedded graph has no entry point.
+    ScopeGraphNoEntryPoint {
+        /// The scope node ID.
+        node: NodeId,
+        /// The scope node name.
+        name: &'static str,
+    },
+    /// A scope node's embedded graph has a validation error.
+    ScopeGraphInvalid {
+        /// The scope node ID.
+        node: NodeId,
+        /// The scope node name.
+        name: &'static str,
+        /// The inner validation error from the embedded graph.
+        inner: Box<ValidationError>,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -802,6 +874,21 @@ impl fmt::Display for ValidationError {
                     "system '{name}' ({node}) requires {requirement} edge context but is not reachable via a matching edge"
                 )
             }
+            ValidationError::EmptyScopeGraph { node, name } => {
+                write!(f, "scope node '{name}' ({node}) contains an empty graph")
+            }
+            ValidationError::ScopeGraphNoEntryPoint { node, name } => {
+                write!(
+                    f,
+                    "scope node '{name}' ({node}) embedded graph has no entry point"
+                )
+            }
+            ValidationError::ScopeGraphInvalid { node, name, inner } => {
+                write!(
+                    f,
+                    "scope node '{name}' ({node}) embedded graph error: {inner}"
+                )
+            }
         }
     }
 }
@@ -854,3 +941,38 @@ impl fmt::Display for MergeError {
 }
 
 impl std::error::Error for MergeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{ContextPolicy, Node, SystemNode};
+    use polaris_system::system::IntoSystem;
+
+    async fn dummy() -> i32 {
+        1
+    }
+
+    #[test]
+    fn scope_graph_no_entry_point() {
+        // Construct a Graph with nodes but no entry point.
+        // This can only happen through pub(crate) access since all public
+        // builder methods set the entry on the first node.
+        let mut inner = Graph::default();
+        let node = Node::System(SystemNode::new(dummy.into_system()));
+        inner.nodes.push(node);
+        // entry remains None, but is_empty() is false
+
+        let mut graph = Graph::new();
+        graph.add_scope("no_entry_scope", inner, ContextPolicy::shared());
+
+        let result = graph.validate();
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|err| matches!(err, ValidationError::ScopeGraphNoEntryPoint { .. })),
+            "expected ScopeGraphNoEntryPoint error, got: {:?}",
+            result.errors
+        );
+    }
+}

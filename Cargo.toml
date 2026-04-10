@@ -1,6 +1,6 @@
 [package]
 name = "polaris-ai"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 categories = ["asynchronous", "development-tools"]
 description = "A unified agent runtime where agent patterns are first-class, composable, and optimizable abstractions."
@@ -96,11 +96,12 @@ default = []
 anthropic = ["polaris_internal/anthropic"]
 bedrock = ["polaris_internal/bedrock"]
 openai = ["polaris_internal/openai"]
-graph_tracing = ["polaris_internal/graph_tracing"]
-models_tracing = ["polaris_internal/models_tracing"]
-tools_tracing = ["polaris_internal/tools_tracing"]
+graph-tracing = ["polaris_internal/graph-tracing"]
+models-tracing = ["polaris_internal/models-tracing"]
+tools-tracing = ["polaris_internal/tools-tracing"]
 otel = ["polaris_internal/otel"]
+sessions-http = ["polaris_internal/sessions-http"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "0.0.2" }
+polaris_internal = { path = "crates/polaris_internal", version = "0.0.3" }
 tracing = { version = "0.1.43", default-features = false, optional = true }

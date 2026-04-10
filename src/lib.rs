@@ -19,6 +19,36 @@
 //! | [`shell`] | `polaris_shell` | Shell command execution with permission model |
 //! | [`app`] | `polaris_app` | HTTP server runtime with plugin integration |
 //!
+//! # Feature Flags
+//!
+//! All features are opt-in (none enabled by default). Features that originate
+//! from a sub-crate and would otherwise be ambiguous at the top level are
+//! prefixed with the sub-crate's short name (e.g. `sessions-http`). Features
+//! that are already unambiguous keep their original name (e.g. `anthropic`).
+//!
+//! ## Model Providers
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `anthropic` | Anthropic Claude provider (`polaris_model_providers`) |
+//! | `openai` | `OpenAI` provider (`polaris_model_providers`) |
+//! | `bedrock` | AWS Bedrock provider (`polaris_model_providers`) |
+//!
+//! ## Observability
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `graph-tracing` | Tracing spans for graph execution (`polaris_core_plugins`) |
+//! | `models-tracing` | Tracing spans for model calls (`polaris_core_plugins`) |
+//! | `tools-tracing` | Tracing spans for tool invocations (`polaris_core_plugins`) |
+//! | `otel` | OpenTelemetry exporter support (`polaris_core_plugins`) |
+//!
+//! ## Sessions
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `sessions-http` | HTTP/REST routes for session management (`polaris_sessions`) |
+//!
 //! # Quick Start
 //!
 //! ```no_run

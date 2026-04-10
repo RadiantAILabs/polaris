@@ -3,8 +3,8 @@
 use super::{Graph, MergeError};
 use crate::edge::{Edge, ErrorEdge, TimeoutEdge};
 use crate::node::{
-    DecisionNode, IntoSystemNode, LoopNode, Node, NodeId, ParallelNode, RetryPolicy, SwitchNode,
-    SystemNode,
+    ContextPolicy, DecisionNode, IntoSystemNode, LoopNode, Node, NodeId, ParallelNode, RetryPolicy,
+    ScopeNode, SwitchNode, SystemNode,
 };
 use crate::predicate::Predicate;
 use hashbrown::HashSet;
@@ -570,6 +570,68 @@ impl Graph {
 
         self
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scope API
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Adds a scope node containing an embedded graph.
+    ///
+    /// The scope node executes the embedded graph as a single opaque unit.
+    /// The [`ContextPolicy`] controls context sharing between parent and child.
+    ///
+    /// Unlike decision/loop/parallel nodes, the embedded graph's nodes are NOT
+    /// merged into the parent graph. The scope node holds the graph as a field.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Human-readable name for the scope node
+    /// * `graph` - The embedded graph to execute
+    /// * `policy` - Context sharing policy
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::node::ContextPolicy;
+    /// # async fn gather_info() -> String { String::new() }
+    /// # async fn summarize() -> String { String::new() }
+    /// // Build an inner graph for the sub-agent
+    /// let mut research = Graph::new();
+    /// research.add_system(gather_info).add_system(summarize);
+    ///
+    /// // Embed it as a scope with inherited context
+    /// let mut graph = Graph::new();
+    /// graph.add_scope("research", research, ContextPolicy::inherit());
+    /// ```
+    pub fn add_scope(
+        &mut self,
+        name: &'static str,
+        graph: Graph,
+        policy: ContextPolicy,
+    ) -> &mut Self {
+        let scope = ScopeNode::new(name, graph, policy);
+        let scope_id = scope.id.clone();
+
+        // Connect to previous node if exists
+        if let Some(prev_id) = self.last_node.clone() {
+            self.add_sequential_edge(prev_id, scope_id.clone());
+        }
+
+        // Set as entry if first node
+        if self.entry.is_none() {
+            self.entry = Some(scope_id.clone());
+        }
+
+        self.nodes.push(Node::Scope(scope));
+        self.last_node = Some(scope_id);
+
+        self
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Error and Timeout Handlers
+    // ─────────────────────────────────────────────────────────────────────────
 
     /// Attaches an error handler to all fallible system nodes that don't
     /// already have an error edge.

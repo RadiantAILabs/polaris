@@ -10,13 +10,23 @@
 //! - `LocalResource` is mutable, isolated per context
 //! - Graphs define execution flow
 //! - Outputs chain between systems
+//! - Scope execution with Shared, Inherit, and Isolated modes
+
+mod test_utils;
 
 use polaris_graph::executor::GraphExecutor;
 use polaris_graph::graph::Graph;
+use polaris_graph::middleware::MiddlewareAPI;
+use polaris_graph::node::ContextPolicy;
 use polaris_system::param::{Res, ResMut, SystemAccess, SystemContext, SystemParam};
-use polaris_system::resource::{GlobalResource, LocalResource};
+use polaris_system::resource::{GlobalResource, LocalResource, Resources};
 use polaris_system::server::Server;
 use polaris_system::system::{BoxFuture, System, SystemError};
+use std::sync::{Arc, Mutex};
+use test_utils::{
+    ConsumerSystem, FlagSystem, ProducerSystem, ReadConfigCapture, SuccessSystem, TestConfig,
+    WriteConfigCapture,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Resources
@@ -719,4 +729,502 @@ async fn conditional_diverge_converge_diamond() {
     let output = ctx.get_output::<DiamondResult>().unwrap();
     assert_eq!(output.step, "converge");
     assert_eq!(output.value, 100);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPE EXECUTION TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn scope_shared_executes_inner_graph() {
+    let mut inner = Graph::new();
+    let flag = Arc::new(Mutex::new(false));
+    inner.add_boxed_system(Box::new(FlagSystem {
+        flag: Arc::clone(&flag),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope("shared_scope", inner, ContextPolicy::shared());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok(), "scope execution should succeed");
+    assert!(*flag.lock().unwrap(), "inner system should have executed");
+}
+
+#[tokio::test]
+async fn scope_shared_outputs_visible_after_scope() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ProducerSystem { value: 42 }));
+
+    let received = Arc::new(Mutex::new(None));
+    let mut graph = Graph::new();
+    graph
+        .add_scope("producer_scope", inner, ContextPolicy::shared())
+        .add_boxed_system(Box::new(ConsumerSystem {
+            received: Arc::clone(&received),
+        }));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some(42),
+        "output from scope should be visible to subsequent systems"
+    );
+}
+
+#[tokio::test]
+async fn scope_shared_reads_parent_resources() {
+    let captured = Arc::new(Mutex::new(None));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigCapture {
+        captured: Arc::clone(&captured),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope("config_scope", inner, ContextPolicy::shared());
+
+    let mut ctx = SystemContext::new().with(TestConfig { value: 99 });
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(99),
+        "shared scope should read parent resources"
+    );
+}
+
+#[tokio::test]
+async fn scope_inherit_executes_inner_graph() {
+    let mut inner = Graph::new();
+    let flag = Arc::new(Mutex::new(false));
+    inner.add_boxed_system(Box::new(FlagSystem {
+        flag: Arc::clone(&flag),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope("inherit_scope", inner, ContextPolicy::inherit());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert!(*flag.lock().unwrap(), "inner system should have executed");
+}
+
+#[tokio::test]
+async fn scope_inherit_merges_outputs_back() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ProducerSystem { value: 77 }));
+
+    let received = Arc::new(Mutex::new(None));
+    let mut graph = Graph::new();
+    graph
+        .add_scope("inherit_scope", inner, ContextPolicy::inherit())
+        .add_boxed_system(Box::new(ConsumerSystem {
+            received: Arc::clone(&received),
+        }));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some(77),
+        "outputs from inherit scope should be merged back to parent"
+    );
+}
+
+#[tokio::test]
+async fn scope_inherit_reads_parent_resources_via_chain() {
+    let captured = Arc::new(Mutex::new(None));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigCapture {
+        captured: Arc::clone(&captured),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope("inherit_scope", inner, ContextPolicy::inherit());
+
+    let mut ctx = SystemContext::new().with(TestConfig { value: 55 });
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(55),
+        "inherit scope should read parent resources via chain"
+    );
+}
+
+#[tokio::test]
+async fn scope_inherit_forward_clones_resource() {
+    let captured = Arc::new(Mutex::new(None));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigCapture {
+        captured: Arc::clone(&captured),
+    }));
+
+    let policy = ContextPolicy::inherit().forward::<TestConfig>();
+
+    let mut graph = Graph::new();
+    graph.add_scope("inherit_fwd", inner, policy);
+
+    let mut ctx = SystemContext::new().with(TestConfig { value: 33 });
+
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(33),
+        "forwarded resource should be readable in child"
+    );
+}
+
+#[tokio::test]
+async fn scope_isolated_executes_inner_graph() {
+    let mut inner = Graph::new();
+    let flag = Arc::new(Mutex::new(false));
+    inner.add_boxed_system(Box::new(FlagSystem {
+        flag: Arc::clone(&flag),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope("isolated_scope", inner, ContextPolicy::isolated());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert!(*flag.lock().unwrap(), "inner system should have executed");
+}
+
+#[tokio::test]
+async fn scope_isolated_merges_outputs_back() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ProducerSystem { value: 101 }));
+
+    let received = Arc::new(Mutex::new(None));
+    let mut graph = Graph::new();
+    graph
+        .add_scope("isolated_scope", inner, ContextPolicy::isolated())
+        .add_boxed_system(Box::new(ConsumerSystem {
+            received: Arc::clone(&received),
+        }));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some(101),
+        "outputs from isolated scope should be merged back"
+    );
+}
+
+#[tokio::test]
+async fn scope_isolated_forward_clones_resource() {
+    let captured = Arc::new(Mutex::new(None));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigCapture {
+        captured: Arc::clone(&captured),
+    }));
+
+    let policy = ContextPolicy::isolated().forward::<TestConfig>();
+
+    let mut graph = Graph::new();
+    graph.add_scope("isolated_fwd_mut", inner, policy);
+
+    let mut ctx = SystemContext::new().with(TestConfig { value: 77 });
+
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(77),
+        "forward should make resource accessible in isolated scope"
+    );
+}
+
+#[tokio::test]
+async fn scope_in_sequential_chain() {
+    let flag_before = Arc::new(Mutex::new(false));
+
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ProducerSystem { value: 10 }));
+
+    let received = Arc::new(Mutex::new(None));
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(FlagSystem {
+        flag: Arc::clone(&flag_before),
+    }));
+    graph
+        .add_scope("middle_scope", inner, ContextPolicy::shared())
+        .add_boxed_system(Box::new(ConsumerSystem {
+            received: Arc::clone(&received),
+        }));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert!(*flag_before.lock().unwrap(), "system before scope ran");
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some(10),
+        "system after scope consumed scope output"
+    );
+}
+
+#[tokio::test]
+async fn scope_node_count_in_result() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(SuccessSystem));
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(SuccessSystem));
+    graph.add_scope("scope", inner, ContextPolicy::shared());
+    graph.add_boxed_system(Box::new(SuccessSystem));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
+
+    // 3 nodes in parent + 1 inner node executed via scope
+    assert_eq!(
+        result.nodes_executed,
+        3 + 1,
+        "should count parent nodes + inner scope nodes"
+    );
+}
+
+#[tokio::test]
+async fn scope_nested_inherits_outputs() {
+    // Outer scope (Shared) → Inner scope (Shared) → ProducerSystem
+    // Consumer after both scopes should see the output.
+    let mut innermost = Graph::new();
+    innermost.add_boxed_system(Box::new(ProducerSystem { value: 99 }));
+
+    let mut outer_inner = Graph::new();
+    outer_inner.add_scope("inner_scope", innermost, ContextPolicy::shared());
+
+    let received = Arc::new(Mutex::new(None));
+    let mut graph = Graph::new();
+    graph
+        .add_scope("outer_scope", outer_inner, ContextPolicy::shared())
+        .add_boxed_system(Box::new(ConsumerSystem {
+            received: Arc::clone(&received),
+        }));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some(99),
+        "output from nested scope should propagate to parent"
+    );
+}
+
+#[tokio::test]
+async fn scope_inside_parallel_branch() {
+    // Parallel with two branches: one containing a scope with a producer,
+    // one containing a plain producer with a different value.
+    let mut scope_inner = Graph::new();
+    scope_inner.add_boxed_system(Box::new(ProducerSystem { value: 50 }));
+
+    let mut graph = Graph::new();
+    graph.add_parallel(
+        "fork",
+        vec![
+            |g: &mut Graph| {
+                let mut inner = Graph::new();
+                inner.add_boxed_system(Box::new(ProducerSystem { value: 50 }));
+                g.add_scope("scoped_branch", inner, ContextPolicy::shared());
+            },
+            |g: &mut Graph| {
+                g.add_boxed_system(Box::new(SuccessSystem));
+            },
+        ],
+    );
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    let result = result.unwrap();
+    // parallel(1) + branch_a scope(1) + inner system(1) + branch_b system(1) = 4
+    assert_eq!(
+        result.nodes_executed, 4,
+        "should execute parallel(1) + scope(1) + inner(1) + branch_b(1)"
+    );
+}
+
+#[tokio::test]
+async fn scope_inherit_write_isolation() {
+    // In Inherit mode, writes inside the scope go to the child's local scope.
+    // The parent's resource should remain unchanged after the scope completes.
+    let captured_before = Arc::new(Mutex::new(None));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(WriteConfigCapture {
+        new_value: 999,
+        captured: Arc::clone(&captured_before),
+    }));
+
+    let policy = ContextPolicy::inherit().forward::<TestConfig>();
+
+    let mut graph = Graph::new();
+    graph.add_scope("inherit_write", inner, policy);
+
+    let mut ctx = SystemContext::new().with(TestConfig { value: 42 });
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok());
+    // The scope system saw the original value via the forwarded clone
+    assert_eq!(
+        *captured_before.lock().unwrap(),
+        Some(42),
+        "scope system should see original forwarded value"
+    );
+    // The parent's resource should be unchanged — writes went to the child
+    let parent_config = ctx.get_resource::<TestConfig>().unwrap();
+    assert_eq!(
+        parent_config.value, 42,
+        "parent resource should be unchanged after inherit scope writes"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scope Middleware
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn scope_middleware_handler_executes() {
+    let invoked = Arc::new(Mutex::new(false));
+    let invoked_clone = Arc::clone(&invoked);
+
+    let mw = MiddlewareAPI::new();
+    mw.register_scope("test_scope_mw", move |_info, ctx, next| {
+        let invoked = Arc::clone(&invoked_clone);
+        Box::pin(async move {
+            *invoked.lock().unwrap() = true;
+            next.run(ctx).await
+        })
+    });
+
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(SuccessSystem));
+
+    let mut graph = Graph::new();
+    graph.add_scope("mw_scope", inner, ContextPolicy::shared());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, Some(&mw)).await;
+
+    assert!(result.is_ok(), "execution should succeed");
+    assert!(
+        *invoked.lock().unwrap(),
+        "scope middleware handler should have been invoked"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Isolated Scope with Globals
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Global resource for testing isolated scope globals inheritance.
+#[derive(Debug)]
+struct GlobalConfig {
+    name: String,
+}
+impl GlobalResource for GlobalConfig {}
+
+/// System that reads a global resource.
+struct ReadGlobalSystem {
+    captured: Arc<Mutex<Option<String>>>,
+}
+
+impl System for ReadGlobalSystem {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let captured = Arc::clone(&self.captured);
+        Box::pin(async move {
+            let config = ctx
+                .get_resource::<GlobalConfig>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            *captured.lock().unwrap() = Some(config.name.clone());
+            Ok(())
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "read_global_system"
+    }
+}
+
+#[tokio::test]
+async fn scope_isolated_inherits_global_resources() {
+    let captured = Arc::new(Mutex::new(None));
+
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadGlobalSystem {
+        captured: Arc::clone(&captured),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope("iso_globals", inner, ContextPolicy::isolated());
+
+    // Create a context with global resources
+    let mut globals = Resources::new();
+    globals.insert(GlobalConfig {
+        name: "global_value".to_string(),
+    });
+    let globals = Arc::new(globals);
+    let mut ctx = SystemContext::with_globals(globals);
+
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        result.is_ok(),
+        "isolated scope should access globals, got: {:?}",
+        result.unwrap_err()
+    );
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some("global_value".to_string()),
+        "isolated scope should have read the global resource"
+    );
 }

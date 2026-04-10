@@ -13,8 +13,8 @@ rust-version = "1.93.0"
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.0.2" }
-polaris_graph = { path = "../polaris_graph", version = "0.0.1" }
+polaris_system = { path = "../polaris_system", version = "0.0.3" }
+polaris_graph = { path = "../polaris_graph", version = "0.1.0" }
 polaris_models = { path = "../polaris_models", version = "0.0.1", optional = true }
 polaris_tools = { path = "../polaris_tools", version = "0.0.1", optional = true }
 persistence_macros = { path = "persistence_macros", version = "0.0.1" }
