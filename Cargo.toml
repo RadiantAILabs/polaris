@@ -1,6 +1,6 @@
 [package]
 name = "polaris-ai"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 categories = ["asynchronous", "development-tools"]
 description = "A unified agent runtime where agent patterns are first-class, composable, and optimizable abstractions."
@@ -103,5 +103,5 @@ otel = ["polaris_internal/otel"]
 sessions-http = ["polaris_internal/sessions-http"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "0.0.3" }
+polaris_internal = { path = "crates/polaris_internal", version = "0.0.4" }
 tracing = { version = "0.1.43", default-features = false, optional = true }

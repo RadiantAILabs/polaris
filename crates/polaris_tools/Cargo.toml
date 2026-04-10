@@ -1,6 +1,6 @@
 [package]
 name = "polaris_tools"
-version = "0.0.1"
+version = "0.0.2"
 description = "Tool framework for Polaris agents"
 edition = "2024"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 polaris_system = { path = "../polaris_system", version = "0.0.3" }
-polaris_models = { path = "../polaris_models", version = "0.0.1" }
+polaris_models = { path = "../polaris_models", version = "0.0.2" }
 tool_macros = { path = "tool_macros", version = "0.0.1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }

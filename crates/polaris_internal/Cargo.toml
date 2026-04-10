@@ -1,6 +1,6 @@
 [package]
 name = "polaris_internal"
-version = "0.0.3"
+version = "0.0.4"
 description = "An internal Polaris crate"
 edition = "2024"
 keywords = []
@@ -24,13 +24,13 @@ sessions-http = ["polaris_sessions/http"]
 polaris_system = { path = "../polaris_system", version = "0.0.3" }
 polaris_graph = { path = "../polaris_graph", version = "0.1.0" }
 polaris_agent = { path = "../polaris_agent", version = "0.0.2" }
-polaris_tools = { path = "../polaris_tools", version = "0.0.1" }
-polaris_model_providers = { path = "../polaris_model_providers", version = "0.0.1" }
-polaris_models = { path = "../polaris_models", version = "0.0.1" }
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.1" }
-polaris_sessions = { path = "../polaris_sessions", version = "0.0.1" }
-polaris_shell = { path = "../polaris_shell", version = "0.0.1" }
-polaris_app = { path = "../polaris_app", version = "0.0.1" }
+polaris_tools = { path = "../polaris_tools", version = "0.0.2" }
+polaris_model_providers = { path = "../polaris_model_providers", version = "0.0.2" }
+polaris_models = { path = "../polaris_models", version = "0.0.2" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.12" }
+polaris_sessions = { path = "../polaris_sessions", version = "0.0.2" }
+polaris_shell = { path = "../polaris_shell", version = "0.0.2" }
+polaris_app = { path = "../polaris_app", version = "0.0.2" }
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "polaris_app"
-version = "0.0.1"
+version = "0.0.2"
 description = "Shared HTTP server runtime for Polaris products."
 edition = "2024"
 keywords = ["polaris-ai", "http", "axum", "server"]
@@ -20,7 +20,7 @@ workspace = true
 
 [dependencies]
 polaris_system = { path = "../polaris_system", version = "0.0.3" }
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.1" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.12" }
 axum = { version = "0.8", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "sync", "net", "signal", "macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util", "propagate-header"] }

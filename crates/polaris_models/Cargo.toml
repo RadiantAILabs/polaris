@@ -1,6 +1,6 @@
 [package]
 name = "polaris_models"
-version = "0.0.1"
+version = "0.0.2"
 description = "Model provider interface and registry for Polaris"
 edition = "2024"
 license = "Apache-2.0"
