@@ -20,7 +20,9 @@
 //! }
 //! ```
 
-use crate::{ExecutionError, node::NodeId};
+use crate::ExecutionError;
+use crate::node::{ContextMode, NodeId};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Unified event enum for all graph execution hooks.
@@ -30,6 +32,7 @@ use std::time::Duration;
 /// - Simple multi-schedule registration (all hooks receive the same type)
 /// - Typed access via pattern matching
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum GraphEvent {
     // ─────────────────────────────────────────────────────────────────────────
     // Graph-Level Events
@@ -84,7 +87,7 @@ pub enum GraphEvent {
         /// The system's name.
         node_name: &'static str,
         /// The error message.
-        error: String,
+        error: Arc<str>,
     },
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -198,6 +201,35 @@ pub enum GraphEvent {
         /// Total duration for parallel execution.
         duration: Duration,
     },
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scope Events
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Event emitted before a scope node begins execution.
+    ScopeStart {
+        /// The node ID of the scope node.
+        node_id: NodeId,
+        /// The scope node's name.
+        node_name: &'static str,
+        /// The context mode for the scope (e.g., "Shared", "Inherit", "Isolated").
+        context_mode: ContextMode,
+        /// Number of nodes in the embedded graph.
+        inner_node_count: usize,
+    },
+
+    /// Event emitted after a scope node completes execution.
+    ScopeComplete {
+        /// The node ID of the scope node.
+        node_id: NodeId,
+        /// The scope node's name.
+        node_name: &'static str,
+        /// The context mode for the scope.
+        context_mode: ContextMode,
+        /// Total nodes executed inside the scope.
+        nodes_executed: usize,
+        /// Total duration for scope execution.
+        duration: Duration,
+    },
 }
 
 impl GraphEvent {
@@ -222,6 +254,8 @@ impl GraphEvent {
             GraphEvent::LoopEnd { .. } => "OnLoopEnd",
             GraphEvent::ParallelStart { .. } => "OnParallelStart",
             GraphEvent::ParallelComplete { .. } => "OnParallelComplete",
+            GraphEvent::ScopeStart { .. } => "OnScopeStart",
+            GraphEvent::ScopeComplete { .. } => "OnScopeComplete",
         }
     }
 
@@ -246,7 +280,9 @@ impl GraphEvent {
             | GraphEvent::LoopIteration { node_id, .. }
             | GraphEvent::LoopEnd { node_id, .. }
             | GraphEvent::ParallelStart { node_id, .. }
-            | GraphEvent::ParallelComplete { node_id, .. } => Some(node_id.clone()),
+            | GraphEvent::ParallelComplete { node_id, .. }
+            | GraphEvent::ScopeStart { node_id, .. }
+            | GraphEvent::ScopeComplete { node_id, .. } => Some(node_id.clone()),
         }
     }
 }
@@ -403,6 +439,31 @@ impl std::fmt::Display for GraphEvent {
                     f,
                     "ParallelComplete({} @ {:?}, branches: {}, executed: {}, duration: {:?})",
                     node_name, node_id, branch_count, total_nodes_executed, duration
+                )
+            }
+            GraphEvent::ScopeStart {
+                node_id,
+                node_name,
+                context_mode,
+                inner_node_count,
+            } => {
+                write!(
+                    f,
+                    "ScopeStart({} @ {:?}, mode: {}, inner_nodes: {})",
+                    node_name, node_id, context_mode, inner_node_count
+                )
+            }
+            GraphEvent::ScopeComplete {
+                node_id,
+                node_name,
+                context_mode,
+                nodes_executed,
+                duration,
+            } => {
+                write!(
+                    f,
+                    "ScopeComplete({} @ {:?}, mode: {}, executed: {}, duration: {:?})",
+                    node_name, node_id, context_mode, nodes_executed, duration
                 )
             }
         }

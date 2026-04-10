@@ -85,8 +85,9 @@ pub mod prelude {
     };
     pub use crate::middleware::{MiddlewareAPI, MiddlewareError};
     pub use crate::node::{
-        DecisionNode, IntoSystemNode, LoopNode, Node, NodeId, NodeMarker, ParallelNode,
-        RetryPolicy, ScheduledNodeMarker, SwitchNode, SystemNode,
+        ContextMode, ContextPolicy, DecisionNode, IntoSystemNode, LoopNode, Node, NodeId,
+        NodeMarker, ParallelNode, ResourceForward, RetryPolicy, ScheduledNodeMarker, ScopeNode,
+        SwitchNode, SystemNode,
     };
     pub use crate::predicate::{
         BoxedDiscriminator, BoxedPredicate, Discriminator, ErasedDiscriminator, ErasedPredicate,
@@ -103,4 +104,4 @@ pub use graph::{
     Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
 };
 pub use middleware::{MiddlewareAPI, MiddlewareError};
-pub use node::{NodeId, RetryPolicy};
+pub use node::{ContextMode, ContextPolicy, NodeId, ResourceForward, RetryPolicy, ScopeNode};

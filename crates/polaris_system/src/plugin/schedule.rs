@@ -139,8 +139,8 @@ macro_rules! impl_into_schedule_ids_for_tuple {
     };
 }
 
-// Generate implementations for tuples from 2 to 16 elements
-all_tuples!(impl_into_schedule_ids_for_tuple, 2, 16, S);
+// Generate implementations for tuples from 2 to 20 elements
+all_tuples!(impl_into_schedule_ids_for_tuple, 2, 20, S);
 
 #[cfg(test)]
 mod tests {

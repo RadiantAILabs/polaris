@@ -13,10 +13,10 @@ use polaris_graph::hooks::HooksAPI;
 use polaris_graph::hooks::events::GraphEvent;
 use polaris_graph::hooks::schedule::{
     OnDecisionComplete, OnDecisionStart, OnGraphComplete, OnGraphFailure, OnGraphStart, OnLoopEnd,
-    OnLoopIteration, OnLoopStart, OnParallelComplete, OnParallelStart, OnSwitchComplete,
-    OnSwitchStart, OnSystemComplete, OnSystemError, OnSystemStart,
+    OnLoopIteration, OnLoopStart, OnParallelComplete, OnParallelStart, OnScopeComplete,
+    OnScopeStart, OnSwitchComplete, OnSwitchStart, OnSystemComplete, OnSystemError, OnSystemStart,
 };
-use polaris_graph::node::NodeId;
+use polaris_graph::node::{ContextPolicy, NodeId};
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::Schedule;
 use polaris_system::system;
@@ -543,4 +543,56 @@ async fn marker_fires_on_system_error() {
         "MarkerA"         => GraphEvent::SystemError { node_id, node_name: "error_fn", error } if *node_id == failing_id && error.contains("intentional failure"),
         "OnGraphFailure"  => GraphEvent::GraphFailure { error } if matches!(error, ExecutionError::SystemError(_)),
     ]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPE HOOKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn scope_fires_hooks() {
+    let hooks = HooksAPI::new();
+
+    let scope_started = Arc::new(Mutex::new(false));
+    let started_clone = Arc::clone(&scope_started);
+    hooks
+        .register_observer::<OnScopeStart, _>("test_scope_start", move |event: &GraphEvent| {
+            if matches!(event, GraphEvent::ScopeStart { .. }) {
+                *started_clone.lock().unwrap() = true;
+            }
+        })
+        .unwrap();
+
+    let scope_completed = Arc::new(Mutex::new(false));
+    let completed_clone = Arc::clone(&scope_completed);
+    hooks
+        .register_observer::<OnScopeComplete, _>(
+            "test_scope_complete",
+            move |event: &GraphEvent| {
+                if matches!(event, GraphEvent::ScopeComplete { .. }) {
+                    *completed_clone.lock().unwrap() = true;
+                }
+            },
+        )
+        .unwrap();
+
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(SuccessSystem));
+
+    let mut graph = Graph::new();
+    graph.add_scope("hooked_scope", inner, ContextPolicy::shared());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, Some(&hooks), None).await;
+
+    assert!(result.is_ok());
+    assert!(
+        *scope_started.lock().unwrap(),
+        "OnScopeStart hook should have fired"
+    );
+    assert!(
+        *scope_completed.lock().unwrap(),
+        "OnScopeComplete hook should have fired"
+    );
 }

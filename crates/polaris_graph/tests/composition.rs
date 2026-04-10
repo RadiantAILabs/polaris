@@ -32,13 +32,14 @@
 //! - **Loop { n }**: multiplies body counts by `n`
 //! - **Switch**: selected case gets real counts, unselected case gets zeros
 //! - **Fallible**: handler body predictions (failing system has no tracker)
+//! - **Scope**: delegates to body (scope executes once, same multiplier)
 //!
 //! ## Property-Based Testing
 //!
 //! The `prop_tests` module uses `proptest` to generate random `Fragment` trees (depth 3,
-//! 256 cases). At each non-leaf level, one of the 6 composite types (Seq, Par, Decision,
-//! Loop, Switch, Fallible) is chosen with equal probability, ensuring broad coverage of
-//! nesting combinations including error handling paths. The property asserts that per-node
+//! 256 cases). At each non-leaf level, one of the 7 composite types (Seq, Par, Decision,
+//! Loop, Switch, Fallible, Scope) is chosen with equal probability, ensuring broad coverage of
+//! nesting combinations including error handling and scope boundary paths. The property asserts that per-node
 //! execution counts match the predicted counts for every generated tree.
 //!
 //! ## Test Infrastructure
@@ -51,7 +52,7 @@ mod test_utils;
 
 use polaris_graph::executor::{ExecutionError, GraphExecutor};
 use polaris_graph::graph::Graph;
-use polaris_graph::node::NodeId;
+use polaris_graph::node::{ContextPolicy, NodeId};
 use test_utils::{
     DecisionOutput, DecisionSystem, ExecutionLog, FailingSystem, SwitchKeySystem, SwitchOutput,
     TrackerNodes, add_tracker, branch, create_test_server, get_hooks,
@@ -93,6 +94,10 @@ enum Fragment {
     /// handler body executes via the error edge. Execution continues normally
     /// after the handler completes.
     Fallible { handler: Box<Fragment> },
+    /// Scope node wrapping a body. Uses `Shared` mode (same context, no boundary)
+    /// so that test infrastructure resources (`ExecutionLog`, `SystemInfo`) remain
+    /// accessible to inner tracking systems.
+    Scope { body: Box<Fragment> },
 }
 
 impl Fragment {
@@ -167,6 +172,11 @@ impl Fragment {
                     .on_error(move |g| handler.build(g, &trackers))
                     .done();
             }
+            Fragment::Scope { body } => {
+                let mut inner = Graph::new();
+                body.build(&mut inner, trackers);
+                g.add_scope("scope", inner, ContextPolicy::shared());
+            }
         }
     }
 
@@ -177,6 +187,9 @@ impl Fragment {
         match self {
             Fragment::Fallible { .. } => true,
             Fragment::Seq(items) => items.iter().any(Fragment::is_diverting),
+            // Scope always completes normally in the test framework because
+            // errors inside are caught by the Fallible handler. The error
+            // diversion is contained within the scope's inner graph.
             _ => false,
         }
     }
@@ -194,6 +207,7 @@ impl Fragment {
             Fragment::Loop { body, .. } => body.tracker_count(),
             Fragment::Switch { a, b, .. } => a.tracker_count() + b.tracker_count(),
             Fragment::Fallible { handler } => handler.tracker_count(),
+            Fragment::Scope { body } => body.tracker_count(),
         }
     }
 
@@ -265,6 +279,8 @@ impl Fragment {
             }
             // FailingSystem has no tracker; only the handler body has trackers.
             Fragment::Fallible { handler } => handler.predicted_counts_inner(multiplier),
+            // Scope executes once; body trackers fire with the same multiplier.
+            Fragment::Scope { body } => body.predicted_counts_inner(multiplier),
         }
     }
 }
@@ -311,6 +327,12 @@ fn switch(case: &'static str, a: Fragment, b: Fragment) -> Fragment {
 fn fallible(handler: Fragment) -> Fragment {
     Fragment::Fallible {
         handler: Box::new(handler),
+    }
+}
+
+fn scope(body: Fragment) -> Fragment {
+    Fragment::Scope {
+        body: Box::new(body),
     }
 }
 
@@ -637,6 +659,34 @@ async fn test_arbitrary_depth_nesting() {
     );
 }
 
+/// Verifies scope node: inner body executes, scope is transparent.
+#[tokio::test]
+async fn test_scope() {
+    let (log, nodes) = run_fragment(scope(track())).await.unwrap();
+    assert_eq!(log.count(&nodes[0]), 1, "scope body should execute");
+}
+
+/// Verifies scope in a sequence with parallel body.
+#[tokio::test]
+async fn test_scope_in_sequence() {
+    let fragment = seq([track(), scope(par([track(), track()])), track()]);
+    let (log, nodes) = run_fragment(fragment).await.unwrap();
+
+    assert_eq!(log.count(&nodes[0]), 1, "before scope");
+    assert_eq!(log.count(&nodes[1]), 1, "scope parallel branch a");
+    assert_eq!(log.count(&nodes[2]), 1, "scope parallel branch b");
+    assert_eq!(log.count(&nodes[3]), 1, "after scope");
+}
+
+/// Verifies scope inside a loop: body runs on each iteration.
+#[tokio::test]
+async fn test_scope_in_loop() {
+    let fragment = loop_n(3, scope(track()));
+    let (log, nodes) = run_fragment(fragment).await.unwrap();
+
+    assert_eq!(log.count(&nodes[0]), 3, "scope body should execute 3 times");
+}
+
 /// Demonstrates arbitrary composition with the Fragment DSL.
 #[tokio::test]
 async fn test_arbitrary_composition() {
@@ -700,7 +750,7 @@ async fn test_arbitrary_composition() {
 ///   equal probability. `Track` is excluded at inner levels so every generated
 ///   tree reaches full depth, preventing trivial trees.
 ///
-/// With 6 composite types at each of 3 levels, running 256 cases provides good
+/// With 7 composite types at each of 3 levels, running 256 cases provides good
 /// coverage of nesting combinations.
 ///
 /// ## Parameterized Branching
@@ -725,7 +775,8 @@ mod prop_tests {
     /// At `depth == 0`, only `Track` leaves are produced.
     /// At `depth > 0`, only composite types are generated (equal weight),
     /// ensuring every tree reaches full depth. Includes `Fallible` to exercise
-    /// error edge routing under arbitrary nesting.
+    /// error edge routing and `Scope` to exercise scope boundaries under
+    /// arbitrary nesting.
     fn arb_fragment(depth: u32) -> BoxedStrategy<Fragment> {
         if depth == 0 {
             Just(Fragment::Track).boxed()
@@ -747,6 +798,7 @@ mod prop_tests {
                 )
                     .prop_map(|(c, a, b)| switch(c, a, b)),
                 arb_fragment(depth - 1).prop_map(fallible),
+                arb_fragment(depth - 1).prop_map(scope),
             ]
             .boxed()
         }

@@ -1,6 +1,6 @@
 [package]
 name = "polaris_system"
-version = "0.0.2"
+version = "0.0.3"
 description = "A lightweight ECS-inspired system framework for Polaris."
 edition = "2024"
 keywords = []

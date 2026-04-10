@@ -3,7 +3,10 @@
 //! Nodes are the vertices in a graph, representing units of computation
 //! or control flow decisions.
 
+use crate::graph::Graph;
 use crate::predicate::BoxedPredicate;
+use core::any::Any;
+use core::hash::{Hash, Hasher};
 use polaris_system::plugin::{IntoScheduleIds, ScheduleId};
 use polaris_system::resource::LocalResource;
 use polaris_system::system::{BoxedSystem, ErasedSystem, IntoSystem};
@@ -73,6 +76,7 @@ impl IntoIterator for NodeId {
 /// Each node represents either a computation unit (system) or a control flow
 /// construct (decision, loop, parallel execution).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Node {
     /// Executes a system function.
     System(SystemNode),
@@ -86,6 +90,8 @@ pub enum Node {
     Parallel(ParallelNode),
     /// Repeats subgraph until termination condition.
     Loop(LoopNode),
+    /// Executes an embedded graph with a configurable context boundary.
+    Scope(ScopeNode),
 }
 
 impl Node {
@@ -98,6 +104,7 @@ impl Node {
             Node::Switch(n) => n.id.clone(),
             Node::Parallel(n) => n.id.clone(),
             Node::Loop(n) => n.id.clone(),
+            Node::Scope(n) => n.id.clone(),
         }
     }
 
@@ -110,6 +117,7 @@ impl Node {
             Node::Switch(n) => n.name,
             Node::Parallel(n) => n.name,
             Node::Loop(n) => n.name,
+            Node::Scope(n) => n.name,
         }
     }
 }
@@ -506,6 +514,252 @@ impl fmt::Debug for LoopNode {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Scope Node
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Base isolation level for context sharing between a parent and scoped graph.
+///
+/// Determines how the parent's [`SystemContext`](polaris_system::param::SystemContext)
+/// is made available to systems within the scoped graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ContextMode {
+    /// Pass the same context through. No boundary.
+    ///
+    /// The scope is purely organizational — a labeled block. All resources
+    /// and outputs are shared with the parent.
+    Shared,
+
+    /// Create a child context via `ctx.child()`.
+    ///
+    /// Reads walk the parent chain (parent locals + globals). Writes go to
+    /// the child's own local scope. Outputs accumulate in the child and are
+    /// merged back into the parent when the scope completes.
+    Inherit,
+
+    /// Create a fresh context with no parent chain.
+    ///
+    /// Nothing is accessible unless explicitly forwarded. Global resources
+    /// are inherited by default (they are infrastructure). Outputs are
+    /// merged back into the parent on completion.
+    Isolated,
+}
+
+impl fmt::Display for ContextMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Shared => f.write_str("Shared"),
+            Self::Inherit => f.write_str("Inherit"),
+            Self::Isolated => f.write_str("Isolated"),
+        }
+    }
+}
+
+/// Identifies a resource to forward across a scope boundary.
+///
+/// Constructed exclusively through [`ContextPolicy::forward`]. The `TypeId`
+/// is used for type-erased resource cloning; `type_name` is retained for
+/// error messages and debugging.
+///
+/// The `clone_fn` is captured at policy-build time from the generic `T: Clone`
+/// bound on the builder methods, eliminating the need for a separate
+/// `register_clone_fn` call at runtime.
+#[derive(Clone)]
+pub struct ResourceForward {
+    pub(crate) type_id: TypeId,
+    pub(crate) type_name: &'static str,
+    /// Type-erased clone function captured from the `T: Clone` bound at build time.
+    /// Returns `None` on downcast failure (should never happen in practice).
+    pub(crate) clone_fn: fn(&dyn Any) -> Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for ResourceForward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResourceForward")
+            .field("type_id", &self.type_id)
+            .field("type_name", &self.type_name)
+            .finish()
+    }
+}
+
+impl PartialEq for ResourceForward {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_id == other.type_id
+    }
+}
+
+impl Eq for ResourceForward {}
+
+impl Hash for ResourceForward {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.type_id.hash(state);
+    }
+}
+
+impl ResourceForward {
+    /// Returns the [`TypeId`] of the forwarded resource.
+    #[must_use]
+    pub fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    /// Returns the type name for display and debugging.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+}
+
+/// Controls how a parent [`SystemContext`](polaris_system::param::SystemContext)
+/// is shared with a scoped graph.
+///
+/// Use the builder methods [`shared()`](Self::shared), [`inherit()`](Self::inherit),
+/// or [`isolated()`](Self::isolated) to create a policy, then chain
+/// [`forward()`](Self::forward) to forward specific resources.
+///
+/// # Example
+///
+/// ```
+/// # use polaris_graph::node::ContextPolicy;
+/// # use polaris_system::resource::LocalResource;
+/// # #[derive(Clone)]
+/// # struct Config;
+/// # impl LocalResource for Config {}
+/// // Isolated scope forwarding a specific resource into the child
+/// let policy = ContextPolicy::isolated().forward::<Config>();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContextPolicy {
+    /// Base isolation level.
+    pub(crate) mode: ContextMode,
+    /// Resources to clone from parent into the child's local scope.
+    ///
+    /// Only meaningful for `Inherit` and `Isolated` modes.
+    /// Ignored in `Shared` mode (everything is already accessible).
+    pub(crate) forward_resources: Vec<ResourceForward>,
+}
+
+impl ContextPolicy {
+    /// Shared mode — same context, no boundary.
+    #[must_use]
+    pub fn shared() -> Self {
+        Self {
+            mode: ContextMode::Shared,
+            forward_resources: Vec::new(),
+        }
+    }
+
+    /// Inherit mode — child context, reads parent, writes own.
+    #[must_use]
+    pub fn inherit() -> Self {
+        Self {
+            mode: ContextMode::Inherit,
+            forward_resources: Vec::new(),
+        }
+    }
+
+    /// Isolated mode — fresh context, only forwarded resources.
+    ///
+    /// The child context inherits the parent's global resources (if any).
+    /// If the parent has no globals, the child starts with an empty context.
+    #[must_use]
+    pub fn isolated() -> Self {
+        Self {
+            mode: ContextMode::Isolated,
+            forward_resources: Vec::new(),
+        }
+    }
+
+    /// Forward a local resource into the child scope.
+    ///
+    /// The resource is cloned from the parent's local scope into the child.
+    /// Only applicable to `Inherit` and `Isolated` modes — in `Shared` mode
+    /// everything is already accessible and forwarded resources are ignored.
+    /// The clone is one-way — mutations in the child do not propagate back
+    /// to the parent.
+    ///
+    /// Note: the clone happens on every scope invocation. If the scope is
+    /// inside a loop, each iteration clones the resource.
+    #[must_use]
+    pub fn forward<T: LocalResource + Clone>(mut self) -> Self {
+        if self.mode == ContextMode::Shared {
+            tracing::debug!(
+                resource = core::any::type_name::<T>(),
+                "forward() has no effect on ContextPolicy::shared() — resources are already accessible",
+            );
+        }
+        self.forward_resources.push(ResourceForward {
+            type_id: TypeId::of::<T>(),
+            type_name: core::any::type_name::<T>(),
+            clone_fn: |any| Some(Box::new(any.downcast_ref::<T>()?.clone())),
+        });
+        self
+    }
+
+    /// Returns the context mode.
+    #[must_use]
+    pub fn mode(&self) -> ContextMode {
+        self.mode
+    }
+
+    /// Returns the list of forwarded resources.
+    #[must_use]
+    pub fn forward_resources(&self) -> &[ResourceForward] {
+        &self.forward_resources
+    }
+}
+
+/// A node that executes an embedded graph with a configurable context boundary.
+///
+/// The embedded graph is a self-contained directed graph that is executed as a
+/// single unit within the parent graph. The [`ContextPolicy`] controls how the
+/// parent's [`SystemContext`](polaris_system::param::SystemContext) is shared
+/// with the embedded graph.
+///
+/// From the parent graph's perspective, the scope node is a single opaque node —
+/// execution enters the scope, runs the embedded graph to completion, and exits
+/// from the scope's outgoing edge.
+///
+/// Unlike decision/loop/parallel nodes, the embedded graph's nodes are NOT merged
+/// into the parent. The `ScopeNode` holds the [`Graph`] as a field.
+#[derive(Debug)]
+pub struct ScopeNode {
+    /// Unique identifier for this node.
+    pub id: NodeId,
+    /// Human-readable name for debugging and tracing.
+    pub name: &'static str,
+    /// The embedded graph to execute.
+    pub(crate) graph: Graph,
+    /// Context sharing policy.
+    pub(crate) context_policy: ContextPolicy,
+}
+
+impl ScopeNode {
+    /// Creates a new scope node.
+    #[must_use]
+    pub fn new(name: &'static str, graph: Graph, context_policy: ContextPolicy) -> Self {
+        Self {
+            id: NodeId::new(),
+            name,
+            graph,
+            context_policy,
+        }
+    }
+
+    /// Returns a reference to the embedded graph.
+    #[must_use]
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Returns a reference to the context policy.
+    #[must_use]
+    pub fn context_policy(&self) -> &ContextPolicy {
+        &self.context_policy
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // IntoSystemNode
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -672,5 +926,55 @@ mod tests {
         assert_eq!(node.schedules.len(), 2);
         assert_eq!(node.schedules[0], ScheduleId::of::<MarkerA>());
         assert_eq!(node.schedules[1], ScheduleId::of::<MarkerB>());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ContextPolicy tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn context_policy_shared() {
+        let policy = ContextPolicy::shared();
+        assert!(matches!(policy.mode, ContextMode::Shared));
+        assert!(policy.forward_resources.is_empty());
+    }
+
+    #[test]
+    fn context_policy_inherit() {
+        let policy = ContextPolicy::inherit();
+        assert!(matches!(policy.mode, ContextMode::Inherit));
+    }
+
+    #[test]
+    fn context_policy_isolated() {
+        let policy = ContextPolicy::isolated();
+        assert!(matches!(policy.mode, ContextMode::Isolated));
+    }
+
+    use polaris_system::resource::LocalResource;
+
+    #[derive(Clone)]
+    struct TestRes;
+    impl LocalResource for TestRes {}
+
+    #[test]
+    fn context_policy_forward() {
+        let policy = ContextPolicy::inherit().forward::<TestRes>();
+        assert_eq!(policy.forward_resources.len(), 1);
+        assert_eq!(policy.forward_resources[0].type_id, TypeId::of::<TestRes>());
+    }
+
+    #[test]
+    fn scope_node_accessors() {
+        let inner = Graph::new();
+        let scope = ScopeNode {
+            id: NodeId::new(),
+            name: "test_scope",
+            graph: inner,
+            context_policy: ContextPolicy::shared(),
+        };
+        let node = Node::Scope(scope);
+        assert_eq!(node.name(), "test_scope");
+        assert!(!node.id().as_str().is_empty());
     }
 }

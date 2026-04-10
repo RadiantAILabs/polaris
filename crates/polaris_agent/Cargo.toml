@@ -1,6 +1,6 @@
 [package]
 name = "polaris_agent"
-version = "0.0.1"
+version = "0.0.2"
 description = "Agent trait for defining reusable behavior patterns in Polaris."
 edition = "2024"
 keywords = []
@@ -13,6 +13,6 @@ rust-version = "1.93.0"
 workspace = true
 
 [dependencies]
-polaris_graph = { path = "../polaris_graph", version = "0.0.1" }
-polaris_system = { path = "../polaris_system", version = "0.0.2" }
+polaris_graph = { path = "../polaris_graph", version = "0.1.0" }
+polaris_system = { path = "../polaris_system", version = "0.0.3" }
 thiserror = "2"

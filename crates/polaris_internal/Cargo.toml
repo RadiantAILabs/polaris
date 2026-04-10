@@ -1,6 +1,6 @@
 [package]
 name = "polaris_internal"
-version = "0.0.2"
+version = "0.0.3"
 description = "An internal Polaris crate"
 edition = "2024"
 keywords = []
@@ -14,15 +14,16 @@ default = []
 anthropic = ["polaris_model_providers/anthropic"]
 openai = ["polaris_model_providers/openai"]
 bedrock = ["polaris_model_providers/bedrock"]
-graph_tracing = ["polaris_core_plugins/graph_tracing"]
-models_tracing = ["polaris_core_plugins/models_tracing"]
-tools_tracing = ["polaris_core_plugins/tools_tracing"]
+graph-tracing = ["polaris_core_plugins/graph_tracing"]
+models-tracing = ["polaris_core_plugins/models_tracing"]
+tools-tracing = ["polaris_core_plugins/tools_tracing"]
 otel = ["polaris_core_plugins/otel"]
+sessions-http = ["polaris_sessions/http"]
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.0.2" }
-polaris_graph = { path = "../polaris_graph", version = "0.0.1" }
-polaris_agent = { path = "../polaris_agent", version = "0.0.1" }
+polaris_system = { path = "../polaris_system", version = "0.0.3" }
+polaris_graph = { path = "../polaris_graph", version = "0.1.0" }
+polaris_agent = { path = "../polaris_agent", version = "0.0.2" }
 polaris_tools = { path = "../polaris_tools", version = "0.0.1" }
 polaris_model_providers = { path = "../polaris_model_providers", version = "0.0.1" }
 polaris_models = { path = "../polaris_models", version = "0.0.1" }

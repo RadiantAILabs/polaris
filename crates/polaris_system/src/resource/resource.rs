@@ -496,6 +496,27 @@ impl Resources {
         let guard = entry.try_read()?;
         Some(clone_fn(&**guard))
     }
+
+    /// Clones a resource by its [`TypeId`] using an externally-provided clone function.
+    ///
+    /// Unlike [`clone_by_type_id`](Self::clone_by_type_id), this does not require
+    /// a clone function to be registered via [`register_clone_fn`](Self::register_clone_fn).
+    /// The caller supplies the clone function directly, which is useful when the
+    /// concrete type (and its `Clone` impl) was captured at an earlier compile-time
+    /// boundary — e.g., in [`ContextPolicy::forward`](crate::ContextPolicy::forward).
+    ///
+    /// Returns `None` if the resource does not exist or is currently write-locked.
+    #[must_use]
+    pub fn clone_by_type_id_with(
+        &self,
+        type_id: TypeId,
+        clone_fn: fn(&dyn Any) -> Option<Box<dyn Any + Send + Sync>>,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        let id = ResourceId(type_id);
+        let entry = self.storage.get(&id)?;
+        let guard = entry.try_read()?;
+        clone_fn(&**guard)
+    }
 }
 
 /// RAII guard for immutable resource access.
@@ -841,5 +862,47 @@ mod tests {
         // Original should be mutated
         let original = resources.get::<Cloneable>().unwrap();
         assert_eq!(original.value, 999);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // clone_by_type_id_with tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn cloneable_clone_fn(any: &dyn Any) -> Option<Box<dyn Any + Send + Sync>> {
+        Some(Box::new(any.downcast_ref::<Cloneable>()?.clone()))
+    }
+
+    #[test]
+    fn clone_with_external_fn() {
+        let mut resources = Resources::new();
+        resources.insert(Cloneable { value: 77 });
+
+        let cloned = resources
+            .clone_by_type_id_with(TypeId::of::<Cloneable>(), cloneable_clone_fn)
+            .expect("clone_with should succeed");
+
+        let val = cloned.downcast_ref::<Cloneable>().expect("should downcast");
+        assert_eq!(val.value, 77);
+    }
+
+    #[test]
+    fn clone_with_nonexistent_resource() {
+        let resources = Resources::new();
+
+        let result = resources.clone_by_type_id_with(TypeId::of::<Cloneable>(), cloneable_clone_fn);
+        assert!(result.is_none(), "should return None for missing resource");
+    }
+
+    #[test]
+    fn clone_with_write_locked_resource() {
+        let mut resources = Resources::new();
+        resources.insert(Cloneable { value: 1 });
+
+        let _guard = resources.get_mut::<Cloneable>().unwrap();
+        let result = resources.clone_by_type_id_with(TypeId::of::<Cloneable>(), cloneable_clone_fn);
+        assert!(
+            result.is_none(),
+            "should return None when resource is write-locked"
+        );
     }
 }

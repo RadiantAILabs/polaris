@@ -35,7 +35,7 @@ use crate::hooks::HooksAPI;
 use crate::hooks::events::GraphEvent;
 use crate::hooks::schedule::{OnGraphComplete, OnGraphFailure, OnGraphStart, OnSystemStart};
 use crate::middleware::{self, MiddlewareAPI};
-use crate::node::{Node, NodeId};
+use crate::node::{ContextMode, Node, NodeId};
 use hashbrown::HashSet;
 use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
@@ -146,24 +146,105 @@ impl GraphExecutor {
             })
             .unwrap_or_default();
 
-        for node in graph.nodes() {
-            if let Node::System(sys) = node {
-                let access = sys.system.access();
-                self.validate_system_access(
-                    &sys.id,
-                    sys.system.name(),
-                    &access,
-                    ctx,
-                    &hook_provided,
-                    &mut errors,
-                );
-            }
-        }
+        self.validate_graph_resources(graph, ctx, &hook_provided, &mut errors, 0);
 
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    /// Recursively validates resource availability for all systems in a graph,
+    /// including systems inside scope nodes.
+    ///
+    /// For scope nodes, the validation builds a synthetic child context that
+    /// matches the runtime context the scoped graph will receive:
+    /// - **Shared**: same context as parent (no boundary)
+    /// - **Inherit**: child context with parent chain + forwarded resources
+    /// - **Isolated**: fresh context with only globals + forwarded resources
+    ///
+    /// The `depth` parameter mirrors the execution depth limit to prevent
+    /// unbounded recursion during validation of deeply nested scope graphs.
+    fn validate_graph_resources(
+        &self,
+        graph: &Graph,
+        ctx: &SystemContext<'_>,
+        hook_provided: &HashSet<TypeId>,
+        errors: &mut Vec<ResourceValidationError>,
+        depth: usize,
+    ) {
+        if depth > self.max_recursion_depth {
+            return;
+        }
+
+        for node in graph.nodes() {
+            match node {
+                Node::System(sys) => {
+                    let access = sys.system.access();
+                    self.validate_system_access(
+                        &sys.id,
+                        sys.system.name(),
+                        &access,
+                        ctx,
+                        hook_provided,
+                        errors,
+                    );
+                }
+                Node::Scope(scope) => {
+                    match scope.context_policy.mode {
+                        ContextMode::Shared => {
+                            // No boundary — same context
+                            self.validate_graph_resources(
+                                &scope.graph,
+                                ctx,
+                                hook_provided,
+                                errors,
+                                depth + 1,
+                            );
+                        }
+                        ContextMode::Inherit => {
+                            // Child context: reads walk parent chain, writes local only.
+                            // Forwarded resources are cloned into the child.
+                            let mut child = ctx.child();
+                            for fwd in &scope.context_policy.forward_resources {
+                                // Placeholder value: validation only checks TypeId
+                                // presence via `contains_resource_by_type_id`, never
+                                // downcasts the value. The actual clone happens at
+                                // execution time in `forward_resources()`.
+                                child.insert_boxed(fwd.type_id, Box::new(()));
+                            }
+                            self.validate_graph_resources(
+                                &scope.graph,
+                                &child,
+                                hook_provided,
+                                errors,
+                                depth + 1,
+                            );
+                        }
+                        ContextMode::Isolated => {
+                            // Fresh context: no parent chain.
+                            // Only forwarded resources + globals are available.
+                            let mut child = match ctx.globals_arc() {
+                                Some(globals) => SystemContext::with_globals(globals),
+                                None => SystemContext::new(),
+                            };
+                            for fwd in &scope.context_policy.forward_resources {
+                                // Placeholder value: see Inherit comment above.
+                                child.insert_boxed(fwd.type_id, Box::new(()));
+                            }
+                            self.validate_graph_resources(
+                                &scope.graph,
+                                &child,
+                                hook_provided,
+                                errors,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
