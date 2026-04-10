@@ -45,6 +45,8 @@ pub mod error;
 pub mod llm;
 mod plugin;
 mod registry;
+pub mod tokenizer;
 
 pub use plugin::ModelsPlugin;
 pub use registry::ModelRegistry;
+pub use tokenizer::{Tokenizer, TokenizerPlugin};

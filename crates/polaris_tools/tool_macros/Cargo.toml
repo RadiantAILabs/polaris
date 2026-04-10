@@ -1,12 +1,12 @@
 [package]
 name = "tool_macros"
-version = "0.0.1"
+version.workspace = true
 description = "Procedural macros for Polaris tool framework"
-edition = "2024"
-license = "Apache-2.0"
+edition.workspace = true
+license.workspace = true
 readme = "README.md"
-repository = "https://github.com/RadiantAILabs/polaris"
-rust-version = "1.93.0"
+repository.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
@@ -15,7 +15,7 @@ workspace = true
 proc-macro = true
 
 [dependencies]
-polaris_macro_utils = { path = "../../polaris_macro_utils", version = "0.0.1" }
+polaris_macro_utils = { path = "../../polaris_macro_utils", version = "0.1.1" }
 syn = { version = "2.0", features = ["full", "extra-traits"] }
 quote = "1.0"
 proc-macro2 = "1.0"

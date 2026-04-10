@@ -43,6 +43,12 @@
 //! | `tools-tracing` | Tracing spans for tool invocations (`polaris_core_plugins`) |
 //! | `otel` | OpenTelemetry exporter support (`polaris_core_plugins`) |
 //!
+//! ## Tokenization
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `tiktoken` | BPE token counting via tiktoken (`polaris_models`) |
+//!
 //! ## Sessions
 //!
 //! | Feature | Enables |
