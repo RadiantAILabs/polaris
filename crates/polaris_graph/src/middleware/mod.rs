@@ -22,6 +22,7 @@
 //! | [`Switch`] | [`SwitchInfo`] | Switch node evaluation |
 //! | [`LoopIteration`] | [`LoopIterationInfo`] | Single loop iteration |
 //! | [`ParallelBranch`] | [`ParallelBranchInfo`] | Single parallel branch |
+//! | [`Scope`] | [`ScopeInfo`] | Scope node execution |
 //!
 //! # Layer Ordering
 //!
@@ -98,6 +99,9 @@ pub struct Decision;
 
 /// Middleware target for switch node evaluation. See [`SwitchInfo`].
 pub struct Switch;
+
+/// Middleware target for scope node execution. See [`ScopeInfo`].
+pub struct Scope;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-node-level targets

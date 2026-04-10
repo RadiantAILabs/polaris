@@ -213,6 +213,38 @@ pub struct OnGraphFailure;
 impl Schedule for OnGraphFailure {}
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Scope Schedules
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Marker type for hooks called before a scope node begins execution.
+///
+/// This hook fires before the scope's embedded graph is executed, allowing you
+/// to inspect the context policy or inject resources before the inner graph runs.
+///
+/// # Validation
+///
+/// Resources provided by `OnScopeStart` hooks are **not** considered during
+/// validation.
+///
+/// Event data: [`GraphEvent::ScopeStart`](super::events::GraphEvent::ScopeStart)
+pub struct OnScopeStart;
+impl Schedule for OnScopeStart {}
+
+/// Marker type for hooks called after a scope node completes execution.
+///
+/// This hook fires after the scope's embedded graph finishes and outputs are
+/// merged back into the parent context.
+///
+/// # Validation
+///
+/// Resources provided by `OnScopeComplete` hooks are **not** considered during
+/// validation.
+///
+/// Event data: [`GraphEvent::ScopeComplete`](super::events::GraphEvent::ScopeComplete)
+pub struct OnScopeComplete;
+impl Schedule for OnScopeComplete {}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Composite Schedule Type
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -254,4 +286,6 @@ pub type AllGraphSchedules = (
     OnLoopEnd,
     OnParallelStart,
     OnParallelComplete,
+    OnScopeStart,
+    OnScopeComplete,
 );

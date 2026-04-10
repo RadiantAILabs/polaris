@@ -7,7 +7,7 @@ mod test_utils;
 
 use polaris_graph::executor::{ErrorKind, ExecutionError, GraphExecutor};
 use polaris_graph::graph::Graph;
-use polaris_graph::node::RetryPolicy;
+use polaris_graph::node::{ContextPolicy, RetryPolicy};
 use polaris_system::param::SystemContext;
 use polaris_system::system::{BoxFuture, System, SystemError};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use test_utils::{
     ConsumerSystem, DecisionOutput, DecisionSystem, ErrorKindLog, EventuallySucceedsSystem,
     FailingSystem, FlagSystem, HandlerLog, HandlerSystem, InitialStateSystem, KindCheckingHandler,
-    LoopIterationSystem, LoopState, ParamFailingSystem, ProducerOutput, ProducerSystem, SlowSystem,
-    SuccessSystem, SwitchKeySystem, SwitchOutput, branch, create_test_server, get_hooks,
+    LoopIterationSystem, LoopState, ParamFailingSystem, ProducerOutput, ProducerSystem,
+    ReadConfigCapture, SlowSystem, SuccessSystem, SwitchKeySystem, SwitchOutput, TestConfig,
+    branch, create_test_server, get_hooks,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -966,5 +967,113 @@ async fn retry_with_timeout_retries_on_timeout() {
         attempts.load(Ordering::SeqCst),
         2,
         "should have attempted twice"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPE EDGE CASES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn scope_isolated_cannot_read_parent_resources() {
+    // In isolated mode, parent resources are NOT accessible
+    let captured = Arc::new(Mutex::new(None));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigCapture {
+        captured: Arc::clone(&captured),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope("isolated_scope", inner, ContextPolicy::isolated());
+
+    let mut ctx = SystemContext::new().with(TestConfig { value: 88 });
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    // ReadConfig should fail because TestConfig is not accessible
+    assert!(
+        matches!(result, Err(ExecutionError::SystemError(_))),
+        "isolated scope should produce SystemError for missing resource, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn scope_error_propagates_to_parent() {
+    // A failing system inside a scope should propagate the error to the parent graph.
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(FailingSystem));
+
+    let mut graph = Graph::new();
+    graph.add_scope("failing_scope", inner, ContextPolicy::shared());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        matches!(result, Err(ExecutionError::SystemError(_))),
+        "error inside scope should propagate to parent, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn scope_error_propagates_inherit_mode() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(FailingSystem));
+
+    let mut graph = Graph::new();
+    graph.add_scope("failing_inherit", inner, ContextPolicy::inherit());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        matches!(result, Err(ExecutionError::SystemError(_))),
+        "error inside inherit scope should propagate, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn scope_error_propagates_isolated_mode() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(FailingSystem));
+
+    let mut graph = Graph::new();
+    graph.add_scope("failing_isolated", inner, ContextPolicy::isolated());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        matches!(result, Err(ExecutionError::SystemError(_))),
+        "error inside isolated scope should propagate, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn scope_forward_missing_resource_still_runs() {
+    // Forward a resource that doesn't exist in parent — scope should still run
+    // (forward is best-effort with a tracing::warn).
+    let flag = Arc::new(Mutex::new(false));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(FlagSystem {
+        flag: Arc::clone(&flag),
+    }));
+
+    // Forward TestConfig but don't put it in the context
+    let policy = ContextPolicy::inherit().forward::<TestConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("fwd_missing", inner, policy);
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_ok(), "scope should still execute");
+    assert!(
+        *flag.lock().unwrap(),
+        "inner system should run even if forwarded resource was missing"
     );
 }

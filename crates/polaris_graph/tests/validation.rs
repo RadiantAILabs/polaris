@@ -6,13 +6,18 @@
 //! - Decision node requirements
 //! - Parallel node requirements
 //! - Loop node requirements
+//! - Scope node validation (empty graph, resource access rules)
 //! - Error display formatting
 
+mod test_utils;
+
 use polaris_graph::CaughtError;
+use polaris_graph::executor::GraphExecutor;
 use polaris_graph::graph::{Graph, ValidationError, ValidationWarning};
-use polaris_graph::node::NodeId;
+use polaris_graph::node::{ContextPolicy, NodeId};
 use polaris_system::param::{ERROR_CONTEXT, ErrOut, SystemAccess, SystemContext, SystemParam};
 use polaris_system::system::{BoxFuture, System, SystemError};
+use test_utils::{ReadConfigSystem, SuccessSystem, TestConfig, WriteConfigSystem};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Systems
@@ -510,5 +515,194 @@ fn validation_result_warnings_preserved_with_errors() {
     assert!(
         result.has_warnings(),
         "warnings should be preserved even when errors exist"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scope Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn scope_with_empty_inner_graph_reports_error() {
+    let inner = Graph::new();
+    let mut graph = Graph::new();
+    graph.add_scope("empty_scope", inner, ContextPolicy::shared());
+
+    let result = graph.validate();
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|err| { matches!(err, ValidationError::EmptyScopeGraph { .. }) }),
+        "should report EmptyScopeGraph error, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn scope_with_valid_inner_graph_passes_validation() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(SuccessSystem));
+
+    let mut graph = Graph::new();
+    graph.add_scope("valid_scope", inner, ContextPolicy::shared());
+
+    let result = graph.validate();
+    assert!(
+        result.errors.is_empty(),
+        "valid scope should pass validation, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn scope_isolated_forward_allows_write_access() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(WriteConfigSystem));
+
+    let policy = ContextPolicy::isolated().forward::<TestConfig>();
+
+    let mut graph = Graph::new();
+    graph.add_scope("isolated_rw", inner, policy);
+
+    let ctx = SystemContext::new().with(TestConfig { value: 1 });
+
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "write access to forwarded resource should pass validation, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn scope_isolated_forward_allows_read_access() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigSystem));
+
+    let policy = ContextPolicy::isolated().forward::<TestConfig>();
+
+    let mut graph = Graph::new();
+    graph.add_scope("isolated_ro_read", inner, policy);
+
+    let ctx = SystemContext::new().with(TestConfig { value: 1 });
+
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "read access to forwarded resource should pass validation, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn scope_inner_graph_invalid_propagates_errors() {
+    // A scope graph with a structural error should produce ScopeGraphInvalid
+    // wrapping the inner error. Here we use a loop whose predicate reads
+    // LoopState but whose body only produces i32.
+    #[derive(Debug)]
+    struct LoopState {
+        done: bool,
+    }
+
+    let mut inner = Graph::new();
+    inner.add_loop::<LoopState, _, _>(
+        "bad_loop",
+        |state| state.done,
+        |g| {
+            g.add_system(loop_body); // produces i32, not LoopState
+        },
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope("invalid_inner_scope", inner, ContextPolicy::shared());
+
+    let result = graph.validate();
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|err| matches!(err, ValidationError::ScopeGraphInvalid { .. })),
+        "should report ScopeGraphInvalid wrapping inner error, got: {:?}",
+        result.errors
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scope Resource Validation — Negative Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn scope_isolated_without_forward_rejects_required_resource() {
+    // An isolated scope whose inner system requires TestConfig (via read)
+    // but the policy does not forward it — validation should fail.
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigSystem));
+
+    let policy = ContextPolicy::isolated(); // no forward
+    let mut graph = Graph::new();
+    graph.add_scope("iso_no_fwd", inner, policy);
+
+    let ctx = SystemContext::new().with(TestConfig { value: 1 });
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_err(),
+        "isolated scope without forwarding should fail resource validation"
+    );
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|err| {
+            matches!(
+                err,
+                polaris_graph::executor::ResourceValidationError::MissingResource { .. }
+            )
+        }),
+        "should report MissingResource, got: {errors:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scope Warning Propagation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn scope_propagates_inner_graph_warnings() {
+    // A scope containing a parallel node with duplicate output types
+    // should produce a ScopeGraphWarning wrapping ConflictingParallelOutputs.
+    let mut inner = Graph::new();
+    inner.add_parallel(
+        "inner_conflict",
+        vec![
+            |g: &mut Graph| {
+                g.add_system(branch_a);
+            },
+            |g: &mut Graph| {
+                g.add_system(branch_b);
+            },
+        ],
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope("warn_scope", inner, ContextPolicy::shared());
+
+    let result = graph.validate();
+    assert!(
+        result.is_ok(),
+        "scope with inner warnings should still pass validation, got errors: {:?}",
+        result.errors
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::ScopeGraphWarning { .. })),
+        "expected ScopeGraphWarning wrapping inner ConflictingParallelOutputs, got: {:?}",
+        result.warnings
     );
 }

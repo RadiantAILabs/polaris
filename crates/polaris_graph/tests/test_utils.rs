@@ -558,6 +558,118 @@ impl System for EventuallySucceedsSystem {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SCOPE TEST SYSTEMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A clonable local resource for testing scope resource forwarding.
+#[derive(Debug, Clone)]
+pub struct TestConfig {
+    pub value: i32,
+}
+impl LocalResource for TestConfig {}
+
+/// System that reads `TestConfig` and captures its value.
+pub struct ReadConfigCapture {
+    pub captured: Arc<Mutex<Option<i32>>>,
+}
+
+impl System for ReadConfigCapture {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let captured = Arc::clone(&self.captured);
+        Box::pin(async move {
+            let config = ctx
+                .get_resource::<TestConfig>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            *captured.lock().unwrap() = Some(config.value);
+            Ok(())
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "read_config_capture"
+    }
+}
+
+/// System that declares `Res<TestConfig>` (read-only access, for validation tests).
+pub struct ReadConfigSystem;
+
+impl System for ReadConfigSystem {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "read_config_system"
+    }
+
+    fn access(&self) -> polaris_system::param::SystemAccess {
+        polaris_system::param::SystemAccess::new().with_read::<TestConfig>()
+    }
+}
+
+/// System that writes a new value to `TestConfig` via `ResMut<T>`.
+pub struct WriteConfigCapture {
+    pub new_value: i32,
+    pub captured: Arc<Mutex<Option<i32>>>,
+}
+
+impl System for WriteConfigCapture {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let captured = Arc::clone(&self.captured);
+        let new_value = self.new_value;
+        Box::pin(async move {
+            let mut config = ctx
+                .get_resource_mut::<TestConfig>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            *captured.lock().unwrap() = Some(config.value);
+            config.value = new_value;
+            Ok(())
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "write_config_capture"
+    }
+}
+
+/// System that declares `ResMut<TestConfig>` (write access, for validation tests).
+pub struct WriteConfigSystem;
+
+impl System for WriteConfigSystem {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "write_config_system"
+    }
+
+    fn access(&self) -> polaris_system::param::SystemAccess {
+        polaris_system::param::SystemAccess::new().with_write::<TestConfig>()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TRACKER NODE COLLECTION
 // ═══════════════════════════════════════════════════════════════════════════════
 

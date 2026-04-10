@@ -18,9 +18,9 @@ file-store = ["tokio/fs"]
 http = ["dep:polaris_app", "dep:axum"]
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.0.2" }
-polaris_graph = { path = "../polaris_graph", version = "0.0.1" }
-polaris_agent = { path = "../polaris_agent", version = "0.0.1" }
+polaris_system = { path = "../polaris_system", version = "0.0.3" }
+polaris_graph = { path = "../polaris_graph", version = "0.1.0" }
+polaris_agent = { path = "../polaris_agent", version = "0.0.2" }
 polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.0.1" }
 hashbrown = "0.16.1"
 nanoid = "0.4"

@@ -208,7 +208,10 @@ impl Graph {
                         stack.push(branch.clone());
                     }
                 }
-                Node::System(_) => {}
+                // Scope nodes hold an opaque embedded graph — do not recurse
+                // into it. The scope node itself is reachable; its inner nodes
+                // live in a separate Graph.
+                Node::System(_) | Node::Scope(_) => {}
             }
 
             // Follow sequential edges from this node

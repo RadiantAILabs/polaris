@@ -5,6 +5,7 @@ use crate::predicate::PredicateError;
 use polaris_system::param::{AccessMode, ErrorContext};
 use std::any::TypeId;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Errors that can occur during graph execution.
@@ -26,7 +27,7 @@ pub enum ExecutionError {
         branch: &'static str,
     },
     /// A system execution error occurred.
-    SystemError(String),
+    SystemError(Arc<str>),
     /// A predicate evaluation error occurred.
     PredicateError(PredicateError),
     /// Maximum iterations exceeded in a loop.
@@ -254,7 +255,7 @@ impl fmt::Display for ErrorKind {
 #[derive(Debug, Clone)]
 pub struct CaughtError {
     /// The error message from the failed system.
-    pub message: String,
+    pub message: Arc<str>,
     /// The name of the system that failed.
     pub system_name: &'static str,
     /// The node ID of the failed system.

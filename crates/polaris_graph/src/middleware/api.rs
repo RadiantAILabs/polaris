@@ -6,7 +6,7 @@
 
 use super::info::{
     DecisionInfo, GraphInfo, LoopInfo, LoopIterationInfo, ParallelBranchInfo, ParallelInfo,
-    SwitchInfo, SystemInfo,
+    ScopeInfo, SwitchInfo, SystemInfo,
 };
 use crate::executor::ExecutionError;
 use futures::future::BoxFuture;
@@ -332,6 +332,7 @@ pub(crate) struct MiddlewareInner {
     pub(crate) switch: Chain<SwitchInfo>,
     pub(crate) loop_iteration: Chain<LoopIterationInfo>,
     pub(crate) parallel_branch: Chain<ParallelBranchInfo>,
+    pub(crate) scope: Chain<ScopeInfo>,
 }
 
 impl fmt::Debug for MiddlewareAPI {
@@ -465,6 +466,18 @@ impl MiddlewareAPI {
         handler: impl MiddlewareHandler<ParallelBranchInfo>,
     ) -> &Self {
         self.inner.parallel_branch.push(name, handler);
+        self
+    }
+
+    /// Registers a middleware handler for [`Scope`](super::Scope) nodes.
+    ///
+    /// See the [module-level docs](super) for handler contract and examples.
+    pub fn register_scope(
+        &self,
+        name: impl Into<String>,
+        handler: impl MiddlewareHandler<ScopeInfo>,
+    ) -> &Self {
+        self.inner.scope.push(name, handler);
         self
     }
 }
@@ -763,7 +776,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(ExecutionError::SystemError(ref msg)) if msg == "inner failure"
+                Err(ExecutionError::SystemError(ref msg)) if &**msg == "inner failure"
             ),
             "inner error should retain its original variant and message, got: {result:?}"
         );
