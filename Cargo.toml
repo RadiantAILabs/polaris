@@ -1,17 +1,17 @@
 [package]
 name = "polaris-ai"
-version = "0.0.7"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 categories = ["asynchronous", "development-tools"]
 description = "A unified agent runtime where agent patterns are first-class, composable, and optimizable abstractions."
 exclude = ["assets/", "tools/", ".github/", "crates/"]
 homepage = "https://getradiant.ai"
 keywords = ["ai", "agents", "ecs", "async", "framework"]
-license = "Apache-2.0"
+license.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/polaris-ai"
-repository = "https://github.com/RadiantAILabs/polaris"
-rust-version = "1.93.0"
+repository.workspace = true
+rust-version.workspace = true
 autoexamples = false
 
 [workspace]
@@ -21,6 +21,13 @@ members = [
     "crates/*",
     "examples",
 ]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris"
+rust-version = "1.93.0"
 
 [workspace.lints.clippy]
 uninlined-format-args = "allow"
@@ -99,9 +106,10 @@ openai = ["polaris_internal/openai"]
 graph-tracing = ["polaris_internal/graph-tracing"]
 models-tracing = ["polaris_internal/models-tracing"]
 tools-tracing = ["polaris_internal/tools-tracing"]
+tiktoken = ["polaris_internal/tiktoken"]
 otel = ["polaris_internal/otel"]
 sessions-http = ["polaris_internal/sessions-http"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "0.0.4" }
+polaris_internal = { path = "crates/polaris_internal", version = "0.1.1" }
 tracing = { version = "0.1.43", default-features = false, optional = true }
