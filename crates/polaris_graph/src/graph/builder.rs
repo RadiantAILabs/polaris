@@ -2,15 +2,61 @@
 
 use super::{Graph, MergeError};
 use crate::edge::{Edge, ErrorEdge, TimeoutEdge};
+use crate::executor::CaughtError;
 use crate::node::{
     ContextPolicy, DecisionNode, IntoSystemNode, LoopNode, Node, NodeId, ParallelNode, RetryPolicy,
     ScopeNode, SwitchNode, SystemNode,
 };
 use crate::predicate::Predicate;
 use hashbrown::HashSet;
+use polaris_system::param::{ERROR_CONTEXT, SystemAccess, SystemContext};
 use polaris_system::resource::Output;
-use polaris_system::system::BoxedSystem;
+use polaris_system::system::{BoxFuture, BoxedSystem, System, SystemError};
 use std::time::Duration;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Closure-based error handler (internal implementation detail)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wraps a closure as a [`System`] for use as an error handler.
+///
+/// The closure receives the [`CaughtError`] stored by the executor when a
+/// system fails and returns a value of type `T`, which becomes the system
+/// output available to subsequent nodes via `Out<T>`.
+struct ClosureErrorHandler<T, F> {
+    handler: F,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T, F> System for ClosureErrorHandler<T, F>
+where
+    T: Output,
+    F: Fn(&CaughtError) -> T + Send + Sync + 'static,
+{
+    type Output = T;
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move {
+            let caught = ctx
+                .get_output::<CaughtError>()
+                .map_err(SystemError::ParamError)?;
+            Ok((self.handler)(&caught))
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.require_context(ERROR_CONTEXT);
+        access
+    }
+}
 
 impl Graph {
     // ─────────────────────────────────────────────────────────────────────────
@@ -779,6 +825,81 @@ impl Graph {
         self
     }
 
+    /// Attaches a closure-based error handler to all fallible system nodes
+    /// that don't already have an error edge.
+    ///
+    /// The closure receives a [`&CaughtError`](CaughtError) and returns
+    /// a value of type `T`. The returned value is stored as the system output,
+    /// making it available to subsequent systems via `Out<T>`.
+    ///
+    /// This is a convenience over [`add_error_handler`](Self::add_error_handler)
+    /// for trivial error mapping that doesn't need a full system definition.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::CaughtError;
+    /// # #[derive(Debug)]
+    /// # struct ErrorResponse { code: u16, message: String }
+    /// # async fn risky_operation() -> Result<i32, String> { Ok(1) }
+    /// # let mut graph = Graph::new();
+    /// graph.add_system(risky_operation)
+    ///     .add_error_handler_fn(|error: &CaughtError| -> ErrorResponse {
+    ///         ErrorResponse {
+    ///             code: 500,
+    ///             message: error.message.to_string(),
+    ///         }
+    ///     });
+    /// ```
+    pub fn add_error_handler_fn<T, F>(&mut self, handler: F) -> &mut Self
+    where
+        T: Output,
+        F: Fn(&CaughtError) -> T + Send + Sync + 'static,
+    {
+        let system = ClosureErrorHandler {
+            handler,
+            _marker: std::marker::PhantomData,
+        };
+        self.add_error_handler(|g| {
+            g.add_boxed_system(Box::new(system));
+        })
+    }
+
+    /// Attaches a closure-based error handler to specific source nodes.
+    ///
+    /// Like [`add_error_handler_fn`](Self::add_error_handler_fn) but only
+    /// wires error edges from the specified source nodes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::CaughtError;
+    /// # async fn risky_a() -> Result<i32, String> { Ok(1) }
+    /// # async fn risky_b() -> Result<i32, String> { Ok(2) }
+    /// # let mut graph = Graph::new();
+    /// let a = graph.add_system_node(risky_a);
+    /// let b = graph.add_system_node(risky_b);
+    /// graph.add_error_handler_fn_for([a, b], |error: &CaughtError| -> String {
+    ///     format!("handled: {}", error.message)
+    /// });
+    /// ```
+    pub fn add_error_handler_fn_for<T, F, I>(&mut self, source_nodes: I, handler: F) -> &mut Self
+    where
+        T: Output,
+        F: Fn(&CaughtError) -> T + Send + Sync + 'static,
+        I: IntoIterator<Item = NodeId>,
+    {
+        let system = ClosureErrorHandler {
+            handler,
+            _marker: std::marker::PhantomData,
+        };
+        self.add_error_handler_for(source_nodes, |g| {
+            g.add_boxed_system(Box::new(system));
+        })
+    }
+
     /// Adds a timeout handler for a specific node.
     ///
     /// When the system at `source_node` times out, execution will continue at the
@@ -1044,6 +1165,37 @@ impl<'a> SystemNodeBuilder<'a> {
     /// Sets a retry policy on this system node.
     pub fn with_retry(self, policy: RetryPolicy) -> Self {
         self.graph.set_retry_policy(self.node_id.clone(), policy);
+        self
+    }
+
+    /// Attaches a closure-based error handler to this system node.
+    ///
+    /// The closure receives a [`&CaughtError`](CaughtError) and returns a value
+    /// of type `T`, which is stored as the handler's output. This is a
+    /// convenience over [`on_error`](Self::on_error) for trivial error mapping.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::CaughtError;
+    /// # async fn risky_operation() -> Result<i32, String> { Ok(1) }
+    /// # async fn next_step() {}
+    /// # let mut graph = Graph::new();
+    /// graph.system(risky_operation)
+    ///     .on_error_fn(|error: &CaughtError| -> String {
+    ///         format!("handled: {}", error.message)
+    ///     })
+    ///     .done()
+    ///     .add_system(next_step);
+    /// ```
+    pub fn on_error_fn<T, F>(self, handler: F) -> Self
+    where
+        T: Output,
+        F: Fn(&CaughtError) -> T + Send + Sync + 'static,
+    {
+        self.graph
+            .add_error_handler_fn_for([self.node_id.clone()], handler);
         self
     }
 

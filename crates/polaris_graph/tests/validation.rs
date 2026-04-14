@@ -12,11 +12,17 @@
 mod test_utils;
 
 use polaris_graph::CaughtError;
-use polaris_graph::executor::GraphExecutor;
+use polaris_graph::executor::{GraphExecutor, ResourceValidationError};
 use polaris_graph::graph::{Graph, ValidationError, ValidationWarning};
+use polaris_graph::hooks::HooksAPI;
+use polaris_graph::hooks::schedule::OnGraphStart;
 use polaris_graph::node::{ContextPolicy, NodeId};
-use polaris_system::param::{ERROR_CONTEXT, ErrOut, SystemAccess, SystemContext, SystemParam};
+use polaris_system::param::{
+    Access, AccessMode, ERROR_CONTEXT, ErrOut, SystemAccess, SystemContext, SystemParam,
+};
+use polaris_system::resource::LocalResource;
 use polaris_system::system::{BoxFuture, System, SystemError};
+use std::any::TypeId;
 use test_utils::{ReadConfigSystem, SuccessSystem, TestConfig, WriteConfigSystem};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -657,12 +663,9 @@ fn scope_isolated_without_forward_rejects_required_resource() {
     );
     let errors = result.unwrap_err();
     assert!(
-        errors.iter().any(|err| {
-            matches!(
-                err,
-                polaris_graph::executor::ResourceValidationError::MissingResource { .. }
-            )
-        }),
+        errors
+            .iter()
+            .any(|err| { matches!(err, ResourceValidationError::MissingResource { .. }) }),
         "should report MissingResource, got: {errors:?}"
     );
 }
@@ -704,5 +707,183 @@ fn scope_propagates_inner_graph_warnings() {
             .any(|w| matches!(w, ValidationWarning::ScopeGraphWarning { .. })),
         "expected ScopeGraphWarning wrapping inner ConflictingParallelOutputs, got: {:?}",
         result.warnings
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Output Reachability Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// System that produces `i32` output.
+struct ProducesI32;
+
+impl System for ProducesI32 {
+    type Output = i32;
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move { Ok(42) })
+    }
+
+    fn name(&self) -> &'static str {
+        "produces_i32"
+    }
+}
+
+/// System that declares an `Out<i32>` dependency in its access.
+struct ConsumesI32Output;
+
+impl System for ConsumesI32Output {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "consumes_i32_output"
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.outputs.push(Access {
+            type_id: TypeId::of::<i32>(),
+            type_name: std::any::type_name::<i32>(),
+            mode: AccessMode::Write,
+            is_global: false,
+        });
+        access
+    }
+}
+
+/// System that declares an `Out<String>` dependency in its access.
+struct ConsumesStringOutput;
+
+impl System for ConsumesStringOutput {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "consumes_string_output"
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.outputs.push(Access {
+            type_id: TypeId::of::<String>(),
+            type_name: std::any::type_name::<String>(),
+            mode: AccessMode::Write,
+            is_global: false,
+        });
+        access
+    }
+}
+
+#[test]
+fn validate_output_reachability_succeeds_for_linear_chain() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(ProducesI32));
+    graph.add_boxed_system(Box::new(ConsumesI32Output));
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "linear chain with matching output should pass validation, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn validate_output_reachability_fails_for_missing_output() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(ProducesI32));
+    graph.add_boxed_system(Box::new(ConsumesStringOutput));
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(result.is_err(), "should fail when output is not produced");
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingOutput {
+                system_name: "consumes_string_output",
+                ..
+            }
+        )),
+        "expected MissingOutput error for consumes_string_output, got: {errors:?}"
+    );
+}
+
+/// A resource type used for testing hook-provided outputs.
+#[derive(Clone)]
+struct HookProvidedOutput;
+impl LocalResource for HookProvidedOutput {}
+
+/// System that declares an `Out<HookProvidedOutput>` dependency.
+struct ConsumesHookOutput;
+
+impl System for ConsumesHookOutput {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "consumes_hook_output"
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.outputs.push(Access {
+            type_id: TypeId::of::<HookProvidedOutput>(),
+            type_name: std::any::type_name::<HookProvidedOutput>(),
+            mode: AccessMode::Write,
+            is_global: false,
+        });
+        access
+    }
+}
+
+#[test]
+fn validate_output_reachability_hook_provided_outputs_pass() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(ConsumesHookOutput));
+
+    let hooks = HooksAPI::new();
+    hooks
+        .register_provider::<OnGraphStart, HookProvidedOutput, _>("provide_hook_output", |_event| {
+            Some(HookProvidedOutput)
+        })
+        .expect("hook registration should succeed");
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, Some(&hooks));
+
+    assert!(
+        result.is_ok(),
+        "hook-provided output should pass validation, got: {:?}",
+        result.unwrap_err()
     );
 }

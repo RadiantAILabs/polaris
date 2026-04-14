@@ -1,3 +1,8 @@
+---
+notion_page: https://www.notion.so/radiant-ai/Testing-33eafe2e695d8053a8afc9c6d22d9412
+title: Testing
+---
+
 # Testing
 
 Testing in Polaris is structured by the same layered architecture that governs the framework itself. Each layer has different invariants, and tests at the wrong layer verify the wrong thing. This document defines what "tested" means at each layer, what contracts tests must verify, and where the boundaries between test levels lie.

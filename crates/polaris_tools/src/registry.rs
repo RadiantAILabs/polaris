@@ -23,6 +23,35 @@ use std::sync::Arc;
 /// Registry of available tools.
 ///
 /// Stores tools by name and provides lookup, execution, and definition listing.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_tools::{ToolRegistry, Tool, ToolError};
+/// use polaris_models::llm::ToolDefinition;
+/// use serde_json::{json, Value};
+/// use std::pin::Pin;
+/// use std::future::Future;
+///
+/// struct GreetTool;
+/// impl Tool for GreetTool {
+///     fn definition(&self) -> ToolDefinition {
+///         ToolDefinition {
+///             name: "greet".into(),
+///             description: "Say hello".into(),
+///             parameters: json!({"type": "object", "properties": {}}),
+///         }
+///     }
+///     fn execute(&self, _args: Value) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + '_>> {
+///         Box::pin(async { Ok(json!("hello")) })
+///     }
+/// }
+///
+/// let mut registry = ToolRegistry::new();
+/// registry.register(GreetTool);
+/// assert!(registry.has("greet"));
+/// assert_eq!(registry.definitions().len(), 1);
+/// ```
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: IndexMap<String, Arc<dyn Tool>>,

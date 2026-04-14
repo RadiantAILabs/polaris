@@ -3,7 +3,9 @@ name = "polaris_agent"
 version.workspace = true
 description = "Agent trait for defining reusable behavior patterns in Polaris."
 edition.workspace = true
-keywords = []
+documentation = "https://docs.rs/polaris-ai"
+keywords = ["polaris-ai", "agents", "ai", "async", "patterns"]
+categories = ["asynchronous", "development-tools"]
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
@@ -13,6 +15,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_graph = { path = "../polaris_graph", version = "0.1.1" }
-polaris_system = { path = "../polaris_system", version = "0.1.1" }
+polaris_graph = { path = "../polaris_graph", version = "0.2.0" }
+polaris_system = { path = "../polaris_system", version = "0.2.0" }
 thiserror = "2"

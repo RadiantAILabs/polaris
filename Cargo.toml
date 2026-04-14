@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris"
@@ -111,5 +111,5 @@ otel = ["polaris_internal/otel"]
 sessions-http = ["polaris_internal/sessions-http"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "0.1.1" }
+polaris_internal = { path = "crates/polaris_internal", version = "0.2.0" }
 tracing = { version = "0.1.43", default-features = false, optional = true }

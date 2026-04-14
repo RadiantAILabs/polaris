@@ -28,9 +28,15 @@
 //!
 //! let sessions = server.api::<SessionsAPI>().unwrap();
 //! ```
+//!
+//! # See Also
+//!
+//! For the full framework guide, architecture overview, and integration patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 pub mod api;
 pub mod error;
+pub mod guard;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod info;
@@ -38,6 +44,7 @@ pub mod store;
 
 pub use api::{SessionsAPI, SessionsPlugin};
 pub use error::SessionError;
+pub use guard::SessionGuard;
 #[cfg(feature = "http")]
 pub use http::HttpPlugin;
 pub use info::{SessionInfo, SessionMetadata};
@@ -53,6 +60,7 @@ pub mod prelude {
 
     pub use crate::api::{SessionsAPI, SessionsPlugin};
     pub use crate::error::SessionError;
+    pub use crate::guard::SessionGuard;
     pub use crate::info::{SessionInfo, SessionMetadata};
     pub use crate::store::memory::InMemoryStore;
     pub use crate::store::{

@@ -97,6 +97,16 @@ impl AppConfig {
     ///
     /// Panics if `host` is not a valid IP address. This validates eagerly so
     /// configuration errors surface at startup rather than at bind time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_app::AppConfig;
+    ///
+    /// let config = AppConfig::new().with_host("0.0.0.0").with_port(8080);
+    /// let addr = config.addr();
+    /// assert_eq!(addr.port(), 8080);
+    /// ```
     #[must_use]
     pub fn addr(&self) -> SocketAddr {
         let raw = format!("{}:{}", self.host, self.port);

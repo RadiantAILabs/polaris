@@ -37,6 +37,11 @@
 //!     Ok(response.text())
 //! }
 //! ```
+//!
+//! # See Also
+//!
+//! For the full framework guide, architecture overview, and integration patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 // Self-reference so tool macros can use `polaris_models::` paths within this crate.
 extern crate self as polaris_models;

@@ -5,7 +5,7 @@ use polaris::system::resource::LocalResource;
 /// Configuration for the `ReAct` agent.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Model identifier (e.g., "anthropic/claude-sonnet-4-5-20250929").
+    /// Model identifier (e.g., "anthropic/claude-sonnet-4-6").
     pub model_id: String,
 }
 

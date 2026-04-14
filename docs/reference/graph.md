@@ -23,7 +23,9 @@ graph
 
 The first node added becomes the graph's entry point. Each subsequent call to the builder connects the new node to the previous one via a sequential edge. This implicit chaining means that for linear pipelines, the builder reads as a sequence of steps.
 
-Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches; and loop nodes have a body and termination condition or iteration limit. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body, and warning about conflicting output types in parallel branches.
+Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches; and loop nodes have a body and termination condition or iteration limit. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body and warning about conflicting output types in parallel branches.
+
+A separate runtime validation pass, `executor.validate_resources()`, checks that all `Res<T>`, `ResMut<T>`, and `Out<T>` parameters can be satisfied before execution begins. Output reachability is validated along the linear (sequential) chain — each system's `Out<T>` dependencies are checked against outputs produced by preceding systems. Non-system nodes contribute all output types reachable from their subgraphs. See [Execution Context — Resource Validation](context.md#resource-validation) for details.
 
 ## Adding System Nodes
 
@@ -141,6 +143,42 @@ graph.add_loop::<LoopState, _, _>(
 
 For loops that should run a fixed number of times without a predicate, `add_loop_n` accepts only an iteration count.
 
+### Scope
+
+A scope node executes an embedded graph with a configurable context boundary. A `ContextPolicy` is constructed upfront and passed to `add_scope`; it determines how the parent's `SystemContext` is shared with the inner graph:
+
+| Policy | Context | Reads | Writes | Output Merge |
+|--------|---------|-------|--------|--------------|
+| `ContextPolicy::shared()` | Same as parent | Parent's resources | Parent's resources | Shared (no merge) |
+| `ContextPolicy::inherit()` | `ctx.child()` | Walk parent chain + globals | Child's local scope | Merged back |
+| `ContextPolicy::isolated()` | Fresh context (globals only) | Only globals + forwarded | Own local scope | Merged back |
+
+```rust
+// Inherit mode: child reads from parent, writes locally
+graph.add_scope("sub_agent", inner_graph, ContextPolicy::inherit());
+
+// Isolated mode with resource forwarding
+let policy = ContextPolicy::isolated().forward::<Memory>();
+graph.add_scope("sandboxed", inner_graph, policy);
+```
+
+Resource forwarding requires the type to implement `Clone`. The clone function is captured at policy-build time, so no separate `register_clone_fn()` call is needed at runtime.
+
+After the inner graph completes, child outputs are merged back into the parent context. See [Execution Context — Context Flow](context.md#context-flow-through-graph-execution) for details.
+
+### Per-Node Context Semantics
+
+Different node types have different relationships to the `SystemContext`:
+
+| Node Type | Creates Child Context? | Context Behavior |
+|-----------|----------------------|------------------|
+| **System** | No | Executes in parent's context directly |
+| **Decision** | No | Evaluates predicate and branches in parent's context |
+| **Switch** | No | Evaluates discriminator and routes in parent's context |
+| **Loop** | No | Body runs in same context across iterations; outputs persist between iterations |
+| **Parallel** | Yes (per branch) | Each branch gets `ctx.child()`; outputs merged back after all branches complete |
+| **Scope** | Depends on mode | Shared: no; Inherit: `ctx.child()`; Isolated: fresh `SystemContext::with_globals()` |
+
 ## Nodes
 
 Nodes are the vertices of the graph. Each node has a unique ID allocated.
@@ -152,6 +190,7 @@ pub enum Node {
     Switch(SwitchNode),
     Parallel(ParallelNode),
     Loop(LoopNode),
+    Scope(ScopeNode),
 }
 ```
 
@@ -198,6 +237,25 @@ impl GraphExecutor {
 
 When a system returns a value, the executor inserts it into the context's output storage keyed by `TypeId`. Downstream systems access it via `Out<T>`, which fetches from the same storage. If multiple systems return the same type, the last write wins. Outputs persist for the duration of graph execution.
 
+After graph execution completes, the `ExecutionResult` contains the terminal system's output. Use `result.output::<T>()` to downcast:
+
+```rust
+let result = executor.execute(&graph, &mut ctx, None, None).await?;
+let answer = result.output::<MyOutput>(); // Option<&MyOutput>
+```
+
+### Graph-Level Timeout
+
+`GraphExecutor` supports a total execution time limit via `with_max_duration`. When the timeout elapses, the executor returns `ExecutionError::GraphTimeout` and fires `OnGraphFailure` hooks — unlike wrapping with `tokio::time::timeout` externally, which bypasses hooks and middleware.
+
+```rust
+let executor = GraphExecutor::new()
+    .with_max_duration(Duration::from_secs(60));
+
+let result = executor.execute(&graph, &mut ctx, None, None).await;
+// On timeout: Err(ExecutionError::GraphTimeout { elapsed, max })
+```
+
 Subgraph execution (branches, loop bodies, case handlers) is recursive with depth tracking. The default recursion limit is 64.
 
 ## Error Handling
@@ -225,6 +283,27 @@ graph.add_error_handler_for(risky_id, |g| {
 graph.add_error_handler(|g| {
     g.add_system(global_fallback);
 });
+
+// Closure-based error handler (no system definition needed):
+graph.add_error_handler_fn(|error: &CaughtError| -> ErrorResponse {
+    ErrorResponse { code: 500, message: error.message.to_string() }
+});
+
+// Closure-based handler for specific nodes:
+graph.add_error_handler_fn_for([risky_id], |error: &CaughtError| -> String {
+    format!("handled: {}", error.message)
+});
+```
+
+The closure-based variants (`add_error_handler_fn`, `add_error_handler_fn_for`) are a convenience for trivial error mapping where defining a full `#[system]` function would be boilerplate. The closure receives `&CaughtError` and returns a value of type `T`, which is stored as the handler's output. The `SystemNodeBuilder` also exposes `on_error_fn` for inline use:
+
+```rust
+graph.system(risky_operation)
+    .on_error_fn(|error: &CaughtError| -> ErrorResponse {
+        ErrorResponse { code: 500, message: error.message.to_string() }
+    })
+    .done()
+    .add_system(next_step);
 ```
 
 ### Timeout Handling
@@ -270,6 +349,48 @@ graph
 
 Both errors and timeouts count as failed attempts. After all retries are exhausted, the final outcome is forwarded to the error or timeout edge as usual.
 
+### ExecutionError Variants
+
+| Variant | Cause |
+|---------|-------|
+| `EmptyGraph` | Graph has no entry point |
+| `NodeNotFound(NodeId)` | Referenced node not in graph |
+| `NoNextNode(NodeId)` | No sequential edge from node (terminal) |
+| `MissingPredicate(NodeId)` | Decision/loop node missing its predicate |
+| `MissingBranch { node, branch }` | Decision node missing true/false branch target |
+| `MissingDiscriminator(NodeId)` | Switch node missing its discriminator |
+| `NoMatchingCase { node, key }` | Switch: no case for key and no default |
+| `SystemError(Arc<str>)` | System execution returned an error |
+| `PredicateError(PredicateError)` | Predicate evaluation failed |
+| `MaxIterationsExceeded { node, max }` | Loop exceeded iteration limit |
+| `NoTerminationCondition(NodeId)` | Loop has neither predicate nor `max_iterations` |
+| `Timeout { node, timeout }` | System execution exceeded timeout |
+| `GraphTimeout { elapsed, max }` | Total graph execution exceeded `max_duration` |
+| `RecursionLimitExceeded { depth, max }` | Nested control flow too deep (default: 64) |
+| `MiddlewareError { middleware, message }` | A middleware layer failed |
+| `InternalError(String)` | Framework invariant violated |
+| `Unimplemented(&str)` | Feature not yet implemented |
+
+### Error Context (ErrOut)
+
+When a system fails and an error edge exists, the executor stores a `CaughtError` in the outputs before routing to the handler. Error handler systems read it via `ErrOut<CaughtError>`:
+
+```rust
+use polaris_graph::CaughtError;
+use polaris_system::param::ErrOut;
+
+#[system]
+async fn handle_error(error: ErrOut<CaughtError>) -> RecoveryState {
+    tracing::error!(
+        "[{}] {} failed after {:?}: {}",
+        error.node_id, error.system_name, error.duration, error.message
+    );
+    RecoveryState::default()
+}
+```
+
+`CaughtError` contains: `message`, `system_name`, `node_id`, `duration`, and `kind` (`Execution` or `ParamResolution`).
+
 ## Hooks
 
 The hook system provides extension points for observing and modifying graph execution at specific lifecycle events. Hooks are registered by plugins during the build phase via `HooksAPI` and invoked by the executor at runtime.
@@ -291,6 +412,8 @@ Each hook is registered against one or more schedule types. The executor invokes
 **Loop:** `OnLoopStart`, `OnLoopIteration`, `OnLoopEnd` — fired before the loop begins, at the start of each iteration, and after the loop completes.
 
 **Parallel:** `OnParallelStart`, `OnParallelComplete` — fired before parallel branches start and after all branches complete.
+
+**Scope:** `OnScopeStart`, `OnScopeComplete` — fired before scope entry and after scope completion. Includes `context_mode` and inner node count.
 
 When multiple hooks are registered for the same schedule, they execute in registration order, and each hook sees context changes made by previous hooks.
 
@@ -326,9 +449,11 @@ async fn my_system(info: Res<SystemInfo>) {
 
 ## Middleware
 
-Middleware wraps execution units with custom logic.
+Middleware wraps execution units with custom logic that must span the unit's duration — for example, holding a tracing span open across a system's execution, which is impossible with two disconnected hook events.
 
-Each middleware is registered against a target type (`System`, `Loop`, `GraphExecution`, etc.) that determines which execution unit it wraps. The handler receives typed `info` metadata, `&mut SystemContext`, and a `Next` value. Calling `next.run(ctx)` continues the chain; omitting it short-circuits.
+Each middleware is registered against a target type that determines which execution unit it wraps. The handler receives typed `info` metadata, `&mut SystemContext`, and a `Next` value. Every handler **must** call `next.run(ctx)` exactly once — dropping `next` without invoking it produces an `ExecutionError::InternalError`.
+
+### Standalone Registration
 
 ```rust
 use polaris_graph::middleware::{MiddlewareAPI, info::SystemInfo};
@@ -347,6 +472,35 @@ mw.register_system("timer", |info: SystemInfo, ctx, next| {
 executor.execute(&graph, &mut ctx, None, Some(&mw)).await?;
 ```
 
+### Plugin Registration
+
+In a plugin, register middleware via `MiddlewareAPI` during `build()`:
+
+```rust
+impl Plugin for TracingPlugin {
+    fn build(&self, server: &mut Server) {
+        let mw = server.api::<MiddlewareAPI>()
+            .expect("GraphPlugin must be added first");
+
+        mw.register_system("tracing::system", |info: SystemInfo, ctx, next| {
+            Box::pin(async move {
+                let span = tracing::info_span!("system", name = info.node_name);
+                let _guard = span.enter();
+                next.run(ctx).await
+            })
+        });
+
+        mw.register_graph("tracing::graph", |info: GraphInfo, ctx, next| {
+            Box::pin(async move {
+                let span = tracing::info_span!("graph", nodes = info.node_count);
+                let _guard = span.enter();
+                next.run(ctx).await
+            })
+        });
+    }
+}
+```
+
 ### Targets
 
 | Target | Info type | Scope |
@@ -359,6 +513,7 @@ executor.execute(&graph, &mut ctx, None, Some(&mw)).await?;
 | `LoopIteration` | `LoopIterationInfo` | Single loop iteration |
 | `Parallel` | `ParallelInfo` | Entire parallel node |
 | `ParallelBranch` | `ParallelBranchInfo` | Single parallel branch |
+| `Scope` | `ScopeInfo` | Scope node execution |
 
 ### Layer Ordering
 

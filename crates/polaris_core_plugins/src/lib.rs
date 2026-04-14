@@ -68,6 +68,9 @@
 //! - **Layer 1** (`polaris_system`, `polaris_core`): Core primitives and infrastructure
 //! - **Layer 2** (`polaris_graph`, `polaris_agent`): Graph execution and agent patterns
 //! - **Layer 3** (plugins): Concrete agent implementations
+//!
+//! For the full framework guide, architecture overview, and integration patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 // Self-reference ensuring `#[derive(Storable)]` macro-generated code can use `polaris_core_plugins::` paths within this crate.
 extern crate self as polaris_core_plugins;

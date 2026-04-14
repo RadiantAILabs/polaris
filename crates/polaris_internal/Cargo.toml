@@ -1,9 +1,11 @@
 [package]
 name = "polaris_internal"
 version.workspace = true
-description = "An internal Polaris crate"
+description = "Internal re-export layer for Polaris (use polaris-ai instead)."
 edition.workspace = true
-keywords = []
+documentation = "https://docs.rs/polaris-ai"
+keywords = ["polaris-ai"]
+categories = ["development-tools"]
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
@@ -22,16 +24,16 @@ otel = ["polaris_core_plugins/otel"]
 sessions-http = ["polaris_sessions/http"]
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.1.1" }
-polaris_graph = { path = "../polaris_graph", version = "0.1.1" }
-polaris_agent = { path = "../polaris_agent", version = "0.1.1" }
-polaris_tools = { path = "../polaris_tools", version = "0.1.1" }
-polaris_model_providers = { path = "../polaris_model_providers", version = "0.1.1" }
-polaris_models = { path = "../polaris_models", version = "0.1.1" }
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.1.1" }
-polaris_sessions = { path = "../polaris_sessions", version = "0.1.1" }
-polaris_shell = { path = "../polaris_shell", version = "0.1.1" }
-polaris_app = { path = "../polaris_app", version = "0.1.1" }
+polaris_system = { path = "../polaris_system", version = "0.2.0" }
+polaris_graph = { path = "../polaris_graph", version = "0.2.0" }
+polaris_agent = { path = "../polaris_agent", version = "0.2.0" }
+polaris_tools = { path = "../polaris_tools", version = "0.2.0" }
+polaris_model_providers = { path = "../polaris_model_providers", version = "0.2.0" }
+polaris_models = { path = "../polaris_models", version = "0.2.0" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.2.0" }
+polaris_sessions = { path = "../polaris_sessions", version = "0.2.0" }
+polaris_shell = { path = "../polaris_shell", version = "0.2.0" }
+polaris_app = { path = "../polaris_app", version = "0.2.0" }
 
 [lints]
 workspace = true

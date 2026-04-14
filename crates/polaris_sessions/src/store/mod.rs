@@ -21,17 +21,49 @@ use std::fmt;
 ///
 /// Generated via [`nanoid`] by default, or created from an existing string.
 /// Display format is `session_{id}`.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_sessions::SessionId;
+///
+/// // Generate a random ID.
+/// let id = SessionId::new();
+///
+/// // Create from a known string (useful for testing or deterministic IDs).
+/// let id = SessionId::from_string("my-session-1");
+/// assert_eq!(id.as_str(), "my-session-1");
+/// assert_eq!(format!("{id}"), "session_my-session-1");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(String);
 
 impl SessionId {
     /// Creates a new session ID with a random nanoid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_sessions::SessionId;
+    ///
+    /// let id = SessionId::new();
+    /// assert!(!id.as_str().is_empty());
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self(nanoid::nanoid!(8))
     }
 
     /// Creates a session ID from an existing string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_sessions::SessionId;
+    ///
+    /// let id = SessionId::from_string("test-session");
+    /// assert_eq!(id.as_str(), "test-session");
+    /// ```
     #[must_use]
     pub fn from_string(id: impl Into<String>) -> Self {
         Self(id.into())
@@ -63,6 +95,15 @@ impl fmt::Display for SessionId {
 /// Identifies an agent type by its stable, user-defined name.
 ///
 /// Wraps the `&'static str` returned by [`Agent::name`].
+///
+/// # Examples
+///
+/// ```
+/// use polaris_sessions::AgentTypeId;
+///
+/// let id = AgentTypeId::from_name("ReActAgent");
+/// assert_eq!(id.as_str(), "ReActAgent");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct AgentTypeId(&'static str);
 
@@ -134,6 +175,18 @@ pub struct SessionData {
 ///
 /// Implementations must be `Send + Sync + 'static` so they can be shared
 /// across threads behind an `Arc`.
+///
+/// # Examples
+///
+/// Using the built-in [`InMemoryStore`](memory::InMemoryStore):
+///
+/// ```
+/// use std::sync::Arc;
+/// use polaris_sessions::store::memory::InMemoryStore;
+/// use polaris_sessions::SessionStore;
+///
+/// let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+/// ```
 pub trait SessionStore: Send + Sync + 'static {
     /// Persists session data under the given ID.
     fn save(&self, id: &SessionId, data: &SessionData) -> BoxFuture<'_, Result<(), SessionError>>;

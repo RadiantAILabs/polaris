@@ -26,7 +26,7 @@ Use the builder API for ergonomic single-shot LLM calls:
 
 ```rust
 let registry = server.get_global::<ModelRegistry>().unwrap();
-let llm = registry.llm("anthropic/claude-sonnet-4-5-20250929")?;
+let llm = registry.llm("anthropic/claude-sonnet-4-6")?;
 
 let response = llm.builder()
     .system("You are a helpful assistant")
@@ -121,7 +121,7 @@ use polaris_system::system;
 #[system]
 async fn my_agent(registry: Res<ModelRegistry>) -> Result<String, SystemError> {
     let llm = registry
-        .llm("anthropic/claude-sonnet-4-5-20250929")
+        .llm("anthropic/claude-sonnet-4-6")
         .map_err(|e| SystemError::ExecutionError(e.to_string()))?;
 
     let response = llm.builder()

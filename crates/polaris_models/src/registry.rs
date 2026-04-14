@@ -89,6 +89,16 @@ impl ModelRegistry {
     /// # Errors
     ///
     /// Returns an error if the `model_id` structure is invalid or the provider is not registered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::ModelRegistry;
+    ///
+    /// let registry = ModelRegistry::new();
+    /// // No providers registered yet
+    /// assert!(registry.llm("openai/gpt-4o").is_err());
+    /// ```
     pub fn llm(&self, model_id: impl AsRef<str>) -> Result<Llm, CreateModelError> {
         let model_id = model_id.as_ref();
 

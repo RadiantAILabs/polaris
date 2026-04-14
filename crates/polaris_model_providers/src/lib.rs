@@ -74,6 +74,11 @@
 //! server.add_plugins(OpenAiPlugin::from_env("OPENAI_API_KEY"));
 //! # }
 //! ```
+//!
+//! # See Also
+//!
+//! For the full framework guide, adding custom providers, and integration
+//! patterns, see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 mod schema;
 

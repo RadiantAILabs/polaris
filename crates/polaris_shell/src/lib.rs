@@ -103,6 +103,11 @@
 //! 1. System calls `executor.execute(request)` → gets [`ShellResponse::ConfirmationRequired(request)`]
 //! 2. System calls `user_io.send("Allow command: `rm -rf`? (y/n)")` + `user_io.receive()`
 //! 3. If approved, system calls `executor.execute_confirmed(request)`
+//!
+//! # See Also
+//!
+//! For the full framework guide and integration patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 pub mod error;
 pub mod executor;

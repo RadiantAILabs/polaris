@@ -3,6 +3,9 @@ name = "polaris_model_providers"
 version.workspace = true
 description = "Model provider implementations for Polaris"
 edition.workspace = true
+documentation = "https://docs.rs/polaris-ai"
+keywords = ["polaris-ai", "llm", "anthropic", "openai", "bedrock"]
+categories = ["asynchronous", "web-programming::http-client"]
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
@@ -24,8 +27,8 @@ bedrock = [
 ]
 
 [dependencies]
-polaris_models = { path = "../polaris_models", version = "0.1.1" }
-polaris_system = { path = "../polaris_system", version = "0.1.1" }
+polaris_models = { path = "../polaris_models", version = "0.2.0" }
+polaris_system = { path = "../polaris_system", version = "0.2.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.13.1", features = ["json", "stream"] }

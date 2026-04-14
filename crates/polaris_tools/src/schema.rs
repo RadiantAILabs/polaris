@@ -26,6 +26,16 @@ pub struct ParameterInfo {
 
 impl ParameterInfo {
     /// Creates a new required parameter with the given name and schema.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::schema::ParameterInfo;
+    /// use serde_json::json;
+    ///
+    /// let param = ParameterInfo::new("city", json!({"type": "string"}));
+    /// assert!(param.required);
+    /// ```
     pub fn new(name: impl Into<String>, schema: serde_json::Value) -> Self {
         Self {
             name: name.into(),
@@ -55,6 +65,20 @@ pub struct FunctionMetadata {
 
 impl FunctionMetadata {
     /// Creates new metadata with the given function name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::schema::{FunctionMetadata, ParameterInfo};
+    /// use serde_json::json;
+    ///
+    /// let meta = FunctionMetadata::new("get_weather")
+    ///     .with_description("Get weather for a city")
+    ///     .add_parameter(ParameterInfo::new("city", json!({"type": "string"})));
+    ///
+    /// let def = meta.to_tool_definition();
+    /// assert_eq!(def.name, "get_weather");
+    /// ```
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),

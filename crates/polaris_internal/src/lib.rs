@@ -1,6 +1,24 @@
 //! # Polaris Internal Library
 //!
-//! Re-exports the core Polaris crates for convenience.
+//! Re-exports the core Polaris crates for convenience. This crate is an
+//! internal implementation detail — use [`polaris-ai`](https://docs.rs/polaris-ai)
+//! as the public-facing entry point.
+//!
+//! For framework documentation, architecture guides, and usage patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use polaris_internal::prelude::*;
+//!
+//! async fn greet() -> String {
+//!     "Hello from Polaris!".into()
+//! }
+//!
+//! let mut graph = Graph::new();
+//! graph.add_system(greet);
+//! ```
 
 /// Layer 1: ECS-inspired system framework.
 pub use polaris_system;
@@ -31,6 +49,14 @@ pub use polaris_shell;
 pub use polaris_app;
 
 /// Re-export all common types for easy access.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_internal::prelude::*;
+///
+/// let graph = Graph::new();
+/// ```
 pub mod prelude {
     pub use polaris_agent::Agent;
     pub use polaris_graph::prelude::*;

@@ -741,3 +741,135 @@ fn add_error_handler_skips_existing_error_edges() {
     assert_eq!(errors_from_a, 1);
     assert_eq!(errors_from_b, 1);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Closure-based error handler (add_error_handler_fn)
+// ─────────────────────────────────────────────────────────────────────────────
+
+use polaris_graph::CaughtError;
+
+#[test]
+fn error_handler_fn_wires_to_all_fallible_systems() {
+    let mut graph = Graph::new();
+
+    let fallible_id = graph.add_boxed_system(Box::new(FailingSystem));
+    let _infallible_id = graph.add_boxed_system(Box::new(SuccessSystem));
+
+    graph.add_error_handler_fn(|_error: &CaughtError| -> String { "handled".to_string() });
+
+    let error_edges: Vec<_> = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)))
+        .collect();
+
+    assert_eq!(error_edges.len(), 1);
+    assert_eq!(error_edges[0].from(), fallible_id);
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[tokio::test]
+async fn error_handler_fn_executes_closure() {
+    use polaris_graph::executor::GraphExecutor;
+    use test_utils::create_test_server;
+
+    let mut graph = Graph::new();
+
+    graph.add_boxed_system(Box::new(FailingSystem));
+    graph.add_error_handler_fn(|err: &CaughtError| -> String {
+        format!("handled: {}", err.message)
+    });
+
+    let server = create_test_server();
+    let hooks = test_utils::get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await
+        .expect("execution should succeed via closure error handler");
+
+    let output = result.output::<String>();
+    assert!(output.is_some(), "closure output should be in the result");
+    assert!(
+        output.unwrap().starts_with("handled: "),
+        "output should contain the handled message"
+    );
+}
+
+#[test]
+fn error_handler_fn_for_specific_nodes() {
+    let mut graph = Graph::new();
+
+    let fallible_a = graph.add_boxed_system(Box::new(FailingSystem));
+    let fallible_b = graph.add_boxed_system(Box::new(FailingSystem));
+
+    graph.add_error_handler_fn_for([fallible_a.clone()], |_err: &CaughtError| -> String {
+        "handled".to_string()
+    });
+
+    let errors_from_a = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)) && edge.from() == fallible_a)
+        .count();
+    let errors_from_b = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)) && edge.from() == fallible_b)
+        .count();
+
+    assert_eq!(errors_from_a, 1, "fallible_a should have an error edge");
+    assert_eq!(errors_from_b, 0, "fallible_b should NOT have an error edge");
+}
+
+#[test]
+fn system_node_builder_on_error_fn() {
+    let mut graph = Graph::new();
+    graph
+        .system_boxed(Box::new(FailingSystem))
+        .on_error_fn(|_err: &CaughtError| -> String { "recovered".to_string() })
+        .done()
+        .add_system(second_step);
+
+    assert_eq!(graph.node_count(), 3);
+
+    let error_edge_count = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)))
+        .count();
+    assert_eq!(error_edge_count, 1);
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[tokio::test]
+async fn system_node_builder_on_error_fn_executes() {
+    use polaris_graph::executor::GraphExecutor;
+    use test_utils::create_test_server;
+
+    let mut graph = Graph::new();
+    graph
+        .system_boxed(Box::new(FailingSystem))
+        .on_error_fn(|err: &CaughtError| -> String { format!("recovered: {}", err.message) });
+
+    let server = create_test_server();
+    let hooks = test_utils::get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await
+        .expect("execution should succeed via on_error_fn handler");
+
+    let output = result.output::<String>();
+    assert!(output.is_some(), "closure output should be in the result");
+    assert!(
+        output.unwrap().starts_with("recovered: "),
+        "output should contain the recovered message"
+    );
+}

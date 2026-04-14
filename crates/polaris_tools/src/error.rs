@@ -3,6 +3,18 @@
 use thiserror::Error;
 
 /// Errors that can occur during tool execution.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_tools::ToolError;
+///
+/// let err = ToolError::parameter_error("missing 'city' field");
+/// assert_eq!(err.error_type(), "validation_error");
+///
+/// let err = ToolError::unknown_tool("nonexistent");
+/// assert_eq!(err.error_type(), "unknown_tool");
+/// ```
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ToolError {

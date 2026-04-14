@@ -256,6 +256,16 @@ pub struct ShellRequest {
 
 impl ShellRequest {
     /// Creates a new request with the given command.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_shell::ShellRequest;
+    ///
+    /// let req = ShellRequest::new("cargo build")
+    ///     .with_working_dir("/home/user/project")
+    ///     .with_timeout(120);
+    /// ```
     #[must_use]
     pub fn new(command: impl Into<String>) -> Self {
         Self {
@@ -471,6 +481,22 @@ impl ShellExecutor {
     /// 1. `denied_commands` match → [`ShellPermission::Deny`]
     /// 2. `allowed_commands` match → [`ShellPermission::Allow`]
     /// 3. Otherwise → [`ShellPermission::Confirm`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_shell::{ShellConfig, ShellExecutor, ShellPermission};
+    ///
+    /// let config = ShellConfig::new()
+    ///     .with_allowed_commands(vec!["cargo *".into()])
+    ///     .with_denied_commands(vec!["rm -rf *".into()])
+    ///     .disable_sandbox();
+    /// let executor = ShellExecutor::new(config);
+    ///
+    /// assert_eq!(executor.check_permission("cargo build"), ShellPermission::Allow);
+    /// assert_eq!(executor.check_permission("rm -rf /"), ShellPermission::Deny);
+    /// assert_eq!(executor.check_permission("ls -la"), ShellPermission::Confirm);
+    /// ```
     #[must_use]
     pub fn check_permission(&self, command: &str) -> ShellPermission {
         let subcommands = split_command_chain(command);
