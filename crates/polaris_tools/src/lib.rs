@@ -54,6 +54,9 @@
 //! - [`Toolset`] — trait for grouped tools (via `#[toolset]`)
 //! - [`ToolRegistry`] — stores and dispatches tools
 //! - [`ToolsPlugin`] — manages registry lifecycle
+//!
+//! For the full framework guide, architecture overview, and integration patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 //! - [`FunctionParam`] / [`InputParam`] — parameter extraction
 //! - [`FunctionMetadata`] / [`ParameterInfo`] — schema building
 

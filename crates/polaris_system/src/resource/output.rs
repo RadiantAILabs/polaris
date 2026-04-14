@@ -97,6 +97,8 @@ impl OutputEntry {
 #[derive(Default)]
 pub struct Outputs {
     storage: HashMap<OutputId, OutputEntry>,
+    /// Tracks the most recently inserted output type for `take_last()`.
+    last_type_id: Option<OutputId>,
 }
 
 impl Outputs {
@@ -105,6 +107,7 @@ impl Outputs {
     pub fn new() -> Self {
         Self {
             storage: HashMap::new(),
+            last_type_id: None,
         }
     }
 
@@ -115,6 +118,7 @@ impl Outputs {
     pub fn insert<T: Output>(&mut self, value: T) -> Option<T> {
         let id = OutputId::of::<T>();
         let entry = OutputEntry::new(value);
+        self.last_type_id = Some(id);
 
         self.storage.insert(id, entry).and_then(|old| {
             old.data
@@ -137,6 +141,7 @@ impl Outputs {
         let entry = OutputEntry {
             data: RwLock::new(value),
         };
+        self.last_type_id = Some(id);
         self.storage.insert(id, entry);
     }
 
@@ -183,6 +188,18 @@ impl Outputs {
     /// Called by the executor between agent runs to reset ephemeral state.
     pub fn clear(&mut self) {
         self.storage.clear();
+        self.last_type_id = None;
+    }
+
+    /// Removes and returns the most recently inserted output as a type-erased box.
+    ///
+    /// Returns `None` if no output has been inserted or if the last output was
+    /// already taken. This is used by the executor to extract the final output
+    /// from a completed graph execution.
+    pub fn take_last(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        let id = self.last_type_id.take()?;
+        let entry = self.storage.remove(&id)?;
+        Some(entry.data.into_inner())
     }
 
     /// Returns the number of outputs stored.
@@ -203,9 +220,19 @@ impl Outputs {
     /// If both containers have an output of the same type, the entry
     /// from `other` overwrites the one in `self`.
     ///
+    /// The `last_type_id` is updated to the source's value when present,
+    /// so the most recent output from the merged container becomes the
+    /// overall most recent. For parallel branches this means the branch
+    /// merged last determines `take_last()`; the merge order is fixed by
+    /// the executor's branch iteration order, which is deterministic for
+    /// a given graph topology.
+    ///
     /// This is used by the executor to propagate outputs from child
     /// contexts (parallel branches) back to the parent context.
     pub fn merge_from(&mut self, other: Outputs) {
+        if let Some(id) = other.last_type_id {
+            self.last_type_id = Some(id);
+        }
         for (id, entry) in other.storage {
             self.storage.insert(id, entry);
         }
@@ -467,5 +494,92 @@ mod tests {
 
         // Different types produce different ids
         assert_ne!(id, tool_id);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // take_last tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn take_last_returns_most_recent_insert() {
+        let mut outputs = Outputs::new();
+        outputs.insert(ReasoningResult {
+            action: "first".into(),
+        });
+        outputs.insert(ToolResult { value: 42 });
+
+        let last = outputs.take_last().unwrap();
+        let tool = last.downcast_ref::<ToolResult>().unwrap();
+        assert_eq!(tool.value, 42);
+    }
+
+    #[test]
+    fn take_last_returns_none_when_empty() {
+        let mut outputs = Outputs::new();
+        assert!(outputs.take_last().is_none());
+    }
+
+    #[test]
+    fn take_last_removes_from_storage() {
+        let mut outputs = Outputs::new();
+        outputs.insert(ReasoningResult {
+            action: "test".into(),
+        });
+
+        let _ = outputs.take_last();
+
+        assert!(!outputs.contains::<ReasoningResult>());
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn take_last_returns_none_after_clear() {
+        let mut outputs = Outputs::new();
+        outputs.insert(ReasoningResult {
+            action: "test".into(),
+        });
+        outputs.clear();
+
+        assert!(outputs.take_last().is_none());
+    }
+
+    #[test]
+    fn take_last_idempotent() {
+        let mut outputs = Outputs::new();
+        outputs.insert(ReasoningResult {
+            action: "test".into(),
+        });
+
+        assert!(outputs.take_last().is_some());
+        assert!(outputs.take_last().is_none());
+    }
+
+    #[test]
+    fn take_last_after_insert_boxed() {
+        let mut outputs = Outputs::new();
+
+        let type_id = TypeId::of::<ToolResult>();
+        let boxed: Box<dyn Any + Send + Sync> = Box::new(ToolResult { value: 99 });
+        outputs.insert_boxed(type_id, boxed);
+
+        let last = outputs.take_last().unwrap();
+        let tool = last.downcast_ref::<ToolResult>().unwrap();
+        assert_eq!(tool.value, 99);
+    }
+
+    #[test]
+    fn merge_from_propagates_last_type_id() {
+        let mut target = Outputs::new();
+        target.insert(ReasoningResult {
+            action: "target".into(),
+        });
+
+        let mut source = Outputs::new();
+        source.insert(ToolResult { value: 42 });
+
+        target.merge_from(source);
+
+        let last = target.take_last().unwrap();
+        assert!(last.downcast_ref::<ToolResult>().is_some());
     }
 }

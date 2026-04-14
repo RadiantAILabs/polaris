@@ -148,13 +148,14 @@ When a system executes, the framework passes the current `SystemContext` to the 
 
 Any type implementing `SystemParam` may be declared as a system parameter.
 
-There are three built-in parameter types:
+There are four built-in parameter types:
 
 | Type | Resolution Scope | Access | Concurrent Borrows |
 |------|------------------|--------|-------------------|
 | `Res<T>` | Hierarchy (local → parents → global) | Immutable | Permitted |
 | `ResMut<T>` | Current context only | Exclusive | None |
 | `Out<T>` | Current context outputs | Immutable | Permitted |
+| `ErrOut<T>` | Current context outputs (error-edge only) | Immutable | Permitted |
 
 **`Res<T>`** provides immutable access to a resource. `T` may implement either `GlobalResource` or `LocalResource`. Resolution traverses the `SystemContext` hierarchy upward, returning the first matching local resource or falling back to global resources. This shadowing semantic allows child contexts to override inherited resources. Multiple `Res<T>` borrows of the same type are permitted concurrently.
 
@@ -182,6 +183,24 @@ async fn execute(reasoning: Out<ReasoningResult>, tools: Res<ToolRegistry>) -> T
     tools.execute(&reasoning.action).await
 }
 ```
+
+**`ErrOut<T>`** provides immutable access to an error-context output produced when a system fails and the executor routes to an error edge. The executor inserts a `CaughtError` into the destination context before invoking the handler, which reads it via `ErrOut<CaughtError>`.
+
+```rust
+use polaris_graph::CaughtError;
+use polaris_system::param::ErrOut;
+
+#[system]
+async fn handle_error(error: ErrOut<CaughtError>) -> RecoveryState {
+    tracing::error!(
+        "[{}] {} failed after {:?}: {}",
+        error.node_id, error.system_name, error.duration, error.message
+    );
+    RecoveryState::default()
+}
+```
+
+`ErrOut<T>` is populated only on the error path. See [Graph — Error Handling](graph.md#error-handling) for how error edges route to handler subgraphs.
 
 ### Outputs
 

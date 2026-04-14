@@ -1,0 +1,23 @@
+# rumdl configuration
+
+[global]
+exclude = [
+    # Rustdoc include_str! fragments — consumed by
+    # `#[doc = include_str!("docs/...")]` in src/lib.rs,
+    # not standalone Markdown.
+    "src/docs/**",
+]
+
+# Disabled rules (mirrors .markdownlint.json)
+disable = [
+    "MD013",  # Line length
+    "MD025",  # Single H1
+    "MD032",  # Blank line around lists
+    "MD033",  # Inline HTML
+    "MD036",  # Emphasis as heading
+    "MD040",  # Fenced code language
+    "MD060",  # Blank line inside code span
+]
+
+[MD024]
+siblings_only = true

@@ -143,13 +143,13 @@ async fn full_server_graph_executor_flow() {
     let memory = ctx.get_resource::<AgentMemory>().unwrap();
     assert_eq!(memory.history, vec![50, 30]);
 
-    // - Last output is available
-    let output = ctx.get_output::<ComputeResult>().unwrap();
-    assert_eq!(output.value, 30);
-
-    // - Execution stats are correct
+    // - Execution stats and output are correct
     let stats = result.unwrap();
     assert_eq!(stats.nodes_executed, 2);
+
+    // - Last output is available on the result
+    let output = stats.output::<ComputeResult>().unwrap();
+    assert_eq!(output.value, 30);
 }
 
 #[tokio::test]
@@ -298,10 +298,12 @@ async fn conditional_branch_with_resources() {
     let mut ctx = server.create_context();
     let executor = GraphExecutor::new();
 
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-    assert!(result.is_ok());
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
 
-    let output = ctx.get_output::<BranchResult>().unwrap();
+    let output = result.output::<BranchResult>().unwrap();
     assert_eq!(output.branch_name, "branch_a");
 }
 
@@ -584,7 +586,7 @@ async fn parallel_diamond_execution() {
     assert_eq!(stats.nodes_executed, 5);
 
     // Final output should be from the after_join step
-    let output = ctx.get_output::<DiamondResult>().unwrap();
+    let output = stats.output::<DiamondResult>().unwrap();
     assert_eq!(output.step, "after_join");
     assert_eq!(output.value, 100);
 }
@@ -658,10 +660,12 @@ async fn parallel_outputs_visible_after_join() {
     let mut ctx = server.create_context();
     let executor = GraphExecutor::new();
 
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-    assert!(result.is_ok(), "Execution failed: {:?}", result.err());
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
 
-    let output = ctx.get_output::<DiamondResult>().unwrap();
+    let output = result.output::<DiamondResult>().unwrap();
     assert_eq!(output.step, "after_join");
     assert_eq!(output.value, 42 + 5); // 42 + len("hello")
 }
@@ -722,11 +726,13 @@ async fn conditional_diverge_converge_diamond() {
     let mut ctx = server.create_context();
     let executor = GraphExecutor::new();
 
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-    assert!(result.is_ok(), "Execution failed: {:?}", result.err());
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
 
     // Final output should be from the converge step (after the branch)
-    let output = ctx.get_output::<DiamondResult>().unwrap();
+    let output = result.output::<DiamondResult>().unwrap();
     assert_eq!(output.step, "converge");
     assert_eq!(output.value, 100);
 }
@@ -1226,5 +1232,141 @@ async fn scope_isolated_inherits_global_resources() {
         *captured.lock().unwrap(),
         Some("global_value".to_string()),
         "isolated scope should have read the global resource"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Graph Timeout Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+use polaris_graph::ExecutionError;
+use test_utils::SlowSystem;
+
+#[tokio::test]
+async fn graph_timeout_fires_when_exceeded() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(200),
+    }));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new().with_max_duration(std::time::Duration::from_millis(50));
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_err(), "expected timeout error");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, ExecutionError::GraphTimeout { .. }),
+        "expected GraphTimeout, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn graph_timeout_does_not_fire_when_within_limit() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(50),
+    }));
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new().with_max_duration(std::time::Duration::from_millis(500));
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        result.is_ok(),
+        "expected success within timeout, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ExecutionResult Typed Output Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn execution_result_contains_typed_output() {
+    async fn compute() -> i32 {
+        42
+    }
+
+    let mut graph = Graph::new();
+    graph.add_system(compute);
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.output::<i32>(), Some(&42));
+}
+
+#[tokio::test]
+async fn execution_result_output_wrong_type_returns_none() {
+    async fn compute() -> i32 {
+        42
+    }
+
+    let mut graph = Graph::new();
+    graph.add_system(compute);
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
+
+    assert!(
+        result.output::<String>().is_none(),
+        "requesting wrong type should return None"
+    );
+}
+
+#[tokio::test]
+async fn execution_result_has_output() {
+    async fn compute() -> i32 {
+        42
+    }
+
+    let mut graph = Graph::new();
+    graph.add_system(compute);
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.has_output(), "result should have an output");
+}
+
+#[tokio::test]
+async fn execution_result_contains_last_system_output() {
+    async fn first() -> i32 {
+        10
+    }
+    async fn second() -> i32 {
+        20
+    }
+
+    let mut graph = Graph::new();
+    graph.add_system(first).add_system(second);
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.output::<i32>(),
+        Some(&20),
+        "output should be from the last system executed"
     );
 }

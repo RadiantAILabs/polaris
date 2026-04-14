@@ -180,6 +180,17 @@ impl IOMessage {
     }
 
     /// Adds a metadata entry to this message, returning self for chaining.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_core_plugins::IOMessage;
+    ///
+    /// let msg = IOMessage::user_text("hello")
+    ///     .with_metadata("session_id", "abc-123")
+    ///     .with_metadata("priority", "high");
+    /// assert_eq!(msg.metadata.get("session_id").unwrap(), "abc-123");
+    /// ```
     #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());

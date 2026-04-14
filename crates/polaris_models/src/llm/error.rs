@@ -86,7 +86,16 @@ pub enum GenerationError {
 }
 
 impl GenerationError {
-    /// Returns a low-cardinality error type string.
+    /// Returns a low-cardinality error type string suitable for metrics labels.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::GenerationError;
+    ///
+    /// let err = GenerationError::Auth("bad key".into());
+    /// assert_eq!(err.error_type(), "auth");
+    /// ```
     #[must_use]
     pub fn error_type(&self) -> &'static str {
         match self {

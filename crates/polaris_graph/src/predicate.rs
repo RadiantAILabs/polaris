@@ -39,6 +39,22 @@ use std::fmt;
 use std::marker::PhantomData;
 
 /// Errors that can occur during predicate evaluation.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::predicate::{Predicate, PredicateError, ErasedPredicate};
+/// use polaris_system::param::SystemContext;
+///
+/// struct MyOutput { value: i32 }
+///
+/// let pred = Predicate::<MyOutput, _>::new(|output| output.value > 5);
+///
+/// // Evaluating without the required output produces an error
+/// let ctx = SystemContext::new();
+/// let result = pred.evaluate(&ctx);
+/// assert!(matches!(result, Err(PredicateError::OutputNotFound { .. })));
+/// ```
 #[derive(Debug, Clone)]
 pub enum PredicateError {
     /// The required output type was not found in the context.
@@ -69,6 +85,22 @@ impl std::error::Error for PredicateError {}
 ///
 /// This trait enables storing heterogeneous predicates in graph nodes
 /// while preserving type information for debugging.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::predicate::{Predicate, BoxedPredicate, ErasedPredicate};
+/// use polaris_system::param::SystemContext;
+///
+/// struct Score { value: i32 }
+///
+/// // Box a typed predicate into the trait object
+/// let pred: BoxedPredicate = Box::new(Predicate::<Score, _>::new(|s| s.value > 50));
+///
+/// let mut ctx = SystemContext::new();
+/// ctx.insert_output(Score { value: 75 });
+/// assert!(pred.evaluate(&ctx).unwrap());
+/// ```
 pub trait ErasedPredicate: Send + Sync {
     /// Evaluates the predicate against the current context.
     ///
@@ -100,6 +132,22 @@ pub type BoxedPredicate = Box<dyn ErasedPredicate>;
 ///
 /// Discriminators are similar to predicates but return a string key
 /// instead of a boolean, enabling multi-way branching in switch nodes.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::predicate::{Discriminator, BoxedDiscriminator, ErasedDiscriminator};
+/// use polaris_system::param::SystemContext;
+///
+/// struct RouterOutput { action: &'static str }
+///
+/// let disc: BoxedDiscriminator =
+///     Box::new(Discriminator::<RouterOutput, _>::new(|out| out.action));
+///
+/// let mut ctx = SystemContext::new();
+/// ctx.insert_output(RouterOutput { action: "tool" });
+/// assert_eq!(disc.discriminate(&ctx).unwrap(), "tool");
+/// ```
 pub trait ErasedDiscriminator: Send + Sync {
     /// Evaluates the discriminator against the current context.
     ///

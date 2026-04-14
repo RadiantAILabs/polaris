@@ -3,7 +3,9 @@ name = "polaris_core_plugins"
 version.workspace = true
 description = "Core infrastructure plugins for Polaris."
 edition.workspace = true
+documentation = "https://docs.rs/polaris-ai"
 keywords = ["polaris-ai", "plugin", "infrastructure"]
+categories = ["asynchronous", "development-tools"]
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
@@ -13,11 +15,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.1.1" }
-polaris_graph = { path = "../polaris_graph", version = "0.1.1" }
-polaris_models = { path = "../polaris_models", version = "0.1.1", optional = true }
-polaris_tools = { path = "../polaris_tools", version = "0.1.1", optional = true }
-persistence_macros = { path = "persistence_macros", version = "0.1.1" }
+polaris_system = { path = "../polaris_system", version = "0.2.0" }
+polaris_graph = { path = "../polaris_graph", version = "0.2.0" }
+polaris_models = { path = "../polaris_models", version = "0.2.0", optional = true }
+polaris_tools = { path = "../polaris_tools", version = "0.2.0", optional = true }
+persistence_macros = { path = "persistence_macros", version = "0.2.0" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -11,6 +11,37 @@ use std::pin::Pin;
 /// Tools expose a [`ToolDefinition`] (name, description, JSON schema) for the LLM,
 /// and an async [`execute`](Tool::execute) method that runs with the tool's
 /// captured environment.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_tools::{Tool, ToolError};
+/// use polaris_models::llm::ToolDefinition;
+/// use serde_json::{json, Value};
+/// use std::pin::Pin;
+/// use std::future::Future;
+///
+/// struct EchoTool;
+///
+/// impl Tool for EchoTool {
+///     fn definition(&self) -> ToolDefinition {
+///         ToolDefinition {
+///             name: "echo".into(),
+///             description: "Echoes input back".into(),
+///             parameters: json!({"type": "object", "properties": {
+///                 "text": {"type": "string"}
+///             }}),
+///         }
+///     }
+///
+///     fn execute(
+///         &self,
+///         args: Value,
+///     ) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + '_>> {
+///         Box::pin(async move { Ok(args) })
+///     }
+/// }
+/// ```
 pub trait Tool: Send + Sync + 'static {
     /// Returns the LLM-facing tool definition with JSON schema.
     fn definition(&self) -> ToolDefinition;

@@ -44,7 +44,8 @@
 //! - **Layer 2** (`polaris_agent`): Agent pattern definition (Agent trait)
 //! - **Layer 3** (plugins): Concrete agent implementations
 //!
-//! See [docs/taxonomy.md](../../docs/taxonomy.md) for architecture details.
+//! For the full framework guide, architecture overview, and integration patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 /// Edge types for connecting nodes in graphs.
 pub mod edge;

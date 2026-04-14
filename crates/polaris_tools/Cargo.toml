@@ -3,6 +3,9 @@ name = "polaris_tools"
 version.workspace = true
 description = "Tool framework for Polaris agents"
 edition.workspace = true
+documentation = "https://docs.rs/polaris-ai"
+keywords = ["polaris-ai", "tools", "agents", "ai", "llm"]
+categories = ["asynchronous", "development-tools"]
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
@@ -12,9 +15,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.1.1" }
-polaris_models = { path = "../polaris_models", version = "0.1.1" }
-tool_macros = { path = "tool_macros", version = "0.1.1" }
+polaris_system = { path = "../polaris_system", version = "0.2.0" }
+polaris_models = { path = "../polaris_models", version = "0.2.0" }
+tool_macros = { path = "tool_macros", version = "0.2.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 schemars = "1.2.0"

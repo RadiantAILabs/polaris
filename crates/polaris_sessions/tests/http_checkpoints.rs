@@ -159,7 +159,7 @@ async fn multiple_checkpoints() {
     assert_eq!(list, vec![1]);
 }
 
-/// Unknown session returns SessionNotFound.
+/// Unknown session returns `SessionNotFound`.
 #[tokio::test]
 async fn checkpoint_unknown_session() {
     let store = Arc::new(InMemoryStore::new());
@@ -181,7 +181,7 @@ async fn checkpoint_unknown_session() {
     ));
 }
 
-/// Rollback to non-existent turn returns TurnNotFound.
+/// Rollback to non-existent turn returns `TurnNotFound`.
 #[tokio::test]
 async fn rollback_invalid_turn() {
     let store = Arc::new(InMemoryStore::new());
@@ -266,7 +266,7 @@ async fn list_stored_sessions() {
     assert_eq!(stored, vec!["session-a", "session-b"]);
 }
 
-/// Resume unknown session returns SessionNotFound.
+/// Resume unknown session returns `SessionNotFound`.
 #[tokio::test]
 async fn resume_unknown_session() {
     let store = Arc::new(InMemoryStore::new());

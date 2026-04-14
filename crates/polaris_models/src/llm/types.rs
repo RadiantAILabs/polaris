@@ -29,6 +29,18 @@ pub struct LlmRequest {
 
 impl LlmRequest {
     /// Returns `true` if any message contains a [`ToolCall`] or [`ToolResult`] block.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::{LlmRequest, Message};
+    ///
+    /// let request = LlmRequest {
+    ///     messages: vec![Message::user("Hello")],
+    ///     ..Default::default()
+    /// };
+    /// assert!(!request.contains_tool_blocks());
+    /// ```
     #[must_use]
     pub fn contains_tool_blocks(&self) -> bool {
         self.messages.iter().any(|msg| match msg {
@@ -94,6 +106,19 @@ impl LlmResponse {
     /// concatenated together.
     ///
     /// Returns an empty string if no text content is found.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::{LlmResponse, AssistantBlock, StopReason, Usage};
+    ///
+    /// let response = LlmResponse {
+    ///     content: vec![AssistantBlock::text("Hello, "), AssistantBlock::text("world!")],
+    ///     usage: Usage::default(),
+    ///     stop_reason: StopReason::EndTurn,
+    /// };
+    /// assert_eq!(response.text(), "Hello, world!");
+    /// ```
     #[must_use]
     pub fn text(&self) -> String {
         self.content
@@ -164,6 +189,14 @@ pub enum Message {
 
 impl Message {
     /// Creates a user message with text content.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::Message;
+    ///
+    /// let msg = Message::user("What is the weather?");
+    /// ```
     #[must_use]
     pub fn user(text: impl Into<String>) -> Self {
         Self::User {
@@ -585,6 +618,16 @@ impl ToolCall {
     ///
     /// Provider-specific fields (`call_id`, `signature`, `additional_params`)
     /// are set to `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::ToolCall;
+    /// use serde_json::json;
+    ///
+    /// let call = ToolCall::new("call_1", "get_weather", json!({"city": "London"}));
+    /// assert_eq!(call.function.name, "get_weather");
+    /// ```
     #[must_use]
     pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
         Self {

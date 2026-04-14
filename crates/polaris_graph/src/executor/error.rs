@@ -9,7 +9,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Errors that can occur during graph execution.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::ExecutionError;
+///
+/// let err = ExecutionError::EmptyGraph;
+/// assert_eq!(format!("{err}"), "graph has no entry point");
+///
+/// // Pattern matching on error variants
+/// match err {
+///     ExecutionError::EmptyGraph => { /* handle empty graph */ }
+///     ExecutionError::NodeNotFound(id) => { /* handle missing node */ }
+///     ExecutionError::SystemError(msg) => { /* handle system failure */ }
+///     _ => { /* handle other errors */ }
+/// }
+/// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ExecutionError {
     /// The graph has no entry point.
     EmptyGraph,
@@ -73,6 +91,13 @@ pub enum ExecutionError {
         /// Description of the failure.
         message: String,
     },
+    /// Total graph execution time exceeded the configured limit.
+    GraphTimeout {
+        /// How long the graph ran before being stopped.
+        elapsed: Duration,
+        /// The configured maximum duration.
+        max: Duration,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -120,6 +145,12 @@ impl fmt::Display for ExecutionError {
             } => {
                 write!(f, "middleware '{middleware}' failed: {message}")
             }
+            ExecutionError::GraphTimeout { elapsed, max } => {
+                write!(
+                    f,
+                    "graph execution timed out after {elapsed:?} (max: {max:?})"
+                )
+            }
         }
     }
 }
@@ -137,7 +168,30 @@ impl std::error::Error for ExecutionError {
 ///
 /// These errors are detected before graph execution starts, allowing
 /// early detection of missing resources that would cause runtime failures.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::ResourceValidationError;
+/// use polaris_graph::NodeId;
+/// use polaris_system::param::AccessMode;
+/// use std::any::TypeId;
+///
+/// let err = ResourceValidationError::MissingResource {
+///     node: NodeId::from_string("node_1"),
+///     system_name: "my_system",
+///     resource_type: "MyConfig",
+///     type_id: TypeId::of::<String>(),
+///     access_mode: AccessMode::Read,
+/// };
+///
+/// // Display provides a human-readable message
+/// let msg = format!("{err}");
+/// assert!(msg.contains("my_system"));
+/// assert!(msg.contains("MyConfig"));
+/// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ResourceValidationError {
     /// A required resource is missing from the context.
     MissingResource {
@@ -205,6 +259,18 @@ impl std::error::Error for ResourceValidationError {}
 ///
 /// Used in [`CaughtError`] to distinguish error sources without parsing
 /// message strings.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::ErrorKind;
+///
+/// let kind = ErrorKind::Execution;
+/// assert_eq!(format!("{kind}"), "execution");
+///
+/// let kind = ErrorKind::ParamResolution;
+/// assert_eq!(format!("{kind}"), "param_resolution");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// System returned `Err(SystemError::ExecutionError(...))`.

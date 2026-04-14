@@ -18,6 +18,11 @@
 //! - **Layer 2** (`polaris_graph`): Graph-based agent execution
 //! - **Layer 3** (plugins): Concrete agent implementations, tools, LLMs
 //!
+//! # See Also
+//!
+//! For the full framework guide, architecture overview, and integration patterns,
+//! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
+//!
 //! # Example
 //!
 //! ```

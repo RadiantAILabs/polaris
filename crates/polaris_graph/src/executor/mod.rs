@@ -30,6 +30,7 @@ mod run;
 pub use error::{CaughtError, ErrorKind, ExecutionError, ResourceValidationError};
 pub use run::DEFAULT_SWITCH_CASE;
 
+use crate::edge::Edge;
 use crate::graph::Graph;
 use crate::hooks::HooksAPI;
 use crate::hooks::events::GraphEvent;
@@ -39,28 +40,132 @@ use crate::node::{ContextMode, Node, NodeId};
 use hashbrown::HashSet;
 use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::time::Duration;
 
 /// Result of executing a graph.
-#[derive(Debug, Default)]
+///
+/// Contains execution statistics and optionally the typed output from
+/// the last system that produced a value. Use [`output`](Self::output)
+/// to downcast the output to a concrete type.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example_fn() -> Result<(), Box<dyn std::error::Error>> {
+/// use polaris_graph::{Graph, GraphExecutor};
+/// use polaris_system::param::SystemContext;
+///
+/// async fn step() -> i32 { 1 }
+///
+/// let mut graph = Graph::new();
+/// graph.add_system(step);
+///
+/// let mut ctx = SystemContext::new();
+/// let executor = GraphExecutor::new();
+/// let result = executor.execute(&graph, &mut ctx, None, None).await?;
+///
+/// assert!(result.nodes_executed > 0);
+/// assert!(!result.duration.is_zero());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default)]
 pub struct ExecutionResult {
     /// Number of nodes executed during traversal.
     pub nodes_executed: usize,
     /// Total execution duration.
     pub duration: Duration,
+    /// The output value from the last system that produced one.
+    ///
+    /// This is the same value stored via `ctx.insert_output_boxed()` during
+    /// execution. Use [`output`](Self::output) to downcast to a concrete type.
+    final_output: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ExecutionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionResult")
+            .field("nodes_executed", &self.nodes_executed)
+            .field("duration", &self.duration)
+            .field(
+                "final_output",
+                if self.final_output.is_some() {
+                    &"Some(<output>)"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
+}
+
+impl ExecutionResult {
+    /// Attempts to extract the typed output from graph execution.
+    ///
+    /// Returns `Some(&T)` if the last system produced a value of type `T`,
+    /// or `None` if no output was produced or the type doesn't match.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use polaris_graph::{Graph, GraphExecutor};
+    /// use polaris_system::param::SystemContext;
+    ///
+    /// async fn compute() -> i32 { 42 }
+    ///
+    /// # async fn example() {
+    /// let mut graph = Graph::new();
+    /// graph.add_system(compute);
+    ///
+    /// let mut ctx = SystemContext::new();
+    /// let executor = GraphExecutor::new();
+    /// let result = executor.execute(&graph, &mut ctx, None, None).await.unwrap();
+    ///
+    /// assert_eq!(result.output::<i32>(), Some(&42));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn output<T: 'static>(&self) -> Option<&T> {
+        self.final_output.as_ref()?.downcast_ref::<T>()
+    }
+
+    /// Returns `true` if the result contains an output value.
+    #[must_use]
+    pub fn has_output(&self) -> bool {
+        self.final_output.is_some()
+    }
 }
 
 /// Graph execution engine.
 ///
 /// `GraphExecutor` traverses a graph starting from its entry point,
 /// executing systems and following control flow edges.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::GraphExecutor;
+///
+/// // Default executor with 1000-iteration safety limit
+/// let executor = GraphExecutor::new();
+///
+/// // Customize limits
+/// let executor = GraphExecutor::new()
+///     .with_default_max_iterations(500)
+///     .with_max_recursion_depth(32);
+///
+/// // No iteration limit (use with caution)
+/// let unlimited = GraphExecutor::without_iteration_limit();
+/// ```
 #[derive(Debug, Clone)]
 pub struct GraphExecutor {
     /// Maximum iterations for loops without explicit limits (safety default).
     pub(crate) default_max_iterations: Option<usize>,
     /// Maximum recursion depth for nested control flow (safety default).
     pub(crate) max_recursion_depth: usize,
+    /// Maximum total execution duration for the graph.
+    pub(crate) max_duration: Option<Duration>,
 }
 
 impl Default for GraphExecutor {
@@ -79,6 +184,7 @@ impl GraphExecutor {
         Self {
             default_max_iterations: Some(1000),
             max_recursion_depth: Self::DEFAULT_MAX_RECURSION_DEPTH,
+            max_duration: None,
         }
     }
 
@@ -93,6 +199,7 @@ impl GraphExecutor {
         Self {
             default_max_iterations: None,
             max_recursion_depth: Self::DEFAULT_MAX_RECURSION_DEPTH,
+            max_duration: None,
         }
     }
 
@@ -110,6 +217,24 @@ impl GraphExecutor {
         self
     }
 
+    /// Sets the maximum total execution duration for the graph.
+    ///
+    /// When set, the executor wraps graph execution in a timeout.
+    /// If exceeded, returns [`ExecutionError::GraphTimeout`] after
+    /// invoking `OnGraphFailure` hooks.
+    ///
+    /// # Cancel safety
+    ///
+    /// When the timeout fires, the in-flight future is dropped. Systems
+    /// that hold mutable state across `.await` points may leave partial
+    /// writes. Design systems to be cancel-safe or use error edges to
+    /// handle cleanup when timeout is enabled.
+    #[must_use]
+    pub fn with_max_duration(mut self, duration: Duration) -> Self {
+        self.max_duration = Some(duration);
+        self
+    }
+
     /// Validates that all resources required by systems in the graph
     /// are available in the context.
     ///
@@ -122,13 +247,41 @@ impl GraphExecutor {
     ///   resources (local scope, parent chain, and globals).
     /// - **Hook-provided resources**: Resources provided by hooks on `OnGraphStart`
     ///   and `OnSystemStart` are considered available.
-    /// - **Outputs** (`Out<T>`): Currently not validated, as outputs are
-    ///   produced dynamically during execution.
+    /// - **Outputs** (`Out<T>`): Validated along sequential (linear) edges.
+    ///   Each system's declared output dependencies are checked against the set
+    ///   of outputs produced by preceding systems in the linear chain. Non-system
+    ///   nodes (Decision, Switch, Loop, Parallel) contribute all output types
+    ///   reachable from their subgraphs. Hook-provided types are also considered
+    ///   available. Scope nodes are skipped (outputs flow differently across
+    ///   scope boundaries). Conditional, switch, and parallel branches are not
+    ///   individually validated because their execution is dynamic.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if all resources are available, or a vector of
     /// validation errors describing missing resources.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use polaris_graph::{Graph, GraphExecutor};
+    /// use polaris_system::param::SystemContext;
+    ///
+    /// async fn my_system() -> i32 { 42 }
+    ///
+    /// let mut graph = Graph::new();
+    /// graph.add_system(my_system);
+    ///
+    /// let ctx = SystemContext::new();
+    /// let executor = GraphExecutor::new();
+    ///
+    /// // Validate before executing to catch missing resources early
+    /// if let Err(errors) = executor.validate_resources(&graph, &ctx, None) {
+    ///     for err in &errors {
+    ///         tracing::error!("{err}");
+    ///     }
+    /// }
+    /// ```
     pub fn validate_resources(
         &self,
         graph: &Graph,
@@ -246,6 +399,121 @@ impl GraphExecutor {
                 _ => {}
             }
         }
+
+        self.validate_output_reachability(graph, hook_provided, errors);
+    }
+
+    /// Validates that `Out<T>` parameters declared by systems have a matching
+    /// output produced by a predecessor system along the linear (sequential) chain.
+    ///
+    /// Walks from the graph's entry node following only sequential edges, building
+    /// a set of output `TypeId`s produced so far. For each system node, every
+    /// declared output dependency (`access.outputs`) must appear in the produced
+    /// set or the hook-provided set. Non-system nodes (Decision, Switch, Loop,
+    /// Parallel) contribute all output types reachable from their subgraphs, since
+    /// at least one execution path through those nodes might produce them. Scope
+    /// nodes are skipped because outputs flow differently across scope boundaries.
+    fn validate_output_reachability(
+        &self,
+        graph: &Graph,
+        hook_provided: &HashSet<TypeId>,
+        errors: &mut Vec<ResourceValidationError>,
+    ) {
+        let chain = self.build_linear_chain(graph);
+
+        let mut produced_outputs: HashSet<TypeId> = HashSet::new();
+
+        for node_id in &chain {
+            let Some(node) = graph.get_node(node_id.clone()) else {
+                continue;
+            };
+
+            match node {
+                Node::System(sys) => {
+                    let access = sys.system.access();
+                    for out_access in &access.outputs {
+                        if !produced_outputs.contains(&out_access.type_id)
+                            && !hook_provided.contains(&out_access.type_id)
+                        {
+                            errors.push(ResourceValidationError::MissingOutput {
+                                node: sys.id.clone(),
+                                system_name: sys.system.name(),
+                                output_type: out_access.type_name,
+                                type_id: out_access.type_id,
+                            });
+                        }
+                    }
+                    produced_outputs.insert(sys.system.output_type_id());
+                }
+                Node::Decision(dec) => {
+                    for branch in [&dec.true_branch, &dec.false_branch].into_iter().flatten() {
+                        for (type_id, _) in graph.collect_branch_output_types(branch) {
+                            produced_outputs.insert(type_id);
+                        }
+                    }
+                }
+                Node::Switch(sw) => {
+                    for (_, target) in &sw.cases {
+                        for (type_id, _) in graph.collect_branch_output_types(target) {
+                            produced_outputs.insert(type_id);
+                        }
+                    }
+                    if let Some(default) = &sw.default {
+                        for (type_id, _) in graph.collect_branch_output_types(default) {
+                            produced_outputs.insert(type_id);
+                        }
+                    }
+                }
+                Node::Loop(lp) => {
+                    if let Some(body) = &lp.body_entry {
+                        for (type_id, _) in graph.collect_branch_output_types(body) {
+                            produced_outputs.insert(type_id);
+                        }
+                    }
+                }
+                Node::Parallel(par) => {
+                    for branch in &par.branches {
+                        for (type_id, _) in graph.collect_branch_output_types(branch) {
+                            produced_outputs.insert(type_id);
+                        }
+                    }
+                }
+                Node::Scope(_) => {}
+            }
+        }
+    }
+
+    /// Builds the linear chain of node IDs by following sequential edges from
+    /// the graph's entry point.
+    fn build_linear_chain(&self, graph: &Graph) -> Vec<NodeId> {
+        let mut chain = Vec::new();
+        let Some(entry) = graph.entry() else {
+            return chain;
+        };
+
+        let seq_edges: hashbrown::HashMap<NodeId, NodeId> = graph
+            .edges()
+            .iter()
+            .filter_map(|edge| {
+                if let Edge::Sequential(seq) = edge {
+                    Some((seq.from.clone(), seq.to.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut current = Some(entry);
+        let mut visited = HashSet::new();
+        while let Some(node_id) = current {
+            if !visited.insert(node_id.clone()) {
+                break;
+            }
+            chain.push(node_id.clone());
+            current = seq_edges.get(&node_id).cloned();
+        }
+
+        chain
     }
 
     /// Validates a single system's access requirements against the context.
@@ -356,13 +624,29 @@ impl GraphExecutor {
             },
         );
 
-        let result = self
-            .execute_from(graph, ctx, entry, 0, hooks, middleware)
-            .await;
+        let result = if let Some(max) = self.max_duration {
+            match tokio::time::timeout(
+                max,
+                self.execute_from(graph, ctx, entry, 0, hooks, middleware),
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_timeout) => {
+                    let elapsed = start.elapsed();
+                    Err(ExecutionError::GraphTimeout { elapsed, max })
+                }
+            }
+        } else {
+            self.execute_from(graph, ctx, entry, 0, hooks, middleware)
+                .await
+        };
 
         let duration = start.elapsed();
         match result {
             Ok(nodes_executed) => {
+                let final_output = ctx.outputs_mut().take_last();
+
                 Self::invoke_hook::<OnGraphComplete>(
                     hooks,
                     ctx,
@@ -374,6 +658,7 @@ impl GraphExecutor {
                 Ok(ExecutionResult {
                     nodes_executed,
                     duration,
+                    final_output,
                 })
             }
             Err(err) => {
@@ -427,12 +712,14 @@ mod tests {
         let executor = GraphExecutor::new();
         assert_eq!(executor.default_max_iterations, Some(1000));
         assert_eq!(executor.max_recursion_depth, 64);
+        assert_eq!(executor.max_duration, None);
     }
 
     #[test]
     fn executor_without_limit() {
         let executor = GraphExecutor::without_iteration_limit();
         assert_eq!(executor.default_max_iterations, None);
+        assert_eq!(executor.max_duration, None);
     }
 
     #[test]
@@ -445,5 +732,11 @@ mod tests {
     fn executor_with_custom_recursion_depth() {
         let executor = GraphExecutor::new().with_max_recursion_depth(128);
         assert_eq!(executor.max_recursion_depth, 128);
+    }
+
+    #[test]
+    fn executor_with_max_duration() {
+        let executor = GraphExecutor::new().with_max_duration(Duration::from_secs(30));
+        assert_eq!(executor.max_duration, Some(Duration::from_secs(30)));
     }
 }

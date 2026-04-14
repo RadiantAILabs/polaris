@@ -62,16 +62,23 @@
 //!     }
 //! }
 //! ```
+//!
+//! # See Also
+//!
+//! For the full framework guide, `DeferredState` pattern details, and HTTP integration
+//! patterns, see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 pub mod auth;
 pub mod config;
 pub mod io;
 mod middleware;
 pub mod plugin;
+pub mod request_context;
 pub mod router;
 
 pub use auth::AuthProvider;
 pub use config::AppConfig;
 pub use io::HttpIOProvider;
 pub use plugin::{AppPlugin, ServerHandle};
+pub use request_context::{RequestContext, RequestContextPlugin};
 pub use router::HttpRouter;

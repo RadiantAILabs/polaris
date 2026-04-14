@@ -3,7 +3,9 @@ name = "polaris_shell"
 version.workspace = true
 description = "Shell command execution for Polaris agents"
 edition.workspace = true
+documentation = "https://docs.rs/polaris-ai"
 keywords = ["polaris-ai", "shell", "execution", "agents"]
+categories = ["os", "development-tools"]
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
@@ -14,9 +16,9 @@ workspace = true
 
 [dependencies]
 dirs = "6.0"
-polaris_system = { path = "../polaris_system", version = "0.1.1" }
-polaris_tools = { path = "../polaris_tools", version = "0.1.1" }
-polaris_models = { path = "../polaris_models", version = "0.1.1" }
+polaris_system = { path = "../polaris_system", version = "0.2.0" }
+polaris_tools = { path = "../polaris_tools", version = "0.2.0" }
+polaris_models = { path = "../polaris_models", version = "0.2.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

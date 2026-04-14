@@ -23,6 +23,23 @@ use std::time::Duration;
 /// merging graphs without ID collision handling.
 ///
 /// Internally uses `Arc<str>` for cheap cloning (reference count bump only).
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::NodeId;
+///
+/// // Auto-generated unique ID
+/// let id = NodeId::new();
+/// assert!(!id.as_str().is_empty());
+///
+/// // From a known string (useful in tests)
+/// let id = NodeId::from_string("my_node");
+/// assert_eq!(id.as_str(), "my_node");
+///
+/// // IDs are always unique
+/// assert_ne!(NodeId::new(), NodeId::new());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(Arc<str>);
 
@@ -75,6 +92,26 @@ impl IntoIterator for NodeId {
 ///
 /// Each node represents either a computation unit (system) or a control flow
 /// construct (decision, loop, parallel execution).
+///
+/// # Examples
+///
+/// Nodes are created through the [`Graph`] builder API rather than directly:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// async fn reason() -> i32 { 1 }
+/// async fn act() -> i32 { 2 }
+///
+/// let mut graph = Graph::new();
+/// graph.add_system(reason).add_system(act);
+///
+/// // Access nodes after construction
+/// for node in graph.nodes() {
+///     let _id = node.id();
+///     let _name = node.name();
+/// }
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Node {
@@ -126,6 +163,26 @@ impl Node {
 ///
 /// When a system fails and has a retry policy, the executor retries
 /// according to the policy before routing to error/timeout handlers.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::RetryPolicy;
+/// use std::time::Duration;
+///
+/// // Fixed delay: retry up to 3 times with 100ms between attempts
+/// let fixed = RetryPolicy::fixed(3, Duration::from_millis(100));
+/// assert_eq!(fixed.max_retries(), 3);
+/// assert_eq!(fixed.delay_for_attempt(0), Duration::from_millis(100));
+/// assert_eq!(fixed.delay_for_attempt(2), Duration::from_millis(100));
+///
+/// // Exponential backoff: 100ms, 200ms, 400ms, ... capped at 1s
+/// let expo = RetryPolicy::exponential(5, Duration::from_millis(100))
+///     .with_max_delay(Duration::from_secs(1));
+/// assert_eq!(expo.delay_for_attempt(0), Duration::from_millis(100));
+/// assert_eq!(expo.delay_for_attempt(3), Duration::from_millis(800));
+/// assert_eq!(expo.delay_for_attempt(4), Duration::from_secs(1)); // capped
+/// ```
 #[derive(Debug, Clone)]
 pub enum RetryPolicy {
     /// Fixed delay between retries.
@@ -220,6 +277,34 @@ impl RetryPolicy {
 ///
 /// This is the most common node type, wrapping an async system function
 /// that performs computation (LLM calls, tool invocations, etc.).
+///
+/// # Examples
+///
+/// System nodes are typically created through the [`Graph`] builder API:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// async fn call_llm() -> String { String::new() }
+/// async fn parse_response() -> i32 { 42 }
+///
+/// let mut graph = Graph::new();
+/// graph
+///     .add_system(call_llm)
+///     .add_system(parse_response);
+/// ```
+///
+/// For low-level construction:
+///
+/// ```
+/// use polaris_graph::node::SystemNode;
+/// use polaris_system::system::IntoSystem;
+///
+/// async fn my_system() -> i32 { 42 }
+///
+/// let node = SystemNode::new(my_system.into_system());
+/// assert!(node.name().contains("my_system"));
+/// ```
 pub struct SystemNode {
     /// Unique identifier for this node.
     pub id: NodeId,
@@ -309,6 +394,29 @@ impl fmt::Debug for SystemNode {
 ///
 /// Decision nodes implement binary branching: if the predicate returns true,
 /// flow continues to the "true" branch; otherwise to the "false" branch.
+///
+/// # Examples
+///
+/// Decision nodes are created through the [`Graph`] builder API:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// #[derive(PartialEq)]
+/// enum Action { UseTool, Respond }
+/// struct ReasoningResult { action: Action }
+///
+/// async fn use_tool() -> i32 { 1 }
+/// async fn respond() -> i32 { 2 }
+///
+/// let mut graph = Graph::new();
+/// graph.add_conditional_branch::<ReasoningResult, _, _, _>(
+///     "needs_tool",
+///     |result| result.action == Action::UseTool,
+///     |g| { g.add_system(use_tool); },
+///     |g| { g.add_system(respond); },
+/// );
+/// ```
 pub struct DecisionNode {
     /// Unique identifier for this node.
     pub id: NodeId,
@@ -364,6 +472,33 @@ impl fmt::Debug for DecisionNode {
 ///
 /// Switch nodes generalize decision nodes to handle multiple cases,
 /// similar to a match/switch statement.
+///
+/// # Examples
+///
+/// Switch nodes are created through the [`Graph`] builder API:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// struct RouterOutput { action: &'static str }
+///
+/// async fn use_tool() -> i32 { 1 }
+/// async fn respond() -> i32 { 2 }
+/// async fn handle_unknown() -> i32 { 3 }
+///
+/// let mut graph = Graph::new();
+/// graph.add_switch::<RouterOutput, _, _, _>(
+///     "route_action",
+///     |output| output.action,
+///     vec![
+///         ("tool", Box::new(|g: &mut Graph| { g.add_system(use_tool); })
+///             as Box<dyn FnOnce(&mut Graph)>),
+///         ("respond", Box::new(|g: &mut Graph| { g.add_system(respond); })
+///             as Box<dyn FnOnce(&mut Graph)>),
+///     ],
+///     Some(Box::new(|g: &mut Graph| { g.add_system(handle_unknown); })),
+/// );
+/// ```
 pub struct SwitchNode {
     /// Unique identifier for this node.
     pub id: NodeId,
@@ -423,6 +558,25 @@ impl fmt::Debug for SwitchNode {
 /// Parallel nodes fork execution into multiple branches that run
 /// simultaneously. After all branches complete, outputs are merged
 /// and execution continues from the parallel node's outgoing edge.
+///
+/// # Examples
+///
+/// Parallel nodes are created through the [`Graph`] builder API:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// async fn fetch_user() -> String { String::new() }
+/// async fn fetch_orders() -> Vec<i32> { vec![] }
+/// async fn fetch_preferences() -> bool { true }
+///
+/// let mut graph = Graph::new();
+/// graph.add_parallel("gather_data", [
+///     |g: &mut Graph| { g.add_system(fetch_user); },
+///     |g: &mut Graph| { g.add_system(fetch_orders); },
+///     |g: &mut Graph| { g.add_system(fetch_preferences); },
+/// ]);
+/// ```
 #[derive(Debug)]
 pub struct ParallelNode {
     /// Unique identifier for this node.
@@ -450,6 +604,39 @@ impl ParallelNode {
 /// Loop nodes implement iterative execution patterns, repeating the
 /// loop body until a termination predicate returns true or max iterations
 /// is reached.
+///
+/// # Examples
+///
+/// Loop nodes are created through the [`Graph`] builder API:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// struct LoopState { done: bool }
+///
+/// async fn iterate() -> LoopState { LoopState { done: false } }
+///
+/// // With a termination predicate
+/// let mut graph = Graph::new();
+/// graph.add_loop::<LoopState, _, _>(
+///     "work_loop",
+///     |state| state.done,
+///     |g| { g.add_system(iterate); },
+/// );
+/// ```
+///
+/// With a fixed iteration count:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// async fn attempt() -> i32 { 1 }
+///
+/// let mut graph = Graph::new();
+/// graph.add_loop_n("retry", 5, |g| {
+///     g.add_system(attempt);
+/// });
+/// ```
 pub struct LoopNode {
     /// Unique identifier for this node.
     pub id: NodeId,
@@ -521,6 +708,15 @@ impl fmt::Debug for LoopNode {
 ///
 /// Determines how the parent's [`SystemContext`](polaris_system::param::SystemContext)
 /// is made available to systems within the scoped graph.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::ContextMode;
+///
+/// let mode = ContextMode::Inherit;
+/// assert_eq!(format!("{mode}"), "Inherit");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ContextMode {
@@ -564,6 +760,22 @@ impl fmt::Display for ContextMode {
 /// The `clone_fn` is captured at policy-build time from the generic `T: Clone`
 /// bound on the builder methods, eliminating the need for a separate
 /// `register_clone_fn` call at runtime.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::ContextPolicy;
+/// use polaris_system::resource::LocalResource;
+///
+/// #[derive(Clone)]
+/// struct MyConfig { retries: usize }
+/// impl LocalResource for MyConfig {}
+///
+/// let policy = ContextPolicy::isolated().forward::<MyConfig>();
+/// let forwards = policy.forward_resources();
+/// assert_eq!(forwards.len(), 1);
+/// assert!(forwards[0].type_name().contains("MyConfig"));
+/// ```
 #[derive(Clone)]
 pub struct ResourceForward {
     pub(crate) type_id: TypeId,
@@ -617,16 +829,25 @@ impl ResourceForward {
 /// or [`isolated()`](Self::isolated) to create a policy, then chain
 /// [`forward()`](Self::forward) to forward specific resources.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
-/// # use polaris_graph::node::ContextPolicy;
-/// # use polaris_system::resource::LocalResource;
-/// # #[derive(Clone)]
-/// # struct Config;
-/// # impl LocalResource for Config {}
-/// // Isolated scope forwarding a specific resource into the child
-/// let policy = ContextPolicy::isolated().forward::<Config>();
+/// use polaris_graph::ContextPolicy;
+/// use polaris_system::resource::LocalResource;
+///
+/// #[derive(Clone)]
+/// struct Config;
+/// impl LocalResource for Config {}
+///
+/// // Shared: no boundary, everything accessible
+/// let shared = ContextPolicy::shared();
+///
+/// // Inherit: child reads parent, writes own scope
+/// let inherit = ContextPolicy::inherit();
+///
+/// // Isolated with forwarded resources
+/// let isolated = ContextPolicy::isolated().forward::<Config>();
+/// assert_eq!(isolated.forward_resources().len(), 1);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContextPolicy {
@@ -722,6 +943,25 @@ impl ContextPolicy {
 ///
 /// Unlike decision/loop/parallel nodes, the embedded graph's nodes are NOT merged
 /// into the parent. The `ScopeNode` holds the [`Graph`] as a field.
+///
+/// # Examples
+///
+/// Scope nodes are created through the [`Graph`] builder API:
+///
+/// ```
+/// use polaris_graph::{Graph, ContextPolicy};
+///
+/// async fn gather_info() -> String { String::new() }
+/// async fn summarize() -> String { String::new() }
+///
+/// // Build an inner graph for the sub-agent
+/// let mut research = Graph::new();
+/// research.add_system(gather_info).add_system(summarize);
+///
+/// // Embed it as a scope with inherited context
+/// let mut graph = Graph::new();
+/// graph.add_scope("research", research, ContextPolicy::inherit());
+/// ```
 #[derive(Debug)]
 pub struct ScopeNode {
     /// Unique identifier for this node.

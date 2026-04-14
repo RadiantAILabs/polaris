@@ -8,6 +8,27 @@ use std::pin::Pin;
 /// Trait implemented by LLM providers for text generation.
 ///
 /// Provider plugins implement this trait to handle generation requests.
+///
+/// # Examples
+///
+/// ```no_run
+/// use polaris_models::llm::{LlmProvider, LlmRequest, LlmResponse, GenerationError};
+///
+/// struct MyProvider;
+///
+/// impl LlmProvider for MyProvider {
+///     fn name(&self) -> &'static str { "my_provider" }
+///
+///     async fn generate(
+///         &self,
+///         model: &str,
+///         request: LlmRequest,
+///     ) -> Result<LlmResponse, GenerationError> {
+///         // Call your backend here
+///         todo!()
+///     }
+/// }
+/// ```
 pub trait LlmProvider: Send + Sync + 'static {
     /// Returns the provider name (e.g., `"openai"`, `"anthropic"`).
     ///

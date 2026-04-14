@@ -57,4 +57,8 @@ pub enum SessionError {
         /// The validation result containing errors and warnings.
         result: ValidationResult,
     },
+
+    /// The graph completed but did not produce the expected output type.
+    #[error("output not found: expected {0}")]
+    OutputNotFound(&'static str),
 }

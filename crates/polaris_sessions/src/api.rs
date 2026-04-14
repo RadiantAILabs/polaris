@@ -5,6 +5,7 @@
 //! and accessed via `server.api::<SessionsAPI>()`.
 
 use crate::error::SessionError;
+use crate::guard::SessionGuard;
 use crate::info::{SessionInfo, SessionMetadata, SessionStatus};
 use crate::store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber};
 use hashbrown::{HashMap, hash_map::Entry};
@@ -17,6 +18,7 @@ use polaris_graph::{ExecutionResult, Graph, GraphExecutor};
 use polaris_system::api::API;
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_system::resource::Output;
 use polaris_system::server::{ContextFactory, Server};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -90,6 +92,24 @@ struct SessionsInner {
 /// # Interior Mutability
 ///
 /// All methods take `&self` and use internal locks for thread safety.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use polaris_sessions::{SessionsAPI, SessionId, AgentTypeId};
+/// # use polaris_system::param::SystemContext;
+/// # async fn example(sessions: &SessionsAPI) -> Result<(), Box<dyn std::error::Error>> {
+/// let agent_type = sessions.find_agent_type("my_agent").unwrap();
+/// let id = SessionId::default();
+/// let ctx = sessions.create_context();
+///
+/// // Create session, run a turn, then clean up
+/// sessions.create_session(ctx, &id, &agent_type)?;
+/// let result = sessions.process_turn(&id).await?;
+/// sessions.delete_session(&id).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct SessionsAPI {
     inner: Arc<SessionsInner>,
@@ -110,6 +130,17 @@ impl SessionsAPI {
     /// Creates a new sessions API with the given store backend.
     ///
     /// Auto-checkpoint is enabled by default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsAPI;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let sessions = SessionsAPI::new(Arc::new(InMemoryStore::new()));
+    /// assert!(sessions.registered_agents().is_empty());
+    /// ```
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
         Self {
             inner: Arc::new(SessionsInner {
@@ -133,6 +164,17 @@ impl SessionsAPI {
     }
 
     /// Sets whether auto-checkpoint is enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsAPI;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let sessions = SessionsAPI::new(Arc::new(InMemoryStore::new()));
+    /// sessions.set_auto_checkpoint(false);
+    /// ```
     pub fn set_auto_checkpoint(&self, enabled: bool) {
         self.inner.auto_checkpoint.store(enabled, Ordering::Relaxed);
     }
@@ -182,6 +224,26 @@ impl SessionsAPI {
     ///
     /// Panics if [`set_context_factory`](Self::set_context_factory) has not
     /// been called.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use polaris_sessions::{SessionsAPI, SessionsPlugin};
+    /// # use polaris_sessions::store::memory::InMemoryStore;
+    /// # use polaris_core_plugins::PersistencePlugin;
+    /// # use polaris_system::server::Server;
+    /// # tokio_test::block_on(async {
+    /// let mut server = Server::new();
+    /// server
+    ///     .add_plugins(PersistencePlugin)
+    ///     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
+    /// server.finish().await;
+    ///
+    /// let sessions = server.api::<SessionsAPI>().unwrap();
+    /// let ctx = sessions.create_context();
+    /// # });
+    /// ```
     #[must_use]
     pub fn create_context(&self) -> SystemContext<'static> {
         self.inner
@@ -205,6 +267,27 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::GraphValidation`] if the agent's graph
     /// contains structural errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsAPI;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    /// use polaris_agent::Agent;
+    /// use polaris_graph::Graph;
+    ///
+    /// # async fn step() {}
+    /// struct MyAgent;
+    /// impl Agent for MyAgent {
+    ///     fn name(&self) -> &'static str { "MyAgent" }
+    ///     fn build(&self, graph: &mut Graph) { graph.add_system(step); }
+    /// }
+    ///
+    /// let sessions = SessionsAPI::new(Arc::new(InMemoryStore::new()));
+    /// sessions.register_agent(MyAgent).unwrap();
+    /// assert!(sessions.registered_agents().contains(&"MyAgent"));
+    /// ```
     pub fn register_agent(&self, agent: impl Agent) -> Result<(), SessionError> {
         let graph = agent.to_graph();
         let result = graph.validate();
@@ -227,6 +310,17 @@ impl SessionsAPI {
     }
 
     /// Returns the names of all registered agent types.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsAPI;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let sessions = SessionsAPI::new(Arc::new(InMemoryStore::new()));
+    /// assert!(sessions.registered_agents().is_empty());
+    /// ```
     #[must_use]
     pub fn registered_agents(&self) -> Vec<&'static str> {
         self.inner
@@ -240,6 +334,30 @@ impl SessionsAPI {
     /// Finds the [`AgentTypeId`] for a registered agent by name.
     ///
     /// Returns `None` if no agent with that name has been registered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsAPI;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    /// use polaris_agent::Agent;
+    /// use polaris_graph::Graph;
+    ///
+    /// # async fn step() {}
+    /// struct MyAgent;
+    /// impl Agent for MyAgent {
+    ///     fn name(&self) -> &'static str { "MyAgent" }
+    ///     fn build(&self, graph: &mut Graph) { graph.add_system(step); }
+    /// }
+    ///
+    /// let sessions = SessionsAPI::new(Arc::new(InMemoryStore::new()));
+    /// assert!(sessions.find_agent_type("MyAgent").is_none());
+    ///
+    /// sessions.register_agent(MyAgent).unwrap();
+    /// let found = sessions.find_agent_type("MyAgent");
+    /// assert!(found.is_some());
+    /// ```
     #[must_use]
     pub fn find_agent_type(&self, name: &str) -> Option<AgentTypeId> {
         self.inner
@@ -264,6 +382,17 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::AgentNotFound`] if the agent type has not
     /// been registered.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId, AgentTypeId};
+    /// # fn example(sessions: &SessionsAPI, agent_type: &AgentTypeId) {
+    /// let id = SessionId::new();
+    /// let ctx = sessions.create_context();
+    /// sessions.create_session(ctx, &id, agent_type).unwrap();
+    /// # }
+    /// ```
     pub fn create_session(
         &self,
         ctx: SystemContext<'static>,
@@ -283,6 +412,22 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::AgentNotFound`] if the agent type has not
     /// been registered.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId, AgentTypeId};
+    /// # use polaris_system::resource::LocalResource;
+    /// # #[derive(Debug, Clone)] struct AgentConfig { model_id: String }
+    /// # impl LocalResource for AgentConfig {}
+    /// # fn example(sessions: &SessionsAPI, agent_type: &AgentTypeId) {
+    /// let id = SessionId::new();
+    /// let ctx = sessions.create_context();
+    /// sessions.create_session_with(ctx, &id, agent_type, |ctx| {
+    ///     ctx.insert(AgentConfig { model_id: "claude-sonnet".into() });
+    /// }).unwrap();
+    /// # }
+    /// ```
     pub fn create_session_with(
         &self,
         ctx: SystemContext<'static>,
@@ -302,6 +447,19 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::AgentNotFound`] if the agent type has not
     /// been registered.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId, AgentTypeId};
+    /// # use polaris_graph::GraphExecutor;
+    /// # fn example(sessions: &SessionsAPI, agent_type: &AgentTypeId) {
+    /// let id = SessionId::new();
+    /// let executor = GraphExecutor::new().with_default_max_iterations(20);
+    /// let ctx = sessions.create_context();
+    /// sessions.create_session_with_executor(ctx, &id, agent_type, executor, |_| {}).unwrap();
+    /// # }
+    /// ```
     pub fn create_session_with_executor(
         &self,
         mut ctx: SystemContext<'static>,
@@ -358,6 +516,16 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist,
     /// or [`SessionError::Execution`] if the graph execution fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let result = sessions.process_turn(id).await.unwrap();
+    /// assert!(result.nodes_executed > 0);
+    /// # }
+    /// ```
     pub async fn process_turn(&self, id: &SessionId) -> Result<ExecutionResult, SessionError> {
         self.process_turn_with(id, |_| {}).await
     }
@@ -376,6 +544,20 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist,
     /// or [`SessionError::Execution`] if the graph execution fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # use polaris_system::resource::LocalResource;
+    /// # #[derive(Debug, Clone)] struct UserInput(String);
+    /// # impl LocalResource for UserInput {}
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let result = sessions.process_turn_with(id, |ctx| {
+    ///     ctx.insert(UserInput("Hello, agent!".into()));
+    /// }).await.unwrap();
+    /// # }
+    /// ```
     pub async fn process_turn_with(
         &self,
         id: &SessionId,
@@ -397,6 +579,19 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionBusy`] if the session context lock
     /// is held, [`SessionError::SessionNotFound`] if the session does not
     /// exist, or [`SessionError::Execution`] if graph execution fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId, SessionError};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// match sessions.try_process_turn(id).await {
+    ///     Ok(result) => { /* turn completed */ }
+    ///     Err(SessionError::SessionBusy(_)) => { /* another turn in progress */ }
+    ///     Err(other) => { /* handle error */ }
+    /// }
+    /// # }
+    /// ```
     pub async fn try_process_turn(&self, id: &SessionId) -> Result<ExecutionResult, SessionError> {
         self.try_process_turn_with(id, |_| {}).await
     }
@@ -413,6 +608,24 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionBusy`] if the session context lock
     /// is held, [`SessionError::SessionNotFound`] if the session does not
     /// exist, or [`SessionError::Execution`] if graph execution fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId, SessionError};
+    /// # use polaris_system::resource::LocalResource;
+    /// # #[derive(Debug, Clone)] struct UserInput(String);
+    /// # impl LocalResource for UserInput {}
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// match sessions.try_process_turn_with(id, |ctx| {
+    ///     ctx.insert(UserInput("hello".into()));
+    /// }).await {
+    ///     Ok(result) => { /* turn completed */ }
+    ///     Err(SessionError::SessionBusy(_)) => { /* another turn in progress */ }
+    ///     Err(other) => { /* handle error */ }
+    /// }
+    /// # }
+    /// ```
     pub async fn try_process_turn_with(
         &self,
         id: &SessionId,
@@ -492,6 +705,17 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::SessionNotFound`] or a persistence error
     /// if serialization fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let turn = sessions.checkpoint(id).await.unwrap();
+    /// let checkpoints = sessions.list_checkpoints(id).unwrap();
+    /// assert!(checkpoints.contains(&turn));
+    /// # }
+    /// ```
     pub async fn checkpoint(&self, id: &SessionId) -> Result<TurnNumber, SessionError> {
         let state = self.get_state(id)?;
         let ctx = state.ctx.lock().await;
@@ -520,6 +744,18 @@ impl SessionsAPI {
     /// # Errors
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let turns = sessions.list_checkpoints(id).unwrap();
+    /// for turn in &turns {
+    ///     // Each entry is the turn number at which the checkpoint was taken.
+    /// }
+    /// # }
+    /// ```
     pub fn list_checkpoints(&self, id: &SessionId) -> Result<Vec<TurnNumber>, SessionError> {
         let state = self.get_state(id)?;
         let checkpoints = state.checkpoints.lock();
@@ -535,6 +771,20 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionNotFound`] if the session does not
     /// exist, [`SessionError::TurnNotFound`] if no checkpoint exists for
     /// the given turn, or a persistence error on deserialization.
+    ///
+    /// # Examples
+    ///
+    /// After rollback, non-persisted resources may need to be restored
+    /// via [`with_context`](Self::with_context) and [`setup_session`](Self::setup_session):
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// sessions.rollback(id, 2).await.unwrap();
+    /// // Re-run agent setup to restore non-persisted resources.
+    /// sessions.setup_session(id).await.unwrap();
+    /// # }
+    /// ```
     pub async fn rollback(&self, id: &SessionId, turn: TurnNumber) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
         let mut ctx = state.ctx.lock().await;
@@ -567,6 +817,16 @@ impl SessionsAPI {
     /// # Errors
     ///
     /// Returns a persistence or store error on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// // Save after processing turns so the session can be resumed later.
+    /// sessions.save_session(id).await.unwrap();
+    /// # }
+    /// ```
     pub async fn save_session(&self, id: &SessionId) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
         let ctx = state.ctx.lock().await;
@@ -595,6 +855,17 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionNotFound`] if the store has no data
     /// for this ID, [`SessionError::AgentNotFound`] if the agent type from
     /// the stored data has not been registered, or a [`SessionError::Persistence`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let ctx = sessions.create_context();
+    /// sessions.resume_session(ctx, id).await.unwrap();
+    /// // Session is now live and ready for process_turn().
+    /// # }
+    /// ```
     pub async fn resume_session(
         &self,
         ctx: SystemContext<'static>,
@@ -613,6 +884,22 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionNotFound`] if the store has no data
     /// for this ID, [`SessionError::AgentNotFound`] if the agent type from
     /// the stored data has not been registered, or a persistence error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # use polaris_system::resource::LocalResource;
+    /// # #[derive(Debug, Clone)] struct Config { model_id: String }
+    /// # impl LocalResource for Config {}
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let ctx = sessions.create_context();
+    /// sessions.resume_session_with(ctx, id, |ctx| {
+    ///     // Inject non-persisted config before Agent::setup runs.
+    ///     ctx.insert(Config { model_id: "claude-sonnet".into() });
+    /// }).await.unwrap();
+    /// # }
+    /// ```
     pub async fn resume_session_with(
         &self,
         ctx: SystemContext<'static>,
@@ -633,6 +920,23 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionNotFound`] if the store has no data
     /// for this ID, [`SessionError::AgentNotFound`] if the agent type from
     /// the stored data has not been registered, or a persistence error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # use polaris_graph::GraphExecutor;
+    /// # use polaris_system::resource::LocalResource;
+    /// # #[derive(Debug, Clone)] struct Config { model_id: String }
+    /// # impl LocalResource for Config {}
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let ctx = sessions.create_context();
+    /// let executor = GraphExecutor::new().with_default_max_iterations(10);
+    /// sessions.resume_session_with_executor(ctx, id, executor, |ctx| {
+    ///     ctx.insert(Config { model_id: "claude-sonnet".into() });
+    /// }).await.unwrap();
+    /// # }
+    /// ```
     pub async fn resume_session_with_executor(
         &self,
         mut ctx: SystemContext<'static>,
@@ -694,6 +998,17 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not
     /// exist, or [`SessionError::Setup`] if the agent's setup fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// // After rollback, re-run setup to restore non-persisted resources.
+    /// sessions.rollback(id, 0).await.unwrap();
+    /// sessions.setup_session(id).await.unwrap();
+    /// # }
+    /// ```
     pub async fn setup_session(&self, id: &SessionId) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
         let agent = self
@@ -719,6 +1034,15 @@ impl SessionsAPI {
     /// # Errors
     ///
     /// Returns a store error on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// sessions.delete_session(id).await.unwrap();
+    /// # }
+    /// ```
     pub async fn delete_session(&self, id: &SessionId) -> Result<(), SessionError> {
         self.inner.sessions.write().remove(id);
         self.inner.store.delete(id).await
@@ -729,11 +1053,34 @@ impl SessionsAPI {
     /// # Errors
     ///
     /// Returns a store error on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # async fn example(sessions: &SessionsAPI) {
+    /// let stored = sessions.list_sessions().await.unwrap();
+    /// for id in &stored {
+    ///     // Each ID can be passed to resume_session().
+    /// }
+    /// # }
+    /// ```
     pub async fn list_sessions(&self) -> Result<Vec<SessionId>, SessionError> {
         self.inner.store.list().await
     }
 
     /// Lists all live session IDs currently held in memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsAPI;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let sessions = SessionsAPI::new(Arc::new(InMemoryStore::new()));
+    /// assert!(sessions.list_live_sessions().is_empty());
+    /// ```
     #[must_use]
     pub fn list_live_sessions(&self) -> Vec<SessionId> {
         self.inner.sessions.read().keys().cloned().collect()
@@ -748,6 +1095,16 @@ impl SessionsAPI {
     /// # Errors
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// let meta = sessions.session_info(id).unwrap();
+    /// assert_eq!(meta.session_id, *id);
+    /// # }
+    /// ```
     pub fn session_info(&self, id: &SessionId) -> Result<SessionMetadata, SessionError> {
         let state = self.get_state(id)?;
         Ok(SessionMetadata {
@@ -763,6 +1120,17 @@ impl SessionsAPI {
     ///
     /// Holds the session lock once for the full scan, avoiding per-session
     /// lock acquisition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsAPI;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let sessions = SessionsAPI::new(Arc::new(InMemoryStore::new()));
+    /// assert!(sessions.list_session_metadata().is_empty());
+    /// ```
     #[must_use]
     pub fn list_session_metadata(&self) -> Vec<SessionMetadata> {
         self.inner
@@ -791,6 +1159,26 @@ impl SessionsAPI {
     /// # Errors
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # use polaris_system::resource::LocalResource;
+    /// # #[derive(Debug, Clone)] struct History(Vec<String>);
+    /// # impl LocalResource for History {}
+    /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
+    /// // Read a resource from the session context.
+    /// let history = sessions.with_context(id, |ctx| {
+    ///     ctx.get_resource::<History>().ok().map(|h| h.0.clone())
+    /// }).await.unwrap();
+    ///
+    /// // Inject a resource into the session context.
+    /// sessions.with_context(id, |ctx| {
+    ///     ctx.insert(History(vec!["Hello".into()]));
+    /// }).await.unwrap();
+    /// # }
+    /// ```
     pub async fn with_context<R>(
         &self,
         id: &SessionId,
@@ -799,6 +1187,105 @@ impl SessionsAPI {
         let state = self.get_state(id)?;
         let mut ctx = state.ctx.lock().await;
         Ok(f(&mut ctx))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Scoped sessions
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Creates a scoped session with automatic cleanup.
+    ///
+    /// Returns a [`SessionGuard`] that deletes the session when dropped.
+    /// This is useful for multi-turn flows where you need guaranteed
+    /// cleanup without manual [`delete_session`](Self::delete_session) calls.
+    ///
+    /// For single-turn patterns, prefer [`run_oneshot`](Self::run_oneshot).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::AgentNotFound`] if the agent type has not
+    /// been registered, or [`SessionError::Setup`] if agent setup fails.
+    pub fn scoped_session(
+        &self,
+        agent_type: &AgentTypeId,
+        setup: impl FnOnce(&mut SystemContext<'static>),
+    ) -> Result<SessionGuard, SessionError> {
+        let id = SessionId::default();
+        let ctx = self.create_context();
+        self.create_session_with(ctx, &id, agent_type, setup)?;
+        Ok(SessionGuard::new(self.clone(), id))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // One-shot execution
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Executes a one-shot agent turn and returns the typed output.
+    ///
+    /// This is the convenience method for the common "request → response"
+    /// pattern: create a transient session, execute one turn, extract the
+    /// output, and clean up. Session cleanup is guaranteed in all exit
+    /// paths (success or execution error).
+    ///
+    /// # Type Parameters
+    ///
+    /// `T` — the output type produced by the agent's terminal system.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::AgentNotFound`] if the agent type has not
+    /// been registered, [`SessionError::Setup`] if agent setup fails,
+    /// [`SessionError::Execution`] if the graph fails, or
+    /// [`SessionError::OutputNotFound`] if the graph completes but does
+    /// not produce an output of type `T`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, AgentTypeId};
+    /// # use polaris_system::resource::LocalResource;
+    /// # #[derive(Clone)] struct MyInput(String);
+    /// # impl MyInput { fn new(s: &str) -> Self { Self(s.into()) } }
+    /// # impl LocalResource for MyInput {}
+    /// # #[derive(Clone)] struct MyOutput;
+    /// # async fn example(sessions: &SessionsAPI) -> Result<(), Box<dyn std::error::Error>> {
+    /// let agent_type = AgentTypeId::from_name("MyAgent");
+    /// let output: MyOutput = sessions
+    ///     .run_oneshot(&agent_type, |ctx| {
+    ///         ctx.insert(MyInput::new("input"));
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_oneshot<T: Output + Clone>(
+        &self,
+        agent_type: &AgentTypeId,
+        setup: impl FnOnce(&mut SystemContext<'static>),
+    ) -> Result<T, SessionError> {
+        let id = SessionId::default();
+        let ctx = self.create_context();
+        // If session creation fails, no session exists — propagate immediately.
+        self.create_session_with(ctx, &id, agent_type, setup)?;
+
+        // Execute turn and extract output. Capture the result so we can
+        // guarantee cleanup before propagating errors.
+        let result = async {
+            let exec_result = self.process_turn(&id).await?;
+
+            let output = exec_result
+                .output::<T>()
+                .cloned()
+                .ok_or(SessionError::OutputNotFound(std::any::type_name::<T>()))?;
+
+            Ok(output)
+        }
+        .await;
+
+        // Always clean up the ephemeral session.
+        let _ = self.delete_session(&id).await;
+
+        result
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -884,6 +1371,21 @@ fn deserialize_into_context(
 /// By default, a background checkpoint is created after every successful
 /// [`process_turn`](SessionsAPI::process_turn). Call
 /// [`without_auto_checkpoint`](Self::without_auto_checkpoint) to disable.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use polaris_sessions::SessionsPlugin;
+/// use polaris_sessions::store::memory::InMemoryStore;
+/// use polaris_core_plugins::PersistencePlugin;
+/// use polaris_system::server::Server;
+///
+/// let mut server = Server::new();
+/// server
+///     .add_plugins(PersistencePlugin)
+///     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
+/// ```
 pub struct SessionsPlugin {
     store: Arc<dyn SessionStore>,
     auto_checkpoint: bool,
@@ -893,6 +1395,16 @@ impl SessionsPlugin {
     /// Creates a new sessions plugin backed by the given store.
     ///
     /// Auto-checkpoint is enabled by default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsPlugin;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let plugin = SessionsPlugin::new(Arc::new(InMemoryStore::new()));
+    /// ```
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
         Self {
             store,
@@ -901,6 +1413,17 @@ impl SessionsPlugin {
     }
 
     /// Disables automatic checkpointing after each successful turn.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsPlugin;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let plugin = SessionsPlugin::new(Arc::new(InMemoryStore::new()))
+    ///     .without_auto_checkpoint();
+    /// ```
     #[must_use]
     pub fn without_auto_checkpoint(mut self) -> Self {
         self.auto_checkpoint = false;

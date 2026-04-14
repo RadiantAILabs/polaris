@@ -3,7 +3,9 @@ name = "polaris_system"
 version.workspace = true
 description = "A lightweight ECS-inspired system framework for Polaris."
 edition.workspace = true
-keywords = []
+documentation = "https://docs.rs/polaris-ai"
+keywords = ["polaris-ai", "ecs", "systems", "async", "framework"]
+categories = ["asynchronous", "development-tools"]
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
@@ -13,7 +15,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_system_macros = { path = "system_macros", version = "0.1.1" }
+polaris_system_macros = { path = "system_macros", version = "0.2.0" }
 downcast-rs = "2.0.2"
 parking_lot = { version = "0.12.5", features = ["send_guard"] }
 thiserror = "2.0.17"

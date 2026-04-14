@@ -14,6 +14,23 @@ use std::sync::Arc;
 /// merging graphs without ID collision handling.
 ///
 /// Internally uses `Arc<str>` for cheap cloning (reference count bump only).
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::edge::EdgeId;
+///
+/// // Auto-generated unique ID
+/// let id = EdgeId::new();
+/// assert!(!id.as_str().is_empty());
+///
+/// // From a known string (useful in tests)
+/// let id = EdgeId::from_string("edge_1");
+/// assert_eq!(id.as_str(), "edge_1");
+///
+/// // IDs are always unique
+/// assert_ne!(EdgeId::new(), EdgeId::new());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgeId(Arc<str>);
 
@@ -55,6 +72,23 @@ impl fmt::Display for EdgeId {
 ///
 /// Edges determine how execution flows through the graph after
 /// a node completes.
+///
+/// # Examples
+///
+/// Edges are created automatically by the [`Graph`](crate::graph::Graph) builder API:
+///
+/// ```
+/// use polaris_graph::Graph;
+///
+/// async fn step_a() -> i32 { 1 }
+/// async fn step_b() -> i32 { 2 }
+///
+/// let mut graph = Graph::new();
+/// graph.add_system(step_a).add_system(step_b);
+///
+/// // The builder created a sequential edge between the two nodes
+/// assert_eq!(graph.edges().len(), 1);
+/// ```
 #[derive(Debug)]
 pub enum Edge {
     /// A -> B, output flows to input.
@@ -103,6 +137,20 @@ impl Edge {
 ///
 /// The simplest edge type, connecting one node to another
 /// with output flowing directly to input.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::edge::SequentialEdge;
+/// use polaris_graph::NodeId;
+///
+/// let from = NodeId::from_string("step_1");
+/// let to = NodeId::from_string("step_2");
+/// let edge = SequentialEdge::new(from, to);
+///
+/// assert_eq!(edge.from.as_str(), "step_1");
+/// assert_eq!(edge.to.as_str(), "step_2");
+/// ```
 #[derive(Debug)]
 pub struct SequentialEdge {
     /// Unique identifier for this edge.
@@ -128,6 +176,21 @@ impl SequentialEdge {
 /// A conditional edge: A -> B if true, else A -> C.
 ///
 /// Used with `DecisionNode` to implement binary branching.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::edge::ConditionalEdge;
+/// use polaris_graph::NodeId;
+///
+/// let decision = NodeId::from_string("check");
+/// let true_target = NodeId::from_string("yes_branch");
+/// let false_target = NodeId::from_string("no_branch");
+///
+/// let edge = ConditionalEdge::new(decision, true_target, false_target);
+/// assert_eq!(edge.true_target.as_str(), "yes_branch");
+/// assert_eq!(edge.false_target.as_str(), "no_branch");
+/// ```
 #[derive(Debug)]
 pub struct ConditionalEdge {
     /// Unique identifier for this edge.
@@ -156,6 +219,22 @@ impl ConditionalEdge {
 /// A parallel edge: A -> [B, C, D] concurrently.
 ///
 /// Used with `ParallelNode` to fork execution into multiple paths.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::edge::ParallelEdge;
+/// use polaris_graph::NodeId;
+///
+/// let fork = NodeId::from_string("fork");
+/// let targets = vec![
+///     NodeId::from_string("branch_a"),
+///     NodeId::from_string("branch_b"),
+/// ];
+///
+/// let edge = ParallelEdge::new(fork, targets);
+/// assert_eq!(edge.targets.len(), 2);
+/// ```
 #[derive(Debug)]
 pub struct ParallelEdge {
     /// Unique identifier for this edge.
@@ -181,6 +260,20 @@ impl ParallelEdge {
 /// A loop-back edge: return to earlier node.
 ///
 /// Used with `LoopNode` to implement iteration.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::edge::LoopBackEdge;
+/// use polaris_graph::NodeId;
+///
+/// let body_end = NodeId::from_string("body_end");
+/// let loop_entry = NodeId::from_string("loop_start");
+///
+/// let edge = LoopBackEdge::new(body_end, loop_entry);
+/// assert_eq!(edge.from.as_str(), "body_end");
+/// assert_eq!(edge.to.as_str(), "loop_start");
+/// ```
 #[derive(Debug)]
 pub struct LoopBackEdge {
     /// Unique identifier for this edge.
@@ -206,6 +299,20 @@ impl LoopBackEdge {
 /// An error edge: fallback path on failure.
 ///
 /// Provides an alternative execution path when a node fails.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::edge::ErrorEdge;
+/// use polaris_graph::NodeId;
+///
+/// let risky = NodeId::from_string("risky_call");
+/// let handler = NodeId::from_string("error_handler");
+///
+/// let edge = ErrorEdge::new(risky, handler);
+/// assert_eq!(edge.from.as_str(), "risky_call");
+/// assert_eq!(edge.to.as_str(), "error_handler");
+/// ```
 #[derive(Debug)]
 pub struct ErrorEdge {
     /// Unique identifier for this edge.
@@ -231,6 +338,20 @@ impl ErrorEdge {
 /// A timeout edge: fallback path on timeout.
 ///
 /// Provides an alternative execution path when a node times out.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::edge::TimeoutEdge;
+/// use polaris_graph::NodeId;
+///
+/// let slow = NodeId::from_string("slow_operation");
+/// let handler = NodeId::from_string("timeout_handler");
+///
+/// let edge = TimeoutEdge::new(slow, handler);
+/// assert_eq!(edge.from.as_str(), "slow_operation");
+/// assert_eq!(edge.to.as_str(), "timeout_handler");
+/// ```
 #[derive(Debug)]
 pub struct TimeoutEdge {
     /// Unique identifier for this edge.

@@ -18,7 +18,7 @@ use polaris_models::llm::Llm;
 use polaris_models::{ModelRegistry, ModelsPlugin};
 use polaris_system::server::Server;
 
-const MODEL: &str = "anthropic/claude-sonnet-4-5-20250929";
+const MODEL: &str = "anthropic/claude-sonnet-4-6";
 
 async fn get_llm(model_id: &str) -> Llm {
     init_env();
