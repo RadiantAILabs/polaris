@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs_dep, feature(doc_cfg))]
+
 //! Shared HTTP server runtime for Polaris products.
 //!
 //! `polaris_app` provides an axum-based HTTP server that integrates with the
@@ -17,8 +19,24 @@
 //!   ├── ServerHandle (shutdown signal, API)
 //!   ├── AuthProvider trait (pluggable authentication)
 //!   ├── Tower middleware (CORS, tracing, request ID, auth)
-//!   └── HttpIOProvider (channel-based IO bridging)
+//!   ├── HttpIOProvider (channel-based IO bridging)
+//!   └── RequestContextPlugin (trace/correlation/request IDs)
 //! ```
+//!
+//! # Request Context
+//!
+//! [`RequestContext`] carries `trace_id`, `correlation_id`, and `request_id`
+//! for observability and propagation. Two entry points:
+//!
+//! - **Custom axum handlers** — [`RequestContext`] implements
+//!   [`FromRequestParts`](axum::extract::FromRequestParts) with
+//!   `Rejection = Infallible`, so handlers can accept it as an argument.
+//! - **Session graphs** — handlers insert [`HttpHeaders`] into the setup
+//!   closure, and [`RequestContextPlugin`]'s `OnGraphStart` hook turns them
+//!   into a [`RequestContext`] that systems read via `Res<RequestContext>`.
+//!
+//! The pure core is [`RequestContext::from_headers`], lenient by design:
+//! missing headers become `None`, never a rejection.
 //!
 //! # Quick Start
 //!
@@ -80,5 +98,5 @@ pub use auth::AuthProvider;
 pub use config::AppConfig;
 pub use io::HttpIOProvider;
 pub use plugin::{AppPlugin, ServerHandle};
-pub use request_context::{RequestContext, RequestContextPlugin};
+pub use request_context::{HttpHeaders, RequestContext, RequestContextPlugin};
 pub use router::HttpRouter;

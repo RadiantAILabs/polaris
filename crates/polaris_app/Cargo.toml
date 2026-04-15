@@ -11,6 +11,10 @@ repository.workspace = true
 categories = ["web-programming::http-server", "asynchronous"]
 rust-version.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
+
 [features]
 default = []
 otel = []
@@ -20,6 +24,7 @@ workspace = true
 
 [dependencies]
 polaris_system = { path = "../polaris_system", version = "0.2.0" }
+polaris_graph = { path = "../polaris_graph", version = "0.2.0" }
 polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.2.0" }
 axum = { version = "0.8", features = ["tokio"] }
 hashbrown = "0.16.1"

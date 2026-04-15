@@ -12,8 +12,8 @@ use crate::info::SessionMetadata;
 use crate::store::SessionId;
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use polaris_app::HttpIOProvider;
+use axum::http::{HeaderMap, StatusCode};
+use polaris_app::{HttpHeaders, HttpIOProvider};
 use polaris_core_plugins::{IOMessage, UserIO};
 use std::sync::Arc;
 
@@ -92,6 +92,7 @@ pub(crate) async fn delete_session(
 pub(crate) async fn process_turn(
     State(deferred): State<DeferredState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<ProcessTurnRequest>,
 ) -> Result<Json<ProcessTurnResponse>, ApiError> {
     let sessions = get_sessions(&deferred)?;
@@ -109,11 +110,14 @@ pub(crate) async fn process_turn(
         .map_err(|_| ApiError::IoChannelClosed)?;
     drop(input_tx);
 
-    // Execute the turn, injecting the IO provider.
+    // Execute the turn, injecting the IO provider and raw request headers.
+    // `RequestContextPlugin`'s `OnGraphStart` hook parses `HttpHeaders` into
+    // a `RequestContext` before any system runs.
     let io_provider = Arc::clone(&provider);
     let result = sessions
         .try_process_turn_with(&session_id, move |ctx| {
             ctx.insert(UserIO::new(io_provider));
+            ctx.insert(HttpHeaders(headers));
         })
         .await?;
 
