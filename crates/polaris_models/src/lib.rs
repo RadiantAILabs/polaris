@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs_dep, feature(doc_cfg))]
+
 //! Model provider interface and registry for Polaris.
 //!
 //! Provides a unified interface for AI model access, decoupling consumers from

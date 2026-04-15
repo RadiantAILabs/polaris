@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs_dep, feature(doc_cfg))]
+
 //! # Polaris Internal Library
 //!
 //! Re-exports the core Polaris crates for convenience. This crate is an

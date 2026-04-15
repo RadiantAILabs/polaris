@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs_dep, feature(doc_cfg))]
+
 //! Core infrastructure plugins for Polaris.
 //!
 //! This crate provides foundational plugins that most Polaris applications need:

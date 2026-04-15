@@ -77,11 +77,17 @@ impl LlmProvider for MyProvider {
 
 # Built-in Providers
 
-| Provider | Feature flag | Crate |
-|----------|-------------|-------|
-| Anthropic Claude | `anthropic` | `polaris_model_providers` |
-| `OpenAI` | `openai` | `polaris_model_providers` |
-| AWS Bedrock | `bedrock` | `polaris_model_providers` |
+| Provider | Feature flag | Public items added | Runtime effect |
+|----------|-------------|--------------------|----------------|
+| Anthropic Claude | `anthropic` | [`anthropic`](crate::models::anthropic), [`AnthropicPlugin`](crate::models::AnthropicPlugin) | Registers the `anthropic/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
+| `OpenAI` | `openai` | [`openai`](crate::models::openai), [`OpenAiPlugin`](crate::models::OpenAiPlugin) | Registers the `openai/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
+| AWS Bedrock | `bedrock` | [`bedrock`](crate::models::bedrock), [`BedrockPlugin`](crate::models::BedrockPlugin) | Registers the `bedrock/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
+
+# Feature-Gated Tokenization
+
+| Feature | Adds public items | Existing public items affected | Runtime effect |
+|---------|-------------------|--------------------------------|----------------|
+| `tiktoken` | [`tokenizer::TiktokenCounter`](crate::models::tokenizer::TiktokenCounter), [`tokenizer::EncodingFamily`](crate::models::tokenizer::EncodingFamily) | Enables [`TokenizerPlugin::default`](crate::models::TokenizerPlugin::default) and defines what that default constructs | [`TokenizerPlugin::default`](crate::models::TokenizerPlugin::default) registers a global [`Tokenizer`](crate::models::Tokenizer) backed by [`tokenizer::TiktokenCounter`](crate::models::tokenizer::TiktokenCounter) |
 
 # Related
 

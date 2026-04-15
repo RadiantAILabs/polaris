@@ -162,6 +162,12 @@ sessions.resume_session(ctx, &session_id).await?; // resume
 
 Backends: `InMemoryStore` (default), `FileStore` (with `file-store` feature).
 
+# Feature-Gated HTTP Surface
+
+| Feature | Adds public items | Existing surface it uses | Runtime effect |
+|---------|-------------------|--------------------------|----------------|
+| `sessions-http` | [`HttpPlugin`](crate::sessions::HttpPlugin), [`http`](crate::sessions::http), [`http::models`](crate::sessions::http::models) | Integrates with [`crate::app::HttpRouter`] and requires [`HttpPlugin`](crate::sessions::HttpPlugin) to be registered alongside [`crate::app::AppPlugin`] | Registers REST routes, handlers, and request/response models for session management |
+
 # Related
 
 - [HTTP integration](crate::app) -- serving sessions over HTTP

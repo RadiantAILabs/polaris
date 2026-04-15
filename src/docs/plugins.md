@@ -41,18 +41,24 @@ server.add_plugins(
 | `ServerInfoPlugin` | Server metadata resource | Global |
 | `TimePlugin` | Wall-clock time resource | Global |
 | `TracingPlugin` | Graph/system execution tracing | Hooks |
-| `DevToolsPlugin` | `HooksAPI`, `MiddlewareAPI`, `SystemInfo` injection | Global APIs / Hooks |
 | `PersistencePlugin` | `PersistenceAPI` for resource serialization | Global API |
-| `RandomPlugin` | Seedable RNG resource | Local |
 
-# Feature-Gated Plugins
+# Feature-Gated Observability
 
-| Feature | Plugin | Purpose |
-|---------|--------|---------|
-| `graph-tracing` | `GraphTracingPlugin` | Tracing spans for graph execution |
-| `models-tracing` | `ModelsTracingPlugin` | Tracing spans for model calls |
-| `tools-tracing` | `ToolsTracingPlugin` | Tracing spans for tool invocations |
-| `otel` | `OpenTelemetry` support | `OTel` exporter integration |
+Most observability features extend [`TracingPlugin`](crate::plugins::TracingPlugin)
+rather than exporting a separate plugin type.
+
+| Feature | Public item to look for | Existing surface it changes | Runtime/API surface |
+|---------|--------------------------|----------------------------|---------------------|
+| `graph-tracing` | [`TracingPlugin`](crate::plugins::TracingPlugin) | No new plugin type; augments the existing tracing plugin | Registers graph middleware via [`crate::graph::MiddlewareAPI`] |
+| `models-tracing` | [`TracingPlugin`](crate::plugins::TracingPlugin) | No new plugin type; augments the existing tracing plugin | Decorates the global [`crate::models::ModelRegistry`] |
+| `tools-tracing` | [`TracingPlugin`](crate::plugins::TracingPlugin) | No new plugin type; augments the existing tracing plugin | Decorates the global [`crate::tools::ToolRegistry`] |
+| `otel` | [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin) | Integrates with [`TracingPlugin`](crate::plugins::TracingPlugin) and [`TracingLayersApi`](crate::plugins::TracingLayersApi) | Pushes an OTLP export layer into the tracing subscriber |
+
+If you are trying to answer “what does the `otel` feature export?”, the public
+type is [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin) under
+[`polaris_ai::plugins`](crate::plugins). This is separate from the crate-local
+`otel` feature on `polaris_app`.
 
 # Related
 

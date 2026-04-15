@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs_dep, feature(doc_cfg))]
+
 //! Session management and orchestration for Polaris agents.
 //!
 //! This crate provides server-managed sessions that own live

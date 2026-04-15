@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs_dep, feature(doc_cfg))]
+
 //! A modular framework for building AI agents in Rust.
 //!
 //! Polaris is an ECS-inspired runtime for composing AI agents as directed
@@ -210,6 +212,17 @@
 //! | [`shell`] | `polaris_shell` | Shell command execution with permission model |
 //! | [`app`] | `polaris_app` | HTTP server runtime with plugin integration |
 //!
+//! # Exploration Map
+//!
+//! | If you want to find… | Start here |
+//! |----------------------|------------|
+//! | System primitives, resources, and plugin lifecycle | [`system`] |
+//! | Graph nodes, edges, execution, hooks, and middleware | [`graph`] |
+//! | LLM providers and provider plugins | [`models`] |
+//! | Core infrastructure plugins and observability | [`plugins`] |
+//! | Session lifecycle, persistence, and HTTP session routes | [`sessions`] |
+//! | Feature-gated exports and which module owns them | [Feature Export Map](#feature-export-map) |
+//!
 //! # Feature Flags
 //!
 //! All features are opt-in (none enabled by default). Features that originate
@@ -219,32 +232,49 @@
 //!
 //! ## Model Providers
 //!
-//! | Feature | Enables |
-//! |---------|---------|
-//! | `anthropic` | Anthropic Claude provider (`polaris_model_providers`) |
-//! | `openai` | `OpenAI` provider (`polaris_model_providers`) |
-//! | `bedrock` | AWS Bedrock provider (`polaris_model_providers`) |
+//! | Feature | Exported item | Find it under |
+//! |---------|---------------|---------------|
+//! | `anthropic` | [`models::AnthropicPlugin`] | [`models`] |
+//! | `openai` | [`models::OpenAiPlugin`] | [`models`] |
+//! | `bedrock` | [`models::BedrockPlugin`] | [`models`] |
 //!
 //! ## Observability
 //!
-//! | Feature | Enables |
-//! |---------|---------|
-//! | `graph-tracing` | Tracing spans for graph execution (`polaris_core_plugins`) |
-//! | `models-tracing` | Tracing spans for model calls (`polaris_core_plugins`) |
-//! | `tools-tracing` | Tracing spans for tool invocations (`polaris_core_plugins`) |
-//! | `otel` | OpenTelemetry exporter support (`polaris_core_plugins`) |
+//! | Feature | Exported item | Effect |
+//! |---------|---------------|--------|
+//! | `graph-tracing` | No new public type | Extends [`plugins::TracingPlugin`] with graph-execution spans |
+//! | `models-tracing` | No new public type | Extends [`plugins::TracingPlugin`] to decorate model providers |
+//! | `tools-tracing` | No new public type | Extends [`plugins::TracingPlugin`] to decorate tools |
+//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Adds OTLP export via the tracing subscriber |
 //!
 //! ## Tokenization
 //!
-//! | Feature | Enables |
-//! |---------|---------|
-//! | `tiktoken` | BPE token counting via tiktoken (`polaris_models`) |
+//! | Feature | Exported item | Effect |
+//! |---------|---------------|--------|
+//! | `tiktoken` | [`models::tokenizer::TiktokenCounter`] and [`models::tokenizer::EncodingFamily`] | Enables tiktoken-backed counting and [`models::TokenizerPlugin::default`] |
 //!
 //! ## Sessions
 //!
-//! | Feature | Enables |
-//! |---------|---------|
-//! | `sessions-http` | HTTP/REST routes for session management (`polaris_sessions`) |
+//! | Feature | Exported item | Find it under |
+//! |---------|---------------|---------------|
+//! | `sessions-http` | [`sessions::HttpPlugin`] and [`sessions::http`] | [`sessions`] |
+//!
+//! ## Feature Coverage Map
+//!
+//! Use this table when the question is “what does feature `X` expose,
+//! modify, or wire up at runtime?”
+//!
+//! | Feature | Adds public items | Also changes | Runtime surface |
+//! |---------|-------------------|--------------|-----------------|
+//! | `anthropic` | [`models::anthropic`], [`models::AnthropicPlugin`] | Makes the `anthropic/...` provider family available through [`models::ModelRegistry`] once registered | [`models::AnthropicPlugin`] registers the Anthropic provider |
+//! | `openai` | [`models::openai`], [`models::OpenAiPlugin`] | Makes the `openai/...` provider family available through [`models::ModelRegistry`] once registered | [`models::OpenAiPlugin`] registers the `OpenAI` provider |
+//! | `bedrock` | [`models::bedrock`], [`models::BedrockPlugin`] | Makes the `bedrock/...` provider family available through [`models::ModelRegistry`] once registered | [`models::BedrockPlugin`] registers the Bedrock provider |
+//! | `graph-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only; no separate `GraphTracingPlugin` exists | [`plugins::TracingPlugin`] registers graph middleware through [`graph::MiddlewareAPI`] |
+//! | `models-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only | [`plugins::TracingPlugin`] decorates the global [`models::ModelRegistry`] |
+//! | `tools-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only | [`plugins::TracingPlugin`] decorates the global [`tools::ToolRegistry`] |
+//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Integrates with the existing [`plugins::TracingPlugin`] / [`plugins::TracingLayersApi`] surface | [`plugins::OpenTelemetryPlugin`] pushes an OTLP export layer into the tracing subscriber |
+//! | `tiktoken` | [`models::tokenizer::TiktokenCounter`], [`models::tokenizer::EncodingFamily`] | Adds [`Default`] for [`models::TokenizerPlugin`] and changes what [`models::TokenizerPlugin::default`] builds | [`models::TokenizerPlugin::default`] registers a global [`models::Tokenizer`] backed by [`models::tokenizer::TiktokenCounter`] |
+//! | `sessions-http` | [`sessions::http`], [`sessions::HttpPlugin`], [`sessions::http::models`] | Adds request/response model types and HTTP-facing session APIs under [`sessions`] | [`sessions::HttpPlugin`] registers routes through [`app::HttpRouter`] and depends on [`app::AppPlugin`] + [`sessions::SessionsPlugin`] |
 
 // Re-export crates under their original names so proc-macro-generated code
 // can resolve `polaris::polaris_tools`, `polaris::polaris_system`, etc.

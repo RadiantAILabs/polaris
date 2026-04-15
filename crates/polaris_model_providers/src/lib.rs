@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs_dep, feature(doc_cfg))]
+
 //! Plugins providing support for various model provider backends.
 //!
 //! Each provider is packaged as a standalone plugin. When added to the server, they register themselves with the [`ModelRegistry`](polaris_models::ModelRegistry), allowing standardized access to different model providers.

@@ -11,6 +11,10 @@ readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
+
 [features]
 default = []
 anthropic = ["polaris_model_providers/anthropic"]
