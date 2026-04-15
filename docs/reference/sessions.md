@@ -192,6 +192,8 @@ async fn normalize(payload: Res<RequestPayload>) -> NormalizedResult {
 
 Prefer this over mutable god-structs (`ResMut<WorkingState>` with `Option` fields): inputs are immutable, downstream systems declare exactly what they read, and the context enforces one `T` per scope.
 
+For the standard `x-trace-id` / `x-correlation-id` / `x-request-id` headers specifically, use `RequestContextPlugin` — insert `HttpHeaders(headers)` in the setup closure and read `Res<RequestContext>` in systems. See [HTTP Integration](http.md#requestcontext-trace-and-correlation-ids).
+
 See [Data Flow Patterns](data-flow.md) for a decision table on when to use `Res<T>` vs. `ResMut<T>` vs. `Out<T>`.
 
 ### Scoped Sessions (RAII Guard)

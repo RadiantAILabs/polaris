@@ -136,6 +136,91 @@ while let Ok(msg) = output_rx.try_recv() {
 - **Input channel**: Bounded (typically buffer size 1 for single-message turns). Sender is dropped after loading to signal end-of-input.
 - **Output channel**: Unbounded to prevent deadlock — the handler only drains after the turn completes. A bounded output would deadlock if the agent produced more messages than capacity.
 
+## RequestContext: Trace and Correlation IDs
+
+`RequestContext` is the per-request record of trace, correlation, and request IDs. It exists in two worlds — the axum handler layer and the `polaris_system` execution layer — and `polaris_app` provides one primitive for each.
+
+```rust
+pub struct RequestContext {
+    pub trace_id: String,              // always populated (header or generated)
+    pub correlation_id: Option<String>,
+    pub request_id: Option<String>,    // populated by SetRequestIdLayer middleware
+    pub extras: HashMap<String, String>,
+}
+```
+
+### Header Conventions
+
+| Header | Field | Fallback |
+|--------|-------|----------|
+| `x-trace-id` | `trace_id` | Generated value (timestamp + thread ID) |
+| `x-correlation-id` | `correlation_id` | `None` |
+| `x-request-id` | `request_id` | `None` (middleware stamps this on every HTTP request) |
+
+The extractor and hook are both **lenient**: missing headers become `None`, never a rejection. Policy about required headers (e.g. "correlation ID is mandatory") belongs at the application layer, not the framework.
+
+### In Custom Handlers: the `FromRequestParts` Extractor
+
+`RequestContext` implements `FromRequestParts<S> for RequestContext` with `Rejection = Infallible`. Any axum handler can accept it as an argument:
+
+```rust
+use polaris_app::RequestContext;
+
+async fn my_handler(
+    req_ctx: RequestContext,
+    Json(body): Json<MyRequest>,
+) -> Result<Json<MyResponse>, StatusCode> {
+    tracing::info!(trace_id = %req_ctx.trace_id, "handling request");
+    // ...
+}
+```
+
+The pure core is `RequestContext::from_headers(&HeaderMap) -> Self`, which you can call directly in tests or from code that already has a `HeaderMap`.
+
+### In Session Handlers: the `RequestContextPlugin` Hook
+
+Session graphs execute inside `try_process_turn_with`, so handlers cannot pass extractor output directly to systems. `RequestContextPlugin` bridges this gap:
+
+1. The handler inserts raw headers as `HttpHeaders(headers)` into the per-turn context.
+2. An `OnGraphStart` hook registered by the plugin reads `HttpHeaders` and produces a `RequestContext` resource before any system runs.
+3. Systems read `Res<RequestContext>`.
+
+```rust
+use polaris_app::{HttpHeaders, RequestContextPlugin};
+
+// Plugin setup:
+server.add_plugins(RequestContextPlugin);
+
+// Handler (see polaris_sessions::http::handlers::process_turn):
+async fn process_turn(
+    // ...
+    headers: HeaderMap,
+    Json(body): Json<ProcessTurnRequest>,
+) -> Result<...> {
+    sessions.try_process_turn_with(&session_id, move |ctx| {
+        ctx.insert(UserIO::new(io_provider));
+        ctx.insert(HttpHeaders(headers));  // hook parses this into RequestContext
+    }).await?;
+}
+
+// System:
+#[system]
+async fn traced_system(req_ctx: Res<RequestContext>) {
+    tracing::info!(trace_id = %req_ctx.trace_id, "processing turn");
+}
+```
+
+Outside the HTTP path (tests, background jobs), `HttpHeaders` is absent, so the hook no-ops and systems see a default `RequestContext` with a generated `trace_id`.
+
+### Why Two Paths?
+
+| Path | Use when |
+|------|----------|
+| `FromRequestParts` extractor | Handler itself needs the trace/correlation IDs — for its own logging, response shaping, or non-graph work. |
+| `HttpHeaders` + plugin hook | Values need to reach systems via `Res<RequestContext>`. |
+
+Both can coexist in the same handler; the extractor and the `HeaderMap` argument both just read the request's headers.
+
 ## Full Flow: HTTP Request to Agent Response
 
 Here is the complete flow from the sessions `HttpPlugin` handler:
@@ -165,6 +250,7 @@ The canonical example is `polaris_sessions::http::handlers::process_turn`:
 pub(crate) async fn process_turn(
     State(deferred): State<DeferredState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<ProcessTurnRequest>,
 ) -> Result<Json<ProcessTurnResponse>, ApiError> {
     let sessions = get_sessions(&deferred)?;
@@ -181,6 +267,7 @@ pub(crate) async fn process_turn(
     let result = sessions
         .try_process_turn_with(&session_id, move |ctx| {
             ctx.insert(UserIO::new(io_provider));
+            ctx.insert(HttpHeaders(headers));
         })
         .await?;
 
@@ -257,6 +344,46 @@ async fn handle_request(
 }
 ```
 
+### One-Shot Execution with `run_oneshot`
+
+For the common "request → response" pattern where the handler doesn't need to persist a session across turns, `SessionsAPI::run_oneshot` is simpler than `process_turn`: it creates a transient session, executes one turn, extracts the typed output, and cleans up in all exit paths (success or error).
+
+```rust
+use polaris_sessions::{SessionsAPI, AgentTypeId};
+
+type DeferredSessions = Arc<OnceLock<SessionsAPI>>;
+
+async fn handle_request(
+    State(deferred): State<DeferredSessions>,
+    headers: HeaderMap,
+    Json(body): Json<RequestBody>,
+) -> Result<Json<MyOutput>, StatusCode> {
+    let sessions = deferred.get().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let agent_type = AgentTypeId::from_name("MyAgent");
+
+    let output: MyOutput = sessions
+        .run_oneshot(&agent_type, move |ctx| {
+            ctx.insert(MyInput::new(body.prompt));
+            ctx.insert(HttpHeaders(headers));
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(output))
+}
+```
+
+When to use which:
+
+| | `run_oneshot` | `process_turn` / `try_process_turn_with` |
+|---|---------------|-------------------------------------------|
+| Session lifetime | Transient, auto-cleaned | Persistent across calls |
+| Conversational state | None between calls | Turn history, checkpoints |
+| Return value | Typed `Output` from terminal system | `ExecutionResult` + whatever handler collects |
+| Typical use | Stateless endpoints (classify, extract, summarize) | Chat, multi-turn agents |
+
+Both accept the same setup closure, so `HttpHeaders`, `UserIO`, and other per-request resources work identically in either path.
+
 ## Session HTTP Endpoints
 
 When the `http` feature is enabled on `polaris_sessions`, `HttpPlugin` registers 11 REST endpoints:
@@ -297,6 +424,7 @@ server
 | `polaris_app/src/io.rs` | `HttpIOProvider` channel bridging |
 | `polaris_app/src/auth.rs` | `AuthProvider` trait |
 | `polaris_app/src/config.rs` | `AppConfig` (bind address, CORS) |
+| `polaris_app/src/request_context.rs` | `RequestContext`, `HttpHeaders`, `RequestContextPlugin` |
 | `polaris_sessions/src/http/mod.rs` | `HttpPlugin`, endpoint table |
 | `polaris_sessions/src/http/handlers.rs` | Handler implementations |
 | `polaris_sessions/src/http/error.rs` | `ApiError` enum |

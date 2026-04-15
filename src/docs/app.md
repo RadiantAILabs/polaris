@@ -114,6 +114,65 @@ let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1);
 let provider = Arc::new(provider);
 ```
 
+# `RequestContext`
+
+`RequestContext` carries per-request `trace_id`, `correlation_id`, and
+`request_id` values. The header conventions:
+
+| Header | Field | Fallback |
+|--------|-------|----------|
+| `x-trace-id` | `trace_id` | Generated value |
+| `x-correlation-id` | `correlation_id` | `None` |
+| `x-request-id` | `request_id` | `None` (`SetRequestIdLayer` stamps this on every HTTP request) |
+
+Extraction is lenient — missing headers become `None`, never a rejection.
+Policy about required headers belongs at the application layer.
+
+## In Custom Handlers
+
+`RequestContext` implements
+[`FromRequestParts`](https://docs.rs/axum/latest/axum/extract/trait.FromRequestParts.html)
+with `Rejection = Infallible`, so axum handlers can accept it directly as
+an argument:
+
+```no_run
+use polaris_ai::app::RequestContext;
+
+// Axum calls this handler with `req_ctx` extracted from request headers.
+async fn my_handler(req_ctx: RequestContext) -> String {
+    req_ctx.trace_id
+}
+```
+
+## In Session Graphs
+
+Session handlers cannot pass extractor output directly to systems because
+graphs run inside `try_process_turn_with`. Add `RequestContextPlugin` and
+insert `HttpHeaders(headers)` in the setup closure; an `OnGraphStart` hook
+parses them into a `RequestContext` before any system runs. Systems then
+read it as a normal resource:
+
+```no_run
+# use polaris_ai::polaris_system;
+use polaris_ai::app::RequestContext;
+use polaris_ai::system::param::Res;
+use polaris_ai::system::system;
+
+// In a system, read the request context like any other resource.
+#[system]
+async fn traced_system(req_ctx: Res<RequestContext>) {
+    tracing::info!(trace_id = %req_ctx.trace_id, "processing turn");
+}
+```
+
+The handler side is one line in the `try_process_turn_with` setup closure:
+`ctx.insert(HttpHeaders(headers))`. See
+[`polaris_sessions::http::handlers::process_turn`](crate::sessions) for
+the canonical example.
+
+Outside the HTTP path, `HttpHeaders` is absent, so the hook no-ops and
+systems see a default `RequestContext` with a generated `trace_id`.
+
 # Session HTTP Endpoints
 
 With the `sessions-http` feature, `HttpPlugin` registers REST endpoints:
