@@ -217,3 +217,41 @@ fn macro_fallible_is_fallible() {
     let erased: &dyn ErasedSystem = &system;
     assert!(erased.is_fallible());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Early `return` in a non-fallible system (regression test)
+//
+// Before the fix, the macro wrapped the body in `Ok(#body)`, so a `return` in
+// the body escaped the outer `async move` block and produced a confusing type
+// mismatch (T vs Result<T, SystemError>). The macro now isolates the body in
+// an inner `async move` block so `return` exits the inner block and the value
+// is wrapped in `Ok` afterwards.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[system]
+async fn macro_early_return(counter: Res<Counter>) -> TestOutput {
+    if counter.count == 0 {
+        return TestOutput { value: -1 };
+    }
+    TestOutput {
+        value: counter.count * 2,
+    }
+}
+
+#[tokio::test]
+async fn macro_non_fallible_early_return_branch() {
+    let system = macro_early_return();
+    let ctx = SystemContext::new().with(Counter { count: 0 });
+
+    let result = system.run(&ctx).await.unwrap();
+    assert_eq!(result.value, -1);
+}
+
+#[tokio::test]
+async fn macro_non_fallible_fallthrough_branch() {
+    let system = macro_early_return();
+    let ctx = SystemContext::new().with(Counter { count: 5 });
+
+    let result = system.run(&ctx).await.unwrap();
+    assert_eq!(result.value, 10);
+}

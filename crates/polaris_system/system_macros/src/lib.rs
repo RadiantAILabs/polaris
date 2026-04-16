@@ -204,10 +204,17 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // When the function returns `Result<T, SystemError>`, the body already produces a Result,
     // so we use it directly. Otherwise, wrap in `Ok()`.
+    //
+    // For the non-fallible case, the body is executed inside an inner `async move` block so
+    // that any `return` statements in the body exit the inner block (yielding `#ret_type`)
+    // rather than escaping the outer async block — which must return
+    // `Result<#ret_type, SystemError>` to satisfy the `?` on fetch statements. Without this
+    // isolation, writing `return x;` in an infallible system produces a confusing
+    // type-mismatch error pointing at the `#[system]` macro site.
     let body_expr = if returns_result {
         quote!(#body)
     } else {
-        quote!(::std::result::Result::Ok(#body))
+        quote!(::std::result::Result::Ok((async move #body).await))
     };
 
     // Generate the struct and System impl
