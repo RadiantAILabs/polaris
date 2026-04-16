@@ -7,7 +7,7 @@ use syn::{FnArg, Generics, ImplItem, ImplItemFn, ItemImpl, Type};
 
 use crate::common::{
     extract_doc_comments, generate_definition, generate_execute, parse_param, to_pascal_case,
-    validate_tool_signature, validate_toolset_method,
+    validate_context_params, validate_tool_signature, validate_toolset_method,
 };
 
 /// Generates a Toolset impl for an impl block with `#[tool]` methods.
@@ -54,7 +54,7 @@ pub(crate) fn generate_toolset(input: &ItemImpl) -> TokenStream {
         })
         .collect();
 
-    // Remove #[tool] and param doc attrs from the original impl
+    // Remove #[tool] and param doc/default/context attrs from the original impl
     let cleaned_items: Vec<_> = input
         .items
         .iter()
@@ -70,7 +70,9 @@ pub(crate) fn generate_toolset(input: &ItemImpl) -> TokenStream {
                     for input in &mut cleaned.sig.inputs {
                         if let FnArg::Typed(pat_type) = input {
                             pat_type.attrs.retain(|attr| {
-                                !attr.path().is_ident("doc") && !attr.path().is_ident("default")
+                                !attr.path().is_ident("doc")
+                                    && !attr.path().is_ident("default")
+                                    && !attr.path().is_ident("context")
                             });
                         }
                     }
@@ -147,6 +149,10 @@ fn generate_single_tool_struct(
         })
         .collect();
 
+    if let Some(err) = validate_context_params(&params) {
+        return err;
+    }
+
     let definition_code = generate_definition(&method_name_str, description_str, &params, &pt);
     let call_target = quote! { self.inner.#method_name };
     let execute_code = generate_execute(
@@ -182,10 +188,11 @@ fn generate_single_tool_struct(
                 #definition_code
             }
 
-            fn execute(
-                &self,
+            fn execute<'__ctx>(
+                &'__ctx self,
                 __args: serde_json::Value,
-            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<serde_json::Value, #pt::ToolError>> + Send + '_>> {
+                __ctx: &'__ctx #pt::ToolContext,
+            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<serde_json::Value, #pt::ToolError>> + Send + '__ctx>> {
                 Box::pin(async move {
                     #execute_code
                 })

@@ -7,6 +7,7 @@
 //!
 //! See the [crate-level documentation](crate) for a full usage example.
 
+use crate::context::ToolContext;
 use crate::error::ToolError;
 use crate::permission::ToolPermission;
 use crate::tool::Tool;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 /// # Examples
 ///
 /// ```
-/// use polaris_tools::{ToolRegistry, Tool, ToolError};
+/// use polaris_tools::{ToolRegistry, Tool, ToolContext, ToolError};
 /// use polaris_models::llm::ToolDefinition;
 /// use serde_json::{json, Value};
 /// use std::pin::Pin;
@@ -42,7 +43,7 @@ use std::sync::Arc;
 ///             parameters: json!({"type": "object", "properties": {}}),
 ///         }
 ///     }
-///     fn execute(&self, _args: Value) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + '_>> {
+///     fn execute<'ctx>(&'ctx self, _args: Value, _ctx: &'ctx ToolContext) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'ctx>> {
 ///         Box::pin(async { Ok(json!("hello")) })
 ///     }
 /// }
@@ -145,7 +146,20 @@ impl ToolRegistry {
             .or_else(|| self.tools.get(name).map(|t| t.permission()))
     }
 
-    /// Executes a tool by name with JSON arguments.
+    /// Executes a tool by name with JSON arguments and an empty context.
+    ///
+    /// This is a convenience wrapper around [`execute_with`](Self::execute_with)
+    /// that passes an empty [`ToolContext`]. Use `execute_with` when tools need
+    /// per-invocation state supplied by the calling system.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::UnknownTool`] if no tool with `name` is registered.
+    /// Propagates any error returned by the tool's `execute` implementation
+    /// (see [`Tool::execute`] for common variants). Tools with required
+    /// `#[context]` parameters will return [`ToolError::ResourceNotFound`]
+    /// because this wrapper supplies an empty context — use
+    /// [`execute_with`](Self::execute_with) for those tools.
     pub fn execute<'a>(
         &'a self,
         name: &'a str,
@@ -155,7 +169,34 @@ impl ToolRegistry {
         let args = args.clone();
         Box::pin(async move {
             let tool = tool.ok_or_else(|| ToolError::unknown_tool(name))?;
-            tool.execute(args).await
+            let ctx = ToolContext::new();
+            tool.execute(args, &ctx).await
+        })
+    }
+
+    /// Executes a tool by name with JSON arguments and per-invocation context.
+    ///
+    /// The [`ToolContext`] carries per-invocation state from the calling system
+    /// into tool functions. Tools declare context dependencies with the
+    /// `#[context]` attribute on parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::UnknownTool`] if no tool with `name` is registered.
+    /// Returns [`ToolError::ResourceNotFound`] if a tool's `#[context]` parameter
+    /// is not present in the context. Propagates any error returned by the
+    /// tool's `execute` implementation (see [`Tool::execute`] for common variants).
+    pub fn execute_with<'a>(
+        &'a self,
+        name: &'a str,
+        args: &serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'a>> {
+        let tool = self.tools.get(name).cloned();
+        let args = args.clone();
+        Box::pin(async move {
+            let tool = tool.ok_or_else(|| ToolError::unknown_tool(name))?;
+            tool.execute(args, ctx).await
         })
     }
 
@@ -221,12 +262,41 @@ impl ToolRegistry {
 }
 
 /// Plugin that provides the [`ToolRegistry`] global resource.
+///
+/// Registers an empty [`ToolRegistry`] during `build()` as a mutable resource so
+/// other plugins can register tools in their own `build()` phase, then freezes
+/// it into a [`GlobalResource`](polaris_system::resource::GlobalResource) during
+/// `ready()` for read-only access by systems via `Res<ToolRegistry>`.
+///
+/// Use this plugin whenever an agent needs a `ToolRegistry` — either to expose
+/// tools to an LLM or to invoke tools directly via
+/// [`ToolRegistry::execute_with`].
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | [`ToolRegistry`] | Global | Registry of tools keyed by name, with permission overrides |
+///
+/// # Dependencies
+///
+/// None.
+///
+/// # Example
+///
+/// ```no_run
+/// use polaris_system::server::Server;
+/// use polaris_tools::ToolsPlugin;
+///
+/// let mut server = Server::new();
+/// server.add_plugins(ToolsPlugin);
+/// ```
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ToolsPlugin;
 
 impl Plugin for ToolsPlugin {
     const ID: &'static str = "polaris::tools";
-    const VERSION: Version = Version::new(0, 0, 1);
+    const VERSION: Version = Version::new(0, 1, 0);
 
     fn build(&self, server: &mut Server) {
         server.insert_resource(ToolRegistry::new());
@@ -263,10 +333,11 @@ mod tests {
             self.permission
         }
 
-        fn execute(
-            &self,
+        fn execute<'ctx>(
+            &'ctx self,
             _args: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>
+            _ctx: &'ctx ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>>
         {
             Box::pin(async { Ok(serde_json::json!("ok")) })
         }

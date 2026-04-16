@@ -53,6 +53,7 @@
 //! - [`Tool`] — trait for executable tools with JSON schema
 //! - [`Toolset`] — trait for grouped tools (via `#[toolset]`)
 //! - [`ToolRegistry`] — stores and dispatches tools
+//! - [`ToolContext`] — per-invocation state supplied by the calling system
 //! - [`ToolsPlugin`] — manages registry lifecycle
 //!
 //! For the full framework guide, architecture overview, and integration patterns,
@@ -65,6 +66,7 @@
 extern crate self as polaris_tools;
 
 pub mod builder;
+pub mod context;
 pub mod error;
 pub mod param;
 pub mod permission;
@@ -75,6 +77,7 @@ pub mod toolset;
 
 // Re-export core types at crate root.
 pub use builder::{LlmReasonExt, LlmRequestBuilderExt, ReasonError};
+pub use context::ToolContext;
 pub use error::ToolError;
 pub use param::{FunctionCall, FunctionParam, InputParam};
 pub use permission::ToolPermission;

@@ -15,9 +15,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.2.2" }
-polaris_models = { path = "../polaris_models", version = "0.2.2" }
-tool_macros = { path = "tool_macros", version = "0.2.2" }
+polaris_system = { path = "../polaris_system", version = "0.3.0" }
+polaris_models = { path = "../polaris_models", version = "0.3.0" }
+tool_macros = { path = "tool_macros", version = "0.3.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 schemars = "1.2.0"

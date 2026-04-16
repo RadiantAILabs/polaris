@@ -149,10 +149,11 @@ mod tests {
             }
         }
 
-        fn execute(
-            &self,
+        fn execute<'ctx>(
+            &'ctx self,
             _args: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, crate::ToolError>> + Send + '_>>
+            _ctx: &'ctx crate::ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, crate::ToolError>> + Send + 'ctx>>
         {
             Box::pin(async { Ok(json!("ok")) })
         }

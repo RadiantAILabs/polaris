@@ -2,6 +2,7 @@
 
 use polaris_models::llm::ToolDefinition;
 use polaris_system::param::Res;
+use polaris_tools::ToolContext;
 use polaris_tools::registry::{ToolRegistry, ToolsPlugin};
 use polaris_tools::tool::Tool;
 use polaris_tools::{FunctionMetadata, ParameterInfo, ToolError, Toolset, tool, toolset};
@@ -29,10 +30,11 @@ impl Tool for ManualTool {
         }
     }
 
-    fn execute(
-        &self,
+    fn execute<'ctx>(
+        &'ctx self,
         args: serde_json::Value,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>
+        _ctx: &'ctx ToolContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>>
     {
         Box::pin(async move {
             let input = args
@@ -52,7 +54,7 @@ async fn manual_tool_definition_and_execute() {
     assert_eq!(def.description, "A manually implemented tool.");
 
     let result = tool
-        .execute(serde_json::json!({"input": "hello"}))
+        .execute(serde_json::json!({"input": "hello"}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result["result"], "echo: hello");
@@ -175,7 +177,7 @@ async fn tool_standalone_basic() {
     assert!(required.contains(&serde_json::json!("name")));
 
     let result = tool
-        .execute(serde_json::json!({"name": "Alice"}))
+        .execute(serde_json::json!({"name": "Alice"}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("Hello, Alice!"));
@@ -218,7 +220,7 @@ async fn toolset_with_captured_state() {
     assert!(props.contains_key("name"));
 
     let result = tool
-        .execute(serde_json::json!({"name": "Bob"}))
+        .execute(serde_json::json!({"name": "Bob"}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("Hi Bob!"));
@@ -263,13 +265,13 @@ async fn toolset_with_mutable_captured_state() {
     assert!(props.contains_key("amount"));
 
     let result = tool
-        .execute(serde_json::json!({"amount": 5}))
+        .execute(serde_json::json!({"amount": 5}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!(5));
 
     let result = tool
-        .execute(serde_json::json!({"amount": 3}))
+        .execute(serde_json::json!({"amount": 3}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!(8));
@@ -293,7 +295,10 @@ async fn tool_no_params() {
     let props = def.parameters["properties"].as_object().unwrap();
     assert!(props.is_empty());
 
-    let result = tool.execute(serde_json::json!({})).await.unwrap();
+    let result = tool
+        .execute(serde_json::json!({}), &ToolContext::new())
+        .await
+        .unwrap();
     assert_eq!(result, serde_json::json!("2025-01-01T00:00:00Z"));
 }
 
@@ -329,14 +334,20 @@ async fn tool_with_default() {
 
     // Without limit — uses default
     let result = tool
-        .execute(serde_json::json!({"category": "books"}))
+        .execute(
+            serde_json::json!({"category": "books"}),
+            &ToolContext::new(),
+        )
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("books: limit 100"));
 
     // With limit — uses provided
     let result = tool
-        .execute(serde_json::json!({"category": "books", "limit": 5}))
+        .execute(
+            serde_json::json!({"category": "books", "limit": 5}),
+            &ToolContext::new(),
+        )
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("books: limit 5"));
@@ -371,14 +382,17 @@ async fn tool_with_option() {
 
     // Without filter
     let result = tool
-        .execute(serde_json::json!({"query": "rust"}))
+        .execute(serde_json::json!({"query": "rust"}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("query=rust"));
 
     // With filter
     let result = tool
-        .execute(serde_json::json!({"query": "rust", "filter": "recent"}))
+        .execute(
+            serde_json::json!({"query": "rust", "filter": "recent"}),
+            &ToolContext::new(),
+        )
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("query=rust, filter=recent"));
@@ -429,7 +443,7 @@ async fn toolset_basic() {
     // Find and execute add
     let add_tool = tools.iter().find(|t| t.definition().name == "add").unwrap();
     let result = add_tool
-        .execute(serde_json::json!({"a": 2.0, "b": 3.0}))
+        .execute(serde_json::json!({"a": 2.0, "b": 3.0}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!(5.0));
@@ -440,7 +454,7 @@ async fn toolset_basic() {
         .find(|t| t.definition().name == "multiply")
         .unwrap();
     let result = mul_tool
-        .execute(serde_json::json!({"a": 4.0, "b": 5.0}))
+        .execute(serde_json::json!({"a": 4.0, "b": 5.0}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!(20.0));
@@ -481,7 +495,7 @@ async fn toolset_with_captured_config() {
     assert!(props.contains_key("message"));
 
     let result = tool
-        .execute(serde_json::json!({"message": "hello"}))
+        .execute(serde_json::json!({"message": "hello"}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("[INFO] hello"));
@@ -558,7 +572,10 @@ async fn tool_struct_param_flat_mode() {
     assert!(required.contains(&serde_json::json!("params")));
 
     let result = tool
-        .execute(serde_json::json!({"params": {"query": "rust", "limit": 10}}))
+        .execute(
+            serde_json::json!({"params": {"query": "rust", "limit": 10}}),
+            &ToolContext::new(),
+        )
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("query=rust, limit=10"));
@@ -602,14 +619,17 @@ async fn tool_tagged_enum_flat_mode() {
 
     // Simple mode — wrapped in the "mode" parameter
     let result = tool
-        .execute(serde_json::json!({"mode": {"type": "Simple", "query": "rust"}}))
+        .execute(
+            serde_json::json!({"mode": {"type": "Simple", "query": "rust"}}),
+            &ToolContext::new(),
+        )
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("simple: rust"));
 
     // Advanced mode
     let result = tool
-        .execute(serde_json::json!({"mode": {"type": "Advanced", "query": "rust", "filters": ["recent"]}}))
+        .execute(serde_json::json!({"mode": {"type": "Advanced", "query": "rust", "filters": ["recent"]}}), &ToolContext::new())
         .await
         .unwrap();
     assert!(result.as_str().unwrap().contains("advanced: rust"));
@@ -706,10 +726,13 @@ async fn tool_struct_and_primitive_params() {
     assert!(required.contains(&serde_json::json!("config")));
 
     let result = tool
-        .execute(serde_json::json!({
-            "query": "rust",
-            "config": {"min_score": 0.5, "tags": ["programming"]}
-        }))
+        .execute(
+            serde_json::json!({
+                "query": "rust",
+                "config": {"min_score": 0.5, "tags": ["programming"]}
+            }),
+            &ToolContext::new(),
+        )
         .await
         .unwrap();
     assert!(result.as_str().unwrap().contains("query=rust"));
@@ -752,17 +775,20 @@ async fn tool_optional_struct_param() {
 
     // Without config
     let result = tool
-        .execute(serde_json::json!({"query": "rust"}))
+        .execute(serde_json::json!({"query": "rust"}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("query=rust, no filter"));
 
     // With config
     let result = tool
-        .execute(serde_json::json!({
-            "query": "rust",
-            "config": {"min_score": 0.8, "tags": ["lang"]}
-        }))
+        .execute(
+            serde_json::json!({
+                "query": "rust",
+                "config": {"min_score": 0.8, "tags": ["lang"]}
+            }),
+            &ToolContext::new(),
+        )
         .await
         .unwrap();
     assert!(result.as_str().unwrap().contains("filtered"));
@@ -802,7 +828,7 @@ async fn toolset_generic_impl() {
     assert_eq!(def.name, "format");
 
     let result = tool
-        .execute(serde_json::json!({"message": "hello"}))
+        .execute(serde_json::json!({"message": "hello"}), &ToolContext::new())
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!("[UPPER] HELLO"));
@@ -833,8 +859,277 @@ async fn toolset_generic_with_where_clause() {
     let tools = WrapperTools { value: 42i32 }.tools();
     assert_eq!(tools.len(), 1);
 
-    let result = tools[0].execute(serde_json::json!({})).await.unwrap();
+    let result = tools[0]
+        .execute(serde_json::json!({}), &ToolContext::new())
+        .await
+        .unwrap();
     assert_eq!(result, serde_json::json!("42"));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 20. #[context] parameter — standalone tool
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+struct SessionId(String);
+
+#[tool]
+/// Tool that tags output with the current session.
+async fn tagged_echo(
+    #[context] session: SessionId,
+    /// The message to echo.
+    message: String,
+) -> Result<String, ToolError> {
+    Ok(format!("[{}] {}", session.0, message))
+}
+
+#[tokio::test]
+async fn context_param_standalone_tool() {
+    let tool = tagged_echo();
+    let def = tool.definition();
+
+    // Context param should NOT appear in schema
+    let props = def.parameters["properties"].as_object().unwrap();
+    assert!(
+        !props.contains_key("session"),
+        "context param should not be in schema"
+    );
+    assert!(
+        props.contains_key("message"),
+        "input param should be in schema"
+    );
+
+    let required = def.parameters["required"].as_array().unwrap();
+    assert!(!required.contains(&serde_json::json!("session")));
+    assert!(required.contains(&serde_json::json!("message")));
+
+    // Execute with context
+    let ctx = ToolContext::new().with(SessionId("s-123".into()));
+    let result = tool
+        .execute(serde_json::json!({"message": "hello"}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result, serde_json::json!("[s-123] hello"));
+}
+
+#[tokio::test]
+async fn context_param_missing_returns_error() {
+    let tool = tagged_echo();
+
+    // Execute WITHOUT the required context — should error
+    let result = tool
+        .execute(serde_json::json!({"message": "hello"}), &ToolContext::new())
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("Resource not found"), "got: {err}");
+    assert!(
+        err.contains("SessionId"),
+        "error should name the missing type, got: {err}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 21. #[context] parameter — toolset method
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct WorkingDir(String);
+
+struct ScopedFileTools {
+    root: String,
+}
+
+#[toolset]
+impl ScopedFileTools {
+    #[tool]
+    /// Resolve a path against the working directory within the configured root.
+    async fn resolve(
+        &self,
+        #[context] cwd: WorkingDir,
+        /// The path to resolve.
+        path: String,
+    ) -> Result<String, ToolError> {
+        Ok(format!("{}/{}/{}", self.root, cwd.0, path))
+    }
+}
+
+#[tokio::test]
+async fn context_param_toolset_method() {
+    let tools = ScopedFileTools {
+        root: "/srv/files".into(),
+    }
+    .tools();
+    assert_eq!(tools.len(), 1);
+
+    let tool = &tools[0];
+    let def = tool.definition();
+
+    // Context param should NOT appear in schema
+    let props = def.parameters["properties"].as_object().unwrap();
+    assert!(
+        !props.contains_key("cwd"),
+        "context param should not be in schema"
+    );
+    assert!(props.contains_key("path"));
+
+    // Execute with context
+    let ctx = ToolContext::new().with(WorkingDir("project".into()));
+    let result = tool
+        .execute(serde_json::json!({"path": "README.md"}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result, serde_json::json!("/srv/files/project/README.md"));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 22. Optional #[context] parameter (Option<T>)
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct DryRun(bool);
+
+#[tool]
+/// Tool with an optional dry-run flag.
+async fn maybe_apply(
+    #[context] dry_run: Option<DryRun>,
+    /// The action description.
+    action: String,
+) -> Result<String, ToolError> {
+    match dry_run {
+        Some(DryRun(true)) => Ok(format!("would: {action}")),
+        _ => Ok(format!("did: {action}")),
+    }
+}
+
+#[tokio::test]
+async fn optional_context_param_present() {
+    let tool = maybe_apply();
+    let ctx = ToolContext::new().with(DryRun(true));
+
+    let result = tool
+        .execute(serde_json::json!({"action": "rebuild"}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result, serde_json::json!("would: rebuild"));
+}
+
+#[tokio::test]
+async fn optional_context_param_absent() {
+    let tool = maybe_apply();
+
+    // No DryRun in context — should succeed with None (defaulting to "did")
+    let result = tool
+        .execute(
+            serde_json::json!({"action": "rebuild"}),
+            &ToolContext::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, serde_json::json!("did: rebuild"));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 23. ToolRegistry::execute_with propagates context
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn registry_execute_with_propagates_context() {
+    let mut registry = ToolRegistry::new();
+    registry.register(tagged_echo());
+
+    let ctx = ToolContext::new().with(SessionId("s-456".into()));
+    let result = registry
+        .execute_with(
+            "tagged_echo",
+            &serde_json::json!({"message": "world"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, serde_json::json!("[s-456] world"));
+}
+
+#[tokio::test]
+async fn registry_execute_without_context_creates_empty() {
+    let mut registry = ToolRegistry::new();
+    registry.register(maybe_apply());
+
+    // execute() (no context) should work for tools with optional context
+    let result = registry
+        .execute("maybe_apply", &serde_json::json!({"action": "noop"}))
+        .await
+        .unwrap();
+    assert_eq!(result, serde_json::json!("did: noop"));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 24. Multiple #[context] params
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Locale(String);
+
+#[tool]
+/// Tool needing multiple context values.
+async fn multi_context(
+    #[context] session: SessionId,
+    #[context] locale: Locale,
+    /// The payload.
+    payload: String,
+) -> Result<String, ToolError> {
+    Ok(format!(
+        "session={} locale={} payload={}",
+        session.0, locale.0, payload
+    ))
+}
+
+#[tokio::test]
+async fn multiple_context_params() {
+    let tool = multi_context();
+    let def = tool.definition();
+
+    // Only payload should be in schema
+    let props = def.parameters["properties"].as_object().unwrap();
+    assert_eq!(props.len(), 1);
+    assert!(props.contains_key("payload"));
+
+    let ctx = ToolContext::new()
+        .with(SessionId("s-1".into()))
+        .with(Locale("en-US".into()));
+
+    let result = tool
+        .execute(serde_json::json!({"payload": "data"}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!("session=s-1 locale=en-US payload=data")
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 25. Only #[context] params (no LLM params)
+// ─────────────────────────────────────────────────────────────────────
+
+#[tool]
+/// Tool with only context params.
+async fn context_only(#[context] session: SessionId) -> Result<String, ToolError> {
+    Ok(format!("session: {}", session.0))
+}
+
+#[tokio::test]
+async fn tool_with_only_context_params() {
+    let tool = context_only();
+    let def = tool.definition();
+
+    // Schema should have empty properties
+    let props = def.parameters["properties"].as_object().unwrap();
+    assert!(props.is_empty());
+
+    let ctx = ToolContext::new().with(SessionId("s-789".into()));
+    let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+    assert_eq!(result, serde_json::json!("session: s-789"));
 }
 
 // ─────────────────────────────────────────────────────────────────────

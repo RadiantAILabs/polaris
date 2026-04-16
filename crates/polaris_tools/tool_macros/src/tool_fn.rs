@@ -2,7 +2,7 @@
 
 use crate::common::{
     extract_doc_comments, generate_definition, generate_execute, parse_param, to_pascal_case,
-    validate_standalone_tool, validate_tool_signature,
+    validate_context_params, validate_standalone_tool, validate_tool_signature,
 };
 use polaris_macro_utils::{PolarisCrate, resolve_crate_path};
 use proc_macro2::TokenStream;
@@ -48,6 +48,10 @@ pub(crate) fn generate_tool_fn(input: &ItemFn) -> TokenStream {
         })
         .collect();
 
+    if let Some(err) = validate_context_params(&params) {
+        return err;
+    }
+
     let definition_code = generate_definition(&fn_name_str, description_str, &params, &pt);
     let call_target = quote! { #impl_fn_name };
     let execute_code =
@@ -65,7 +69,9 @@ pub(crate) fn generate_tool_fn(input: &ItemFn) -> TokenStream {
             if let FnArg::Typed(pat_type) = arg {
                 let mut cleaned = pat_type.clone();
                 cleaned.attrs.retain(|attr| {
-                    !attr.path().is_ident("default") && !attr.path().is_ident("doc")
+                    !attr.path().is_ident("default")
+                        && !attr.path().is_ident("doc")
+                        && !attr.path().is_ident("context")
                 });
                 FnArg::Typed(cleaned)
             } else {
@@ -86,10 +92,11 @@ pub(crate) fn generate_tool_fn(input: &ItemFn) -> TokenStream {
                 #definition_code
             }
 
-            fn execute(
-                &self,
+            fn execute<'__ctx>(
+                &'__ctx self,
                 __args: serde_json::Value,
-            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<serde_json::Value, #pt::ToolError>> + Send + '_>> {
+                __ctx: &'__ctx #pt::ToolContext,
+            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<serde_json::Value, #pt::ToolError>> + Send + '__ctx>> {
                 Box::pin(async move {
                     #execute_code
                 })

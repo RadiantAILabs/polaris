@@ -13,9 +13,11 @@ title: Tools
 |-----------|---------|
 | `#[tool]` | Attribute macro turning an async function into a `Tool` impl |
 | `#[toolset]` | Attribute macro generating `Toolset` for an `impl` block |
+| `#[context]` | Parameter attribute injecting a value from `ToolContext` (not in LLM schema) |
 | `Tool` | Trait for executable tools (definition + `execute`) |
 | `Toolset` | Trait for grouped tools on a struct |
 | `ToolRegistry` | Stores tools by name, dispatches execution, tracks permissions |
+| `ToolContext` | Typed map of per-invocation state passed from the calling system into tools |
 | `ToolsPlugin` | Manages the registry lifecycle |
 | `ToolPermission` | Per-tool access level (`Allow` / `Confirm` / `Deny`) |
 
@@ -100,7 +102,7 @@ impl FileTools {
 For dynamic tools whose schema is not known at compile time, implement `Tool` directly:
 
 ```rust
-use polaris_tools::{Tool, ToolError, ToolPermission};
+use polaris_tools::{Tool, ToolContext, ToolError, ToolPermission};
 use polaris_models::llm::ToolDefinition;
 
 struct DynamicQuery { schema: serde_json::Value }
@@ -116,10 +118,11 @@ impl Tool for DynamicQuery {
 
     fn permission(&self) -> ToolPermission { ToolPermission::Confirm }
 
-    fn execute(
-        &self,
+    fn execute<'ctx>(
+        &'ctx self,
         args: serde_json::Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        _ctx: &'ctx ToolContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>> {
         Box::pin(async move { Ok(serde_json::json!({"ok": true})) })
     }
 }
@@ -216,6 +219,89 @@ async fn invoke_tool(
 
 For LLM tool calling, pass `registry.definitions()` to the model provider and dispatch the returned tool calls through `registry.execute(&name, &args)`.
 
+## Per-Invocation Context
+
+`ToolContext` carries per-invocation state from the calling system into tool execution — anything a tool needs that shouldn't be part of its LLM-facing argument schema. It is a lightweight typed map keyed by `TypeId` — no locks, no hierarchy.
+
+Tools declare context dependencies with `#[context]` on parameters. These parameters are **not** rendered into the LLM-facing JSON schema and must satisfy `T: Clone + Send + Sync + 'static`. `Option<T>` parameters resolve to `None` when absent instead of erroring. Nested `Option<Option<T>>` is rejected at compile time — use `Option<T>` for an optional context value.
+
+```rust
+use polaris_tools::{tool, ToolError};
+use std::path::PathBuf;
+
+#[derive(Clone)]
+struct WorkingDir(PathBuf);
+
+#[derive(Clone)]
+struct DryRun(bool);
+
+#[tool]
+/// Write `contents` to `path` relative to the working directory.
+async fn write_file(
+    /// Path relative to the working directory.
+    path: String,
+    /// Contents to write.
+    contents: String,
+    #[context] cwd: WorkingDir,
+    #[context] dry_run: Option<DryRun>,
+) -> Result<String, ToolError> {
+    let full = cwd.0.join(&path);
+    if dry_run.is_some_and(|d| d.0) {
+        return Ok(format!("would write {} bytes to {}", contents.len(), full.display()));
+    }
+    // ... write ...
+    Ok(format!("wrote {}", full.display()))
+}
+```
+
+### Dispatching with Context
+
+Use `ToolRegistry::execute_with` to supply a context:
+
+```rust
+use polaris_tools::{ToolContext, ToolRegistry};
+use std::path::PathBuf;
+
+# #[derive(Clone)] struct WorkingDir(PathBuf);
+# #[derive(Clone)] struct DryRun(bool);
+# async fn run(registry: &ToolRegistry) {
+let ctx = ToolContext::new()
+    .with(WorkingDir(PathBuf::from("/tmp/work")))
+    .with(DryRun(true));
+
+let args = serde_json::json!({"path": "notes.txt", "contents": "hello"});
+let result = registry.execute_with("write_file", &args, &ctx).await;
+# let _ = result;
+# }
+```
+
+| Method | Use when |
+|--------|----------|
+| `registry.execute(name, args)` | Tool has no `#[context]` parameters, or all context params are `Option<T>` |
+| `registry.execute_with(name, args, ctx)` | Tool has required `#[context]` parameters |
+
+A required `#[context]` parameter whose type is not present in the supplied context returns `ToolError::ResourceNotFound`.
+
+### Cloning & Sharing a Context
+
+`ToolContext` implements `Clone` cheaply — values are stored behind `Arc`, so cloning bumps a refcount per entry rather than duplicating payloads. Value types themselves do not need to implement `Clone`; a non-`Clone` handle (e.g., a database connection or open file) can still live in context and be shared across clones.
+
+```rust
+use polaris_tools::{ToolContext, ToolRegistry};
+
+# struct BackendHandle;
+# async fn run(registry: &ToolRegistry, names: Vec<String>, handle: BackendHandle) {
+let ctx = ToolContext::new().with(handle);
+for name in names {
+    let _ = registry.execute_with(&name, &serde_json::json!({}), &ctx.clone()).await;
+}
+# }
+```
+
+### Security Note
+
+When a `ToolContext` happens to carry secret material (auth tokens, session cookies, signing keys), compare extracted values with a constant-time comparison such as `subtle::ConstantTimeEq` rather than `==`, to avoid timing side-channels.
+
 ### Lookup
 
 | Method | Returns |
@@ -231,8 +317,11 @@ For LLM tool calling, pass `registry.definitions()` to the model provider and di
 | Variant | Cause |
 |---------|-------|
 | `ToolError::UnknownTool(name)` | `execute()` called with an unregistered name |
-| `ToolError::InvalidArguments(msg)` | Argument deserialization failed |
-| `ToolError::ExecutionFailed(msg)` | Tool body returned an error |
+| `ToolError::ParameterError(msg)` | Argument deserialization or validation failed |
+| `ToolError::ExecutionError(msg)` | Tool body returned an error |
+| `ToolError::PermissionDenied(msg)` | Invocation blocked by the tool's permission policy |
+| `ToolError::ResourceNotFound(type)` | Required `#[context]` value was absent from `ToolContext` |
+| `ToolError::SerializationError(err)` | JSON (de)serialization failure |
 | `ToolError::RegistryError(msg)` | Registry-level failure (e.g., `set_permission` on unknown tool) |
 
 ## Decorator Pattern
