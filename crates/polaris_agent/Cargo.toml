@@ -15,6 +15,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_graph = { path = "../polaris_graph", version = "0.2.1" }
-polaris_system = { path = "../polaris_system", version = "0.2.1" }
+polaris_graph = { path = "../polaris_graph", version = "0.2.2" }
+polaris_system = { path = "../polaris_system", version = "0.2.2" }
 thiserror = "2"

@@ -64,7 +64,7 @@ See [`examples`](examples/README.md) for a full implementation of a file assista
 
 ```toml
 [dependencies]
-polaris-ai = "0.2.1"
+polaris-ai = "0.2.2"
 ```
 
 Requires **Rust 1.93.0+** (Edition 2024). Run `cargo make test` for the full test suite.
