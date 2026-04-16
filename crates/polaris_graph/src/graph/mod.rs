@@ -6,13 +6,13 @@
 mod builder;
 mod validation;
 
-pub use builder::SystemNodeBuilder;
-pub use validation::{MergeError, ValidationError, ValidationResult, ValidationWarning};
-
 use crate::edge::{Edge, EdgeId, SequentialEdge};
 use crate::node::{Node, NodeId};
+pub use builder::SystemNodeBuilder;
 use hashbrown::HashSet;
 use std::any::TypeId;
+use std::time::Duration;
+pub use validation::{MergeError, ValidationError, ValidationResult, ValidationWarning};
 
 /// A directed graph of systems.
 ///
@@ -21,6 +21,9 @@ use std::any::TypeId;
 /// - **Nodes**: Computation units (systems) and control flow constructs
 /// - **Edges**: Connections defining execution flow between nodes
 /// - **Entry**: The starting point for graph execution
+///
+/// By default, a graph has no execution time limit (`max_duration` is `None`).
+/// Use [`with_max_duration`](Graph::with_max_duration) to set one.
 ///
 /// # Example
 ///
@@ -51,6 +54,12 @@ pub struct Graph {
     pub(crate) entry: Option<NodeId>,
     /// The last node added (for chaining).
     pub(crate) last_node: Option<NodeId>,
+    /// Maximum total execution duration for this graph.
+    ///
+    /// When set, the executor wraps this graph's execution in a timeout.
+    /// If exceeded, returns [`ExecutionError::GraphTimeout`](crate::executor::ExecutionError::GraphTimeout).
+    /// This takes precedence over the executor's own `max_duration`.
+    pub(crate) max_duration: Option<Duration>,
 }
 
 impl Graph {
@@ -100,6 +109,12 @@ impl Graph {
     #[must_use]
     pub fn last_node(&self) -> Option<NodeId> {
         self.last_node.clone()
+    }
+
+    /// Returns the maximum execution duration for this graph, if set.
+    #[must_use]
+    pub fn max_duration(&self) -> Option<Duration> {
+        self.max_duration
     }
 
     /// Gets a node by ID.

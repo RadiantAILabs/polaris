@@ -60,6 +60,65 @@ where
 
 impl Graph {
     // ─────────────────────────────────────────────────────────────────────────
+    // Graph Configuration
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Sets the maximum total execution duration for this graph.
+    ///
+    /// When set, the executor wraps this graph's execution in a timeout.
+    /// If exceeded, returns [`ExecutionError::GraphTimeout`](crate::executor::ExecutionError::GraphTimeout)
+    /// after invoking `OnGraphFailure` hooks. For scope-embedded graphs,
+    /// `OnGraphFailure` fires on the **parent** graph (not a scope-specific
+    /// event) and `OnScopeComplete` is skipped.
+    ///
+    /// This takes precedence over the executor's own
+    /// [`with_max_duration`](crate::executor::GraphExecutor::with_max_duration).
+    /// If the graph does not set a timeout, the executor's value is used as a
+    /// fallback. Note that `GraphExecutor::with_max_duration` uses a consuming
+    /// builder (`self -> Self`) while this method uses `&mut self -> &mut Self`
+    /// to match the `Graph` builder convention.
+    ///
+    /// # Cancel safety
+    ///
+    /// Graph-level timeout is a hard abort. When it fires mid-system, tokio
+    /// drops the currently-running future at its next `.await` point:
+    ///
+    /// - Rust `Drop` impls run, but `async` code after the cancellation
+    ///   point does not execute.
+    /// - Writes already made to `SystemContext` persist; later writes are
+    ///   lost.
+    /// - External side effects may have committed remotely but gone
+    ///   unacknowledged.
+    /// - The cancelled system's `on_error` / `on_timeout` edges are **not**
+    ///   invoked — graph-level timeout bypasses node dispatch.
+    /// - For scope graphs using [`ContextPolicy::shared()`](crate::node::ContextPolicy::shared),
+    ///   the parent context may retain partial writes from systems that ran
+    ///   before the timeout fired.
+    ///
+    /// This is distinct from **per-node** timeout, which integrates with
+    /// retry policies and timeout handler edges for structured recovery.
+    /// Per-node timeouts are set via [`SystemNodeBuilder::with_timeout`]
+    /// (fluent builder) or [`Graph::set_timeout`] (by node ID).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use std::time::Duration;
+    /// # async fn step_a() {}
+    /// # async fn step_b() {}
+    /// let mut graph = Graph::new();
+    /// graph
+    ///     .with_max_duration(Duration::from_secs(30))
+    ///     .add_system(step_a)
+    ///     .add_system(step_b);
+    /// ```
+    pub fn with_max_duration(&mut self, duration: Duration) -> &mut Self {
+        self.max_duration = Some(duration);
+        self
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Builder API
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -282,6 +341,10 @@ impl Graph {
     /// `other`'s last node so further chaining continues from the end
     /// of the appended graph.
     ///
+    /// `max_duration` from `other` is **not** preserved — the receiving
+    /// graph's timeout policy takes precedence. If `other` has a
+    /// `max_duration` set, a warning is logged.
+    ///
     /// Appending an empty graph is a no-op.
     ///
     /// # Errors
@@ -332,6 +395,13 @@ impl Graph {
             self.check_connectivity(&self_entry)?;
 
             self.add_sequential_edge(self_exit, other_entry);
+        }
+
+        if other.max_duration.is_some() && self.max_duration.is_none() {
+            tracing::warn!(
+                "appended graph has max_duration set but the receiving graph does not — \
+                 the appended graph's timeout will be discarded"
+            );
         }
 
         self.nodes.extend(other.nodes);

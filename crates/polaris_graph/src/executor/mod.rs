@@ -219,9 +219,13 @@ impl GraphExecutor {
 
     /// Sets the maximum total execution duration for the graph.
     ///
-    /// When set, the executor wraps graph execution in a timeout.
-    /// If exceeded, returns [`ExecutionError::GraphTimeout`] after
-    /// invoking `OnGraphFailure` hooks.
+    /// This acts as a **fallback** — if a [`Graph`] sets its own
+    /// [`max_duration`](Graph::with_max_duration), the graph's value takes
+    /// precedence. The executor's value is used only when the graph does not
+    /// declare one.
+    ///
+    /// When the effective timeout elapses, returns
+    /// [`ExecutionError::GraphTimeout`] after invoking `OnGraphFailure` hooks.
     ///
     /// # Cancel safety
     ///
@@ -229,6 +233,7 @@ impl GraphExecutor {
     /// that hold mutable state across `.await` points may leave partial
     /// writes. Design systems to be cancel-safe or use error edges to
     /// handle cleanup when timeout is enabled.
+    ///
     #[must_use]
     pub fn with_max_duration(mut self, duration: Duration) -> Self {
         self.max_duration = Some(duration);
@@ -624,7 +629,10 @@ impl GraphExecutor {
             },
         );
 
-        let result = if let Some(max) = self.max_duration {
+        // Graph timeout takes precedence; executor timeout is the fallback.
+        let effective_timeout = graph.max_duration.or(self.max_duration);
+
+        let result = if let Some(max) = effective_timeout {
             match tokio::time::timeout(
                 max,
                 self.execute_from(graph, ctx, entry, 0, hooks, middleware),
@@ -738,5 +746,26 @@ mod tests {
     fn executor_with_max_duration() {
         let executor = GraphExecutor::new().with_max_duration(Duration::from_secs(30));
         assert_eq!(executor.max_duration, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn graph_max_duration() {
+        let mut graph = Graph::new();
+        assert_eq!(graph.max_duration(), None);
+
+        graph.with_max_duration(Duration::from_secs(10));
+        assert_eq!(graph.max_duration(), Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn graph_max_duration_chains() {
+        async fn step() {}
+
+        let mut graph = Graph::new();
+        graph
+            .with_max_duration(Duration::from_secs(10))
+            .add_system(step);
+        assert_eq!(graph.max_duration(), Some(Duration::from_secs(10)));
+        assert_eq!(graph.node_count(), 1);
     }
 }

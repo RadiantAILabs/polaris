@@ -120,15 +120,24 @@ graph.add_loop::<LoopState, _, _>(
 System outputs are stored in the context keyed by `TypeId` and read via
 [`Out<T>`](crate::system::param::Out).
 
+A total execution time limit can be set on the `Graph` itself or on the
+`GraphExecutor`. Graph-level declarations travel with the graph; the executor
+value acts as a fallback. When both are set, the graph wins.
+
 ```no_run
 # use polaris_ai::graph::{Graph, GraphExecutor};
 # use polaris_ai::system::param::SystemContext;
 # use std::time::Duration;
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-# let graph = Graph::new();
-# let mut ctx = SystemContext::new();
+// Graph-level (travels with the graph):
+let mut graph = Graph::new();
+graph.with_max_duration(Duration::from_secs(30));
+
+// Executor-level (fallback default across all graphs):
 let executor = GraphExecutor::new()
     .with_max_duration(Duration::from_secs(60));
+
+# let mut ctx = SystemContext::new();
 let result = executor.execute(&graph, &mut ctx, None, None).await?;
 # Ok(())
 # }

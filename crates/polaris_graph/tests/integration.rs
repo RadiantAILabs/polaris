@@ -1282,6 +1282,228 @@ async fn graph_timeout_does_not_fire_when_within_limit() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Graph-Level Timeout Tests (max_duration on Graph)
+// ─────────────────────────────────────────────────────────────────────────────
+
+use polaris_graph::hooks::HooksAPI;
+use polaris_graph::hooks::events::GraphEvent;
+use polaris_graph::hooks::schedule::OnGraphFailure;
+
+#[tokio::test]
+async fn graph_level_timeout_fires_when_exceeded() {
+    let mut graph = Graph::new();
+    graph.with_max_duration(std::time::Duration::from_millis(50));
+    graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(200),
+    }));
+    assert!(graph.validate().is_ok());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_err(), "expected timeout error");
+    match result.unwrap_err() {
+        ExecutionError::GraphTimeout { max, .. } => {
+            assert_eq!(max, std::time::Duration::from_millis(50));
+        }
+        other => panic!("expected GraphTimeout, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn graph_level_timeout_does_not_fire_when_within_limit() {
+    let mut graph = Graph::new();
+    graph.with_max_duration(std::time::Duration::from_millis(500));
+    graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(50),
+    }));
+    assert!(graph.validate().is_ok());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    let result = result.expect("expected success within timeout");
+    assert_eq!(result.nodes_executed, 1);
+}
+
+#[tokio::test]
+async fn graph_timeout_takes_precedence_over_executor_timeout() {
+    let mut graph = Graph::new();
+    // Graph sets a generous timeout
+    graph.with_max_duration(std::time::Duration::from_millis(500));
+    graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(100),
+    }));
+    assert!(graph.validate().is_ok());
+
+    let mut ctx = SystemContext::new();
+    // Executor sets a very tight timeout — but graph should win
+    let executor = GraphExecutor::new().with_max_duration(std::time::Duration::from_millis(50));
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    let result = result.expect("graph timeout should take precedence over executor timeout");
+    assert_eq!(result.nodes_executed, 1);
+}
+
+#[tokio::test]
+async fn executor_timeout_used_as_fallback_when_graph_has_none() {
+    let mut graph = Graph::new();
+    // No graph-level timeout set
+    graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(200),
+    }));
+    assert!(graph.validate().is_ok());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new().with_max_duration(std::time::Duration::from_millis(50));
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_err(), "executor fallback timeout should fire");
+    match result.unwrap_err() {
+        ExecutionError::GraphTimeout { max, .. } => {
+            assert_eq!(max, std::time::Duration::from_millis(50));
+        }
+        other => panic!("expected GraphTimeout, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn graph_level_timeout_fires_on_graph_failure_hook() {
+    let mut graph = Graph::new();
+    graph.with_max_duration(std::time::Duration::from_millis(50));
+    graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(200),
+    }));
+
+    let hooks = HooksAPI::new();
+    let hook_fired = Arc::new(Mutex::new(false));
+    let flag = Arc::clone(&hook_fired);
+    hooks
+        .register_observer::<OnGraphFailure, _>("timeout_hook", move |event: &GraphEvent| {
+            if let GraphEvent::GraphFailure { error } = event
+                && matches!(error, ExecutionError::GraphTimeout { .. })
+            {
+                *flag.lock().unwrap() = true;
+            }
+        })
+        .unwrap();
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, Some(&hooks), None).await;
+
+    assert!(result.is_err());
+    assert!(
+        *hook_fired.lock().unwrap(),
+        "OnGraphFailure should fire on graph-level timeout"
+    );
+}
+
+#[tokio::test]
+async fn scope_graph_timeout_fires_shared() {
+    async fn fast_step() -> i32 {
+        1
+    }
+
+    let mut inner_graph = Graph::new();
+    inner_graph.with_max_duration(std::time::Duration::from_millis(50));
+    inner_graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(200),
+    }));
+
+    let mut graph = Graph::new();
+    graph
+        .add_system(fast_step)
+        .add_scope("timed_scope", inner_graph, ContextPolicy::shared());
+    assert!(graph.validate().is_ok());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(result.is_err(), "scope graph timeout should fire");
+    match result.unwrap_err() {
+        ExecutionError::GraphTimeout { max, .. } => {
+            assert_eq!(max, std::time::Duration::from_millis(50));
+        }
+        other => panic!("expected GraphTimeout from scope, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn scope_graph_timeout_fires_inherit() {
+    async fn fast_step() -> i32 {
+        1
+    }
+
+    let mut inner_graph = Graph::new();
+    inner_graph.with_max_duration(std::time::Duration::from_millis(50));
+    inner_graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(200),
+    }));
+
+    let mut graph = Graph::new();
+    graph
+        .add_system(fast_step)
+        .add_scope("timed_scope", inner_graph, ContextPolicy::inherit());
+    assert!(graph.validate().is_ok());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        result.is_err(),
+        "scope graph timeout should fire in inherit mode"
+    );
+    assert!(matches!(
+        result.unwrap_err(),
+        ExecutionError::GraphTimeout { .. }
+    ));
+}
+
+#[tokio::test]
+async fn scope_graph_timeout_fires_isolated() {
+    async fn fast_step() -> i32 {
+        1
+    }
+
+    let mut inner_graph = Graph::new();
+    inner_graph.with_max_duration(std::time::Duration::from_millis(50));
+    inner_graph.add_boxed_system(Box::new(SlowSystem {
+        duration: std::time::Duration::from_millis(200),
+    }));
+
+    let mut graph = Graph::new();
+    graph
+        .add_system(fast_step)
+        .add_scope("timed_scope", inner_graph, ContextPolicy::isolated());
+    assert!(graph.validate().is_ok());
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        result.is_err(),
+        "scope graph timeout should fire in isolated mode"
+    );
+    assert!(matches!(
+        result.unwrap_err(),
+        ExecutionError::GraphTimeout { .. }
+    ));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ExecutionResult Typed Output Tests
 // ─────────────────────────────────────────────────────────────────────────────
 

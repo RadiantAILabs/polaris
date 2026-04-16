@@ -246,7 +246,19 @@ let answer = result.output::<MyOutput>(); // Option<&MyOutput>
 
 ### Graph-Level Timeout
 
-`GraphExecutor` supports a total execution time limit via `with_max_duration`. When the timeout elapses, the executor returns `ExecutionError::GraphTimeout` and fires `OnGraphFailure` hooks — unlike wrapping with `tokio::time::timeout` externally, which bypasses hooks and middleware.
+A total execution time limit can be set at two levels: on the `Graph` itself (via `with_max_duration`) or on the `GraphExecutor` (via `with_max_duration`). When the timeout elapses, the executor returns `ExecutionError::GraphTimeout` and fires `OnGraphFailure` hooks — unlike wrapping with `tokio::time::timeout` externally, which bypasses hooks and middleware.
+
+**Graph-level timeout** — declared as part of the graph definition, travels with the graph. Use this when the agent author knows the intended time budget for their graph:
+
+```rust
+let mut graph = Graph::new();
+graph
+    .with_max_duration(Duration::from_secs(30))
+    .add_system(step_one)
+    .add_system(step_two);
+```
+
+**Executor-level timeout** — a fallback default applied by the runtime across all graphs it executes:
 
 ```rust
 let executor = GraphExecutor::new()
@@ -255,6 +267,29 @@ let executor = GraphExecutor::new()
 let result = executor.execute(&graph, &mut ctx, None, None).await;
 // On timeout: Err(ExecutionError::GraphTimeout { elapsed, max })
 ```
+
+**Precedence** — when both are set, the graph's `max_duration` wins. The executor's value is only used as a fallback when the graph does not declare one:
+
+```rust
+let effective_timeout = graph.max_duration().or(executor_max_duration);
+```
+
+**Scope graphs** — a scope node's embedded `Graph` can declare its own `max_duration`, which is enforced independently around that scope's execution. This lets authors give nested subgraphs their own time budgets without affecting the parent. When a scope graph times out, `OnScopeComplete` is **not** fired for that scope. The `ExecutionError::GraphTimeout` propagates up, and `OnGraphFailure` fires on the top-level (parent) graph — there is no scope-specific failure hook.
+
+**`Graph::append`** — when a graph with `max_duration` is appended into another, the appended graph's timeout is discarded. The receiving graph's timeout policy takes precedence. A warning is logged if the appended graph had a timeout set but the receiver did not.
+
+#### Cancel Safety
+
+Graph-level timeout is a **hard abort**. When it fires mid-execution, tokio drops the currently-running system's future at its next `.await` point. Concretely:
+
+- The cancelled system's Rust `Drop` impls run (RAII cleanup works), but any `async` code after the cancellation point does not execute.
+- Writes already made to `SystemContext` via `ResMut<T>` persist; writes that would have happened after the cancellation are lost.
+- External side effects (HTTP calls, DB writes) dispatched before the `.await` may have committed remotely but the response is never observed — the system cannot distinguish "never happened" from "happened but unacknowledged."
+- The cancelled system's **error and timeout edges are not invoked** — graph-level timeout bypasses node-dispatch entirely.
+- `OnSystemComplete` / `OnSystemError` hooks for the in-flight system do not fire. Only `OnGraphFailure` fires on the top-level graph, with `ExecutionError::GraphTimeout { elapsed, max }` — which does not identify which node was executing when the timeout fired.
+- For scope graphs using `ContextPolicy::shared()`, the parent context may retain partial writes from systems that ran before the timeout fired.
+
+This is distinct from **per-node timeout** (`SystemNodeBuilder::with_timeout` or `Graph::set_timeout(node_id, duration)`), which integrates with retry policies and timeout handler edges for structured recovery. Use per-node timeout when you need handler-based recovery; use graph-level timeout for hard time budgets.
 
 Subgraph execution (branches, loop bodies, case handlers) is recursive with depth tracking. The default recursion limit is 64.
 

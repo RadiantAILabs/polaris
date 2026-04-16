@@ -568,55 +568,69 @@ impl GraphExecutor {
 
             let entry = scope.graph.entry().ok_or(ExecutionError::EmptyGraph)?;
 
-            let count = match scope.context_policy.mode {
-                ContextMode::Shared => {
-                    self.execute_from(&scope.graph, ctx, entry, depth + 1, hooks, middleware)
-                        .await?
+            let execute_scope = async {
+                match scope.context_policy.mode {
+                    ContextMode::Shared => {
+                        self.execute_from(&scope.graph, ctx, entry, depth + 1, hooks, middleware)
+                            .await
+                    }
+                    ContextMode::Inherit => {
+                        let mut child = ctx.child();
+                        Self::forward_resources(scope, ctx, &mut child);
+                        let inner_count = self
+                            .execute_from(
+                                &scope.graph,
+                                &mut child,
+                                entry,
+                                depth + 1,
+                                hooks,
+                                middleware,
+                            )
+                            .await?;
+                        let child_outputs = child.take_outputs();
+                        drop(child);
+                        ctx.outputs_mut().merge_from(child_outputs);
+                        Ok(inner_count)
+                    }
+                    ContextMode::Isolated => {
+                        // Inherit globals (infrastructure resources) if present.
+                        // globals_arc() is None only when the root context was
+                        // created via SystemContext::new() (tests) — in that case
+                        // there are no globals to inherit.
+                        let mut child = if let Some(globals) = ctx.globals_arc() {
+                            SystemContext::with_globals(globals)
+                        } else {
+                            SystemContext::new()
+                        };
+                        Self::forward_resources(scope, ctx, &mut child);
+                        let inner_count = self
+                            .execute_from(
+                                &scope.graph,
+                                &mut child,
+                                entry,
+                                depth + 1,
+                                hooks,
+                                middleware,
+                            )
+                            .await?;
+                        let child_outputs = child.take_outputs();
+                        drop(child);
+                        ctx.outputs_mut().merge_from(child_outputs);
+                        Ok(inner_count)
+                    }
                 }
-                ContextMode::Inherit => {
-                    let mut child = ctx.child();
-                    Self::forward_resources(scope, ctx, &mut child);
-                    let inner_count = self
-                        .execute_from(
-                            &scope.graph,
-                            &mut child,
-                            entry,
-                            depth + 1,
-                            hooks,
-                            middleware,
-                        )
-                        .await?;
-                    let child_outputs = child.take_outputs();
-                    drop(child);
-                    ctx.outputs_mut().merge_from(child_outputs);
-                    inner_count
+            };
+
+            let count = if let Some(max) = scope.graph.max_duration {
+                match tokio::time::timeout(max, execute_scope).await {
+                    Ok(inner) => inner?,
+                    Err(_timeout) => {
+                        let elapsed = start.elapsed();
+                        return Err(ExecutionError::GraphTimeout { elapsed, max });
+                    }
                 }
-                ContextMode::Isolated => {
-                    // Inherit globals (infrastructure resources) if present.
-                    // globals_arc() is None only when the root context was
-                    // created via SystemContext::new() (tests) — in that case
-                    // there are no globals to inherit.
-                    let mut child = if let Some(globals) = ctx.globals_arc() {
-                        SystemContext::with_globals(globals)
-                    } else {
-                        SystemContext::new()
-                    };
-                    Self::forward_resources(scope, ctx, &mut child);
-                    let inner_count = self
-                        .execute_from(
-                            &scope.graph,
-                            &mut child,
-                            entry,
-                            depth + 1,
-                            hooks,
-                            middleware,
-                        )
-                        .await?;
-                    let child_outputs = child.take_outputs();
-                    drop(child);
-                    ctx.outputs_mut().merge_from(child_outputs);
-                    inner_count
-                }
+            } else {
+                execute_scope.await?
             };
 
             Self::invoke_hook::<OnScopeComplete>(
