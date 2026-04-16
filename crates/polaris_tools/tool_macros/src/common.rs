@@ -2,6 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::spanned::Spanned;
 use syn::{
     Attribute, Expr, ExprLit, FnArg, GenericArgument, Lit, Meta, Pat, PatType, PathArguments,
     ReturnType, Signature, Type,
@@ -104,6 +105,8 @@ pub(crate) struct ParamInfo {
     pub description: Option<String>,
     /// Default value expression from `#[default(expr)]`.
     pub default_expr: Option<TokenStream>,
+    /// Whether this parameter is injected from [`ToolContext`] rather than LLM args.
+    pub is_context: bool,
 }
 
 /// Extracts doc comment text from attributes.
@@ -140,13 +143,41 @@ pub(crate) fn parse_param(pat_type: &PatType) -> Option<ParamInfo> {
     let ty = (*pat_type.ty).clone();
     let description = extract_doc_comments(&pat_type.attrs);
     let default_expr = extract_default_expr(&pat_type.attrs);
+    let is_context = pat_type
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("context"));
 
     Some(ParamInfo {
         name,
         ty,
         description,
         default_expr,
+        is_context,
     })
+}
+
+/// Validates that `#[context]` parameters use supported type shapes.
+///
+/// Rejects nested `Option<Option<T>>` context params: the outer `Option` already
+/// expresses "optional context value," so wrapping it again is redundant and
+/// ambiguous in semantics.
+pub(crate) fn validate_context_params(params: &[ParamInfo]) -> Option<TokenStream> {
+    for param in params.iter().filter(|p| p.is_context) {
+        if let Some(inner) = unwrap_option_inner(&param.ty)
+            && unwrap_option_inner(inner).is_some()
+        {
+            return Some(
+                syn::Error::new(
+                    param.ty.span(),
+                    "#[context] parameter cannot be `Option<Option<T>>`; \
+                     use `Option<T>` for an optional context value",
+                )
+                .to_compile_error(),
+            );
+        }
+    }
+    None
 }
 
 /// Extracts the default value from `#[default(expr)]`.
@@ -202,14 +233,18 @@ pub(crate) fn to_pascal_case(s: &str) -> String {
 }
 
 /// Generates the `definition()` body for a tool, producing a `ToolDefinition`.
+///
+/// Only input parameters (non-`#[context]`) are included in the JSON schema.
 pub(crate) fn generate_definition(
     fn_name: &str,
     description: &str,
     params: &[ParamInfo],
     pt: &TokenStream,
 ) -> TokenStream {
+    // Only include input params in the schema — context params are invisible to the LLM
     let param_additions: Vec<_> = params
         .iter()
+        .filter(|p| !p.is_context)
         .map(|param| {
             let param_name_str = &param.name;
             let desc_code = param
@@ -272,6 +307,10 @@ pub(crate) fn generate_definition(
 ///
 /// `call_target` is the token stream for the function/method to call,
 /// e.g. `quote! { #impl_fn_name }` or `quote! { self.inner.#method_name }`.
+///
+/// Input parameters are extracted from `__args` (LLM-provided JSON).
+/// Context parameters (marked with `#[context]`) are extracted from
+/// `__ctx` ([`ToolContext`]).
 pub(crate) fn generate_execute(
     fn_name: &str,
     call_target: &TokenStream,
@@ -279,7 +318,9 @@ pub(crate) fn generate_execute(
     return_type: &ReturnType,
     pt: &TokenStream,
 ) -> TokenStream {
-    let call_preamble = if !params.is_empty() {
+    let has_input_params = params.iter().any(|p| !p.is_context);
+
+    let call_preamble = if has_input_params {
         quote! {
             let __call = #pt::FunctionCall::from_value(#fn_name, __args)?;
         }
@@ -291,22 +332,14 @@ pub(crate) fn generate_execute(
         .iter()
         .map(|param| {
             let param_ident = format_ident!("{}", &param.name);
-            let param_name_str = &param.name;
             let param_type = &param.ty;
 
-            if let Some(inner_type) = unwrap_option_inner(&param.ty) {
-                quote! {
-                    let #param_ident: #param_type = <#inner_type as #pt::FunctionParam>::extract_optional(&__call, #param_name_str)?;
-                }
-            } else if let Some(default_expr) = &param.default_expr {
-                quote! {
-                    let #param_ident: #param_type = <#param_type as #pt::FunctionParam>::extract_optional(&__call, #param_name_str)?
-                        .unwrap_or(#default_expr);
-                }
+            if param.is_context {
+                // Context parameter — extract from ToolContext
+                generate_context_extraction(&param_ident, param_type, pt)
             } else {
-                quote! {
-                    let #param_ident: #param_type = <#param_type as #pt::FunctionParam>::extract(&__call, #param_name_str)?;
-                }
+                // Input parameter — extract from LLM-provided JSON args
+                generate_input_extraction(param, pt)
             }
         })
         .collect();
@@ -340,5 +373,54 @@ pub(crate) fn generate_execute(
         #call_preamble
         #(#param_extractions)*
         #result_handling
+    }
+}
+
+/// Generates extraction code for a `#[context]` parameter from `__ctx`.
+///
+/// - `Option<T>` → `None` when absent (no error)
+/// - `T` → `ToolError::ResourceNotFound` when absent (requires `T: Clone`)
+fn generate_context_extraction(
+    param_ident: &proc_macro2::Ident,
+    param_type: &Type,
+    pt: &TokenStream,
+) -> TokenStream {
+    if let Some(inner_type) = unwrap_option_inner(param_type) {
+        // Option<T> context param — None when absent
+        quote! {
+            let #param_ident: #param_type = __ctx.get::<#inner_type>().cloned();
+        }
+    } else {
+        // Required context param — error when absent
+        quote! {
+            let #param_ident: #param_type = __ctx
+                .get::<#param_type>()
+                .cloned()
+                .ok_or_else(|| #pt::ToolError::resource_not_found(
+                    ::std::any::type_name::<#param_type>()
+                ))?;
+        }
+    }
+}
+
+/// Generates extraction code for an input parameter from `__call` (LLM JSON args).
+fn generate_input_extraction(param: &ParamInfo, pt: &TokenStream) -> TokenStream {
+    let param_ident = format_ident!("{}", &param.name);
+    let param_name_str = &param.name;
+    let param_type = &param.ty;
+
+    if let Some(inner_type) = unwrap_option_inner(&param.ty) {
+        quote! {
+            let #param_ident: #param_type = <#inner_type as #pt::FunctionParam>::extract_optional(&__call, #param_name_str)?;
+        }
+    } else if let Some(default_expr) = &param.default_expr {
+        quote! {
+            let #param_ident: #param_type = <#param_type as #pt::FunctionParam>::extract_optional(&__call, #param_name_str)?
+                .unwrap_or(#default_expr);
+        }
+    } else {
+        quote! {
+            let #param_ident: #param_type = <#param_type as #pt::FunctionParam>::extract(&__call, #param_name_str)?;
+        }
     }
 }

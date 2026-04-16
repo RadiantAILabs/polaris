@@ -15,7 +15,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_system_macros = { path = "system_macros", version = "0.2.2" }
+polaris_system_macros = { path = "system_macros", version = "0.3.0" }
 downcast-rs = "2.0.2"
 parking_lot = { version = "0.12.5", features = ["send_guard"] }
 thiserror = "2.0.17"

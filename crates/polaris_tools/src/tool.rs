@@ -1,5 +1,6 @@
 //! The core [`Tool`] trait for executable tools.
 
+use crate::context::ToolContext;
 use crate::error::ToolError;
 use crate::permission::ToolPermission;
 use polaris_models::llm::ToolDefinition;
@@ -10,12 +11,12 @@ use std::pin::Pin;
 ///
 /// Tools expose a [`ToolDefinition`] (name, description, JSON schema) for the LLM,
 /// and an async [`execute`](Tool::execute) method that runs with the tool's
-/// captured environment.
+/// captured environment and an optional [`ToolContext`] for per-invocation state.
 ///
 /// # Examples
 ///
 /// ```
-/// use polaris_tools::{Tool, ToolError};
+/// use polaris_tools::{Tool, ToolContext, ToolError};
 /// use polaris_models::llm::ToolDefinition;
 /// use serde_json::{json, Value};
 /// use std::pin::Pin;
@@ -34,10 +35,11 @@ use std::pin::Pin;
 ///         }
 ///     }
 ///
-///     fn execute(
-///         &self,
+///     fn execute<'ctx>(
+///         &'ctx self,
 ///         args: Value,
-///     ) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + '_>> {
+///         _ctx: &'ctx ToolContext,
+///     ) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'ctx>> {
 ///         Box::pin(async move { Ok(args) })
 ///     }
 /// }
@@ -58,11 +60,35 @@ pub trait Tool: Send + Sync + 'static {
         ToolPermission::Allow
     }
 
-    /// Executes the tool with JSON arguments.
-    fn execute(
-        &self,
+    /// Executes the tool with JSON arguments and per-invocation context.
+    ///
+    /// The [`ToolContext`] carries per-invocation state supplied by the
+    /// calling system — anything the tool needs that shouldn't appear in
+    /// the LLM-facing argument schema (e.g., a session ID, a working
+    /// directory, a dry-run flag, an opaque backend handle). Tools that
+    /// don't need per-invocation state can ignore the context parameter.
+    ///
+    /// For `#[tool]` macro-generated tools, context parameters are declared
+    /// with the `#[context]` attribute and extracted automatically.
+    ///
+    /// # Errors
+    ///
+    /// Implementations commonly return:
+    /// - [`ToolError::ParameterError`] or [`ToolError::SerializationError`]
+    ///   if `args` cannot be parsed into the tool's parameter types.
+    /// - [`ToolError::ResourceNotFound`] if a required `#[context]` value
+    ///   is not present in `ctx`.
+    /// - [`ToolError::ExecutionError`] if the tool body fails.
+    ///
+    /// [`ToolError::ParameterError`]: ToolError::ParameterError
+    /// [`ToolError::SerializationError`]: ToolError::SerializationError
+    /// [`ToolError::ResourceNotFound`]: ToolError::ResourceNotFound
+    /// [`ToolError::ExecutionError`]: ToolError::ExecutionError
+    fn execute<'ctx>(
+        &'ctx self,
         args: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>;
+        ctx: &'ctx ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>>;
 }
 
 #[cfg(test)]
@@ -80,10 +106,11 @@ mod tests {
             }
         }
 
-        fn execute(
-            &self,
+        fn execute<'ctx>(
+            &'ctx self,
             _args: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>
+            _ctx: &'ctx ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>>
         {
             Box::pin(async { Ok(serde_json::json!("ok")) })
         }
@@ -93,5 +120,11 @@ mod tests {
     fn default_permission_is_allow() {
         let tool = DummyTool;
         assert_eq!(tool.permission(), ToolPermission::Allow);
+    }
+
+    #[test]
+    fn tool_is_dyn_compatible() {
+        let _boxed: Box<dyn Tool> = Box::new(DummyTool);
+        let _arced: std::sync::Arc<dyn Tool> = std::sync::Arc::new(DummyTool);
     }
 }

@@ -266,8 +266,12 @@ impl TracingPlugin {
     /// `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`.
     ///
     /// These attributes may be large and can contain sensitive data.
+    /// Tool arguments and results are captured verbatim — a tool that
+    /// returns or receives credentials (auth tokens, API keys), PII, or
+    /// other secret material will have those values recorded on the span.
     /// Enable only when the configured trace backend is an appropriate
-    /// destination for such data.
+    /// destination for such data, or ensure tools scrub sensitive fields
+    /// from their inputs and outputs before returning.
     ///
     /// Disabled by default.
     #[must_use]
@@ -279,7 +283,7 @@ impl TracingPlugin {
 
 impl Plugin for TracingPlugin {
     const ID: &'static str = "polaris::tracing";
-    const VERSION: Version = Version::new(0, 0, 1);
+    const VERSION: Version = Version::new(0, 1, 0);
 
     fn build(&self, server: &mut Server) {
         server.insert_global(TracingConfig { level: self.level });
@@ -440,6 +444,7 @@ mod tests {
     #[cfg(feature = "tools_tracing")]
     mod tools_tracing_tests {
         use super::*;
+        use polaris_tools::ToolContext;
         use polaris_tools::permission::ToolPermission;
         use polaris_tools::tool::Tool;
         use polaris_tools::{ToolError, ToolRegistry, ToolsPlugin};
@@ -457,10 +462,11 @@ mod tests {
                 }
             }
 
-            fn execute(
-                &self,
+            fn execute<'ctx>(
+                &'ctx self,
                 _args: serde_json::Value,
-            ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>
+                _ctx: &'ctx ToolContext,
+            ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>>
             {
                 Box::pin(async { Ok(serde_json::json!("ok")) })
             }

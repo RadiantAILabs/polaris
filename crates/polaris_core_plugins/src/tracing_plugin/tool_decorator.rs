@@ -5,6 +5,7 @@
 
 use polaris_models::llm::ToolDefinition;
 use polaris_tools::ToolError;
+use polaris_tools::context::ToolContext;
 use polaris_tools::tool::Tool;
 use std::future::Future;
 use std::pin::Pin;
@@ -32,10 +33,11 @@ impl Tool for TracingTool {
         self.inner.definition()
     }
 
-    fn execute(
-        &self,
+    fn execute<'ctx>(
+        &'ctx self,
         args: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        ctx: &'ctx ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>> {
         let def = self.inner.definition();
         let span_name = format!("execute_tool {}", def.name);
         let span = tracing::info_span!(
@@ -62,7 +64,7 @@ impl Tool for TracingTool {
                     current.record("gen_ai.tool.call.arguments", args.to_string().as_str());
                 }
 
-                let result = inner.execute(args).await;
+                let result = inner.execute(args, ctx).await;
 
                 match &result {
                     Ok(value) => {
@@ -73,13 +75,16 @@ impl Tool for TracingTool {
                     }
                     Err(tool_err) => {
                         let current = tracing::Span::current();
+                        let error_type = tool_err.error_type();
                         if capture_genai_content {
-                            current
-                                .record("gen_ai.tool.call.result", tool_err.to_string().as_str());
+                            let message = tool_err.to_string();
+                            current.record("gen_ai.tool.call.result", message.as_str());
+                            current.record("otel.status_description", message.as_str());
+                        } else {
+                            current.record("otel.status_description", error_type);
                         }
-                        current.record("error.type", tool_err.error_type());
+                        current.record("error.type", error_type);
                         current.record("otel.status_code", "ERROR");
-                        current.record("otel.status_description", tool_err.to_string().as_str());
                     }
                 }
 

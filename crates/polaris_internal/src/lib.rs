@@ -64,8 +64,8 @@ pub mod prelude {
     pub use polaris_graph::prelude::*;
     pub use polaris_system::prelude::*;
     pub use polaris_tools::{
-        LlmReasonExt, LlmRequestBuilderExt, ReasonError, Tool, ToolError, ToolRegistry,
-        ToolsPlugin, Toolset,
+        LlmReasonExt, LlmRequestBuilderExt, ReasonError, Tool, ToolContext, ToolError,
+        ToolRegistry, ToolsPlugin, Toolset,
     };
 }
 

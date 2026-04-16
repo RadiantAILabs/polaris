@@ -28,16 +28,16 @@ otel = ["polaris_core_plugins/otel"]
 sessions-http = ["polaris_sessions/http"]
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.2.2" }
-polaris_graph = { path = "../polaris_graph", version = "0.2.2" }
-polaris_agent = { path = "../polaris_agent", version = "0.2.2" }
-polaris_tools = { path = "../polaris_tools", version = "0.2.2" }
-polaris_model_providers = { path = "../polaris_model_providers", version = "0.2.2" }
-polaris_models = { path = "../polaris_models", version = "0.2.2" }
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.2.2" }
-polaris_sessions = { path = "../polaris_sessions", version = "0.2.2" }
-polaris_shell = { path = "../polaris_shell", version = "0.2.2" }
-polaris_app = { path = "../polaris_app", version = "0.2.2" }
+polaris_system = { path = "../polaris_system", version = "0.3.0" }
+polaris_graph = { path = "../polaris_graph", version = "0.3.0" }
+polaris_agent = { path = "../polaris_agent", version = "0.3.0" }
+polaris_tools = { path = "../polaris_tools", version = "0.3.0" }
+polaris_model_providers = { path = "../polaris_model_providers", version = "0.3.0" }
+polaris_models = { path = "../polaris_models", version = "0.3.0" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.3.0" }
+polaris_sessions = { path = "../polaris_sessions", version = "0.3.0" }
+polaris_shell = { path = "../polaris_shell", version = "0.3.0" }
+polaris_app = { path = "../polaris_app", version = "0.3.0" }
 
 [lints]
 workspace = true

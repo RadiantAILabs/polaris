@@ -18,6 +18,9 @@ use proc_macro::TokenStream;
 ///
 /// - `/// doc comment` — becomes the parameter's description in JSON schema
 /// - `#[default(value)]` — makes the parameter optional with a default value
+/// - `#[context]` — extracts the parameter from [`ToolContext`] instead of LLM
+///   arguments; the parameter does not appear in the JSON schema and requires
+///   `T: Clone`. Use `Option<T>` for optional context values.
 ///
 /// # Example
 ///
