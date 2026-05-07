@@ -37,6 +37,9 @@
 //! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 pub mod api;
+#[cfg(feature = "dashboard")]
+#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
+pub mod dashboard;
 pub mod error;
 pub mod guard;
 #[cfg(feature = "http")]
@@ -45,6 +48,9 @@ pub mod info;
 pub mod store;
 
 pub use api::{SessionsAPI, SessionsPlugin};
+#[cfg(feature = "dashboard")]
+#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
+pub use dashboard::SessionsDashboardPlugin;
 pub use error::SessionError;
 pub use guard::SessionGuard;
 #[cfg(feature = "http")]

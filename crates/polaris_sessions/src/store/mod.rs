@@ -12,6 +12,8 @@ use crate::error::SessionError;
 use polaris_system::system::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+#[cfg(feature = "typegen")]
+use ts_rs::TS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SessionId
@@ -36,6 +38,7 @@ use std::fmt;
 /// assert_eq!(format!("{id}"), "session_my-session-1");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(TS), ts(export))]
 pub struct SessionId(String);
 
 impl SessionId {
@@ -105,7 +108,8 @@ impl fmt::Display for SessionId {
 /// assert_eq!(id.as_str(), "ReActAgent");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub struct AgentTypeId(&'static str);
+#[cfg_attr(feature = "typegen", derive(TS), ts(export))]
+pub struct AgentTypeId(#[cfg_attr(feature = "typegen", ts(type = "string"))] &'static str);
 
 impl AgentTypeId {
     /// Creates an [`AgentTypeId`] from an agent name.

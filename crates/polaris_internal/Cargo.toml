@@ -26,18 +26,35 @@ tools-tracing = ["polaris_core_plugins/tools_tracing"]
 tiktoken = ["polaris_models/tiktoken"]
 otel = ["polaris_core_plugins/otel"]
 sessions-http = ["polaris_sessions/http"]
+# Pulls `polaris_dashboard` (and its `axum` runtime dep) into the dep
+# graph and re-exports it as `polaris_internal::dashboard`. Implied by
+# every `*-dashboard` feature so plugin contributions always compile
+# alongside the registry they target.
+dashboard-registry = ["dep:polaris_dashboard"]
+typegen = ["polaris_sessions/typegen", "dashboard-registry", "polaris_dashboard/typegen"]
+sessions-dashboard = ["dashboard-registry", "polaris_sessions/dashboard"]
+tools-dashboard = ["dashboard-registry", "polaris_tools/dashboard"]
+models-dashboard = ["dashboard-registry", "polaris_models/dashboard"]
+tracing-dashboard = ["dashboard-registry", "polaris_core_plugins/dashboard"]
+dashboard = [
+    "sessions-dashboard",
+    "tools-dashboard",
+    "models-dashboard",
+    "tracing-dashboard",
+]
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.3.0" }
-polaris_graph = { path = "../polaris_graph", version = "0.3.0" }
-polaris_agent = { path = "../polaris_agent", version = "0.3.0" }
-polaris_tools = { path = "../polaris_tools", version = "0.3.0" }
-polaris_model_providers = { path = "../polaris_model_providers", version = "0.3.0" }
-polaris_models = { path = "../polaris_models", version = "0.3.0" }
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.3.0" }
-polaris_sessions = { path = "../polaris_sessions", version = "0.3.0" }
-polaris_shell = { path = "../polaris_shell", version = "0.3.0" }
-polaris_app = { path = "../polaris_app", version = "0.3.0" }
+polaris_system = { path = "../polaris_system", version = "0.4.0" }
+polaris_graph = { path = "../polaris_graph", version = "0.4.0" }
+polaris_agent = { path = "../polaris_agent", version = "0.4.0" }
+polaris_tools = { path = "../polaris_tools", version = "0.4.0" }
+polaris_model_providers = { path = "../polaris_model_providers", version = "0.4.0" }
+polaris_models = { path = "../polaris_models", version = "0.4.0" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4.0" }
+polaris_sessions = { path = "../polaris_sessions", version = "0.4.0" }
+polaris_shell = { path = "../polaris_shell", version = "0.4.0" }
+polaris_app = { path = "../polaris_app", version = "0.4.0", default-features = false }
+polaris_dashboard = { path = "../polaris_dashboard", version = "0.4.0", optional = true }
 
 [lints]
 workspace = true

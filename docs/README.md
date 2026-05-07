@@ -14,7 +14,7 @@
 - [**Plugins**](./reference/plugins.md) — Plugin system and compositional architecture
 - [**APIs**](./reference/api.md) — Capability registration for shared behaviours across plugins
 - [**Sessions**](./reference/sessions.md) — SessionsAPI, turn execution, checkpoints, persistence
-- [**HTTP Integration**](./reference/http.md) — HTTP handlers, DeferredState, HttpIOProvider, route registration
+- [**HTTP Integration**](./reference/http.md) — HTTP handlers, deferred router construction, HttpIOProvider, route registration
 - [**Scheduling**](./reference/scheduling.md) — Server lifecycle, tick scheduling, plugin update ordering
 - [**Data Flow Patterns**](./reference/data-flow.md) — Choosing between `Res<T>`, `ResMut<T>`, and `Out<T>`
 - [**Tools**](./reference/tools.md) — Tool definitions, `ToolRegistry`, permission model

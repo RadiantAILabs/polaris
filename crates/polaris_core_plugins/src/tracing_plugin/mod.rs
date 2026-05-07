@@ -11,14 +11,22 @@
 
 mod fmt_layer;
 pub use fmt_layer::FmtConfig;
+#[cfg(feature = "dashboard")]
+mod dashboard;
 #[cfg(feature = "models_tracing")]
 mod genai_content;
 #[cfg(feature = "graph_tracing")]
 mod graph_middleware;
 #[cfg(feature = "models_tracing")]
 mod llm_decorator;
+#[cfg(feature = "dashboard")]
+mod span_buffer;
 #[cfg(feature = "tools_tracing")]
 mod tool_decorator;
+#[cfg(feature = "dashboard")]
+pub use dashboard::{SpansResponse, TracingDashboardPlugin};
+#[cfg(feature = "dashboard")]
+pub use span_buffer::{SpanBuffer, SpanBufferLayer, SpanKind, SpanRecord};
 
 use crate::ServerInfoPlugin;
 #[cfg(feature = "models_tracing")]

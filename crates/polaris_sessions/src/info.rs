@@ -3,6 +3,8 @@
 use crate::store::{AgentTypeId, SessionId, TurnNumber};
 use polaris_system::resource::LocalResource;
 use serde::Serialize;
+#[cfg(feature = "typegen")]
+use ts_rs::TS;
 
 /// Metadata about the current session, injected into the context
 /// at the start of each [`process_turn`](crate::api::SessionsAPI::process_turn).
@@ -21,6 +23,7 @@ impl LocalResource for SessionInfo {}
 
 /// Status of a live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SessionStatus {
@@ -31,12 +34,14 @@ pub enum SessionStatus {
 /// Metadata about a session returned by
 /// [`SessionsAPI::session_info`](crate::api::SessionsAPI::session_info).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(TS), ts(export))]
 pub struct SessionMetadata {
     /// The session's unique identifier.
     pub session_id: SessionId,
     /// The type of the agent that owns this session.
     pub agent_type: AgentTypeId,
     /// The current turn number.
+    #[cfg_attr(feature = "typegen", ts(type = "number"))]
     pub turn_number: TurnNumber,
     /// ISO 8601 UTC timestamp of when the session was created.
     pub created_at: String,

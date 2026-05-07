@@ -3,3 +3,9 @@ git-fetch-with-cli = true
 
 [env]
 TRYBUILD = "overwrite"
+# `ts-rs` writes generated TypeScript bindings into the TypeScript package's
+# `src/` directory. Resolved relative to this config file (workspace root) so
+# paths stay stable regardless of which crate `cargo test --features typegen`
+# is run from. The `bindings/` parent is reserved for additional language
+# targets (e.g. `bindings/python/`) in the future.
+TS_RS_EXPORT_DIR = { value = "bindings/ts/src", relative = true }

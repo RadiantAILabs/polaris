@@ -28,7 +28,7 @@
 //! |-------|------|---------|-------|
 //! | **1** | System Framework | [`system`] | Systems, resources, plugins, server |
 //! | **2** | Graph Execution | [`graph`], [`agent`] | Directed-graph model, agent trait |
-//! | **3** | Plugins | [`tools`], [`models`], [`plugins`], [`sessions`], [`app`], [`shell`] | LLM providers, tools, HTTP, sessions |
+//! | **3** | Plugins | [`tools`], [`models`], [`plugins`], [`sessions`], [`app`], [`shell`], [`dashboard`] | LLM providers, tools, HTTP, sessions, dashboard contributions |
 //!
 //! **Layer 1** provides the ECS-inspired primitives: systems as pure async
 //! functions, resources as shared state, dependency injection via typed
@@ -191,8 +191,8 @@
 //! |------|---------|-------------|
 //! | Run one-shot agent | `sessions.run_oneshot(&agent_type, \|ctx\| { ... })` | [`sessions`] |
 //! | Multi-turn with cleanup | `sessions.scoped_session(&agent_type, \|ctx\| { ... })` | [`sessions`] |
-//! | Execute agent from HTTP | `DeferredState` → `SessionsAPI` → `HttpIOProvider` | [`app`] |
-//! | Register HTTP routes | `server.api::<HttpRouter>().add_routes(router)` | [`app`] |
+//! | Execute agent from HTTP | `HttpRouter::add_routes_with` → `SessionsAPI` → `HttpIOProvider` | [`app`] |
+//! | Register HTTP routes | `server.api::<HttpRouter>().add_routes(router)` (stateless) / `add_routes_with(\|server\| ...)` (stateful) | [`app`] |
 //! | Add tools for LLM | `#[tool]` macro + `ToolRegistry` | [`tools`] |
 //! | Add model provider | Implement `LlmProvider` + register via plugin | [`models`] |
 //! | Handle system errors | Fallible system + error edge + `ErrOut<CaughtError>` | [`graph`] |
@@ -211,6 +211,7 @@
 //! | [`sessions`] | `polaris_sessions` | Session management and orchestration |
 //! | [`shell`] | `polaris_shell` | Shell command execution with permission model |
 //! | [`app`] | `polaris_app` | HTTP server runtime with plugin integration |
+//! | [`dashboard`] | `polaris_dashboard` | Cross-plugin dashboard contribution registry |
 //!
 //! # Exploration Map
 //!
@@ -352,4 +353,11 @@ pub mod shell {
 pub mod app {
     #[doc(inline)]
     pub use polaris_internal::app::*;
+}
+
+#[cfg(feature = "dashboard-registry")]
+#[doc = include_str!("docs/dashboard.md")]
+pub mod dashboard {
+    #[doc(inline)]
+    pub use polaris_internal::dashboard::*;
 }

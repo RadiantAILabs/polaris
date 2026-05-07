@@ -50,6 +50,11 @@ pub use polaris_shell;
 /// HTTP server runtime.
 pub use polaris_app;
 
+/// Cross-plugin dashboard contribution registry (opt-in via the
+/// `dashboard-registry` feature, or any `*-dashboard` umbrella).
+#[cfg(feature = "dashboard-registry")]
+pub use polaris_dashboard;
+
 /// Re-export all common types for easy access.
 ///
 /// # Examples
@@ -113,4 +118,10 @@ pub mod shell {
 /// Re-export all app-related types for easy access.
 pub mod app {
     pub use polaris_app::*;
+}
+
+/// Re-export all dashboard-registry types for easy access.
+#[cfg(feature = "dashboard-registry")]
+pub mod dashboard {
+    pub use polaris_dashboard::*;
 }

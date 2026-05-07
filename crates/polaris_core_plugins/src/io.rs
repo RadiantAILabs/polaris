@@ -242,6 +242,20 @@ pub trait IOProvider: Send + Sync + 'static {
     fn stream(&self) -> impl Future<Output = Result<IOStream, IOError>> + Send + '_ {
         async { Err(IOError::Unsupported("streaming not supported".into())) }
     }
+
+    /// Closes the provider's output channel.
+    ///
+    /// After this call, [`send`](Self::send) should return
+    /// [`IOError::Closed`] and any receiver watching the output channel
+    /// should observe stream termination.
+    ///
+    /// The default implementation is a no-op, which is correct for
+    /// providers whose channel lifetime is managed externally (e.g.
+    /// terminal I/O). Providers that own channel senders override this to drop
+    /// the sender half.
+    fn close(&self) -> impl Future<Output = ()> + Send + '_ {
+        async {}
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +282,9 @@ trait ErasedProvider: Send + Sync + 'static {
     fn stream_erased(
         &self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<IOStream, IOError>> + Send + '_>>;
+
+    /// Closes the provider's output channel (type-erased).
+    fn close_erased(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Automatically implement object safe trait `ErasedProvider` for any `IOProvider`.
@@ -291,6 +308,10 @@ impl<T: IOProvider> ErasedProvider for T {
         &self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<IOStream, IOError>> + Send + '_>> {
         Box::pin(self.stream())
+    }
+
+    fn close_erased(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.close())
     }
 }
 
@@ -440,6 +461,18 @@ impl UserIO {
     /// Returns [`IOError::Unsupported`] if the provider does not support streaming.
     pub async fn stream(&self) -> Result<IOStream, IOError> {
         self.provider.stream_erased().await
+    }
+
+    /// Closes the provider's output channel.
+    ///
+    /// After this call, subsequent [`send`](Self::send) calls return
+    /// [`IOError::Closed`] and receivers see stream termination. Used by
+    /// streaming HTTP handlers to signal that a turn has finished and the
+    /// SSE stream should close.
+    ///
+    /// The default [`IOProvider`] implementation is a no-op.
+    pub async fn close(&self) {
+        self.provider.close_erased().await;
     }
 }
 

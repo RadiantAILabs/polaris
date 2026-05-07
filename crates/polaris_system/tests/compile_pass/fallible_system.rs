@@ -1,4 +1,4 @@
-use polaris_system::param::{Res, SystemContext};
+use polaris_system::param::Res;
 use polaris_system::prelude::SystemError;
 use polaris_system::resource::LocalResource;
 use polaris_system::system;
@@ -19,9 +19,7 @@ struct CounterOutput {
 #[system]
 async fn fallible_read(counter: Res<Counter>) -> Result<CounterOutput, SystemError> {
     if counter.count < 0 {
-        return Err(SystemError::ExecutionError(
-            "negative count".to_string(),
-        ));
+        return Err(SystemError::ExecutionError("negative count".to_string()));
     }
     Ok(CounterOutput {
         value: counter.count,
@@ -29,8 +27,8 @@ async fn fallible_read(counter: Res<Counter>) -> Result<CounterOutput, SystemErr
 }
 
 fn main() {
-    use std::any::TypeId;
     use polaris_system::system::ErasedSystem;
+    use std::any::TypeId;
 
     let system = fallible_read();
 

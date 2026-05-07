@@ -32,7 +32,9 @@ The graph is the agent. Its full topology is inspectable, individual nodes can b
 
 The Polaris server is a plugin orchestrator. Every capability, including logging, tracing, I/O, tool execution, memory, and LLM providers, is delivered through plugins that are registered at startup.
 
-This means that every component is replaceable, testable in isolation, and optional. Any implementation can be swapped with minimal conflicts. This makes it practical to experiment with alternatives, run different configurations in parallel, and package stable designs as reusable modules
+Plugins are the unit of composition. Each one is a small, self-contained building block with a narrow responsibility, and complex agentic applications are assembled by snapping these blocks together — much like Lego. A plugin exposes resources and APIs that other plugins can consume, which lets higher-level capabilities be built from lower-level ones without either side knowing about the other's internals. The result is an ecosystem where small pieces combine into arbitrarily sophisticated systems, and where the same building block can be reused across very different assemblies.
+
+Because every component is replaceable, testable in isolation, and optional, developers can mix and match the plugins they need, swap any implementation with minimal conflicts, and evolve their architecture incrementally. This makes it practical to experiment with alternatives, run different configurations in parallel, and package stable designs as reusable modules — turning proven compositions into new building blocks for the next layer of the system.
 
 ---
 

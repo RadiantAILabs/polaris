@@ -6,10 +6,10 @@
 #![cfg(feature = "http")]
 
 use polaris_agent::Agent;
-use polaris_app::HttpIOProvider;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin};
 use polaris_core_plugins::{IOContent, IOMessage, UserIO};
 use polaris_graph::graph::Graph;
+use polaris_sessions::http::HttpIOProvider;
 use polaris_sessions::store::memory::InMemoryStore;
 use polaris_sessions::store::{AgentTypeId, SessionId};
 use polaris_sessions::{SessionError, SessionsAPI, SessionsPlugin};
@@ -106,7 +106,7 @@ async fn turn_echo_round_trip() {
     let id = SessionId::new();
     create_session(&server, &id, "EchoAgent");
 
-    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32);
+    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32, 32);
     let provider = Arc::new(provider);
 
     input_tx.send(IOMessage::user_text("hello")).await.unwrap();
@@ -160,7 +160,7 @@ async fn turn_concurrent_returns_busy() {
     let id = SessionId::new();
     create_session(&server, &id, "BlockingAgent");
 
-    let (provider, input_tx, _output_rx) = HttpIOProvider::new(32);
+    let (provider, input_tx, _output_rx) = HttpIOProvider::new(32, 32);
     let provider = Arc::new(provider);
 
     input_tx.send(IOMessage::user_text("first")).await.unwrap();

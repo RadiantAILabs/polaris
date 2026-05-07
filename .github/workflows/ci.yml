@@ -43,3 +43,12 @@ jobs:
 
       - name: Check examples
         run: cargo check --manifest-path examples/Cargo.toml
+
+      - name: Verify generated TS bindings are up to date
+        run: |
+          if [ -n "$(git status --porcelain bindings/)" ]; then
+            echo "::error::Generated bindings/ are stale. Run 'cargo test --features typegen' and commit the result."
+            git status --porcelain bindings/
+            git diff bindings/
+            exit 1
+          fi

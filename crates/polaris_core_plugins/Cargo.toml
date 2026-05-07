@@ -19,11 +19,11 @@ rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.3.0" }
-polaris_graph = { path = "../polaris_graph", version = "0.3.0" }
-polaris_models = { path = "../polaris_models", version = "0.3.0", optional = true }
-polaris_tools = { path = "../polaris_tools", version = "0.3.0", optional = true }
-persistence_macros = { path = "persistence_macros", version = "0.3.0" }
+polaris_system = { path = "../polaris_system", version = "0.4.0" }
+polaris_graph = { path = "../polaris_graph", version = "0.4.0" }
+polaris_models = { path = "../polaris_models", version = "0.4.0", optional = true }
+polaris_tools = { path = "../polaris_tools", version = "0.4.0", optional = true }
+persistence_macros = { path = "persistence_macros", version = "0.4.0" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,6 +31,10 @@ parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+polaris_app = { path = "../polaris_app", version = "0.4.0", optional = true, default-features = false }
+polaris_dashboard = { path = "../polaris_dashboard", version = "0.4.0", optional = true }
+axum = { version = "0.8", features = ["tokio"], optional = true }
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.31", features = [
     "rt-tokio",
@@ -44,6 +48,7 @@ tokio-test = "0.4"
 
 [features]
 default = []
+dashboard = ["dep:axum", "dep:chrono", "dep:polaris_app", "dep:polaris_dashboard"]
 otel = [
     "opentelemetry",
     "opentelemetry_sdk",

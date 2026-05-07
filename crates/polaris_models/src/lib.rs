@@ -48,12 +48,18 @@
 // Self-reference so tool macros can use `polaris_models::` paths within this crate.
 extern crate self as polaris_models;
 
+#[cfg(feature = "dashboard")]
+#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
+pub mod dashboard;
 pub mod error;
 pub mod llm;
 mod plugin;
 mod registry;
 pub mod tokenizer;
 
+#[cfg(feature = "dashboard")]
+#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
+pub use dashboard::ModelsDashboardPlugin;
 pub use plugin::ModelsPlugin;
 pub use registry::ModelRegistry;
 pub use tokenizer::{Tokenizer, TokenizerPlugin};

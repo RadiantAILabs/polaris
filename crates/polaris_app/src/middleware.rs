@@ -28,7 +28,7 @@ pub(crate) fn apply_middleware(
     config: &AppConfig,
     auth: Option<Arc<dyn AuthProvider>>,
 ) -> axum::Router {
-    let cors = build_cors_layer(config);
+    let cors = build_cors_layer(config, auth.is_some());
 
     let router = router
         .layer(PropagateHeaderLayer::new(X_REQUEST_ID.clone()))
@@ -167,14 +167,18 @@ fn record_status(span: &tracing::Span, status: u16) {
 
 /// Builds the CORS layer from config.
 ///
-/// If no origins are configured, allows any origin.
-/// Always allows `Content-Type` header and common HTTP methods.
-fn build_cors_layer(config: &AppConfig) -> CorsLayer {
+/// Resolution order:
+/// 1. If explicit origins are configured, allow only those.
+/// 2. If `with_allow_any_cors_origin()` was called, allow any origin.
+/// 3. If an [`AuthProvider`] is registered, panic — wildcard CORS would
+///    expose authenticated endpoints cross-origin without the operator
+///    explicitly opting in.
+/// 4. Otherwise (no origins, no auth) emit a warning and fall back to
+///    `AllowOrigin::any()` so unauthenticated demo / dev paths keep working.
+fn build_cors_layer(config: &AppConfig, has_auth: bool) -> CorsLayer {
     let origins = config.cors_origins();
 
-    let allow_origin = if origins.is_empty() {
-        AllowOrigin::any()
-    } else {
+    let allow_origin = if !origins.is_empty() {
         let parsed: Vec<_> = origins
             .iter()
             .filter_map(|origin| match origin.parse() {
@@ -190,6 +194,22 @@ fn build_cors_layer(config: &AppConfig) -> CorsLayer {
             })
             .collect();
         AllowOrigin::list(parsed)
+    } else if config.allow_any_cors_origin() {
+        AllowOrigin::any()
+    } else if has_auth {
+        panic!(
+            "AppConfig has no CORS origins configured and an AuthProvider is registered — \
+             refusing to start with `Access-Control-Allow-Origin: *` on authenticated routes. \
+             Configure explicit origins via `with_cors_origin(..)` or call \
+             `with_allow_any_cors_origin()` to opt in deliberately."
+        );
+    } else {
+        tracing::warn!(
+            "AppConfig has no CORS origins configured; defaulting to `Access-Control-Allow-Origin: *`. \
+             Set explicit origins via `with_cors_origin(..)` for production, or call \
+             `with_allow_any_cors_origin()` to silence this warning."
+        );
+        AllowOrigin::any()
     };
 
     CorsLayer::new()
@@ -203,9 +223,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_allows_any_origin() {
+    fn default_config_without_auth_allows_any_origin_with_warning() {
         let config = AppConfig::default();
-        let _cors = build_cors_layer(&config);
+        let _cors = build_cors_layer(&config, false);
+    }
+
+    #[test]
+    fn explicit_opt_in_allows_any_origin_even_with_auth() {
+        let config = AppConfig::new().with_allow_any_cors_origin();
+        let _cors = build_cors_layer(&config, true);
     }
 
     #[test]
@@ -213,6 +239,19 @@ mod tests {
         let config = AppConfig::new()
             .with_cors_origin("http://localhost:3000")
             .with_cors_origin("https://example.com");
-        let _cors = build_cors_layer(&config);
+        let _cors = build_cors_layer(&config, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "AuthProvider is registered")]
+    fn auth_without_explicit_origins_panics() {
+        let config = AppConfig::default();
+        let _ = build_cors_layer(&config, true);
+    }
+
+    #[test]
+    fn auth_with_explicit_origins_is_accepted() {
+        let config = AppConfig::new().with_cors_origin("https://example.com");
+        let _cors = build_cors_layer(&config, true);
     }
 }

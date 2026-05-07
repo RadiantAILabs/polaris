@@ -1,4 +1,4 @@
-use polaris_system::param::{Res, SystemContext};
+use polaris_system::param::Res;
 use polaris_system::resource::LocalResource;
 use polaris_system::system;
 use polaris_system::system::System;

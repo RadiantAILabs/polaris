@@ -61,57 +61,50 @@ server.api::<HttpRouter>()
 
 The `AuthProvider` trait is synchronous. For async auth, register a Tower layer directly on your router instead.
 
-## The DeferredState Pattern
+## Deferred Router Construction
 
-The core challenge: routes are registered in `build()`, but the APIs they need (e.g., `SessionsAPI`) are only available in `ready()`. The `DeferredState` pattern bridges this gap using `Arc<OnceLock<T>>`.
+The core challenge: routes are registered in `build()`, but the APIs they need (e.g., `SessionsAPI`) are registered by *other* plugins' `build()` methods, and may not exist yet. `HttpRouter::add_routes_with` solves this by accepting a closure that runs during `AppPlugin::ready()`, once every plugin has finished `build()` and all APIs are resolvable.
 
 ```rust
-use std::sync::{Arc, OnceLock};
-
-pub(crate) type DeferredState = Arc<OnceLock<SessionsAPI>>;
-
-pub struct MyHttpPlugin {
-    state: DeferredState,
-}
-
 impl Plugin for MyHttpPlugin {
     fn build(&self, server: &mut Server) {
-        let state = Arc::clone(&self.state);
-        let router = Router::new()
-            .route("/my-endpoint", get(my_handler))
-            .with_state(state);  // axum receives the Arc<OnceLock<...>>
-
-        server.api::<HttpRouter>().unwrap().add_routes(router);
+        server.api::<HttpRouter>().unwrap().add_routes_with(|server| {
+            let sessions = server.api::<SessionsAPI>().unwrap().clone();
+            Router::new()
+                .route("/my-endpoint", get(my_handler))
+                .with_state(sessions)  // strongly-typed state
+        });
     }
 
-    async fn ready(&self, server: &mut Server) {
-        // Now the API is available — fill the OnceLock
-        let api = server.api::<SessionsAPI>().unwrap().clone();
-        self.state.set(api).expect("ready() called once");
+    fn dependencies(&self) -> Vec<PluginId> {
+        vec![
+            PluginId::of::<AppPlugin>(),
+            PluginId::of::<SessionsPlugin>(),
+        ]
     }
 }
 
-// Handler extracts the deferred state
 async fn my_handler(
-    State(deferred): State<DeferredState>,
+    State(sessions): State<SessionsAPI>,
 ) -> Result<Json<MyResponse>, ApiError> {
-    let sessions = deferred.get().ok_or(ApiError::NotReady)?; // 503 if not ready
-    // ... use sessions
+    // `sessions` is always initialized — no "not ready" branch needed.
 }
 ```
 
-This pattern is used by `polaris_sessions::HttpPlugin` for all session REST endpoints.
+Use `add_routes` for stateless fragments (`/healthz`, static content) and `add_routes_with` whenever the router's state comes from another plugin's API. `polaris_sessions::HttpPlugin` uses this pattern for all session REST endpoints.
+
+**Note:** builders are drained once during `AppPlugin::ready()`. Calling `add_routes` or `add_routes_with` *from* a builder closure has no effect — register everything for your plugin before returning the `Router`.
 
 ## HttpIOProvider: Bridging HTTP to Agent IO
 
 `HttpIOProvider` connects an HTTP handler to the agent's `UserIO` abstraction via tokio channels. The handler pre-loads user input and collects agent output.
 
 ```rust
-use polaris_app::HttpIOProvider;
+use polaris_sessions::http::HttpIOProvider;
 use polaris_core_plugins::{IOMessage, UserIO};
 
 // 1. Create channels
-let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1);
+let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, 64);
 let provider = Arc::new(provider);
 
 // 2. Send user message, then close input
@@ -228,7 +221,7 @@ Here is the complete flow from the sessions `HttpPlugin` handler:
 ```text
 HTTP POST /v1/sessions/{id}/turns
   │
-  ├── 1. Extract DeferredState → get SessionsAPI (503 if not ready)
+  ├── 1. Extract State<SessionsAPI> (injected at router-build time)
   ├── 2. Create HttpIOProvider (input_tx, output_rx)
   ├── 3. Send user message via input_tx, drop sender
   ├── 4. Call sessions.try_process_turn_with()
@@ -248,15 +241,14 @@ The canonical example is `polaris_sessions::http::handlers::process_turn`:
 
 ```rust
 pub(crate) async fn process_turn(
-    State(deferred): State<DeferredState>,
+    State(sessions): State<SessionsAPI>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<ProcessTurnRequest>,
 ) -> Result<Json<ProcessTurnResponse>, ApiError> {
-    let sessions = get_sessions(&deferred)?;
     let session_id = SessionId::from_string(id);
 
-    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1);
+    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, 64);
     let provider = Arc::new(provider);
 
     input_tx.send(IOMessage::user_text(body.message)).await
@@ -292,35 +284,26 @@ pub(crate) async fn process_turn(
 
 To add your own endpoints that interact with Polaris resources:
 
-### Step 1: Define your plugin with deferred state
+### Step 1: Define your plugin
 
 ```rust
-struct MyPlugin {
-    state: Arc<OnceLock<MyAPI>>,
-}
-
-impl MyPlugin {
-    fn new() -> Self {
-        Self { state: Arc::new(OnceLock::new()) }
-    }
-}
+struct MyPlugin;
 ```
 
-### Step 2: Register routes in build(), populate state in ready()
+### Step 2: Register routes via `add_routes_with`
+
+The closure runs during `AppPlugin::ready()`, by which time every other
+plugin's `build()` has completed and its APIs are resolvable.
 
 ```rust
 impl Plugin for MyPlugin {
     fn build(&self, server: &mut Server) {
-        let state = Arc::clone(&self.state);
-        let router = Router::new()
-            .route("/my/endpoint", post(handle_request))
-            .with_state(state);
-        server.api::<HttpRouter>().unwrap().add_routes(router);
-    }
-
-    async fn ready(&self, server: &mut Server) {
-        let api = server.api::<MyAPI>().unwrap().clone();
-        self.state.set(api).unwrap();
+        server.api::<HttpRouter>().unwrap().add_routes_with(|server| {
+            let api = server.api::<MyAPI>().unwrap().clone();
+            Router::new()
+                .route("/my/endpoint", post(handle_request))
+                .with_state(api)
+        });
     }
 
     fn dependencies(&self) -> Vec<PluginId> {
@@ -332,13 +315,10 @@ impl Plugin for MyPlugin {
 ### Step 3: Write handler functions
 
 ```rust
-type DeferredMyAPI = Arc<OnceLock<MyAPI>>;
-
 async fn handle_request(
-    State(deferred): State<DeferredMyAPI>,
+    State(api): State<MyAPI>,
     Json(body): Json<RequestBody>,
 ) -> Result<Json<ResponseBody>, StatusCode> {
-    let api = deferred.get().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     // Use api...
     Ok(Json(ResponseBody { /* ... */ }))
 }
@@ -351,14 +331,11 @@ For the common "request → response" pattern where the handler doesn't need to 
 ```rust
 use polaris_sessions::{SessionsAPI, AgentTypeId};
 
-type DeferredSessions = Arc<OnceLock<SessionsAPI>>;
-
 async fn handle_request(
-    State(deferred): State<DeferredSessions>,
+    State(sessions): State<SessionsAPI>,
     headers: HeaderMap,
     Json(body): Json<RequestBody>,
 ) -> Result<Json<MyOutput>, StatusCode> {
-    let sessions = deferred.get().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let agent_type = AgentTypeId::from_name("MyAgent");
 
     let output: MyOutput = sessions
@@ -421,7 +398,7 @@ server
 |------|---------|
 | `polaris_app/src/plugin.rs` | `AppPlugin` lifecycle, `ServerHandle` |
 | `polaris_app/src/router.rs` | `HttpRouter` API for route registration |
-| `polaris_app/src/io.rs` | `HttpIOProvider` channel bridging |
+| `polaris_sessions/src/http/io.rs` | `HttpIOProvider` channel bridging |
 | `polaris_app/src/auth.rs` | `AuthProvider` trait |
 | `polaris_app/src/config.rs` | `AppConfig` (bind address, CORS) |
 | `polaris_app/src/request_context.rs` | `RequestContext`, `HttpHeaders`, `RequestContextPlugin` |
