@@ -7,22 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **`AppConfig::with_allow_any_cors_origin`** — explicit opt-in for `Access-Control-Allow-Origin: *`. The default no-origin path now warns and falls back to wildcard CORS only when no `AuthProvider` is registered; configuring auth without origins (or without this opt-in) panics at startup rather than silently exposing authenticated endpoints cross-origin.
-- **`dashboard-registry` Cargo feature** (`polaris-ai`, `polaris_internal`) — gates the `polaris_dashboard` crate (and its `axum` runtime dep) so it stays out of the release dep graph until any `*-dashboard` umbrella or `DashboardPlugin` is opted into. All `*-dashboard` features now imply `dashboard-registry`.
-
-### Changed
-
-- **BREAKING — `HttpIOProvider::new(input_buffer)` → `HttpIOProvider::new(input_buffer, output_buffer)`** (`polaris_sessions::http`). The output channel is now bounded with explicit per-call capacity; agents that emit faster than the consumer drains apply backpressure via `await` instead of growing memory unbounded. SSE turn streams use `tokio_stream::wrappers::ReceiverStream` instead of the unbounded variant. The `process_turn_stream` handler documents that turns are not aborted on client disconnect — disconnects propagate via channel close → `IOError::Closed` on the next agent send.
-
-### Fixed
-
-- **`stream_turn_busy` integration test** synchronizes on a `BlockingAgent`-emitted `system` message instead of a 100 ms wall-clock sleep. Removes a CI flake source. Test agents now send a `blocking-ready` signal as soon as the session lock is held; the test polls for that signal with a 5 s deadline.
-- **`manifest_union::full_server_unions_manifest_and_serves_endpoints`** asserts the actual contents of `/v1/tools`, `/v1/models/providers`, and `/v1/tracing/spans` instead of discarding response bodies. A regression that returned bogus or empty payloads from those endpoints now surfaces.
-- **Stale `crates/polaris_app/src/io.rs` references** in `CLAUDE.md` / `AGENT.md` updated to point at `crates/polaris_sessions/src/http/io.rs` (where `HttpIOProvider` actually lives after the 0.4.0 relocation).
-
-## [0.4.0] - 2026-05-06
+## [0.4.0] - 2026-05-07
 
 ### Added
 
@@ -46,9 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`StreamTurnDone`** (`polaris_sessions::http`) — terminal SSE event payload for successful streaming turns, containing the same `TurnExecutionMetadata` as the buffered response.
 
+- **`AppConfig::with_allow_any_cors_origin`** — explicit opt-in for `Access-Control-Allow-Origin: *`. The default no-origin path now warns and falls back to wildcard CORS only when no `AuthProvider` is registered; configuring auth without origins (or without this opt-in) panics at startup rather than silently exposing authenticated endpoints cross-origin.
+
+- **`dashboard-registry` Cargo feature** (`polaris-ai`, `polaris_internal`) — gates the `polaris_dashboard` crate (and its `axum` runtime dep) so it stays out of the release dep graph until any `*-dashboard` umbrella or `DashboardPlugin` is opted into. All `*-dashboard` features now imply `dashboard-registry`.
+
 ### Changed
 
 - **BREAKING — `HttpIOProvider` relocated** from `polaris_app` to `polaris_sessions::http`. The move breaks a `polaris_core_plugins → polaris_app → polaris_core_plugins` dependency cycle that `TracingPlugin`'s dashboard contribution would otherwise introduce. Downstream consumers must update `use polaris_app::HttpIOProvider` to `use polaris_sessions::http::HttpIOProvider`. The type's API is unchanged.
+
+- **BREAKING — `HttpIOProvider::new(input_buffer)` → `HttpIOProvider::new(input_buffer, output_buffer)`** (`polaris_sessions::http`). The output channel is now bounded with explicit per-call capacity; agents that emit faster than the consumer drains apply backpressure via `await` instead of growing memory unbounded. SSE turn streams use `tokio_stream::wrappers::ReceiverStream` instead of the unbounded variant. The `process_turn_stream` handler documents that turns are not aborted on client disconnect — disconnects propagate via channel close → `IOError::Closed` on the next agent send.
 
 - **`polaris_sessions::http::HttpPlugin`** refactored to use `add_routes_with`. `DeferredState` (`Arc<OnceLock<SessionsAPI>>`) pattern removed; routes are now constructed in `ready()` via the deferred builder with direct `with_state(SessionsAPI)`. `HttpPlugin` is now a unit struct; the separate `ready()` implementation is gone.
 
@@ -63,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Removed legacy WS-envelope decision that mirrored the inherited frontend shape (envelope now designed with B2).
   - Subscription keying extended: `Agent::name` doubles as graph-identity key alongside session id — no separate `graph_id` needed.
   - Added "Naming Conventions" legend disambiguating `polaris_dashboard` (Rust crate) vs `polaris-dashboard` (Svelte repo) vs `polaris-dashboard-plugin` (consumer crate) vs `@polaris/dashboard` (npm package).
+
+### Fixed
+
+- **`stream_turn_busy` integration test** synchronizes on a `BlockingAgent`-emitted `system` message instead of a 100 ms wall-clock sleep. Removes a CI flake source. Test agents now send a `blocking-ready` signal as soon as the session lock is held; the test polls for that signal with a 5 s deadline.
+- **`manifest_union::full_server_unions_manifest_and_serves_endpoints`** asserts the actual contents of `/v1/tools`, `/v1/models/providers`, and `/v1/tracing/spans` instead of discarding response bodies. A regression that returned bogus or empty payloads from those endpoints now surfaces.
+- **Stale `crates/polaris_app/src/io.rs` references** in `CLAUDE.md` / `AGENT.md` updated to point at `crates/polaris_sessions/src/http/io.rs` (where `HttpIOProvider` actually lives after the relocation).
 
 ### Removed
 
