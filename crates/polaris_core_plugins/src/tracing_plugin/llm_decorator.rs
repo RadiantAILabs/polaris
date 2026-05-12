@@ -298,12 +298,8 @@ mod tests {
         let waker = &std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut items = vec![];
-        loop {
-            match stream.as_mut().poll_next(&mut cx) {
-                Poll::Ready(Some(item)) => items.push(item),
-                Poll::Ready(None) => break,
-                Poll::Pending => break,
-            }
+        while let Poll::Ready(Some(item)) = stream.as_mut().poll_next(&mut cx) {
+            items.push(item);
         }
         items
     }

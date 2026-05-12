@@ -355,11 +355,8 @@ mod tests {
     ) -> Vec<Result<RawStreamEvent, GenerationError>> {
         let mut stream = std::pin::pin!(stream);
         let mut events = Vec::new();
-        loop {
-            match std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
-                Some(event) => events.push(event),
-                None => break,
-            }
+        while let Some(event) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            events.push(event);
         }
         events
     }

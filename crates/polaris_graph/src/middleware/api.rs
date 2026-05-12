@@ -543,7 +543,7 @@ mod tests {
         let result = api
             .inner
             .system
-            .execute(mock_system_info(), &mut ctx, &terminal)
+            .execute(mock_system_info(), &mut ctx, terminal)
             .await;
 
         assert!(result.is_ok());
@@ -580,7 +580,7 @@ mod tests {
         let result = api
             .inner
             .system
-            .execute(mock_system_info(), &mut ctx, &terminal)
+            .execute(mock_system_info(), &mut ctx, terminal)
             .await;
 
         assert!(result.is_ok());
@@ -622,7 +622,7 @@ mod tests {
         let mut ctx = SystemContext::new();
         api.inner
             .system
-            .execute(mock_system_info(), &mut ctx, &terminal)
+            .execute(mock_system_info(), &mut ctx, terminal)
             .await
             .unwrap();
 
@@ -660,7 +660,7 @@ mod tests {
 
         api.inner
             .system
-            .execute(info, &mut ctx, &terminal)
+            .execute(info, &mut ctx, terminal)
             .await
             .unwrap();
 
@@ -702,7 +702,7 @@ mod tests {
         let result = api
             .inner
             .system
-            .execute(mock_system_info(), &mut ctx, &terminal)
+            .execute(mock_system_info(), &mut ctx, terminal)
             .await;
 
         assert!(
@@ -739,7 +739,7 @@ mod tests {
         let result = api
             .inner
             .system
-            .execute(mock_system_info(), &mut ctx, &terminal)
+            .execute(mock_system_info(), &mut ctx, terminal)
             .await;
 
         assert!(

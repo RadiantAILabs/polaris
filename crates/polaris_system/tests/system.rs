@@ -1325,7 +1325,7 @@ async fn context_factory_during_ready_does_not_block_insert_global() {
     use polaris_system::server::ContextFactory;
     use std::sync::{Arc, OnceLock};
 
-    /// Global resource registered by PluginLate.
+    /// Global resource registered by `PluginLate`.
     #[derive(Debug, PartialEq)]
     struct LateGlobal {
         value: i32,
@@ -1349,7 +1349,7 @@ async fn context_factory_during_ready_does_not_block_insert_global() {
         }
     }
 
-    /// Inserts a global resource during `ready()` — runs *after* EarlyPlugin.
+    /// Inserts a global resource during `ready()` — runs *after* `EarlyPlugin`.
     struct LatePlugin;
     impl Plugin for LatePlugin {
         const ID: &'static str = "test::late";
