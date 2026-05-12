@@ -95,6 +95,7 @@ pub mod auth;
 pub mod config;
 mod middleware;
 pub mod plugin;
+pub mod public_route;
 pub mod request_context;
 pub mod router;
 #[cfg(feature = "ws")]
@@ -104,6 +105,7 @@ pub mod ws;
 pub use auth::AuthProvider;
 pub use config::AppConfig;
 pub use plugin::{AppPlugin, ServerHandle};
+pub use public_route::{PublicPath, PublicPrefix, PublicRouteError};
 pub use request_context::{HttpHeaders, RequestContext, RequestContextPlugin};
 pub use router::HttpRouter;
 #[cfg(feature = "ws")]

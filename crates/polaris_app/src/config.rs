@@ -1,5 +1,6 @@
 //! HTTP server configuration.
 
+use crate::public_route::{PublicPath, PublicPrefix};
 use polaris_system::resource::GlobalResource;
 use std::net::SocketAddr;
 
@@ -16,7 +17,9 @@ use std::net::SocketAddr;
 /// let config = AppConfig::new()
 ///     .with_host("0.0.0.0")
 ///     .with_port(8080)
-///     .with_cors_origin("http://localhost:3000");
+///     .with_cors_origin("http://localhost:3000")
+///     .with_public_path("/healthz")
+///     .with_public_prefix("/dashboard/");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -28,6 +31,10 @@ pub struct AppConfig {
     cors_origins: Vec<String>,
     /// Whether `Access-Control-Allow-Origin: *` is explicitly opted into.
     allow_any_cors_origin: bool,
+    /// Exact request paths exempt from `AuthProvider`.
+    public_paths: Vec<PublicPath>,
+    /// Path prefixes exempt from `AuthProvider`.
+    public_prefixes: Vec<PublicPrefix>,
 }
 
 impl GlobalResource for AppConfig {}
@@ -39,6 +46,8 @@ impl Default for AppConfig {
             port: 3000,
             cors_origins: Vec::new(),
             allow_any_cors_origin: false,
+            public_paths: Vec::new(),
+            public_prefixes: Vec::new(),
         }
     }
 }
@@ -93,6 +102,70 @@ impl AppConfig {
         self
     }
 
+    /// Exempts an exact request path from [`AuthProvider`](crate::AuthProvider).
+    ///
+    /// Useful for endpoints that must be reachable before authentication can
+    /// even be attempted: load-balancer health checks, login pages, OAuth
+    /// callback URLs. Path comparison is exact — for hierarchies, see
+    /// [`with_public_prefix`](Self::with_public_prefix).
+    ///
+    /// Path-based exemption belongs at the config layer rather than inside an
+    /// `AuthProvider` impl, because every auth scheme has public routes and
+    /// embedding routing decisions in the auth trait conflates two concerns.
+    ///
+    /// Accepts anything convertible into [`PublicPath`] — `&str`, `String`,
+    /// or a pre-validated [`PublicPath`]. The conversion calls
+    /// [`PublicPath::new`] internally; use that constructor directly if you
+    /// prefer to handle invalid input as a [`Result`] rather than a panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input is empty or does not start with `/`. Validating
+    /// eagerly surfaces misconfiguration (e.g. `with_public_path(env_var)`
+    /// where the variable is unset) at startup rather than silently exposing
+    /// authenticated endpoints.
+    #[must_use]
+    pub fn with_public_path(mut self, path: impl Into<String>) -> Self {
+        let path = PublicPath::new(path).unwrap_or_else(|err| {
+            panic!("AppConfig::with_public_path: {err}");
+        });
+        self.public_paths.push(path);
+        self
+    }
+
+    /// Exempts a request-path prefix from [`AuthProvider`](crate::AuthProvider).
+    ///
+    /// Use for hierarchical exemptions like a static-asset mount
+    /// (`/dashboard/`) where every path under it should bypass auth. The
+    /// prefix matches as a string against [`http::Uri::path`]; a trailing
+    /// slash is required so `"/dashboard/"` does not match
+    /// `/dashboard-attack`. For an exact-match exemption (e.g. `/healthz`)
+    /// use [`with_public_path`](Self::with_public_path) instead.
+    ///
+    /// Accepts anything convertible into [`PublicPrefix`] — `&str`,
+    /// `String`, or a pre-validated [`PublicPrefix`]. The conversion calls
+    /// [`PublicPrefix::new`] internally; use that constructor directly if
+    /// you prefer to handle invalid input as a [`Result`] rather than a
+    /// panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input is empty, does not start with `/`, or does not
+    /// end with `/`. An empty prefix would make every request public
+    /// (`str::starts_with("")` is always `true`), silently disabling the
+    /// [`AuthProvider`](crate::AuthProvider); a prefix without a trailing
+    /// slash matches sibling paths (`"/dashboard"` matches
+    /// `/dashboard-attack`). Validating eagerly surfaces both
+    /// misconfigurations at startup rather than at request time.
+    #[must_use]
+    pub fn with_public_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = PublicPrefix::new(prefix).unwrap_or_else(|err| {
+            panic!("AppConfig::with_public_prefix: {err}");
+        });
+        self.public_prefixes.push(prefix);
+        self
+    }
+
     /// Returns the configured host.
     #[must_use]
     pub fn host(&self) -> &str {
@@ -117,6 +190,18 @@ impl AppConfig {
         self.allow_any_cors_origin
     }
 
+    /// Returns the configured exact public paths (auth-exempt).
+    #[must_use]
+    pub fn public_paths(&self) -> &[PublicPath] {
+        &self.public_paths
+    }
+
+    /// Returns the configured public path prefixes (auth-exempt).
+    #[must_use]
+    pub fn public_prefixes(&self) -> &[PublicPrefix] {
+        &self.public_prefixes
+    }
+
     /// Returns the parsed socket address.
     ///
     /// # Panics
@@ -138,5 +223,51 @@ impl AppConfig {
         let raw = format!("{}:{}", self.host, self.port);
         raw.parse()
             .expect("AppConfig host must be a valid IP address")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "AppConfig::with_public_prefix: must not be empty")]
+    fn with_public_prefix_rejects_empty() {
+        let _ = AppConfig::new().with_public_prefix("");
+    }
+
+    #[test]
+    #[should_panic(expected = "AppConfig::with_public_prefix: must start with '/'")]
+    fn with_public_prefix_rejects_missing_leading_slash() {
+        let _ = AppConfig::new().with_public_prefix("dashboard");
+    }
+
+    #[test]
+    #[should_panic(expected = "AppConfig::with_public_path: must not be empty")]
+    fn with_public_path_rejects_empty() {
+        let _ = AppConfig::new().with_public_path("");
+    }
+
+    #[test]
+    #[should_panic(expected = "AppConfig::with_public_path: must start with '/'")]
+    fn with_public_path_rejects_missing_leading_slash() {
+        let _ = AppConfig::new().with_public_path("healthz");
+    }
+
+    #[test]
+    #[should_panic(expected = "must end with '/'")]
+    fn with_public_prefix_rejects_missing_trailing_slash() {
+        let _ = AppConfig::new().with_public_prefix("/dashboard");
+    }
+
+    #[test]
+    fn valid_public_path_and_prefix_are_accepted() {
+        let config = AppConfig::new()
+            .with_public_path("/healthz")
+            .with_public_prefix("/dashboard/");
+        assert_eq!(config.public_paths().len(), 1);
+        assert_eq!(config.public_paths()[0].as_str(), "/healthz");
+        assert_eq!(config.public_prefixes().len(), 1);
+        assert_eq!(config.public_prefixes()[0].as_str(), "/dashboard/");
     }
 }

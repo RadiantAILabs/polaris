@@ -73,8 +73,12 @@ impl NavItem {
 
 /// A logical grouping of [`Panel`]s within a [`NavItem`].
 ///
-/// A `NavItem` with no `Section`s renders its panels directly; with one or
-/// more `Section`s, panels are grouped under section titles.
+/// Every panel is expected to belong to a section: [`Panel::section_id`]
+/// is the only formal linkage from a panel back to its [`NavItem`] (via
+/// `section.nav_item_id`), so consumers that render panels grouped by
+/// section will drop section-less panels. A nav item with no logical
+/// grouping should still register a single "Overview" section so its
+/// panels render.
 ///
 /// `#[non_exhaustive]` so future fields can be added without breaking
 /// downstream contributors. Construct via [`Section::new`] +

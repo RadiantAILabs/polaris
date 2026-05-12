@@ -17,7 +17,7 @@ rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
 
 [features]
 default = []
-otel = []
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 ws = ["axum/ws"]
 
 [lints]
@@ -35,6 +35,8 @@ tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util
 tracing = "0.1"
 parking_lot = "0.12"
 http = "1"
+opentelemetry = { version = "0.31", optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 
 [dev-dependencies]
 polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4.0" }

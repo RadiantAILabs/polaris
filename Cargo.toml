@@ -106,7 +106,9 @@ unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
 
 [features]
-default = []
+# `file-store` is on by default to match the historical session-store
+# behavior. Set `default-features = false` to opt out of `tokio/fs`.
+default = ["file-store"]
 anthropic = ["polaris_internal/anthropic"]
 bedrock = ["polaris_internal/bedrock"]
 openai = ["polaris_internal/openai"]
@@ -114,8 +116,20 @@ graph-tracing = ["polaris_internal/graph-tracing"]
 models-tracing = ["polaris_internal/models-tracing"]
 tools-tracing = ["polaris_internal/tools-tracing"]
 tiktoken = ["polaris_internal/tiktoken"]
+# Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s
+# HTTP request spans to OTel HTTP semantic-convention field names
+# (`http.request.method`, `url.path`, etc., plus `otel.name` / `otel.kind`).
+# Does not extract incoming W3C `traceparent` headers — each request starts a
+# fresh trace.
 otel = ["polaris_internal/otel"]
 sessions-http = ["polaris_internal/sessions-http"]
+# WebSocket router (`app::WsRouter`) and the dashboard event-stream surface.
+ws = ["polaris_internal/ws"]
+# `MockClock` and `MockIOProvider` re-exports for downstream test code.
+test-utils = ["polaris_internal/test-utils"]
+# Filesystem-backed `SessionStore` (brings in `tokio/fs`). On by default; set
+# `default-features = false` to opt out.
+file-store = ["polaris_internal/file-store"]
 # Generates TypeScript bindings for canonical Polaris types.
 # Off by default so release builds do not pull `ts-rs` into the dep graph.
 # Enabling this and running `cargo test --features typegen` writes `.ts`
@@ -126,11 +140,15 @@ typegen = ["polaris_internal/typegen"]
 # intend to mount `DashboardPlugin` or any `*-dashboard` contribution.
 dashboard-registry = ["polaris_internal/dashboard-registry"]
 sessions-dashboard = ["polaris_internal/sessions-dashboard"]
+# Adds `Serialize` / `Deserialize` to the graph correlation types
+# (`graph::hooks::events::RunId`, `RunLabels`) so events can flow across
+# process boundaries. Pulls `serde` into the dep graph.
+serde = ["polaris_internal/serde"]
 tools-dashboard = ["polaris_internal/tools-dashboard"]
 models-dashboard = ["polaris_internal/models-dashboard"]
 tracing-dashboard = ["polaris_internal/tracing-dashboard"]
 dashboard = ["polaris_internal/dashboard"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "0.4.0" }
+polaris_internal = { path = "crates/polaris_internal", version = "0.4.0", default-features = false }
 tracing = { version = "0.1.43", default-features = false }

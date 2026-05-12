@@ -44,3 +44,9 @@ description = "Run doc tests"
 workspace = false
 command = "cargo"
 args = ["test", "--doc", "--workspace", "--all-features"]
+
+[tasks.test-features]
+description = "Check each feature flag compiles in isolation (requires cargo-hack)"
+workspace = false
+command = "cargo"
+args = ["hack", "--each-feature", "--no-dev-deps", "check"]

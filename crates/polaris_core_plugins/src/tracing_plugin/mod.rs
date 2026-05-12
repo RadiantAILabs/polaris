@@ -344,7 +344,8 @@ impl Plugin for TracingPlugin {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl TracingPlugin {
-    /// Registers graph middleware for span creation around node execution.
+    /// Registers graph middleware for span creation around node execution
+    /// and hooks that record decision/switch outcomes onto those spans.
     #[cfg(feature = "graph_tracing")]
     fn register_instrumentation(&self, server: &mut Server) {
         if !server.contains_api::<polaris_graph::MiddlewareAPI>() {
@@ -355,6 +356,15 @@ impl TracingPlugin {
             .api::<polaris_graph::MiddlewareAPI>()
             .expect("MiddlewareAPI should be present after initialization");
         graph_middleware::register(mw);
+
+        if !server.contains_api::<polaris_graph::hooks::HooksAPI>() {
+            server.insert_api(polaris_graph::hooks::HooksAPI::new());
+        }
+
+        let hooks = server
+            .api::<polaris_graph::hooks::HooksAPI>()
+            .expect("HooksAPI should be present after initialization");
+        graph_middleware::register_outcome_hooks(hooks);
     }
 
     /// Wraps registered providers and tools with tracing decorators.

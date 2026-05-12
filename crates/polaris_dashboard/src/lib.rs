@@ -43,7 +43,7 @@
 //! ```no_run
 //! use polaris_app::{AppConfig, AppPlugin};
 //! use polaris_dashboard::{
-//!     DashboardPlugin, DashboardRegistry, NavItem, Panel, Transport,
+//!     DashboardPlugin, DashboardRegistry, NavItem, Panel, Section, Transport,
 //! };
 //! use polaris_system::plugin::{Plugin, PluginId, Version};
 //! use polaris_system::server::Server;
@@ -59,13 +59,17 @@
 //!             .api::<DashboardRegistry>()
 //!             .expect("DashboardPlugin must be added first")
 //!             .add_nav_item(NavItem::new("sessions", "Sessions"))
-//!             .add_panel(Panel::new(
-//!                 "sessions-list",
-//!                 "Active sessions",
-//!                 "list",
-//!                 "/v1/sessions",
-//!                 Transport::Rest,
-//!             ));
+//!             .add_section(Section::new("sessions-overview", "sessions", "Overview"))
+//!             .add_panel(
+//!                 Panel::new(
+//!                     "sessions-list",
+//!                     "Active sessions",
+//!                     "list",
+//!                     "/v1/sessions",
+//!                     Transport::Rest,
+//!                 )
+//!                 .with_section("sessions-overview"),
+//!             );
 //!     }
 //!
 //!     fn dependencies(&self) -> Vec<PluginId> {

@@ -194,7 +194,7 @@ async fn request_id_header_is_present() {
 // SSE streaming tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns an SSE response with three pre-loaded IOMessages.
+/// Returns an SSE response with three pre-loaded `IOMessages`.
 ///
 /// The sender is dropped immediately so the stream completes as soon as all
 /// messages are consumed.
@@ -324,6 +324,300 @@ async fn sse_streams_io_messages() {
     assert_eq!(data2["source"], "User");
 
     server.cleanup().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public-path allowlist tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod allowlist_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::response::Response;
+    use http::StatusCode;
+    use polaris_app::AuthProvider;
+    use polaris_app::auth::AuthRejection;
+
+    /// Auth provider that rejects every request. The allowlist must short-
+    /// circuit before this is reached for an exempt path to return 200.
+    #[derive(Debug)]
+    struct RejectAllAuth;
+
+    impl AuthProvider for RejectAllAuth {
+        fn authenticate(&self, _parts: &http::request::Parts) -> Result<(), AuthRejection> {
+            Err(Box::new(
+                Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Body::from("unauthorized"))
+                    .expect("failed to build rejection response"),
+            ))
+        }
+    }
+
+    /// Plugin that registers `RejectAllAuth` and a few routes.
+    struct AllowlistRoutesPlugin;
+
+    impl Plugin for AllowlistRoutesPlugin {
+        const ID: &'static str = "test::allowlist_routes";
+        const VERSION: Version = Version::new(0, 0, 1);
+
+        fn build(&self, server: &mut Server) {
+            use axum::routing::post;
+
+            let http_router = server.api::<HttpRouter>().expect("HttpRouter must exist");
+            http_router.set_auth(RejectAllAuth);
+            http_router.add_routes(
+                Router::new()
+                    .route("/healthz", get(|| async { "ok" }))
+                    .route("/dashboard/index.html", get(|| async { "spa" }))
+                    .route("/dashboard-attack", get(|| async { "should be protected" }))
+                    .route("/v1/sessions", get(|| async { "sessions" }))
+                    // POST endpoints used by the method-agnostic allowlist test.
+                    .route("/dashboard/submit", post(|| async { "spa-post" }))
+                    .route("/v1/sessions", post(|| async { "sessions-post" })),
+            );
+        }
+
+        fn dependencies(&self) -> Vec<PluginId> {
+            vec![PluginId::of::<AppPlugin>()]
+        }
+    }
+
+    async fn start_server(config: AppConfig) -> (Server, u16) {
+        let (listener, port) = bind_ephemeral().await;
+        let mut server = Server::new();
+        server.add_plugins(
+            AppPlugin::new(config.with_host("127.0.0.1").with_port(port)).with_listener(listener),
+        );
+        server.add_plugins(AllowlistRoutesPlugin);
+        server.finish().await;
+        wait_for_server(port).await;
+        (server, port)
+    }
+
+    #[tokio::test]
+    async fn no_allowlist_rejects_every_route() {
+        let (mut server, port) = start_server(
+            AppConfig::new()
+                // Explicit CORS so AppPlugin doesn't panic when auth is set.
+                .with_allow_any_cors_origin(),
+        )
+        .await;
+
+        let base = format!("http://127.0.0.1:{port}");
+
+        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "/healthz should be auth-rejected when no allowlist is configured"
+        );
+
+        let resp = reqwest::get(format!("{base}/v1/sessions")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "/v1/sessions should be auth-rejected when no allowlist is configured"
+        );
+
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn exact_public_path_skips_auth() {
+        let (mut server, port) = start_server(
+            AppConfig::new()
+                .with_allow_any_cors_origin()
+                .with_public_path("/healthz"),
+        )
+        .await;
+
+        let base = format!("http://127.0.0.1:{port}");
+
+        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "/healthz should bypass auth via with_public_path"
+        );
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        // Non-exempt routes still go through auth.
+        let resp = reqwest::get(format!("{base}/v1/sessions")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "/v1/sessions is not on the allowlist and must still be auth-protected"
+        );
+
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn public_prefix_skips_auth_for_subpaths() {
+        let (mut server, port) = start_server(
+            AppConfig::new()
+                .with_allow_any_cors_origin()
+                .with_public_prefix("/dashboard/"),
+        )
+        .await;
+
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Path under the prefix is public.
+        let resp = reqwest::get(format!("{base}/dashboard/index.html"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "/dashboard/index.html should bypass auth via with_public_prefix(\"/dashboard/\")"
+        );
+        assert_eq!(resp.text().await.unwrap(), "spa");
+
+        // Path that *looks* like the prefix without the trailing slash is
+        // still protected — the trailing slash is load-bearing.
+        let resp = reqwest::get(format!("{base}/dashboard-attack"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "/dashboard-attack must NOT match the /dashboard/ prefix (trailing-slash discipline)"
+        );
+
+        // Routes outside the prefix are still protected.
+        let resp = reqwest::get(format!("{base}/v1/sessions")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "/v1/sessions is outside the allowlist prefix and must stay protected"
+        );
+
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn paths_and_prefixes_compose() {
+        let (mut server, port) = start_server(
+            AppConfig::new()
+                .with_allow_any_cors_origin()
+                .with_public_path("/healthz")
+                .with_public_prefix("/dashboard/"),
+        )
+        .await;
+
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Assert handler identity via response body, not just status — a 200
+        // alone wouldn't catch a misrouted request that lands on the wrong
+        // handler.
+        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "/healthz exact-public-path should bypass auth in the composed config"
+        );
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "ok",
+            "/healthz must reach the /healthz handler, not a prefix-matched handler"
+        );
+
+        let resp = reqwest::get(format!("{base}/dashboard/index.html"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "/dashboard/index.html prefix-public should bypass auth in the composed config"
+        );
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "spa",
+            "/dashboard/index.html must reach the SPA handler"
+        );
+
+        let resp = reqwest::get(format!("{base}/v1/sessions")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "/v1/sessions must stay auth-protected in the composed config"
+        );
+
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn allowlist_is_method_agnostic() {
+        // The allowlist matches on path, not method. POSTs to allowlisted
+        // routes must bypass auth identically to GETs, and POSTs to
+        // non-allowlisted routes must stay rejected.
+        let (mut server, port) = start_server(
+            AppConfig::new()
+                .with_allow_any_cors_origin()
+                .with_public_path("/healthz")
+                .with_public_prefix("/dashboard/"),
+        )
+        .await;
+
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // POST to a prefix-allowlisted route must succeed.
+        let resp = client
+            .post(format!("{base}/dashboard/submit"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "POST /dashboard/submit must bypass auth (allowlist is method-agnostic)"
+        );
+        assert_eq!(resp.text().await.unwrap(), "spa-post");
+
+        // POST to a non-allowlisted route must still be rejected.
+        let resp = client
+            .post(format!("{base}/v1/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "POST /v1/sessions must be auth-rejected — allowlist applies to paths, not methods"
+        );
+
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn query_string_does_not_defeat_allowlist() {
+        // `parts.uri.path()` strips the query string before matching, so an
+        // allowlisted path stays allowlisted regardless of `?foo=bar`. Pin
+        // that load-bearing assumption.
+        let (mut server, port) = start_server(
+            AppConfig::new()
+                .with_allow_any_cors_origin()
+                .with_public_path("/healthz"),
+        )
+        .await;
+
+        let base = format!("http://127.0.0.1:{port}");
+
+        let resp = reqwest::get(format!("{base}/healthz?probe=1&token=abc"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "/healthz?probe=1&token=abc must still bypass auth — query string is stripped before matching"
+        );
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        server.cleanup().await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

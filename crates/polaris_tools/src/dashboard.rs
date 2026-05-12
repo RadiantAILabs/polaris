@@ -10,7 +10,7 @@ use axum::{
 };
 use bytes::Bytes;
 use polaris_app::{AppPlugin, HttpRouter};
-use polaris_dashboard::{DashboardPlugin, DashboardRegistry, NavItem, Panel, Transport};
+use polaris_dashboard::{DashboardPlugin, DashboardRegistry, NavItem, Panel, Section, Transport};
 use polaris_models::llm::ToolDefinition;
 use polaris_system::api::API;
 use polaris_system::plugin::{Plugin, PluginId, Version};
@@ -166,13 +166,17 @@ impl Plugin for ToolsDashboardPlugin {
             .api::<DashboardRegistry>()
             .expect("DashboardPlugin must be added before ToolsDashboardPlugin")
             .add_nav_item(NavItem::new("tools", "Tools"))
-            .add_panel(Panel::new(
-                "tools-list",
-                "Available tools",
-                "list",
-                TOOLS_PATH,
-                Transport::Rest,
-            ));
+            .add_section(Section::new("tools-overview", "tools", "Overview"))
+            .add_panel(
+                Panel::new(
+                    "tools-list",
+                    "Available tools",
+                    "list",
+                    TOOLS_PATH,
+                    Transport::Rest,
+                )
+                .with_section("tools-overview"),
+            );
     }
 
     async fn ready(&self, server: &mut Server) {

@@ -170,6 +170,7 @@ impl Plugin for DevToolsPlugin {
                     if let GraphEvent::SystemStart {
                         node_id,
                         node_name: system_name,
+                        ..
                     } = event
                     {
                         Some(SystemInfo::new(node_id.clone(), system_name))

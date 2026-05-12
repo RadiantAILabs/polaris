@@ -14,7 +14,7 @@ use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin, ResourceSerializer};
 use polaris_graph::MiddlewareAPI;
 use polaris_graph::hooks::HooksAPI;
-use polaris_graph::{ExecutionResult, Graph, GraphExecutor};
+use polaris_graph::{ExecutionResult, Graph, GraphExecutor, RunLabels};
 use polaris_system::api::API;
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::{Plugin, PluginId, Version};
@@ -23,6 +23,7 @@ use polaris_system::server::{ContextFactory, Server};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use tracing::Instrument;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Checkpoint (internal)
@@ -51,6 +52,17 @@ struct SessionState {
     turn_number: AtomicU32,
     checkpoints: parking_lot::Mutex<Vec<Checkpoint>>,
     created_at: String,
+    /// Pre-built `(session_id, agent_type)` labels shared across every turn.
+    /// `RunLabels` is `Arc`-backed, so per-turn cost is one `Arc::clone`
+    /// instead of allocating a fresh `HashMap`.
+    labels: RunLabels,
+}
+
+fn build_session_labels(id: &SessionId, agent_type: &AgentTypeId) -> RunLabels {
+    RunLabels::from([
+        ("session_id", id.as_str().to_owned()),
+        ("agent_type", agent_type.as_str().to_owned()),
+    ])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -494,6 +506,7 @@ impl SessionsAPI {
             turn_number: AtomicU32::new(0),
             checkpoints: parking_lot::Mutex::new(Vec::new()),
             created_at: utc_now_iso8601(),
+            labels: build_session_labels(id, agent_type),
         });
 
         match self.inner.sessions.write().entry(id.clone()) {
@@ -523,7 +536,7 @@ impl SessionsAPI {
     /// # use polaris_sessions::{SessionsAPI, SessionId};
     /// # async fn example(sessions: &SessionsAPI, id: &SessionId) {
     /// let result = sessions.process_turn(id).await.unwrap();
-    /// assert!(result.nodes_executed > 0);
+    /// assert!(result.nodes_executed() > 0);
     /// # }
     /// ```
     pub async fn process_turn(&self, id: &SessionId) -> Result<ExecutionResult, SessionError> {
@@ -660,9 +673,17 @@ impl SessionsAPI {
         let hooks = self.inner.hooks.get();
         let middleware = self.inner.middleware.get();
 
+        let turn_span = tracing::info_span!(
+            "polaris.session.turn",
+            polaris.session.id = %id,
+            polaris.session.turn_number = turn,
+            polaris.session.agent_type = %state.agent_type,
+        );
+
         let result = state
             .executor
-            .execute(&state.graph, ctx, hooks, middleware)
+            .execute_with_labels(&state.graph, ctx, hooks, middleware, state.labels.clone())
+            .instrument(turn_span)
             .await?;
 
         state.turn_number.store(turn + 1, Ordering::Release);
@@ -983,6 +1004,7 @@ impl SessionsAPI {
             turn_number: AtomicU32::new(data.turn_number),
             checkpoints: parking_lot::Mutex::new(Vec::new()),
             created_at: data.created_at.clone(),
+            labels: build_session_labels(id, &agent_type),
         });
 
         self.inner.sessions.write().insert(id.clone(), state);

@@ -53,7 +53,7 @@
 //! # let hooks = HooksAPI::new();
 //! hooks.register_provider::<OnSystemStart, SystemInfo, _>("devtools", |event: &GraphEvent| {
 //!     match event {
-//!         GraphEvent::SystemStart { node_id, node_name } => {
+//!         GraphEvent::SystemStart { node_id, node_name, .. } => {
 //!             Some(SystemInfo::new(node_id.clone(), node_name))
 //!         }
 //!         _ => None,
@@ -317,7 +317,7 @@ impl HooksAPI {
     ///     "devtools",
     ///     |event: &GraphEvent| {
     ///         match event {
-    ///             GraphEvent::SystemStart { node_id, node_name } => {
+    ///             GraphEvent::SystemStart { node_id, node_name, .. } => {
     ///                 Some(SystemInfo::new(node_id.clone(), node_name))
     ///             }
     ///             _ => None,
@@ -448,6 +448,7 @@ impl HooksAPI {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::events::{RunId, RunLabels};
     use crate::hooks::schedule::{OnSystemComplete, OnSystemStart};
     use crate::node::NodeId;
     use polaris_system::plugin::Schedule;
@@ -455,6 +456,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    fn sample_system_start(node_name: &'static str) -> GraphEvent {
+        GraphEvent::SystemStart {
+            run_id: RunId::new(),
+            labels: RunLabels::empty(),
+            node_id: NodeId::new(),
+            node_name,
+        }
+    }
 
     #[test]
     fn hooks_api_register_increments_count() {
@@ -485,10 +495,7 @@ mod tests {
         .expect("registration should succeed");
 
         let mut ctx = SystemContext::new();
-        let event = GraphEvent::SystemStart {
-            node_id: NodeId::new(),
-            node_name: "test",
-        };
+        let event = sample_system_start("test");
 
         api.invoke(schedule, &mut ctx, &event);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -513,10 +520,7 @@ mod tests {
         }
 
         let mut ctx = SystemContext::new();
-        let event = GraphEvent::SystemStart {
-            node_id: NodeId::new(),
-            node_name: "test",
-        };
+        let event = sample_system_start("test");
 
         api.invoke(schedule, &mut ctx, &event);
 
@@ -532,10 +536,7 @@ mod tests {
     fn hooks_api_invoke_unknown_schedule_is_noop() {
         let api = HooksAPI::new();
         let mut ctx = SystemContext::new();
-        let event = GraphEvent::SystemStart {
-            node_id: NodeId::new(),
-            node_name: "test",
-        };
+        let event = sample_system_start("test");
 
         // Should not panic when no hooks are registered
         api.invoke(OnSystemStart::schedule_id(), &mut ctx, &event);
@@ -559,10 +560,7 @@ mod tests {
         .expect("registration should succeed");
 
         let mut ctx = SystemContext::new();
-        let event = GraphEvent::SystemStart {
-            node_id: NodeId::new(),
-            node_name: "test",
-        };
+        let event = sample_system_start("test");
 
         // Before invoke, resource should not exist
         assert!(!ctx.contains_resource::<TestResource>());
@@ -696,10 +694,7 @@ mod tests {
         .unwrap();
 
         let mut ctx = SystemContext::new();
-        let event = GraphEvent::SystemStart {
-            node_id: NodeId::new(),
-            node_name: "test",
-        };
+        let event = sample_system_start("test");
 
         api.invoke(schedule, &mut ctx, &event);
 
@@ -737,6 +732,8 @@ mod tests {
             OnSystemStart::schedule_id(),
             &mut ctx,
             &GraphEvent::SystemStart {
+                run_id: RunId::new(),
+                labels: RunLabels::empty(),
                 node_id: NodeId::new(),
                 node_name: "test",
             },
@@ -746,6 +743,8 @@ mod tests {
             OnSystemComplete::schedule_id(),
             &mut ctx,
             &GraphEvent::SystemComplete {
+                run_id: RunId::new(),
+                labels: RunLabels::empty(),
                 node_id: NodeId::new(),
                 node_name: "test",
                 duration: Duration::ZERO,
@@ -780,6 +779,8 @@ mod tests {
             OnSystemStart::schedule_id(),
             &mut ctx,
             &GraphEvent::SystemStart {
+                run_id: RunId::new(),
+                labels: RunLabels::empty(),
                 node_id: NodeId::new(),
                 node_name: "my_system",
             },

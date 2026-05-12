@@ -167,28 +167,74 @@ async fn full_server_unions_manifest_and_serves_endpoints() {
         BTreeSet::from(["models", "sessions", "tools", "tracing"]),
     );
 
+    // Each *DashboardPlugin contributes a default `<nav>-overview` section so
+    // its panels have a section to render under (the canonical consumer drops
+    // section-less panels). Sessions also keeps its `Detail` section.
+    let section_ids: BTreeSet<_> = manifest
+        .sections
+        .iter()
+        .map(|section| (section.id.as_str(), section.nav_item_id.as_str()))
+        .collect();
     assert_eq!(
-        manifest.sections.len(),
-        1,
-        "sessions should contribute one detail section"
+        section_ids,
+        BTreeSet::from([
+            ("models-overview", "models"),
+            ("sessions-overview", "sessions"),
+            ("sessions-detail", "sessions"),
+            ("tools-overview", "tools"),
+            ("tracing-overview", "tracing"),
+        ]),
     );
-    let section = &manifest.sections[0];
-    assert_eq!(section.id, "sessions-detail");
-    assert_eq!(section.nav_item_id, "sessions");
-    assert_eq!(section.title, "Detail");
 
     let panels: Vec<_> = manifest
         .panels
         .iter()
-        .map(|panel| (panel.id.as_str(), panel.kind.as_str(), panel.transport))
+        .map(|panel| {
+            (
+                panel.id.as_str(),
+                panel.kind.as_str(),
+                panel.transport,
+                panel.section_id.as_deref(),
+            )
+        })
         .collect();
     let required = [
-        ("sessions-list", "list", Transport::Rest),
-        ("sessions-graph", "polaris-graph", Transport::Rest),
-        ("sessions-turn-stream", "log", Transport::Sse),
-        ("tools-list", "list", Transport::Rest),
-        ("models-providers", "list", Transport::Rest),
-        ("tracing-spans", "log", Transport::Rest),
+        (
+            "sessions-list",
+            "list",
+            Transport::Rest,
+            Some("sessions-overview"),
+        ),
+        (
+            "sessions-graph",
+            "polaris-graph",
+            Transport::Rest,
+            Some("sessions-detail"),
+        ),
+        (
+            "sessions-turn-stream",
+            "log",
+            Transport::Sse,
+            Some("sessions-detail"),
+        ),
+        (
+            "tools-list",
+            "list",
+            Transport::Rest,
+            Some("tools-overview"),
+        ),
+        (
+            "models-providers",
+            "list",
+            Transport::Rest,
+            Some("models-overview"),
+        ),
+        (
+            "tracing-spans",
+            "log",
+            Transport::Rest,
+            Some("tracing-overview"),
+        ),
     ];
     for entry in &required {
         assert!(
@@ -198,11 +244,38 @@ async fn full_server_unions_manifest_and_serves_endpoints() {
     }
     // The `otel` feature on `polaris_core_plugins` adds an extra
     // `tracing-otel-trace` panel; allow it but require nothing else.
-    let allowed_extra = ("tracing-otel-trace", "otel-trace", Transport::Rest);
+    let allowed_extra = (
+        "tracing-otel-trace",
+        "otel-trace",
+        Transport::Rest,
+        Some("tracing-overview"),
+    );
     for panel in &panels {
         assert!(
             required.contains(panel) || panel == &allowed_extra,
             "unexpected extra panel in manifest: {panel:?}",
+        );
+    }
+
+    // Referential integrity: every panel must declare a section_id that
+    // resolves to one of the asserted sections. The canonical consumer
+    // drops section-less panels, so this contract is load-bearing — pin
+    // it explicitly rather than implicitly through the panel tuples above.
+    let advertised_section_ids: BTreeSet<&str> = manifest
+        .sections
+        .iter()
+        .map(|section| section.id.as_str())
+        .collect();
+    for panel in &manifest.panels {
+        let section_id = panel
+            .section_id
+            .as_deref()
+            .unwrap_or_else(|| panic!("panel {:?} has no section_id", panel.id));
+        assert!(
+            advertised_section_ids.contains(section_id),
+            "panel {:?} references unknown section_id {section_id:?}; \
+             advertised sections: {advertised_section_ids:?}",
+            panel.id,
         );
     }
 
@@ -259,12 +332,17 @@ async fn single_contributor_does_not_leak_others() {
         .map(|item| item.id.as_str())
         .collect();
     assert_eq!(nav_ids, vec!["tools"]);
-    assert!(
-        manifest.sections.is_empty(),
-        "tools should not contribute sections"
-    );
+    assert_eq!(manifest.sections.len(), 1);
+    assert_eq!(manifest.sections[0].id, "tools-overview");
+    assert_eq!(manifest.sections[0].nav_item_id, "tools");
     assert_eq!(manifest.panels.len(), 1);
     assert_eq!(manifest.panels[0].id, "tools-list");
+    assert_eq!(
+        manifest.panels[0].section_id.as_deref(),
+        Some("tools-overview"),
+        "tools-list must be routed through tools-overview so the canonical \
+         consumer can render it",
+    );
 
     // Confirm `ToolsDashboardPlugin::ready` actually freezes the registered
     // tool. With an empty registry the snapshot endpoint is byte-identical to

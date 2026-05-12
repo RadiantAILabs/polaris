@@ -7,7 +7,7 @@ use axum::{
     routing::get,
 };
 use polaris_app::{AppPlugin, HttpRouter};
-use polaris_dashboard::{DashboardPlugin, DashboardRegistry, NavItem, Panel, Transport};
+use polaris_dashboard::{DashboardPlugin, DashboardRegistry, NavItem, Panel, Section, Transport};
 use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::server::Server;
 use serde::{Deserialize, Serialize};
@@ -140,13 +140,17 @@ impl Plugin for TracingDashboardPlugin {
             .expect("DashboardPlugin must be added before TracingDashboardPlugin");
         registry
             .add_nav_item(NavItem::new("tracing", "Tracing"))
-            .add_panel(Panel::new(
-                "tracing-spans",
-                "Recent spans",
-                "log",
-                TRACING_SPANS_PATH,
-                Transport::Rest,
-            ));
+            .add_section(Section::new("tracing-overview", "tracing", "Overview"))
+            .add_panel(
+                Panel::new(
+                    "tracing-spans",
+                    "Recent spans",
+                    "log",
+                    TRACING_SPANS_PATH,
+                    Transport::Rest,
+                )
+                .with_section("tracing-overview"),
+            );
 
         #[cfg(feature = "otel")]
         registry.add_panel(
@@ -157,6 +161,7 @@ impl Plugin for TracingDashboardPlugin {
                 TRACING_SPANS_PATH,
                 Transport::Rest,
             )
+            .with_section("tracing-overview")
             .with_metadata(serde_json::json!({ "format": "otel" })),
         );
     }

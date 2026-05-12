@@ -5,11 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-## [0.4.0] - 2026-05-07
+## [0.4.0] - 2026-05-11
 
 ### Added
+
+- **`RunId` / `RunLabels` on `GraphEvent`** (`polaris_graph`) — every `GraphEvent` variant carries a `run_id` (freshly minted per `GraphExecutor::execute*` invocation) and an opaque `labels: RunLabels` bag, so hook handlers can correlate `GraphStart`/`SystemStart`/…/`GraphComplete` into a single trace and filter by application-level identifiers without any new layered dependencies. `ExecutionResult` exposes `run_id` for the same purpose. `GraphEvent::run_id()` and `GraphEvent::labels()` accessors land on the enum. `RunLabels` derives `PartialEq` / `Eq` for ergonomic `assert_eq!(event.labels(), &expected)` in hook tests.
+
+- **`GraphExecutor::execute_with_labels`** (`polaris_graph`) — escape hatch for callers that want to attach correlation labels (e.g. `"session_id"`, `"agent_type"`) without the executor knowing anything about sessions or agents. `execute(...)` keeps the same signature and delegates to this with empty labels.
+
+- **Session-tagged graph events** (`polaris_sessions`) — `SessionsAPI::process_turn*` calls `execute_with_labels` with `session_id` and `agent_type` so dashboards and tracing pipelines can scope live graph events to a session out of the box.
+
+- **`AppConfig::with_public_path` / `with_public_prefix`** (`polaris_app`) — declarative allowlist for routes that should bypass `AuthProvider`. Use exact paths (`/healthz`, `/v1/auth/login`) or trailing-slash prefixes (`/dashboard/`) for hierarchical exemptions. The middleware consults the allowlist before invoking the provider, so consumers no longer hand-code `if path == "/healthz"` checks inside their `AuthProvider` impls. Empty allowlist (the default) preserves today's behavior — every request goes through the provider. Both builders panic at config time if the supplied path/prefix is empty or does not start with `/`; an empty prefix would otherwise have made every request public (`str::starts_with("")` is always `true`), silently disabling `AuthProvider`.
+
+- **`PublicPath` / `PublicPrefix` newtypes** (`polaris_app`) — validated wrappers around the request paths and prefixes consumed by the allowlist above. The smart constructors `PublicPath::new` / `PublicPrefix::new` (and `TryFrom<&str>` / `TryFrom<String>`) return `Result<_, PublicRouteError>`; invalid input (empty string, missing leading `/`) is now impossible to represent at the type level. The `AppConfig::with_public_path` / `with_public_prefix` builders accept `impl Into<String>` and route through the same constructors, so the panic behavior is preserved. Use the newtypes directly when you want validation as a `Result` at the boundary. Exposed as `polaris_app::{PublicPath, PublicPrefix, PublicRouteError}`.
 
 - **`polaris_dashboard` crate** — registry-only, zero-frontend Layer 3 plugin where any plugin can contribute nav items, sections, and panels to a dashboard or observability UI without depending on a downstream consumer repo. `DashboardRegistry` exposes chained `add_nav_item` / `add_section` / `add_panel` and `remove_*` for build-time suppression of upstream contributions (silent no-op when the id is absent). Descriptors `NavItem`, `Section`, `Panel`, `Transport` carry a free-form `kind: String` and `metadata: serde_json::Value`; seed `kind` vocabulary documented at the crate level (`list`, `detail`, `kv`, `log`, `timeseries`, `polaris-graph`, `otel-trace`, `external`). `DashboardPlugin` mounts `GET /v1/dashboard/manifest` via `add_routes_with`, freezes the registry in `ready()`, caches manifest bytes, and broadcasts `RegistryEvent::Ready(Arc<Manifest>)` once on freeze. `RegistryEvent` is `#[non_exhaustive]`. Opt-in — not in `DefaultPlugins`.
 
@@ -37,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `GraphEvent` variants gained fields** (`polaris_graph`) — `run_id` and `labels` are new fields on every variant. Pattern matches that don't already use `..` need to either ignore the new fields or bind them. `event.run_id()` / `event.labels()` accessors mean most observers don't need to touch struct patterns.
+
+- **BREAKING — `ExecutionResult` fields demoted to methods** (`polaris_graph`) — `nodes_executed: pub usize` and `duration: pub Duration` are now `pub(crate)` and exposed via `ExecutionResult::nodes_executed()` and `ExecutionResult::duration()`. The new `run_id()` accessor lands alongside them. Migration: `result.nodes_executed` → `result.nodes_executed()`, `result.duration` → `result.duration()`. Struct-pattern destructures (`let ExecutionResult { nodes_executed, duration, .. } = result;`) need to switch to the accessor calls. Encapsulating the fields lets the executor evolve the result shape (e.g. add `run_id`) without rippling through call sites.
+
+- **BREAKING — `AppConfig::public_paths` / `public_prefixes` return types** (`polaris_app`) — accessors now return `&[PublicPath]` / `&[PublicPrefix]` instead of `&[String]`. Call `.as_str()` on the newtype to recover the previous `&str` view, e.g. `config.public_paths().iter().map(PublicPath::as_str)`. The newtypes guarantee that allowlist storage cannot hold empty or unanchored strings, which is the type-system version of the eager validation on the builders.
+
 - **BREAKING — `HttpIOProvider` relocated** from `polaris_app` to `polaris_sessions::http`. The move breaks a `polaris_core_plugins → polaris_app → polaris_core_plugins` dependency cycle that `TracingPlugin`'s dashboard contribution would otherwise introduce. Downstream consumers must update `use polaris_app::HttpIOProvider` to `use polaris_sessions::http::HttpIOProvider`. The type's API is unchanged.
 
 - **BREAKING — `HttpIOProvider::new(input_buffer)` → `HttpIOProvider::new(input_buffer, output_buffer)`** (`polaris_sessions::http`). The output channel is now bounded with explicit per-call capacity; agents that emit faster than the consumer drains apply backpressure via `await` instead of growing memory unbounded. SSE turn streams use `tokio_stream::wrappers::ReceiverStream` instead of the unbounded variant. The `process_turn_stream` handler documents that turns are not aborted on client disconnect — disconnects propagate via channel close → `IOError::Closed` on the next agent send.
@@ -46,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SSE error events hardened** — error payloads now use a structured `{ code, message }` JSON envelope; HTTP error codes centralized in `polaris_sessions::http::error`.
 
 - **Top-level re-exports** — `polaris_dashboard` re-exported as `polaris_ai::dashboard`; layer table and quick-reference in `src/lib.rs` updated to mention `add_routes_with` and the new `dashboard` module.
+
+- **Dashboard panel→section contract tightened** — every `Panel` is expected to belong to a `Section`. Canonical dashboard consumers group panels by section and **drop section-less panels**; the registry itself does not validate cross-references, so this is documentation-as-convention. Each `*DashboardPlugin` shipped in this release (`polaris_sessions`, `polaris_tools`, `polaris_models`, `polaris_core_plugins::TracingPlugin`) now contributes a default `<nav>-overview` `Section` and routes its first panel through it. External plugins contributing panels should register a corresponding section (typically a single `"overview"` section is enough) or set `panel.section_id` to an existing one.
+
+- **`otel` feature docs corrected** (`polaris-ai`, `polaris_internal`) — the `otel` feature description in `Cargo.toml`, `polaris_internal/Cargo.toml`, and `src/lib.rs` previously claimed "OTel-aware HTTP middleware" and "end-to-end OTel context propagation". The feature only switches `polaris_app`'s HTTP request spans to OTel HTTP semantic-convention field names (`http.request.method`, `url.path`, `http.response.status_code`, plus `otel.name` / `otel.kind`); it does **not** extract incoming W3C `traceparent` headers. Docs now describe the actual behavior.
+
+- **CORS `allow_headers` includes `Authorization`** (`polaris_app`) — the CORS layer previously whitelisted only `Content-Type`, which caused cross-origin preflights to strip `Authorization: Bearer …` headers before they reached the `AuthProvider`. Browser SPAs hosted on a separate origin (e.g. a `polaris-dashboard` deployment talking to a Polaris backend) now have their bearer-token preflights succeed without operator-side workarounds.
+
+- **`AuthProvider` doc example uses constant-time comparison** (`polaris_app`) — the rustdoc example on `AuthProvider` previously compared bearer tokens with `==`, which short-circuits on the first mismatched byte and leaks the length of the matching prefix through timing. The example now demonstrates a constant-time comparison helper and points readers at `subtle::ConstantTimeEq`, `ring::constant_time`, and `openssl::memcmp::eq` for production use. Documentation-only — no runtime behavior change.
 
 - **Dashboard bridge plan** (`docs/plans/polaris-dashboard.md`) substantially revised:
   - Expanded from 9 to 14 architectural decisions — adds the in-core `polaris_dashboard` crate (registry-only, zero frontend), free-form descriptors with curated `kind` vocabulary, `ts-rs` Rust→TS typegen, lean registry with broadcast channel.

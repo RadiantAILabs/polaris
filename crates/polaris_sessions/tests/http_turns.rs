@@ -120,7 +120,7 @@ async fn turn_echo_round_trip() {
         .await
         .unwrap();
 
-    assert!(result.nodes_executed > 0);
+    assert!(result.nodes_executed() > 0);
 
     let mut messages = Vec::new();
     while let Ok(msg) = output_rx.try_recv() {

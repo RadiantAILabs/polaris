@@ -16,7 +16,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
 
 [features]
-default = []
+# `file-store` is on by default to preserve the historical behavior where
+# `polaris_sessions` was pulled with default features. Disable via
+# `default-features = false` on the consumer side if you want a `tokio/fs`-free
+# build.
+default = ["file-store"]
 anthropic = ["polaris_model_providers/anthropic"]
 openai = ["polaris_model_providers/openai"]
 bedrock = ["polaris_model_providers/bedrock"]
@@ -24,8 +28,18 @@ graph-tracing = ["polaris_core_plugins/graph_tracing"]
 models-tracing = ["polaris_core_plugins/models_tracing"]
 tools-tracing = ["polaris_core_plugins/tools_tracing"]
 tiktoken = ["polaris_models/tiktoken"]
-otel = ["polaris_core_plugins/otel"]
+# Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s
+# HTTP request spans to OTel HTTP semantic-convention field names. Does not
+# extract incoming W3C `traceparent` headers — each request starts a fresh
+# trace.
+otel = ["polaris_core_plugins/otel", "polaris_app/otel"]
 sessions-http = ["polaris_sessions/http"]
+# WebSocket router and dashboard event-stream surface in `polaris_app`.
+ws = ["polaris_app/ws"]
+# `MockClock` and `MockIOProvider` for downstream test code.
+test-utils = ["polaris_core_plugins/test-utils"]
+# Filesystem-backed `SessionStore`. Brings in `tokio/fs`.
+file-store = ["polaris_sessions/file-store"]
 # Pulls `polaris_dashboard` (and its `axum` runtime dep) into the dep
 # graph and re-exports it as `polaris_internal::dashboard`. Implied by
 # every `*-dashboard` feature so plugin contributions always compile
@@ -36,6 +50,9 @@ sessions-dashboard = ["dashboard-registry", "polaris_sessions/dashboard"]
 tools-dashboard = ["dashboard-registry", "polaris_tools/dashboard"]
 models-dashboard = ["dashboard-registry", "polaris_models/dashboard"]
 tracing-dashboard = ["dashboard-registry", "polaris_core_plugins/dashboard"]
+# Adds `Serialize` / `Deserialize` to `polaris_graph`'s correlation types
+# (`RunId`, `RunLabels`) so events can flow across process boundaries.
+serde = ["polaris_graph/serde"]
 dashboard = [
     "sessions-dashboard",
     "tools-dashboard",
@@ -51,7 +68,7 @@ polaris_tools = { path = "../polaris_tools", version = "0.4.0" }
 polaris_model_providers = { path = "../polaris_model_providers", version = "0.4.0" }
 polaris_models = { path = "../polaris_models", version = "0.4.0" }
 polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4.0" }
-polaris_sessions = { path = "../polaris_sessions", version = "0.4.0" }
+polaris_sessions = { path = "../polaris_sessions", version = "0.4.0", default-features = false }
 polaris_shell = { path = "../polaris_shell", version = "0.4.0" }
 polaris_app = { path = "../polaris_app", version = "0.4.0", default-features = false }
 polaris_dashboard = { path = "../polaris_dashboard", version = "0.4.0", optional = true }

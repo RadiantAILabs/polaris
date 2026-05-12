@@ -139,8 +139,8 @@ pub(crate) async fn process_turn(
     Ok(Json(ProcessTurnResponse {
         messages,
         execution: TurnExecutionMetadata {
-            nodes_executed: result.nodes_executed,
-            duration_ms: result.duration.as_millis() as u64,
+            nodes_executed: result.nodes_executed(),
+            duration_ms: result.duration().as_millis() as u64,
             turn_number: info.turn_number,
         },
     }))
@@ -258,8 +258,8 @@ pub(crate) async fn process_turn_stream(
                     .event("done")
                     .json_data(&StreamTurnDone {
                         execution: TurnExecutionMetadata {
-                            nodes_executed: exec_result.nodes_executed,
-                            duration_ms: exec_result.duration.as_millis() as u64,
+                            nodes_executed: exec_result.nodes_executed(),
+                            duration_ms: exec_result.duration().as_millis() as u64,
                             turn_number,
                         },
                     })

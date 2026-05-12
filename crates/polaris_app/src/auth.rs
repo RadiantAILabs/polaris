@@ -11,9 +11,33 @@
 //! use axum::response::IntoResponse;
 //! use http::StatusCode;
 //!
+//! /// Constant-time equality on two byte slices.
+//! ///
+//! /// Production implementations should reach for a vetted constant-time
+//! /// comparator (`subtle::ConstantTimeEq`, `ring::constant_time`,
+//! /// `openssl::memcmp::eq`) rather than `==`. A short-circuiting `==`
+//! /// leaks the length of the matching prefix through timing, which is
+//! /// enough for a remote attacker to recover a bearer token byte by byte.
+//! fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+//!     if a.len() != b.len() {
+//!         return false;
+//!     }
+//!     let mut diff = 0u8;
+//!     for (x, y) in a.iter().zip(b.iter()) {
+//!         diff |= x ^ y;
+//!     }
+//!     diff == 0
+//! }
+//!
 //! #[derive(Debug)]
 //! struct BearerAuth {
-//!     expected_token: String,
+//!     expected_header: String,
+//! }
+//!
+//! impl BearerAuth {
+//!     fn new(token: &str) -> Self {
+//!         Self { expected_header: format!("Bearer {token}") }
+//!     }
 //! }
 //!
 //! impl AuthProvider for BearerAuth {
@@ -21,11 +45,13 @@
 //!         let header = parts
 //!             .headers
 //!             .get(http::header::AUTHORIZATION)
-//!             .and_then(|v| v.to_str().ok());
+//!             .and_then(|v| v.to_str().ok())
+//!             .unwrap_or("");
 //!
-//!         match header {
-//!             Some(val) if val == format!("Bearer {}", self.expected_token) => Ok(()),
-//!             _ => Err(Box::new(StatusCode::UNAUTHORIZED.into_response())),
+//!         if constant_time_eq(header.as_bytes(), self.expected_header.as_bytes()) {
+//!             Ok(())
+//!         } else {
+//!             Err(Box::new(StatusCode::UNAUTHORIZED.into_response()))
 //!         }
 //!     }
 //! }
@@ -50,6 +76,15 @@ pub type AuthRejection = Box<axum::response::Response>;
 /// scheme requires async I/O (e.g., remote token introspection), perform the
 /// lookup in a Tower layer registered directly via
 /// [`HttpRouter::add_routes`](crate::HttpRouter::add_routes) instead.
+///
+/// # Public routes
+///
+/// For path-based exemptions (health checks, login pages, static assets),
+/// prefer [`AppConfig::with_public_path`](crate::AppConfig::with_public_path)
+/// and [`AppConfig::with_public_prefix`](crate::AppConfig::with_public_prefix)
+/// over hand-rolling matching inside the trait. The middleware consults the
+/// allowlist before invoking `authenticate`, keeping path-based routing
+/// decisions out of credential-validation logic.
 pub trait AuthProvider: Send + Sync + std::fmt::Debug + 'static {
     /// Validates request authentication.
     ///

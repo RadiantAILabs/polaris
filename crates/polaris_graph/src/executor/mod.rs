@@ -33,7 +33,7 @@ pub use run::DEFAULT_SWITCH_CASE;
 use crate::edge::Edge;
 use crate::graph::Graph;
 use crate::hooks::HooksAPI;
-use crate::hooks::events::GraphEvent;
+use crate::hooks::events::{GraphEvent, RunId, RunLabels};
 use crate::hooks::schedule::{OnGraphComplete, OnGraphFailure, OnGraphStart, OnSystemStart};
 use crate::middleware::{self, MiddlewareAPI};
 use crate::node::{ContextMode, Node, NodeId};
@@ -42,6 +42,19 @@ use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
 use std::any::{Any, TypeId};
 use std::time::Duration;
+
+/// Per-invocation correlation context threaded through executor internals.
+///
+/// Bundles the freshly minted [`RunId`] and the caller-supplied [`RunLabels`]
+/// so every emitted [`GraphEvent`] can be tagged consistently without
+/// duplicating two parameters across every helper method.
+#[derive(Clone)]
+pub(crate) struct RunContext {
+    /// Identifier minted for this `execute*` invocation.
+    pub(crate) run_id: RunId,
+    /// Caller-supplied correlation labels.
+    pub(crate) labels: RunLabels,
+}
 
 /// Result of executing a graph.
 ///
@@ -65,27 +78,34 @@ use std::time::Duration;
 /// let executor = GraphExecutor::new();
 /// let result = executor.execute(&graph, &mut ctx, None, None).await?;
 ///
-/// assert!(result.nodes_executed > 0);
-/// assert!(!result.duration.is_zero());
+/// assert!(result.nodes_executed() > 0);
+/// assert!(!result.duration().is_zero());
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Default)]
 pub struct ExecutionResult {
+    /// Identifier minted for the run that produced this result.
+    ///
+    /// Matches the `run_id` carried by every [`GraphEvent`] emitted during
+    /// the same invocation, letting callers correlate the returned result
+    /// with collected hook events.
+    pub(crate) run_id: RunId,
     /// Number of nodes executed during traversal.
-    pub nodes_executed: usize,
+    pub(crate) nodes_executed: usize,
     /// Total execution duration.
-    pub duration: Duration,
+    pub(crate) duration: Duration,
     /// The output value from the last system that produced one.
     ///
     /// This is the same value stored via `ctx.insert_output_boxed()` during
     /// execution. Use [`output`](Self::output) to downcast to a concrete type.
-    final_output: Option<Box<dyn Any + Send + Sync>>,
+    pub(crate) final_output: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for ExecutionResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionResult")
+            .field("run_id", &self.run_id)
             .field("nodes_executed", &self.nodes_executed)
             .field("duration", &self.duration)
             .field(
@@ -101,6 +121,27 @@ impl std::fmt::Debug for ExecutionResult {
 }
 
 impl ExecutionResult {
+    /// Returns the identifier minted for the run that produced this result.
+    ///
+    /// Matches the `run_id` carried by every [`GraphEvent`] emitted during
+    /// the same invocation.
+    #[must_use]
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// Returns the number of nodes executed during traversal.
+    #[must_use]
+    pub fn nodes_executed(&self) -> usize {
+        self.nodes_executed
+    }
+
+    /// Returns the total execution duration.
+    #[must_use]
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
     /// Attempts to extract the typed output from graph execution.
     ///
     /// Returns `Some(&T)` if the last system produced a value of type `T`,
@@ -586,18 +627,50 @@ impl GraphExecutor {
         hooks: Option<&HooksAPI>,
         middleware: Option<&MiddlewareAPI>,
     ) -> Result<ExecutionResult, ExecutionError> {
+        self.execute_with_labels(graph, ctx, hooks, middleware, RunLabels::empty())
+            .await
+    }
+
+    /// Executes a graph with caller-supplied correlation labels.
+    ///
+    /// Identical to [`execute`](Self::execute) except that the supplied
+    /// `labels` are attached to every emitted [`GraphEvent`] and to the
+    /// returned [`ExecutionResult`]. Layer 3 callers (e.g. session managers)
+    /// populate the labels with keys such as `"session_id"` and `"agent_type"`
+    /// so hook handlers and dashboards can correlate events across runs.
+    ///
+    /// A fresh [`RunId`] is minted for every invocation regardless of the
+    /// labels passed in.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`execute`](Self::execute).
+    pub async fn execute_with_labels(
+        &self,
+        graph: &Graph,
+        ctx: &mut SystemContext<'_>,
+        hooks: Option<&HooksAPI>,
+        middleware: Option<&MiddlewareAPI>,
+        labels: RunLabels,
+    ) -> Result<ExecutionResult, ExecutionError> {
         let default_mw = MiddlewareAPI::default();
         let mw = middleware.unwrap_or(&default_mw);
 
         let entry = graph.entry().ok_or(ExecutionError::EmptyGraph)?;
         let node_count = graph.node_count();
 
+        let run_ctx = RunContext {
+            run_id: RunId::new(),
+            labels,
+        };
+
         let middleware_info = middleware::info::GraphInfo { node_count };
         mw.inner
             .graph_execution
             .execute(middleware_info, ctx, |ctx| {
                 let entry = entry.clone();
-                Box::pin(self.execute_graph_body(graph, ctx, entry, node_count, hooks, mw))
+                let run_ctx = run_ctx.clone();
+                Box::pin(self.execute_graph_body(graph, ctx, entry, node_count, hooks, mw, run_ctx))
             })
             .await
     }
@@ -611,6 +684,7 @@ impl GraphExecutor {
         node_count: usize,
         hooks: Option<&HooksAPI>,
         middleware: &MiddlewareAPI,
+        run_ctx: RunContext,
     ) -> Result<ExecutionResult, ExecutionError> {
         let start = std::time::Instant::now();
 
@@ -624,6 +698,8 @@ impl GraphExecutor {
             hooks,
             ctx,
             &GraphEvent::GraphStart {
+                run_id: run_ctx.run_id.clone(),
+                labels: run_ctx.labels.clone(),
                 node_count,
                 node_map,
             },
@@ -635,7 +711,7 @@ impl GraphExecutor {
         let result = if let Some(max) = effective_timeout {
             match tokio::time::timeout(
                 max,
-                self.execute_from(graph, ctx, entry, 0, hooks, middleware),
+                self.execute_from(graph, ctx, entry, 0, hooks, middleware, &run_ctx),
             )
             .await
             {
@@ -646,7 +722,7 @@ impl GraphExecutor {
                 }
             }
         } else {
-            self.execute_from(graph, ctx, entry, 0, hooks, middleware)
+            self.execute_from(graph, ctx, entry, 0, hooks, middleware, &run_ctx)
                 .await
         };
 
@@ -659,11 +735,14 @@ impl GraphExecutor {
                     hooks,
                     ctx,
                     &GraphEvent::GraphComplete {
+                        run_id: run_ctx.run_id.clone(),
+                        labels: run_ctx.labels.clone(),
                         nodes_executed,
                         duration,
                     },
                 );
                 Ok(ExecutionResult {
+                    run_id: run_ctx.run_id,
                     nodes_executed,
                     duration,
                     final_output,
@@ -673,7 +752,11 @@ impl GraphExecutor {
                 Self::invoke_hook::<OnGraphFailure>(
                     hooks,
                     ctx,
-                    &GraphEvent::GraphFailure { error: err.clone() },
+                    &GraphEvent::GraphFailure {
+                        run_id: run_ctx.run_id.clone(),
+                        labels: run_ctx.labels.clone(),
+                        error: err.clone(),
+                    },
                 );
                 Err(err)
             }

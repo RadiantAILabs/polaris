@@ -71,14 +71,18 @@ impl Plugin for SessionsDashboardPlugin {
             .api::<DashboardRegistry>()
             .expect("DashboardPlugin must be added before SessionsDashboardPlugin")
             .add_nav_item(NavItem::new("sessions", "Sessions"))
+            .add_section(Section::new("sessions-overview", "sessions", "Overview"))
             .add_section(Section::new("sessions-detail", "sessions", "Detail"))
-            .add_panel(Panel::new(
-                "sessions-list",
-                "Active sessions",
-                "list",
-                "/v1/sessions",
-                Transport::Rest,
-            ))
+            .add_panel(
+                Panel::new(
+                    "sessions-list",
+                    "Active sessions",
+                    "list",
+                    "/v1/sessions",
+                    Transport::Rest,
+                )
+                .with_section("sessions-overview"),
+            )
             .add_panel(
                 Panel::new(
                     "sessions-graph",

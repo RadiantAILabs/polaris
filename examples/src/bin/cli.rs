@@ -433,8 +433,8 @@ async fn main() {
                     Ok(result) => {
                         eprintln!(
                             "{STYLE_DIM}  ({} nodes, {:.2}s){STYLE_RESET}\n",
-                            result.nodes_executed,
-                            result.duration.as_secs_f64()
+                            result.nodes_executed(),
+                            result.duration().as_secs_f64()
                         );
                     }
                     Err(err) => {
