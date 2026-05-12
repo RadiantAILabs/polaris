@@ -50,41 +50,34 @@ impl Plugin for HealthPlugin {
 Routes are registered during `build()` and merged into a single router in
 `AppPlugin::ready()`.
 
-# The `DeferredState` Pattern
+# Deferred Router Construction
 
-Routes are registered in `build()`, but the APIs they need (e.g.,
-`SessionsAPI`) are only available in `ready()`. The `DeferredState` pattern
-bridges this gap using `Arc<OnceLock<T>>`:
+Stateless routes can be registered with `add_routes`, but many plugins need
+state that only exists *after* every plugin's `build()` runs (for example,
+a `SessionsAPI` registered by another plugin). `add_routes_with` defers
+router construction until `AppPlugin::ready()`, where the closure receives
+a fully-initialized `&Server`:
 
 ```ignore
-use std::sync::{Arc, OnceLock};
 use polaris_ai::system::plugin::{Plugin, PluginId, Version};
 use polaris_ai::system::server::Server;
 use polaris_ai::app::{AppPlugin, HttpRouter};
 use polaris_ai::sessions::SessionsAPI;
-use axum::{Router, routing::get, extract::State, Json};
+use axum::{Router, routing::get, extract::State};
 
-type DeferredState = Arc<OnceLock<SessionsAPI>>;
-
-struct MyHttpPlugin {
-    state: DeferredState,
-}
+struct MyHttpPlugin;
 
 impl Plugin for MyHttpPlugin {
     const ID: &'static str = "myapp::http";
     const VERSION: Version = Version::new(0, 1, 0);
 
     fn build(&self, server: &mut Server) {
-        let state = Arc::clone(&self.state);
-        let router = Router::new()
-            .route("/endpoint", get(my_handler))
-            .with_state(state);
-        server.api::<HttpRouter>().unwrap().add_routes(router);
-    }
-
-    async fn ready(&self, server: &mut Server) {
-        let api = server.api::<SessionsAPI>().unwrap().clone();
-        self.state.set(api).expect("ready() called once");
+        server.api::<HttpRouter>().unwrap().add_routes_with(|server| {
+            let sessions = server.api::<SessionsAPI>().unwrap().clone();
+            Router::new()
+                .route("/endpoint", get(my_handler))
+                .with_state(sessions)  // strongly-typed state
+        });
     }
 
     fn dependencies(&self) -> Vec<PluginId> {
@@ -92,13 +85,14 @@ impl Plugin for MyHttpPlugin {
     }
 }
 
-async fn my_handler(
-    State(deferred): State<DeferredState>,
-) -> &'static str {
-    let _sessions = deferred.get().expect("not ready");
+async fn my_handler(State(_sessions): State<SessionsAPI>) -> &'static str {
     "ok"
 }
 ```
+
+Handlers use `State<SessionsAPI>` directly — no `Option` unwrap, no
+"server not ready" branch. Use `add_routes` for stateless fragments and
+`add_routes_with` whenever the router needs another plugin's API.
 
 # `HttpIOProvider`
 
@@ -106,11 +100,11 @@ Bridges HTTP requests to the agent's `UserIO` abstraction via tokio
 channels:
 
 ```no_run
-use polaris_ai::app::HttpIOProvider;
+use polaris_ai::sessions::http::HttpIOProvider;
 # use polaris_ai::plugins::IOMessage;
 use std::sync::Arc;
 
-let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1);
+let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, 64);
 let provider = Arc::new(provider);
 ```
 

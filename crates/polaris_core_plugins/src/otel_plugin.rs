@@ -33,6 +33,7 @@ use crate::TracingLayersApi;
 use crate::TracingPlugin;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::Mutex;
 use polaris_system::plugin::{Plugin, PluginId, Version};
@@ -151,6 +152,10 @@ impl Plugin for OpenTelemetryPlugin {
     const VERSION: Version = Version::new(0, 0, 1);
 
     fn build(&self, server: &mut Server) {
+        // Install the W3C trace-context propagator so HTTP boundary extractors
+        // (e.g. `polaris_app::middleware`) can parent spans on upstream traces.
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
         // Build the OTLP HTTP exporter
         let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder()
             .with_http()

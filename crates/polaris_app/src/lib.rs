@@ -15,11 +15,11 @@
 //! ```text
 //! AppPlugin (axum server lifecycle)
 //!   ├── HttpRouter API (route and auth registration)
+//!   ├── WsRouter API (WebSocket route registration, `ws` feature)
 //!   ├── AppConfig (host, port, CORS)
 //!   ├── ServerHandle (shutdown signal, API)
 //!   ├── AuthProvider trait (pluggable authentication)
 //!   ├── Tower middleware (CORS, tracing, request ID, auth)
-//!   ├── HttpIOProvider (channel-based IO bridging)
 //!   └── RequestContextPlugin (trace/correlation/request IDs)
 //! ```
 //!
@@ -37,6 +37,10 @@
 //!
 //! The pure core is [`RequestContext::from_headers`], lenient by design:
 //! missing headers become `None`, never a rejection.
+//!
+//! # Feature Flags
+//!
+//! - `ws` — enables [`WsRouter`] for plugin-contributed WebSocket routes
 //!
 //! # Quick Start
 //!
@@ -83,20 +87,27 @@
 //!
 //! # See Also
 //!
-//! For the full framework guide, `DeferredState` pattern details, and HTTP integration
-//! patterns, see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
+//! For the full framework guide, deferred router construction
+//! (`add_routes_with`), and HTTP integration patterns, see the
+//! [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 pub mod auth;
 pub mod config;
-pub mod io;
 mod middleware;
 pub mod plugin;
+pub mod public_route;
 pub mod request_context;
 pub mod router;
+#[cfg(feature = "ws")]
+#[cfg_attr(docsrs_dep, doc(cfg(feature = "ws")))]
+pub mod ws;
 
 pub use auth::AuthProvider;
 pub use config::AppConfig;
-pub use io::HttpIOProvider;
 pub use plugin::{AppPlugin, ServerHandle};
+pub use public_route::{PublicPath, PublicPrefix, PublicRouteError};
 pub use request_context::{HttpHeaders, RequestContext, RequestContextPlugin};
 pub use router::HttpRouter;
+#[cfg(feature = "ws")]
+#[cfg_attr(docsrs_dep, doc(cfg(feature = "ws")))]
+pub use ws::WsRouter;

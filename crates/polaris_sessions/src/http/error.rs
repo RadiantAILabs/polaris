@@ -6,13 +6,28 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
+/// Machine-readable error code strings emitted in the `code` field of
+/// JSON error responses and `event: error` SSE payloads.
+///
+/// These are part of the HTTP contract — adding, renaming, or removing
+/// a code is a breaking change for clients. Keep this module the single
+/// source of truth so handlers and [`ApiError::code`] cannot drift.
+pub(crate) mod codes {
+    pub(crate) const SESSION_NOT_FOUND: &str = "session_not_found";
+    pub(crate) const SESSION_BUSY: &str = "session_busy";
+    pub(crate) const TURN_NOT_FOUND: &str = "turn_not_found";
+    pub(crate) const AGENT_NOT_FOUND: &str = "agent_not_found";
+    pub(crate) const SESSION_ALREADY_EXISTS: &str = "session_already_exists";
+    pub(crate) const GRAPH_VALIDATION: &str = "graph_validation";
+    pub(crate) const IO_CHANNEL_CLOSED: &str = "io_channel_closed";
+    pub(crate) const INTERNAL_ERROR: &str = "internal_error";
+}
+
 /// HTTP error type for session endpoints.
 ///
 /// Maps [`SessionError`] variants to appropriate HTTP status codes and
 /// JSON error bodies.
 pub(crate) enum ApiError {
-    /// Server not yet ready (state not initialized).
-    NotReady,
     /// Session not found.
     SessionNotFound(SessionId),
     /// Session is already executing a turn.
@@ -33,56 +48,51 @@ pub(crate) enum ApiError {
 
 impl ApiError {
     /// Returns the machine-readable error code for this variant.
-    fn code(&self) -> &'static str {
+    pub(super) fn code(&self) -> &'static str {
         match self {
-            Self::NotReady => "service_unavailable",
-            Self::SessionNotFound(_) => "session_not_found",
-            Self::SessionBusy(_) => "session_busy",
-            Self::TurnNotFound(_) => "turn_not_found",
-            Self::AgentNotFound(_) => "agent_not_found",
-            Self::Conflict(_) => "session_already_exists",
-            Self::GraphValidation(_) => "graph_validation",
-            Self::IoChannelClosed => "io_channel_closed",
-            Self::Internal(_) => "internal_error",
+            Self::SessionNotFound(_) => codes::SESSION_NOT_FOUND,
+            Self::SessionBusy(_) => codes::SESSION_BUSY,
+            Self::TurnNotFound(_) => codes::TURN_NOT_FOUND,
+            Self::AgentNotFound(_) => codes::AGENT_NOT_FOUND,
+            Self::Conflict(_) => codes::SESSION_ALREADY_EXISTS,
+            Self::GraphValidation(_) => codes::GRAPH_VALIDATION,
+            Self::IoChannelClosed => codes::IO_CHANNEL_CLOSED,
+            Self::Internal(_) => codes::INTERNAL_ERROR,
+        }
+    }
+
+    /// Returns a human-readable error message for this variant.
+    pub(super) fn message(&self) -> String {
+        match self {
+            Self::SessionNotFound(id) => format!("session not found: {id}"),
+            Self::SessionBusy(id) => format!("session already executing a turn: {id}"),
+            Self::TurnNotFound(turn) => format!("no checkpoint for turn: {turn}"),
+            Self::AgentNotFound(name) => format!("agent not found: {name}"),
+            Self::Conflict(id) => format!("session already exists: {id}"),
+            Self::GraphValidation(msg) | Self::Internal(msg) => msg.clone(),
+            Self::IoChannelClosed => "IO channel closed unexpectedly".to_owned(),
+        }
+    }
+
+    /// Returns the HTTP status code for this variant.
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::SessionNotFound(_) => StatusCode::NOT_FOUND,
+            Self::SessionBusy(_) | Self::Conflict(_) => StatusCode::CONFLICT,
+            // 400 (not 404): the turn number is caller-supplied input that
+            // failed validation, not a missing sub-resource.
+            Self::TurnNotFound(_) | Self::AgentNotFound(_) => StatusCode::BAD_REQUEST,
+            Self::GraphValidation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::IoChannelClosed | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, message) = match &self {
-            Self::NotReady => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server not ready".to_owned(),
-            ),
-            Self::SessionNotFound(id) => {
-                (StatusCode::NOT_FOUND, format!("session not found: {id}"))
-            }
-            Self::SessionBusy(id) => (
-                StatusCode::CONFLICT,
-                format!("session already executing a turn: {id}"),
-            ),
-            // 400 (not 404): the turn number is caller-supplied input that
-            // failed validation, not a missing sub-resource.
-            Self::TurnNotFound(turn) => (
-                StatusCode::BAD_REQUEST,
-                format!("no checkpoint for turn: {turn}"),
-            ),
-            Self::AgentNotFound(name) => {
-                (StatusCode::BAD_REQUEST, format!("agent not found: {name}"))
-            }
-            Self::Conflict(id) => (
-                StatusCode::CONFLICT,
-                format!("session already exists: {id}"),
-            ),
-            Self::GraphValidation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
-            Self::IoChannelClosed => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "IO channel closed unexpectedly".to_owned(),
-            ),
-            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        };
+        let status = self.status();
         let code = self.code();
+        let message = self.message();
         (
             status,
             Json(serde_json::json!({ "error": { "code": code, "message": message } })),

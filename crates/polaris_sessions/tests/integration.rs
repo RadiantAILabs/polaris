@@ -6,6 +6,9 @@
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin, Storable};
 use polaris_graph::graph::Graph;
+use polaris_graph::hooks::HooksAPI;
+use polaris_graph::hooks::events::GraphEvent;
+use polaris_graph::hooks::schedule::OnGraphStart;
 use polaris_sessions::store::memory::InMemoryStore;
 use polaris_sessions::store::{AgentTypeId, SessionId, SessionStore};
 use polaris_sessions::{SessionError, SessionsAPI, SessionsPlugin};
@@ -14,7 +17,7 @@ use polaris_system::resource::LocalResource;
 use polaris_system::server::Server;
 use polaris_system::system;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test fixtures
@@ -377,10 +380,18 @@ async fn scoped_session_cleans_up_on_drop() {
         guard.id().clone()
     };
 
-    // Give the spawned cleanup task time to run.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    assert!(!sessions.list_live_sessions().contains(&id));
+    // The guard spawns deletion onto the tokio runtime — yield until it has
+    // run rather than sleeping a fixed duration. `yield_now` lets the
+    // spawned task make progress; bound the wait to fail loudly if the
+    // cleanup task never runs instead of hanging the test suite.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sessions.list_live_sessions().contains(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "guard cleanup task did not run within 5s"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 /// `scoped_session` returns `AgentNotFound` for unregistered agents.
@@ -474,6 +485,57 @@ async fn try_process_turn_returns_session_busy_while_turn_in_flight() {
         .await
         .expect("spawned task did not panic")
         .expect("background turn should succeed");
+}
+
+/// `process_turn` populates `session_id` and `agent_type` labels on every
+/// emitted graph event, so dashboards and tracing pipelines can scope events
+/// to a specific session without relying on out-of-band correlation.
+#[tokio::test]
+async fn process_turn_labels_events_with_session_and_agent_type() {
+    let store = Arc::new(InMemoryStore::new());
+
+    let mut server = Server::new();
+    server
+        .add_plugins(PersistencePlugin)
+        .add_plugins(SessionsPlugin::new(store).without_auto_checkpoint());
+    // Insert HooksAPI before finish() so SessionsPlugin::ready() picks it up.
+    let hooks_api = HooksAPI::new();
+    server.insert_api(hooks_api);
+
+    let captured: Arc<Mutex<Vec<GraphEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = Arc::clone(&captured);
+    server
+        .api::<HooksAPI>()
+        .unwrap()
+        .register_observer::<OnGraphStart, _>("label_capture", move |event: &GraphEvent| {
+            captured_clone.lock().unwrap().push(event.clone());
+        })
+        .unwrap();
+
+    server.finish().await;
+
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    sessions.register_agent(CounterAgent).unwrap();
+
+    let id = SessionId::from_string("sess-labels-1");
+    sessions
+        .create_session_with(
+            server.create_context(),
+            &id,
+            &AgentTypeId::from_name("CounterAgent"),
+            |ctx| {
+                ctx.insert(Counter::default());
+            },
+        )
+        .unwrap();
+
+    sessions.process_turn(&id).await.unwrap();
+
+    let events = captured.lock().unwrap();
+    assert_eq!(events.len(), 1, "exactly one OnGraphStart per turn");
+    let labels = events[0].labels();
+    assert_eq!(labels.get("session_id"), Some("sess-labels-1"));
+    assert_eq!(labels.get("agent_type"), Some("CounterAgent"));
 }
 
 /// `try_process_turn` returns `SessionNotFound` for an unknown session.

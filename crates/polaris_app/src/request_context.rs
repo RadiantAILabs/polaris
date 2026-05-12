@@ -65,6 +65,7 @@ use std::convert::Infallible;
 /// Any additional headers the application needs to propagate can be stored
 /// in [`extras`](Self::extras).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RequestContext {
     /// Unique identifier for this request's trace.
     ///
@@ -327,6 +328,8 @@ mod tests {
             ScheduleId::of::<OnGraphStart>(),
             &mut ctx,
             &GraphEvent::GraphStart {
+                run_id: polaris_graph::RunId::new(),
+                labels: polaris_graph::RunLabels::empty(),
                 node_count: 0,
                 node_map: Vec::new(),
             },
@@ -376,6 +379,8 @@ mod tests {
             ScheduleId::of::<OnGraphStart>(),
             &mut ctx,
             &GraphEvent::GraphStart {
+                run_id: polaris_graph::RunId::new(),
+                labels: polaris_graph::RunLabels::empty(),
                 node_count: 0,
                 node_map: Vec::new(),
             },

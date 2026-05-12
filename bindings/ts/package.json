@@ -1,0 +1,22 @@
+{
+  "name": "@polaris/types",
+  "version": "0.1.0",
+  "description": "Generated TypeScript bindings for Polaris wire types (sessions, dashboard manifest, etc.). Source of truth is the Rust workspace; do not edit generated files by hand.",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RadiantAILabs/polaris",
+    "directory": "bindings/ts"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "files": [
+    "src"
+  ]
+}

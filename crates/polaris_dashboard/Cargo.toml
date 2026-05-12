@@ -1,0 +1,48 @@
+[package]
+name = "polaris_dashboard"
+version.workspace = true
+description = "Cross-plugin contribution registry for Polaris dashboards and observability UIs."
+edition.workspace = true
+documentation = "https://docs.rs/polaris-ai"
+keywords = ["polaris-ai", "dashboard", "registry", "plugin"]
+categories = ["asynchronous", "development-tools"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Generates TypeScript bindings for the dashboard descriptor types.
+# Off by default so release builds do not pull `ts-rs` into the dep graph.
+typegen = ["dep:ts-rs"]
+
+[dependencies]
+polaris_system = { path = "../polaris_system", version = "0.4.0" }
+polaris_app = { path = "../polaris_app", version = "0.4.0", default-features = false }
+axum = { version = "0.8", features = ["tokio"] }
+bytes = "1"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+
+# Optional typegen dependency (enabled by `typegen` feature)
+ts-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+polaris_core_plugins = { path = "../polaris_core_plugins", features = ["dashboard"] }
+polaris_models = { path = "../polaris_models", features = ["dashboard"] }
+polaris_sessions = { path = "../polaris_sessions", features = ["dashboard"] }
+polaris_tools = { path = "../polaris_tools", features = ["dashboard"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-test = "0.4"
+reqwest = { version = "0.13", features = ["json"] }

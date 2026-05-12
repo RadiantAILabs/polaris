@@ -50,14 +50,15 @@ Multiple plugins can register routes independently -- they are all merged before
 
 ## HttpIOProvider
 
-Bridges HTTP requests to agent `UserIO` via tokio channels. Used by session HTTP endpoints to connect an HTTP handler to an agent's IO abstraction:
+`HttpIOProvider` lives in `polaris_sessions::http` (its only consumer). It
+bridges HTTP requests to agent `UserIO` via tokio channels:
 
 ```rust
-use polaris_app::HttpIOProvider;
+use polaris_sessions::http::HttpIOProvider;
 use polaris_core_plugins::{IOMessage, UserIO};
 use std::sync::Arc;
 
-let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32);
+let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32, 32);
 
 // Pre-load user input from HTTP request body
 // input_tx.send(IOMessage::user_text("hello")).await;

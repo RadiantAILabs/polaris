@@ -54,7 +54,7 @@
 //! # impl SystemInfo { fn new(n: polaris_graph::node::NodeId, s: &'static str) -> Self { Self { node_id: n, name: s } } }
 //! # impl LocalResource for SystemInfo {}
 //! hooks.register_provider::<OnSystemStart, SystemInfo, _>("devtools", |event: &GraphEvent| {
-//!     if let GraphEvent::SystemStart { node_id, node_name } = event {
+//!     if let GraphEvent::SystemStart { node_id, node_name, .. } = event {
 //!         Some(SystemInfo::new(node_id.clone(), node_name))
 //!     } else {
 //!         None
@@ -82,4 +82,4 @@ pub mod events;
 pub mod schedule;
 
 pub use api::{HookRegistrationError, HooksAPI};
-pub use events::GraphEvent;
+pub use events::{GraphEvent, RunId, RunLabels};

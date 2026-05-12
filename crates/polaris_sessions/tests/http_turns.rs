@@ -6,10 +6,10 @@
 #![cfg(feature = "http")]
 
 use polaris_agent::Agent;
-use polaris_app::HttpIOProvider;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin};
 use polaris_core_plugins::{IOContent, IOMessage, UserIO};
 use polaris_graph::graph::Graph;
+use polaris_sessions::http::HttpIOProvider;
 use polaris_sessions::store::memory::InMemoryStore;
 use polaris_sessions::store::{AgentTypeId, SessionId};
 use polaris_sessions::{SessionError, SessionsAPI, SessionsPlugin};
@@ -49,9 +49,15 @@ impl Agent for EchoAgent {
 
 /// System that calls receive twice — the second will block forever,
 /// holding the context lock.
+///
+/// Emits a `system` `IOMessage` after the first receive so callers can
+/// synchronize on lock acquisition without sleeping on the wall clock.
 #[system]
 async fn blocking_receive(io: Res<UserIO>) {
     let _first = io.receive().await.expect("should receive first message");
+    io.send(IOMessage::system_text("blocking-ready"))
+        .await
+        .expect("should signal lock acquisition");
     // This second receive blocks forever because there is no second message.
     let _second = io.receive().await;
 }
@@ -106,7 +112,7 @@ async fn turn_echo_round_trip() {
     let id = SessionId::new();
     create_session(&server, &id, "EchoAgent");
 
-    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32);
+    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32, 32);
     let provider = Arc::new(provider);
 
     input_tx.send(IOMessage::user_text("hello")).await.unwrap();
@@ -120,7 +126,7 @@ async fn turn_echo_round_trip() {
         .await
         .unwrap();
 
-    assert!(result.nodes_executed > 0);
+    assert!(result.nodes_executed() > 0);
 
     let mut messages = Vec::new();
     while let Ok(msg) = output_rx.try_recv() {
@@ -160,7 +166,7 @@ async fn turn_concurrent_returns_busy() {
     let id = SessionId::new();
     create_session(&server, &id, "BlockingAgent");
 
-    let (provider, input_tx, _output_rx) = HttpIOProvider::new(32);
+    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32, 32);
     let provider = Arc::new(provider);
 
     input_tx.send(IOMessage::user_text("first")).await.unwrap();
@@ -180,8 +186,17 @@ async fn turn_concurrent_returns_busy() {
             .await
     });
 
-    // Wait briefly for the first turn to acquire the lock.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Synchronize on the BlockingAgent's `blocking-ready` system message
+    // so we know the session lock is held before issuing the second turn.
+    // Bounded by a deadline to avoid hanging forever on a bug.
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), output_rx.recv())
+        .await
+        .expect("BlockingAgent did not signal lock acquisition within 5 s")
+        .expect("output channel closed before ready signal");
+    assert!(
+        matches!(ready.content, IOContent::Text(ref t) if t == "blocking-ready"),
+        "expected blocking-ready signal, got {ready:?}"
+    );
 
     // The second turn should fail immediately with SessionBusy.
     let result = sessions.try_process_turn(&id).await;

@@ -204,10 +204,9 @@ impl Fragment {
             Fragment::Seq(items) => items.iter().map(Fragment::tracker_count).sum(),
             Fragment::Par(branches) => branches.iter().map(Fragment::tracker_count).sum(),
             Fragment::Decision { t, f, .. } => t.tracker_count() + f.tracker_count(),
-            Fragment::Loop { body, .. } => body.tracker_count(),
+            Fragment::Loop { body, .. } | Fragment::Scope { body } => body.tracker_count(),
             Fragment::Switch { a, b, .. } => a.tracker_count() + b.tracker_count(),
             Fragment::Fallible { handler } => handler.tracker_count(),
-            Fragment::Scope { body } => body.tracker_count(),
         }
     }
 

@@ -73,6 +73,30 @@ pub struct TurnExecutionMetadata {
     pub turn_number: TurnNumber,
 }
 
+/// Terminal SSE event for `POST /v1/sessions/{id}/turns/stream`.
+///
+/// Sent as an `event: done` SSE event when the turn completes
+/// successfully. Contains the same execution metadata as the
+/// synchronous [`ProcessTurnResponse`].
+///
+/// # JSON representation
+///
+/// ```json
+/// {
+///     "execution": {
+///         "nodes_executed": 3,
+///         "duration_ms": 142,
+///         "turn_number": 1
+///     }
+/// }
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamTurnDone {
+    /// Execution metadata for the completed turn.
+    pub execution: TurnExecutionMetadata,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Checkpoints
 // ─────────────────────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@
 //! body in an inner `async move` block so `return` exits the inner block and
 //! the value is wrapped in `Ok` afterwards.
 
-use polaris_system::param::{Res, SystemContext};
+use polaris_system::param::Res;
 use polaris_system::resource::LocalResource;
 use polaris_system::system;
 use polaris_system::system::System;

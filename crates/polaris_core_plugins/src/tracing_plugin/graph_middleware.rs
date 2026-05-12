@@ -2,9 +2,18 @@
 //!
 //! Registers tracing spans around all graph execution targets
 //! (systems, loops, parallel branches, decisions, switches).
+//!
+//! Decision and switch *outcomes* (which branch / case was taken) are
+//! recorded onto the active span via [`register_outcome_hooks`], which
+//! subscribes to `OnDecisionComplete` / `OnSwitchComplete`. The hooks fire
+//! inside the middleware's instrumented future, so `Span::current()` is the
+//! span created above and `Span::record` lands the attribute on it.
 
 use polaris_graph::MiddlewareAPI;
+use polaris_graph::hooks::schedule::{OnDecisionComplete, OnSwitchComplete};
+use polaris_graph::hooks::{GraphEvent, HooksAPI};
 use tracing::Instrument;
+use tracing::field::Empty;
 
 /// Registers tracing middleware on all graph execution targets.
 pub(super) fn register(mw: &MiddlewareAPI) {
@@ -63,6 +72,7 @@ pub(super) fn register(mw: &MiddlewareAPI) {
         let span = tracing::info_span!(
             "polaris.graph.execute_decision",
             polaris.graph.decision.name = info.node_name,
+            polaris.graph.decision.branch = Empty,
         );
         Box::pin(async move { next.run(ctx).await }.instrument(span))
     });
@@ -71,7 +81,47 @@ pub(super) fn register(mw: &MiddlewareAPI) {
         let span = tracing::info_span!(
             "polaris.graph.execute_switch",
             polaris.graph.switch.name = info.node_name,
+            polaris.graph.switch.case = Empty,
+            polaris.graph.switch.used_default = Empty,
         );
         Box::pin(async move { next.run(ctx).await }.instrument(span))
     });
+}
+
+/// Registers hooks that record decision/switch outcomes onto the active span.
+///
+/// Fires inside the middleware-instrumented future, so `Span::current()` is
+/// the `polaris.graph.execute_decision` / `polaris.graph.execute_switch` span
+/// created in [`register`]. The matching fields are declared with
+/// [`tracing::field::Empty`] there so `record` can land them.
+pub(super) fn register_outcome_hooks(hooks: &HooksAPI) {
+    hooks
+        .register_observer::<OnDecisionComplete, _>(
+            "tracing.decision_outcome",
+            |event: &GraphEvent| {
+                if let GraphEvent::DecisionComplete {
+                    selected_branch, ..
+                } = event
+                {
+                    tracing::Span::current()
+                        .record("polaris.graph.decision.branch", *selected_branch);
+                }
+            },
+        )
+        .expect("tracing.decision_outcome hook must register");
+
+    hooks
+        .register_observer::<OnSwitchComplete, _>("tracing.switch_outcome", |event: &GraphEvent| {
+            if let GraphEvent::SwitchComplete {
+                selected_case,
+                used_default,
+                ..
+            } = event
+            {
+                let span = tracing::Span::current();
+                span.record("polaris.graph.switch.case", *selected_case);
+                span.record("polaris.graph.switch.used_default", *used_default);
+            }
+        })
+        .expect("tracing.switch_outcome hook must register");
 }

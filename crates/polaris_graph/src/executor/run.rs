@@ -1,6 +1,7 @@
 //! Core graph execution engine — node dispatch and control flow.
 
 use super::GraphExecutor;
+use super::RunContext;
 use super::error::{CaughtError, ErrorKind, ExecutionError, SystemOutcome};
 use crate::edge::Edge;
 use crate::graph::Graph;
@@ -133,6 +134,7 @@ impl GraphExecutor {
         depth: usize,
         hooks: Option<&'a HooksAPI>,
         middleware: &'a MiddlewareAPI,
+        run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             let mut iterations = 0;
@@ -143,6 +145,8 @@ impl GraphExecutor {
                 hooks,
                 ctx,
                 &GraphEvent::LoopStart {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: loop_node.id.clone(),
                     node_name: loop_node.name,
                     max_iterations,
@@ -184,12 +188,22 @@ impl GraphExecutor {
                                 hooks,
                                 ctx,
                                 &GraphEvent::LoopIteration {
+                                    run_id: run_ctx.run_id.clone(),
+                                    labels: run_ctx.labels.clone(),
                                     node_id: loop_node.id.clone(),
                                     node_name: loop_node.name,
                                     iteration: iterations,
                                 },
                             );
-                            self.execute_from(graph, ctx, body.clone(), depth, hooks, middleware)
+                            self.execute_from(
+                                graph,
+                                ctx,
+                                body.clone(),
+                                depth,
+                                hooks,
+                                middleware,
+                                run_ctx,
+                            )
                         })
                         .await?;
                     nodes_executed += count;
@@ -203,6 +217,8 @@ impl GraphExecutor {
                 hooks,
                 ctx,
                 &GraphEvent::LoopEnd {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: loop_node.id.clone(),
                     node_name: loop_node.name,
                     iterations,
@@ -227,6 +243,7 @@ impl GraphExecutor {
         depth: usize,
         hooks: Option<&'a HooksAPI>,
         middleware: &'a MiddlewareAPI,
+        run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             use futures::future::try_join_all;
@@ -238,6 +255,8 @@ impl GraphExecutor {
                 hooks,
                 ctx,
                 &GraphEvent::ParallelStart {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: par.id.clone(),
                     node_name: par.name,
                     branch_count,
@@ -265,7 +284,15 @@ impl GraphExecutor {
                         .inner
                         .parallel_branch
                         .execute(branch_info, child_ctx, |ctx| {
-                            self.execute_from(graph, ctx, branch.clone(), depth, hooks, middleware)
+                            self.execute_from(
+                                graph,
+                                ctx,
+                                branch.clone(),
+                                depth,
+                                hooks,
+                                middleware,
+                                run_ctx,
+                            )
                         })
                 });
 
@@ -288,6 +315,8 @@ impl GraphExecutor {
                 hooks,
                 ctx,
                 &GraphEvent::ParallelComplete {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: par.id.clone(),
                     node_name: par.name,
                     branch_count,
@@ -309,6 +338,7 @@ impl GraphExecutor {
         depth: usize,
         hooks: Option<&'a HooksAPI>,
         middleware: &'a MiddlewareAPI,
+        run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             // Invoke OnSwitchStart hook
@@ -316,6 +346,8 @@ impl GraphExecutor {
                 hooks,
                 ctx,
                 &GraphEvent::SwitchStart {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: switch_node.id.clone(),
                     node_name: switch_node.name,
                     case_count: switch_node.cases.len(),
@@ -344,7 +376,7 @@ impl GraphExecutor {
                 })?;
 
             let nodes_executed = self
-                .execute_from(graph, ctx, target, depth, hooks, middleware)
+                .execute_from(graph, ctx, target, depth, hooks, middleware, run_ctx)
                 .await?;
 
             // Invoke OnSwitchComplete hook
@@ -352,6 +384,8 @@ impl GraphExecutor {
                 hooks,
                 ctx,
                 &GraphEvent::SwitchComplete {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: switch_node.id.clone(),
                     node_name: switch_node.name,
                     selected_case: if used_default {
@@ -403,9 +437,12 @@ impl GraphExecutor {
         current: &'a NodeId,
         hooks: Option<&'a HooksAPI>,
         ctx: &'a mut SystemContext<'_>,
+        run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<(), ExecutionError>> {
         Box::pin(async move {
             let start_event = GraphEvent::SystemStart {
+                run_id: run_ctx.run_id.clone(),
+                labels: run_ctx.labels.clone(),
                 node_id: current.clone(),
                 node_name: sys.name(),
             };
@@ -419,6 +456,8 @@ impl GraphExecutor {
                     ctx.insert_output_boxed(sys.output_type_id(), output);
 
                     let complete_event = GraphEvent::SystemComplete {
+                        run_id: run_ctx.run_id.clone(),
+                        labels: run_ctx.labels.clone(),
                         node_id: current.clone(),
                         node_name: sys.name(),
                         duration: system_start.elapsed(),
@@ -444,6 +483,8 @@ impl GraphExecutor {
                     let error_msg: Arc<str> = Arc::from(err.to_string());
 
                     let error_event = GraphEvent::SystemError {
+                        run_id: run_ctx.run_id.clone(),
+                        labels: run_ctx.labels.clone(),
                         node_id: current.clone(),
                         node_name: sys.name(),
                         error: Arc::clone(&error_msg),
@@ -478,12 +519,15 @@ impl GraphExecutor {
         hooks: Option<&'a HooksAPI>,
         middleware: &'a MiddlewareAPI,
         ctx: &'a mut SystemContext<'_>,
+        run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             Self::invoke_hook::<OnDecisionStart>(
                 hooks,
                 ctx,
                 &GraphEvent::DecisionStart {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: decision_id.clone(),
                     node_name: dec.name,
                 },
@@ -521,13 +565,23 @@ impl GraphExecutor {
             };
 
             let branch_count = self
-                .execute_from(graph, ctx, branch_entry, depth + 1, hooks, middleware)
+                .execute_from(
+                    graph,
+                    ctx,
+                    branch_entry,
+                    depth + 1,
+                    hooks,
+                    middleware,
+                    run_ctx,
+                )
                 .await?;
 
             Self::invoke_hook::<OnDecisionComplete>(
                 hooks,
                 ctx,
                 &GraphEvent::DecisionComplete {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: decision_id.clone(),
                     node_name: dec.name,
                     selected_branch,
@@ -551,12 +605,15 @@ impl GraphExecutor {
         hooks: Option<&'a HooksAPI>,
         middleware: &'a MiddlewareAPI,
         ctx: &'a mut SystemContext<'_>,
+        run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             Self::invoke_hook::<OnScopeStart>(
                 hooks,
                 ctx,
                 &GraphEvent::ScopeStart {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: scope_id.clone(),
                     node_name: scope.name,
                     context_mode,
@@ -571,8 +628,16 @@ impl GraphExecutor {
             let execute_scope = async {
                 match scope.context_policy.mode {
                     ContextMode::Shared => {
-                        self.execute_from(&scope.graph, ctx, entry, depth + 1, hooks, middleware)
-                            .await
+                        self.execute_from(
+                            &scope.graph,
+                            ctx,
+                            entry,
+                            depth + 1,
+                            hooks,
+                            middleware,
+                            run_ctx,
+                        )
+                        .await
                     }
                     ContextMode::Inherit => {
                         let mut child = ctx.child();
@@ -585,6 +650,7 @@ impl GraphExecutor {
                                 depth + 1,
                                 hooks,
                                 middleware,
+                                run_ctx,
                             )
                             .await?;
                         let child_outputs = child.take_outputs();
@@ -611,6 +677,7 @@ impl GraphExecutor {
                                 depth + 1,
                                 hooks,
                                 middleware,
+                                run_ctx,
                             )
                             .await?;
                         let child_outputs = child.take_outputs();
@@ -637,6 +704,8 @@ impl GraphExecutor {
                 hooks,
                 ctx,
                 &GraphEvent::ScopeComplete {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
                     node_id: scope_id.clone(),
                     node_name: scope.name,
                     context_mode,
@@ -697,6 +766,7 @@ impl GraphExecutor {
         depth: usize,
         hooks: Option<&'a HooksAPI>,
         middleware: &'a MiddlewareAPI,
+        run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
             if depth >= self.max_recursion_depth {
@@ -726,7 +796,7 @@ impl GraphExecutor {
                             .inner
                             .system
                             .execute(sys_info, ctx, |ctx| {
-                                self.run_system_body(sys, &current, hooks, ctx)
+                                self.run_system_body(sys, &current, hooks, ctx, run_ctx)
                             })
                             .await;
                         (0, self.route_system_result(graph, &current, result)?)
@@ -750,6 +820,7 @@ impl GraphExecutor {
                                     hooks,
                                     middleware,
                                     ctx,
+                                    run_ctx,
                                 )
                             })
                             .await?;
@@ -779,6 +850,7 @@ impl GraphExecutor {
                                     depth + 1,
                                     hooks,
                                     middleware,
+                                    run_ctx,
                                 )
                             })
                             .await?;
@@ -794,7 +866,15 @@ impl GraphExecutor {
                             .inner
                             .parallel_node
                             .execute(par_info, ctx, |ctx| {
-                                self.execute_parallel(graph, ctx, par, depth + 1, hooks, middleware)
+                                self.execute_parallel(
+                                    graph,
+                                    ctx,
+                                    par,
+                                    depth + 1,
+                                    hooks,
+                                    middleware,
+                                    run_ctx,
+                                )
                             })
                             .await?;
                         (parallel_count, self.advance(graph, &current)?)
@@ -817,6 +897,7 @@ impl GraphExecutor {
                                     depth + 1,
                                     hooks,
                                     middleware,
+                                    run_ctx,
                                 )
                             })
                             .await?;
@@ -843,6 +924,7 @@ impl GraphExecutor {
                                     hooks,
                                     middleware,
                                     ctx,
+                                    run_ctx,
                                 )
                             })
                             .await?;

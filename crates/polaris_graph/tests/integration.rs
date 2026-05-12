@@ -145,7 +145,7 @@ async fn full_server_graph_executor_flow() {
 
     // - Execution stats and output are correct
     let stats = result.unwrap();
-    assert_eq!(stats.nodes_executed, 2);
+    assert_eq!(stats.nodes_executed(), 2);
 
     // - Last output is available on the result
     let output = stats.output::<ComputeResult>().unwrap();
@@ -583,7 +583,7 @@ async fn parallel_diamond_execution() {
     // Verify execution stats
     // Nodes: entry (1) + parallel (1) + branch_a (1) + branch_b (1) + after_join (1) = 5
     let stats = result.unwrap();
-    assert_eq!(stats.nodes_executed, 5);
+    assert_eq!(stats.nodes_executed(), 5);
 
     // Final output should be from the after_join step
     let output = stats.output::<DiamondResult>().unwrap();
@@ -1021,7 +1021,7 @@ async fn scope_node_count_in_result() {
 
     // 3 nodes in parent + 1 inner node executed via scope
     assert_eq!(
-        result.nodes_executed,
+        result.nodes_executed(),
         3 + 1,
         "should count parent nodes + inner scope nodes"
     );
@@ -1087,7 +1087,8 @@ async fn scope_inside_parallel_branch() {
     let result = result.unwrap();
     // parallel(1) + branch_a scope(1) + inner system(1) + branch_b system(1) = 4
     assert_eq!(
-        result.nodes_executed, 4,
+        result.nodes_executed(),
+        4,
         "should execute parallel(1) + scope(1) + inner(1) + branch_b(1)"
     );
 }
@@ -1327,7 +1328,7 @@ async fn graph_level_timeout_does_not_fire_when_within_limit() {
     let result = executor.execute(&graph, &mut ctx, None, None).await;
 
     let result = result.expect("expected success within timeout");
-    assert_eq!(result.nodes_executed, 1);
+    assert_eq!(result.nodes_executed(), 1);
 }
 
 #[tokio::test]
@@ -1347,7 +1348,7 @@ async fn graph_timeout_takes_precedence_over_executor_timeout() {
     let result = executor.execute(&graph, &mut ctx, None, None).await;
 
     let result = result.expect("graph timeout should take precedence over executor timeout");
-    assert_eq!(result.nodes_executed, 1);
+    assert_eq!(result.nodes_executed(), 1);
 }
 
 #[tokio::test]
@@ -1386,7 +1387,7 @@ async fn graph_level_timeout_fires_on_graph_failure_hook() {
     let flag = Arc::clone(&hook_fired);
     hooks
         .register_observer::<OnGraphFailure, _>("timeout_hook", move |event: &GraphEvent| {
-            if let GraphEvent::GraphFailure { error } = event
+            if let GraphEvent::GraphFailure { error, .. } = event
                 && matches!(error, ExecutionError::GraphTimeout { .. })
             {
                 *flag.lock().unwrap() = true;

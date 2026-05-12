@@ -104,5 +104,6 @@ pub use executor::{
 pub use graph::{
     Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
 };
+pub use hooks::{RunId, RunLabels};
 pub use middleware::{MiddlewareAPI, MiddlewareError};
 pub use node::{ContextMode, ContextPolicy, NodeId, ResourceForward, RetryPolicy, ScopeNode};

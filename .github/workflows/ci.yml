@@ -43,3 +43,30 @@ jobs:
 
       - name: Check examples
         run: cargo check --manifest-path examples/Cargo.toml
+
+      - name: Verify generated TS bindings are up to date
+        run: |
+          if [ -n "$(git status --porcelain bindings/)" ]; then
+            echo "::error::Generated bindings/ are stale. Run 'cargo test --features typegen' and commit the result."
+            git status --porcelain bindings/
+            git diff bindings/
+            exit 1
+          fi
+
+  feature-matrix:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: Check each feature in isolation
+        run: cargo hack --each-feature --no-dev-deps check

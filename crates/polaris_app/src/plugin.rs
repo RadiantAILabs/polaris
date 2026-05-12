@@ -1,7 +1,9 @@
 //! [`AppPlugin`] — HTTP server lifecycle management.
 //!
-//! Registers [`AppConfig`] and [`HttpRouter`], then starts an axum server
-//! in `ready()` with all routes merged and middleware applied.
+//! Registers [`AppConfig`] and [`HttpRouter`] (and
+//! [`WsRouter`](crate::ws::WsRouter) when the `ws` feature is enabled), then
+//! starts an axum server in `ready()` with all routes merged and middleware
+//! applied.
 
 use crate::config::AppConfig;
 use crate::middleware;
@@ -57,10 +59,11 @@ impl ServerHandle {
 /// # Lifecycle
 ///
 /// - **`build()`** — inserts [`AppConfig`] as a global resource, registers
-///   [`HttpRouter`] as a build-time API.
-/// - **`ready()`** — merges all registered routes, applies middleware
-///   (CORS, tracing, request ID, optional auth), spawns the axum server,
-///   and registers [`ServerHandle`] as a build-time API.
+///   [`HttpRouter`] as a build-time API (and [`WsRouter`](crate::ws::WsRouter)
+///   when the `ws` feature is enabled).
+/// - **`ready()`** — merges all registered HTTP and WebSocket routes, applies
+///   middleware (CORS, tracing, request ID, optional auth), spawns the axum
+///   server, and registers [`ServerHandle`] as a build-time API.
 /// - **`cleanup()`** — sends shutdown signal via [`ServerHandle`] and awaits
 ///   graceful drain (5-second timeout).
 ///
@@ -119,6 +122,8 @@ impl Plugin for AppPlugin {
     fn build(&self, server: &mut Server) {
         server.insert_global(self.config.clone());
         server.insert_api(HttpRouter::new());
+        #[cfg(feature = "ws")]
+        server.insert_api(crate::ws::WsRouter::new());
     }
 
     async fn ready(&self, server: &mut Server) {
@@ -126,13 +131,33 @@ impl Plugin for AppPlugin {
             .api::<HttpRouter>()
             .expect("HttpRouter API must exist (registered in build)");
 
-        // Collect route fragments and auth provider registered by plugins
+        // Collect route fragments, deferred builders, and auth registered by plugins.
+        // Drain everything up front so the router API is not borrowed while
+        // builders run (they receive `&Server` and may call `server.api::<_>()`).
         let fragments = router_api.take_routes();
+        let builders = router_api.take_builders();
         let auth = router_api.take_auth();
 
         let mut app = axum::Router::new();
         for fragment in fragments {
             app = app.merge(fragment);
+        }
+        for build in builders {
+            app = app.merge(build(&*server));
+        }
+
+        // Merge WebSocket route fragments (when ws feature is enabled).
+        // WS routes are merged before middleware so upgrade requests pass
+        // through the same auth, tracing, and CORS stack as REST requests.
+        #[cfg(feature = "ws")]
+        {
+            let ws_api = server
+                .api::<crate::ws::WsRouter>()
+                .expect("WsRouter API must exist (registered in build)");
+            let ws_fragments = ws_api.take_routes();
+            for fragment in ws_fragments {
+                app = app.merge(fragment);
+            }
         }
 
         // Apply middleware stack (including auth if registered).

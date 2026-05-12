@@ -28,7 +28,7 @@
 //! |-------|------|---------|-------|
 //! | **1** | System Framework | [`system`] | Systems, resources, plugins, server |
 //! | **2** | Graph Execution | [`graph`], [`agent`] | Directed-graph model, agent trait |
-//! | **3** | Plugins | [`tools`], [`models`], [`plugins`], [`sessions`], [`app`], [`shell`] | LLM providers, tools, HTTP, sessions |
+//! | **3** | Plugins | [`tools`], [`models`], [`plugins`], [`sessions`], [`app`], [`shell`], [`dashboard`] | LLM providers, tools, HTTP, sessions, dashboard contributions |
 //!
 //! **Layer 1** provides the ECS-inspired primitives: systems as pure async
 //! functions, resources as shared state, dependency injection via typed
@@ -191,8 +191,8 @@
 //! |------|---------|-------------|
 //! | Run one-shot agent | `sessions.run_oneshot(&agent_type, \|ctx\| { ... })` | [`sessions`] |
 //! | Multi-turn with cleanup | `sessions.scoped_session(&agent_type, \|ctx\| { ... })` | [`sessions`] |
-//! | Execute agent from HTTP | `DeferredState` → `SessionsAPI` → `HttpIOProvider` | [`app`] |
-//! | Register HTTP routes | `server.api::<HttpRouter>().add_routes(router)` | [`app`] |
+//! | Execute agent from HTTP | `HttpRouter::add_routes_with` → `SessionsAPI` → `HttpIOProvider` | [`app`] |
+//! | Register HTTP routes | `server.api::<HttpRouter>().add_routes(router)` (stateless) / `add_routes_with(\|server\| ...)` (stateful) | [`app`] |
 //! | Add tools for LLM | `#[tool]` macro + `ToolRegistry` | [`tools`] |
 //! | Add model provider | Implement `LlmProvider` + register via plugin | [`models`] |
 //! | Handle system errors | Fallible system + error edge + `ErrOut<CaughtError>` | [`graph`] |
@@ -211,6 +211,7 @@
 //! | [`sessions`] | `polaris_sessions` | Session management and orchestration |
 //! | [`shell`] | `polaris_shell` | Shell command execution with permission model |
 //! | [`app`] | `polaris_app` | HTTP server runtime with plugin integration |
+//! | [`dashboard`] | `polaris_dashboard` | Cross-plugin dashboard contribution registry |
 //!
 //! # Exploration Map
 //!
@@ -225,9 +226,13 @@
 //!
 //! # Feature Flags
 //!
-//! All features are opt-in (none enabled by default). Features that originate
-//! from a sub-crate and would otherwise be ambiguous at the top level are
-//! prefixed with the sub-crate's short name (e.g. `sessions-http`). Features
+//! Every workspace feature that downstream consumers might want is surfaced
+//! through `polaris-ai` directly, so consumers don't need to depend on the
+//! inner crates (`polaris_app`, `polaris_core_plugins`, etc.). All features
+//! are opt-in **except `file-store`**, which is on by default to preserve the
+//! historical session-store behavior — set `default-features = false` to opt
+//! out. Features that would otherwise be ambiguous at the top level are
+//! prefixed with the sub-crate's short name (e.g. `sessions-http`); features
 //! that are already unambiguous keep their original name (e.g. `anthropic`).
 //!
 //! ## Model Providers
@@ -245,7 +250,7 @@
 //! | `graph-tracing` | No new public type | Extends [`plugins::TracingPlugin`] with graph-execution spans |
 //! | `models-tracing` | No new public type | Extends [`plugins::TracingPlugin`] to decorate model providers |
 //! | `tools-tracing` | No new public type | Extends [`plugins::TracingPlugin`] to decorate tools |
-//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Adds OTLP export via the tracing subscriber |
+//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Adds OTLP export via the tracing subscriber and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names |
 //!
 //! ## Tokenization
 //!
@@ -258,6 +263,19 @@
 //! | Feature | Exported item | Find it under |
 //! |---------|---------------|---------------|
 //! | `sessions-http` | [`sessions::HttpPlugin`] and [`sessions::http`] | [`sessions`] |
+//! | `file-store` *(default)* | [`sessions::FileStore`] | [`sessions`] |
+//!
+//! ## HTTP App Runtime
+//!
+//! | Feature | Exported item | Effect |
+//! |---------|---------------|--------|
+//! | `ws` | [`app::WsRouter`] | Adds the WebSocket router and the dashboard event-stream surface |
+//!
+//! ## Testing
+//!
+//! | Feature | Exported item | Effect |
+//! |---------|---------------|--------|
+//! | `test-utils` | [`plugins::MockClock`], [`plugins::MockIOProvider`] | Mocks for clock and user IO; intended for downstream `dev-dependencies` |
 //!
 //! ## Feature Coverage Map
 //!
@@ -272,9 +290,12 @@
 //! | `graph-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only; no separate `GraphTracingPlugin` exists | [`plugins::TracingPlugin`] registers graph middleware through [`graph::MiddlewareAPI`] |
 //! | `models-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only | [`plugins::TracingPlugin`] decorates the global [`models::ModelRegistry`] |
 //! | `tools-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only | [`plugins::TracingPlugin`] decorates the global [`tools::ToolRegistry`] |
-//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Integrates with the existing [`plugins::TracingPlugin`] / [`plugins::TracingLayersApi`] surface | [`plugins::OpenTelemetryPlugin`] pushes an OTLP export layer into the tracing subscriber |
+//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Integrates with [`plugins::TracingPlugin`] / [`plugins::TracingLayersApi`] and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names | [`plugins::OpenTelemetryPlugin`] pushes an OTLP export layer into the tracing subscriber; [`app::AppPlugin`] emits spans with `http.request.method` / `url.path` / `http.response.status_code` fields (plus `otel.name` / `otel.kind`) instead of the `polaris.http.*` defaults. Does not extract W3C `traceparent` headers — incoming requests start a fresh trace. |
 //! | `tiktoken` | [`models::tokenizer::TiktokenCounter`], [`models::tokenizer::EncodingFamily`] | Adds [`Default`] for [`models::TokenizerPlugin`] and changes what [`models::TokenizerPlugin::default`] builds | [`models::TokenizerPlugin::default`] registers a global [`models::Tokenizer`] backed by [`models::tokenizer::TiktokenCounter`] |
 //! | `sessions-http` | [`sessions::http`], [`sessions::HttpPlugin`], [`sessions::http::models`] | Adds request/response model types and HTTP-facing session APIs under [`sessions`] | [`sessions::HttpPlugin`] registers routes through [`app::HttpRouter`] and depends on [`app::AppPlugin`] + [`sessions::SessionsPlugin`] |
+//! | `file-store` *(default)* | [`sessions::FileStore`] | Pulls `tokio/fs` into the dep graph | Lets [`sessions::SessionsPlugin`] use a filesystem-backed [`sessions::SessionStore`] |
+//! | `ws` | [`app::WsRouter`] | Enables `axum/ws` and gates WebSocket route registration on [`app::AppPlugin`] | [`app::AppPlugin`] mounts the [`app::WsRouter`]; required by the dashboard event stream |
+//! | `test-utils` | [`plugins::MockClock`], [`plugins::MockIOProvider`] | None at runtime | Provides mocks for downstream test suites that exercise [`plugins::TimePlugin`] / [`plugins::IOProvider`] |
 
 // Re-export crates under their original names so proc-macro-generated code
 // can resolve `polaris::polaris_tools`, `polaris::polaris_system`, etc.
@@ -352,4 +373,11 @@ pub mod shell {
 pub mod app {
     #[doc(inline)]
     pub use polaris_internal::app::*;
+}
+
+#[cfg(feature = "dashboard-registry")]
+#[doc = include_str!("docs/dashboard.md")]
+pub mod dashboard {
+    #[doc(inline)]
+    pub use polaris_internal::dashboard::*;
 }

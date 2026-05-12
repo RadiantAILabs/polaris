@@ -13,6 +13,8 @@
 //!
 //! # Feature Flags
 //!
+//! - `dashboard` - Enables [`TracingDashboardPlugin`] and the
+//!   `/v1/tracing/spans` dashboard endpoint
 //! - `otel` - Enables [`OpenTelemetryPlugin`] for OTLP trace export
 //! - `graph_tracing` - Enables tracing spans around graph node execution
 //! - `models_tracing` - Enables LLM provider tracing via [`TracingPlugin`]
@@ -90,6 +92,11 @@ pub use server_info::ServerInfoPlugin;
 pub use time::{Clock, ClockProvider, Stopwatch, TimePlugin};
 pub use tracing_plugin::{
     FmtConfig, TracingConfig, TracingFormat, TracingLayersApi, TracingPlugin,
+};
+#[cfg(feature = "dashboard")]
+#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
+pub use tracing_plugin::{
+    SpanBuffer, SpanBufferLayer, SpanKind, SpanRecord, SpansResponse, TracingDashboardPlugin,
 };
 
 // Re-export IO types
