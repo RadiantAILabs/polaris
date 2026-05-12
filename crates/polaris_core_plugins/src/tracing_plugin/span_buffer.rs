@@ -97,6 +97,7 @@ pub enum SpanKind {
 
 /// Wire representation of a recent tracing record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SpanRecord {
     /// ISO-8601 UTC timestamp.
     pub ts: String,

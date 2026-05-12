@@ -63,10 +63,51 @@ use polaris_system::server::Server;
 
 /// Plugin that exposes session management over HTTP.
 ///
-/// Registers REST endpoints for creating, listing, inspecting, and
-/// deleting sessions. Requires [`AppPlugin`] and [`SessionsPlugin`].
+/// Registers REST endpoints against the [`HttpRouter`] for creating,
+/// listing, inspecting, deleting sessions, processing agent turns (with
+/// optional SSE streaming), managing checkpoints, and persisting or
+/// resuming sessions. Routes are composed inside an `add_routes_with`
+/// closure so the [`SessionsAPI`] handle is resolved during the app's
+/// `ready()` phase rather than at `build()` time.
 ///
-/// See the [module-level documentation](self) for endpoint details.
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_   | —     | This plugin only mounts HTTP routes against [`HttpRouter`]. |
+///
+/// # APIs Provided
+///
+/// None. State for the routes is the [`SessionsAPI`] handle obtained
+/// from [`SessionsPlugin`].
+///
+/// # Dependencies
+///
+/// - [`AppPlugin`] — provides the [`HttpRouter`] the routes are mounted on.
+/// - [`SessionsPlugin`] — provides the [`SessionsAPI`] used as handler state.
+///
+/// See the [module-level documentation](self) for the endpoint table.
+///
+/// # Example
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// use polaris_app::{AppConfig, AppPlugin};
+/// use polaris_core_plugins::PersistencePlugin;
+/// use polaris_sessions::{SessionsPlugin, http::HttpPlugin};
+/// use polaris_sessions::store::memory::InMemoryStore;
+/// use polaris_system::server::Server;
+///
+/// # async fn run() {
+/// let mut server = Server::new();
+/// server
+///     .add_plugins(PersistencePlugin)
+///     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())))
+///     .add_plugins(AppPlugin::new(AppConfig::new()))
+///     .add_plugins(HttpPlugin::new());
+/// server.run().await;
+/// # }
+/// ```
 #[derive(Debug, Default)]
 pub struct HttpPlugin;
 
