@@ -3,24 +3,28 @@
 //! Provides [`HttpPlugin`], which registers REST endpoints for
 //! creating, listing, inspecting, deleting sessions, processing
 //! agent turns, managing checkpoints, and persisting sessions.
-//! Requires the `http` feature flag.
+//! Requires the `sessions-http` feature flag.
 //!
 //! # Endpoints
 //!
-//! | Method   | Path                              | Description              |
-//! |----------|-----------------------------------|--------------------------|
-//! | `POST`   | `/v1/sessions`                    | Create a new session     |
-//! | `GET`    | `/v1/sessions`                    | List live sessions       |
-//! | `GET`    | `/v1/sessions/stored`             | List persisted sessions  |
-//! | `GET`    | `/v1/sessions/{id}`               | Get session info         |
-//! | `DELETE` | `/v1/sessions/{id}`               | Delete a session         |
-//! | `POST`   | `/v1/sessions/{id}/turns`         | Process a turn           |
-//! | `POST`   | `/v1/sessions/{id}/turns/stream`  | Process a turn (SSE)     |
-//! | `POST`   | `/v1/sessions/{id}/checkpoints`   | Create a checkpoint      |
-//! | `GET`    | `/v1/sessions/{id}/checkpoints`   | List checkpoints         |
-//! | `POST`   | `/v1/sessions/{id}/rollback`      | Rollback to a checkpoint |
-//! | `POST`   | `/v1/sessions/{id}/save`          | Persist session to store |
-//! | `POST`   | `/v1/sessions/{id}/resume`        | Resume from store        |
+//! | Method   | Path                                 | Description                  |
+//! |----------|--------------------------------------|------------------------------|
+//! | `POST`   | `/v1/sessions`                       | Create a new session         |
+//! | `GET`    | `/v1/sessions`                       | List live sessions           |
+//! | `GET`    | `/v1/sessions/stored`                | List persisted sessions      |
+//! | `GET`    | `/v1/sessions/agent-types`           | List registered agent types  |
+//! | `GET`    | `/v1/sessions/{id}`                  | Get session info             |
+//! | `DELETE` | `/v1/sessions/{id}`                  | Delete a session             |
+//! | `POST`   | `/v1/sessions/{id}/turns`            | Process a turn               |
+//! | `POST`   | `/v1/sessions/{id}/turns/stream`     | Process a turn (SSE)         |
+//! | `GET`    | `/v1/sessions/{id}/turns`            | List recorded turn summaries |
+//! | `GET`    | `/v1/sessions/{id}/turns/{n}`        | Get a single turn detail     |
+//! | `GET`    | `/v1/sessions/{id}/uptime`           | Bucketed lifecycle series    |
+//! | `POST`   | `/v1/sessions/{id}/checkpoints`      | Create a checkpoint          |
+//! | `GET`    | `/v1/sessions/{id}/checkpoints`      | List checkpoints             |
+//! | `POST`   | `/v1/sessions/{id}/rollback`         | Rollback to a checkpoint     |
+//! | `POST`   | `/v1/sessions/{id}/save`             | Persist session to store     |
+//! | `POST`   | `/v1/sessions/{id}/resume`           | Resume from store            |
 //!
 //! # Example
 //!
@@ -88,6 +92,15 @@ use polaris_system::server::Server;
 ///
 /// See the [module-level documentation](self) for the endpoint table.
 ///
+/// # Extends
+///
+/// - [`HttpRouter`] (from [`AppPlugin`]) — registers the session REST
+///   endpoints listed in the [module-level documentation](self) via an
+///   `add_routes_with` closure, so the [`SessionsAPI`] handler state is
+///   resolved during the app's `ready()` phase. This plugin provides no
+///   resources or APIs of its own — it composes session management onto
+///   the shared HTTP server.
+///
 /// # Example
 ///
 /// ```no_run
@@ -137,17 +150,24 @@ impl Plugin for HttpPlugin {
                         "/v1/sessions",
                         post(handlers::create_session).get(handlers::list_sessions),
                     )
-                    // Static path before wildcard to avoid `{id}` capturing "stored".
+                    // Static paths before wildcards to avoid `{id}` capturing
+                    // `stored` or `agent-types`.
                     .route("/v1/sessions/stored", get(handlers::list_stored_sessions))
+                    .route("/v1/sessions/agent-types", get(handlers::list_agent_types))
                     .route(
                         "/v1/sessions/{id}",
                         get(handlers::get_session).delete(handlers::delete_session),
                     )
-                    .route("/v1/sessions/{id}/turns", post(handlers::process_turn))
+                    .route(
+                        "/v1/sessions/{id}/turns",
+                        post(handlers::process_turn).get(handlers::list_turns),
+                    )
                     .route(
                         "/v1/sessions/{id}/turns/stream",
                         post(handlers::process_turn_stream),
                     )
+                    .route("/v1/sessions/{id}/turns/{n}", get(handlers::get_turn))
+                    .route("/v1/sessions/{id}/uptime", get(handlers::get_uptime))
                     .route(
                         "/v1/sessions/{id}/checkpoints",
                         post(handlers::create_checkpoint).get(handlers::list_checkpoints),

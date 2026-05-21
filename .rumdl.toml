@@ -6,6 +6,10 @@ exclude = [
     # `#[doc = include_str!("docs/...")]` in src/lib.rs,
     # not standalone Markdown.
     "src/docs/**",
+    # Claude scratch space (git worktrees, agent memory, etc.) lives
+    # under `.claude/` per CLAUDE.md's "Ignored Files" list. It can
+    # contain in-flight WIP markdown that isn't part of the project.
+    ".claude/**",
 ]
 
 # Disabled rules (mirrors .markdownlint.json)

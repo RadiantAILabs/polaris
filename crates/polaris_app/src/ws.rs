@@ -41,7 +41,7 @@
 //!         let router = Router::new()
 //!             .route("/ws/echo", get(ws_handler));
 //!         server.api::<WsRouter>()
-//!             .expect("AppPlugin with `ws` feature must be added first")
+//!             .expect("AppPlugin must be added first")
 //!             .add_routes(router);
 //!     }
 //!
@@ -56,10 +56,10 @@ use polaris_system::api::API;
 
 /// Build-time API for registering WebSocket routes.
 ///
-/// Plugins call [`add_routes`](WsRouter::add_routes) during their `build()`
-/// phase to contribute route fragments that contain WebSocket upgrade handlers.
-/// [`AppPlugin`](crate::AppPlugin) merges all fragments in `ready()` alongside
-/// HTTP route fragments, before applying the middleware stack.
+/// Reach for `WsRouter` when a plugin needs to serve a WebSocket endpoint:
+/// it collects axum route fragments containing WebSocket upgrade handlers so
+/// [`AppPlugin`](crate::AppPlugin) can merge them into the main router before
+/// the server starts.
 ///
 /// Uses interior mutability (`RwLock`) so `server.api::<WsRouter>()` returns
 /// `&WsRouter` while still allowing registration.
@@ -67,6 +67,80 @@ use polaris_system::api::API;
 /// Authentication for WebSocket upgrade requests is handled by the existing
 /// [`HttpRouter::set_auth`](crate::HttpRouter::set_auth) mechanism -- there is
 /// no separate auth on `WsRouter`.
+///
+/// # Provided by
+///
+/// [`AppPlugin`](crate::AppPlugin), via `insert_api` during its `build()`
+/// phase.
+///
+/// # Surface
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | [`add_routes`](WsRouter::add_routes) | Registers an axum `Router` fragment containing WebSocket upgrade handlers. |
+///
+/// # Lifecycle
+///
+/// [`add_routes`](WsRouter::add_routes) is meant to be called during a
+/// plugin's `build()` phase. [`AppPlugin`](crate::AppPlugin) drains every
+/// registered fragment in `ready()` and merges them before the server starts —
+/// so calling [`add_routes`](WsRouter::add_routes) after `ready()` has run is
+/// too late and has no effect, because the fragment is never served.
+///
+/// # Composition
+///
+/// **Open extension** — any plugin may call
+/// [`add_routes`](WsRouter::add_routes) through `&self`; the type uses an
+/// `RwLock` for interior mutability so concurrent registration is safe.
+///
+/// # Example consumers
+///
+/// Any plugin that serves a WebSocket endpoint consumes `WsRouter`. The
+/// `EchoWsPlugin` in the [module-level example](self) is the representative
+/// case — it registers a `/ws/echo` upgrade route. No other in-repo plugin
+/// currently consumes it.
+///
+/// # Example
+///
+/// See the [module-level example](self) for a full provider/consumer snippet:
+/// [`AppPlugin`](crate::AppPlugin) inserts `WsRouter` in `build()`, and an
+/// `EchoWsPlugin` resolves it with `server.api::<WsRouter>()` then calls
+/// [`add_routes`](WsRouter::add_routes) during its own `build()`.
+///
+/// ```no_run
+/// use polaris_system::plugin::{Plugin, PluginId, Version};
+/// use polaris_system::server::Server;
+/// use polaris_app::{AppPlugin, AppConfig, WsRouter};
+/// use axum::{Router, routing::get, extract::ws::WebSocketUpgrade};
+/// use axum::response::IntoResponse;
+///
+/// // Provider side: AppPlugin inserts `WsRouter` in `build()`.
+/// let mut server = Server::new();
+/// server.add_plugins(AppPlugin::new(AppConfig::new().with_port(8080)));
+///
+/// // Consumer side: a plugin registering a WebSocket route in `build()`.
+/// struct EchoWsPlugin;
+///
+/// async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+///     ws.on_upgrade(|_socket| async {})
+/// }
+///
+/// impl Plugin for EchoWsPlugin {
+///     const ID: &'static str = "myapp::echo_ws";
+///     const VERSION: Version = Version::new(0, 1, 0);
+///
+///     fn build(&self, server: &mut Server) {
+///         let router = Router::new().route("/ws/echo", get(ws_handler));
+///         server.api::<WsRouter>()
+///             .expect("AppPlugin must be added first")
+///             .add_routes(router);
+///     }
+///
+///     fn dependencies(&self) -> Vec<PluginId> {
+///         vec![PluginId::of::<AppPlugin>()]
+///     }
+/// }
+/// ```
 pub struct WsRouter {
     routes: RwLock<Vec<axum::Router>>,
 }

@@ -10,18 +10,61 @@ use std::sync::Arc;
 
 /// Plugin providing support for AWS Bedrock models.
 ///
-/// # Examples
+/// Registers a [`BedrockProvider`] with the [`ModelRegistry`] during
+/// `build()`. After [`ModelsPlugin::ready`] freezes the registry, models
+/// served by this provider become resolvable through
+/// [`ModelRegistry::resolve`](polaris_models::ModelRegistry::resolve) under
+/// the `bedrock/<model>` identifier.
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_   | —     | This plugin only registers a provider with the [`ModelRegistry`] owned by [`ModelsPlugin`]. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | This plugin contributes a provider to [`ModelRegistry`] rather than installing its own API. |
+///
+/// # Dependencies
+///
+/// - [`ModelsPlugin`] — owns the [`ModelRegistry`] that this plugin
+///   registers itself with. Must be added before `BedrockPlugin`.
+///
+/// # Lifecycle
+///
+/// - The plugin is gated behind the `bedrock` feature.
+/// - **`build()`** — resolves the AWS SDK config (either the explicit
+///   config from [`from_sdk_config`](Self::from_sdk_config), or, for
+///   [`from_env`](Self::from_env), the default credential chain loaded on
+///   a dedicated thread with its own tokio runtime), builds a Bedrock
+///   client, and registers a `BedrockProvider` with the [`ModelRegistry`].
+///   Panics if [`ModelsPlugin`] was not added first, if AWS config
+///   loading fails, or if the config-loading thread panics.
+/// - No `ready()` or `cleanup()` behavior; registers no tick schedules.
+///
+/// # Extends
+///
+/// - [`ModelRegistry`] (from [`ModelsPlugin`]) — registers a
+///   `BedrockProvider` so that `bedrock/<model>` identifiers become
+///   resolvable once `ModelsPlugin` freezes the registry in `ready()`.
+///
+/// # Example
 ///
 /// ```no_run
 /// # #[cfg(feature = "bedrock")]
 /// # {
 /// # use polaris_model_providers::BedrockPlugin;
+/// # use polaris_models::ModelsPlugin;
 /// # let mut server = polaris_system::server::Server::new();
+/// server.add_plugins(ModelsPlugin);
 ///
 /// // Using default AWS credential chain
 /// server.add_plugins(BedrockPlugin::from_env());
 ///
-/// // With custom SDK config
+/// // Or with an explicit SDK config
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
 ///     .region("us-west-2")
@@ -29,7 +72,7 @@ use std::sync::Arc;
 ///     .await;
 /// server.add_plugins(BedrockPlugin::from_sdk_config(sdk_config));
 /// # });
-/// }
+/// # }
 /// ```
 pub struct BedrockPlugin {
     sdk_config: Option<aws_config::SdkConfig>,

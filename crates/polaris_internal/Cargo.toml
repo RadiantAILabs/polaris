@@ -24,40 +24,34 @@ default = ["file-store"]
 anthropic = ["polaris_model_providers/anthropic"]
 openai = ["polaris_model_providers/openai"]
 bedrock = ["polaris_model_providers/bedrock"]
-graph-tracing = ["polaris_core_plugins/graph_tracing"]
-models-tracing = ["polaris_core_plugins/models_tracing"]
-tools-tracing = ["polaris_core_plugins/tools_tracing"]
 tiktoken = ["polaris_models/tiktoken"]
 # Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s
 # HTTP request spans to OTel HTTP semantic-convention field names. Does not
 # extract incoming W3C `traceparent` headers — each request starts a fresh
 # trace.
 otel = ["polaris_core_plugins/otel", "polaris_app/otel"]
-sessions-http = ["polaris_sessions/http"]
-# WebSocket router and dashboard event-stream surface in `polaris_app`.
-ws = ["polaris_app/ws"]
+sessions-http = ["polaris_sessions/sessions-http"]
 # `MockClock` and `MockIOProvider` for downstream test code.
 test-utils = ["polaris_core_plugins/test-utils"]
-# Filesystem-backed `SessionStore`. Brings in `tokio/fs`.
-file-store = ["polaris_sessions/file-store"]
-# Pulls `polaris_dashboard` (and its `axum` runtime dep) into the dep
-# graph and re-exports it as `polaris_internal::dashboard`. Implied by
-# every `*-dashboard` feature so plugin contributions always compile
-# alongside the registry they target.
-dashboard-registry = ["dep:polaris_dashboard"]
-typegen = ["polaris_sessions/typegen", "dashboard-registry", "polaris_dashboard/typegen"]
-sessions-dashboard = ["dashboard-registry", "polaris_sessions/dashboard"]
-tools-dashboard = ["dashboard-registry", "polaris_tools/dashboard"]
-models-dashboard = ["dashboard-registry", "polaris_models/dashboard"]
-tracing-dashboard = ["dashboard-registry", "polaris_core_plugins/dashboard"]
-# Adds `Serialize` / `Deserialize` to `polaris_graph`'s correlation types
-# (`RunId`, `RunLabels`) so events can flow across process boundaries.
-serde = ["polaris_graph/serde"]
+# Filesystem-backed stores: `polaris_sessions::FileStore` for session
+# state, and `polaris_core_plugins::FileSpanStore` for tracing-dashboard
+# run history. Both bring in `tokio/fs`. Propagated to both crates so a
+# consumer that enables `file-store` on the umbrella gets both backends.
+file-store = [
+    "polaris_sessions/file-store",
+    "polaris_core_plugins/file-store",
+]
+typegen = [
+    "polaris_sessions/typegen",
+    "polaris_core_plugins/typegen",
+]
+# Enables the dashboard HTTP surface (tools/models snapshots, tracing
+# spans & usage) across `polaris_tools`, `polaris_models`, and
+# `polaris_core_plugins`. Pulls axum and `polaris_app` into the graph.
 dashboard = [
-    "sessions-dashboard",
-    "tools-dashboard",
-    "models-dashboard",
-    "tracing-dashboard",
+    "polaris_tools/dashboard",
+    "polaris_models/dashboard",
+    "polaris_core_plugins/dashboard",
 ]
 
 [dependencies]
@@ -71,7 +65,6 @@ polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4.0" }
 polaris_sessions = { path = "../polaris_sessions", version = "0.4.0", default-features = false }
 polaris_shell = { path = "../polaris_shell", version = "0.4.0" }
 polaris_app = { path = "../polaris_app", version = "0.4.0", default-features = false }
-polaris_dashboard = { path = "../polaris_dashboard", version = "0.4.0", optional = true }
 
 [lints]
 workspace = true

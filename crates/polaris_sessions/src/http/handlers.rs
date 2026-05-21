@@ -2,20 +2,24 @@
 
 use super::error::{ApiError, codes};
 use super::models::{
-    CheckpointResponse, CreateSessionRequest, CreateSessionResponse, ListCheckpointsResponse,
-    ListSessionsResponse, ListStoredSessionsResponse, ProcessTurnRequest, ProcessTurnResponse,
-    RollbackRequest, StreamTurnDone, TurnExecutionMetadata,
+    AgentTypeSummary, BucketGranularity, CheckpointResponse, CreateSessionRequest,
+    CreateSessionResponse, ListAgentTypesResponse, ListCheckpointsResponse, ListSessionsResponse,
+    ListStoredSessionsResponse, ListTurnsResponse, ProcessTurnRequest, ProcessTurnResponse,
+    RollbackRequest, SessionUptimeResponse, StreamTurnDone, Turn, TurnExecutionMetadata,
 };
 use crate::api::SessionsAPI;
 use crate::http::HttpIOProvider;
 use crate::info::SessionMetadata;
-use crate::store::SessionId;
+use crate::store::{SessionId, TurnNumber};
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use parking_lot::Mutex;
 use polaris_app::HttpHeaders;
-use polaris_core_plugins::{IOMessage, IOProvider, IOSource, UserIO};
+use polaris_core_plugins::{IOError, IOMessage, IOProvider, IOSource, UserIO};
+use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +109,12 @@ pub(crate) async fn process_turn(
 ) -> Result<Json<ProcessTurnResponse>, ApiError> {
     let session_id = SessionId::from_string(id);
 
+    // Snapshot the turn number before execution so we can key the
+    // post-turn message recording on the same value `execute_turn` used
+    // for its history entry (the session's atomic counter is incremented
+    // on success, so reading it after the call would be off-by-one).
+    let turn_before = sessions.session_info(&session_id)?.turn_number;
+
     // Bounded input (one user message per turn) and bounded output to
     // apply backpressure on agents that emit faster than we drain.
     let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, TURN_OUTPUT_BUFFER);
@@ -133,6 +143,8 @@ pub(crate) async fn process_turn(
     while let Ok(msg) = output_rx.try_recv() {
         messages.push(msg);
     }
+
+    sessions.record_turn_messages(&session_id, turn_before, messages.clone());
 
     let info = sessions.session_info(&session_id)?;
 
@@ -214,10 +226,21 @@ pub(crate) async fn process_turn_stream(
 
     // Pre-stream validation: fail with a normal HTTP error before
     // committing to the SSE response.
-    sessions.session_info(&session_id)?;
+    let info = sessions.session_info(&session_id)?;
+    let turn_before = info.turn_number;
 
     let (provider, input_tx, output_rx) = HttpIOProvider::new(1, TURN_OUTPUT_BUFFER);
     let provider = Arc::new(provider);
+    // Wrap with a recorder so the spawned task can flush the full
+    // message array to the session's turn history once the turn ends.
+    // The wrapper records on `send`, before the bounded channel is
+    // touched, so it captures every message even if the SSE consumer
+    // is still draining `output_rx` when we finalize the record.
+    let recorded: Arc<Mutex<Vec<IOMessage>>> = Arc::new(Mutex::new(Vec::new()));
+    let recording = Arc::new(RecordingIOProvider {
+        inner: Arc::clone(&provider),
+        recorded: Arc::clone(&recorded),
+    });
 
     input_tx
         .send(IOMessage::user_text(body.message))
@@ -235,17 +258,24 @@ pub(crate) async fn process_turn_stream(
     // detached rather than aborted on client disconnect.
     let sessions_bg = sessions.clone();
     let session_id_bg = session_id.clone();
-    let provider_bg = Arc::clone(&provider);
+    let recording_bg = Arc::clone(&recording);
+    let recorded_bg = Arc::clone(&recorded);
     tokio::spawn(async move {
         let result = sessions_bg
             .try_process_turn_with(&session_id_bg, move |ctx| {
-                ctx.insert(UserIO::new(provider_bg));
+                ctx.insert(UserIO::new(recording_bg));
                 ctx.insert(HttpHeaders(headers));
             })
             .await;
 
         // Close the output channel so the IOMessage stream terminates.
         provider.close().await;
+
+        // Flush captured messages to the turn history. Cloning is fine —
+        // a turn's IO volume is bounded by the agent's behavior, not by
+        // the channel buffer.
+        let captured = recorded_bg.lock().clone();
+        sessions_bg.record_turn_messages(&session_id_bg, turn_before, captured);
 
         // Send terminal event.
         let event = match result {
@@ -380,4 +410,155 @@ pub(crate) async fn list_stored_sessions(
     Ok(Json(ListStoredSessionsResponse {
         sessions: sessions_list,
     }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dashboard endpoints (A9)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `GET /v1/sessions/agent-types` — enumerate registered agent types.
+pub(crate) async fn list_agent_types(
+    State(sessions): State<SessionsAPI>,
+) -> Json<ListAgentTypesResponse> {
+    let items = sessions
+        .registered_agents()
+        .into_iter()
+        .map(|name| AgentTypeSummary {
+            name: name.to_owned(),
+        })
+        .collect();
+    Json(ListAgentTypesResponse { items })
+}
+
+/// Query parameters for `GET /v1/sessions/{id}/turns`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct TurnsListQuery {
+    /// Comma-separated list of optional sections to include. Currently
+    /// the only recognized token is `messages` — when present, each
+    /// summary embeds the full IO message array.
+    include: Option<String>,
+}
+
+impl TurnsListQuery {
+    fn include_messages(&self) -> bool {
+        self.include
+            .as_deref()
+            .map(|s| s.split(',').any(|token| token.trim() == "messages"))
+            .unwrap_or(false)
+    }
+}
+
+/// `GET /v1/sessions/{id}/turns` — list recorded turn summaries.
+pub(crate) async fn list_turns(
+    State(sessions): State<SessionsAPI>,
+    Path(id): Path<String>,
+    Query(query): Query<TurnsListQuery>,
+) -> Result<Json<ListTurnsResponse>, ApiError> {
+    let session_id = SessionId::from_string(id);
+    let items = sessions.turn_history(&session_id, query.include_messages())?;
+    Ok(Json(ListTurnsResponse { items }))
+}
+
+/// `GET /v1/sessions/{id}/turns/{n}` — fetch a single turn's full payload.
+pub(crate) async fn get_turn(
+    State(sessions): State<SessionsAPI>,
+    Path((id, turn)): Path<(String, TurnNumber)>,
+) -> Result<Json<Turn>, ApiError> {
+    let session_id = SessionId::from_string(id);
+    let turn = sessions.turn(&session_id, turn)?;
+    Ok(Json(turn))
+}
+
+/// Query parameters for `GET /v1/sessions/{id}/uptime`.
+///
+/// `bucket` defaults to `1m` when omitted. Unknown values fail
+/// deserialization and surface as a 400 from axum's `Query` extractor,
+/// matching the spec's "reject unknown buckets" contract.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct UptimeQuery {
+    bucket: Option<BucketGranularity>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+/// Default lookback window for uptime queries when `?since=` is omitted.
+const DEFAULT_UPTIME_LOOKBACK_HOURS: i64 = 24;
+
+/// Upper bound on the number of uptime buckets a single request may produce.
+///
+/// `since`, `until`, and `bucket` are all client-controlled. Without this cap
+/// a request for a wide range at `1m` granularity drives an unbounded
+/// `Vec::with_capacity` in the recorder and can exhaust server memory.
+/// 10 000 one-minute buckets is ~7 days — well past any real dashboard
+/// window — so a larger range is rejected as a bad request.
+const MAX_UPTIME_BUCKETS: usize = 10_000;
+
+fn parse_iso8601(field: &str, value: &str) -> Result<DateTime<Utc>, ApiError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|err| ApiError::BadRequest(format!("invalid `{field}` timestamp: {err}")))
+}
+
+/// `GET /v1/sessions/{id}/uptime` — bucketed lifecycle time-series.
+pub(crate) async fn get_uptime(
+    State(sessions): State<SessionsAPI>,
+    Path(id): Path<String>,
+    Query(query): Query<UptimeQuery>,
+) -> Result<Json<SessionUptimeResponse>, ApiError> {
+    let session_id = SessionId::from_string(id);
+
+    let bucket = query.bucket.unwrap_or(BucketGranularity::OneMinute);
+    let until = match query.until.as_deref() {
+        Some(value) => parse_iso8601("until", value)?,
+        None => Utc::now(),
+    };
+    let since = match query.since.as_deref() {
+        Some(value) => parse_iso8601("since", value)?,
+        None => until - ChronoDuration::hours(DEFAULT_UPTIME_LOOKBACK_HOURS),
+    };
+
+    // Reject ranges that would allocate an unbounded bucket vector before
+    // any work is done. `since`/`until`/`bucket` are all client-controlled.
+    let num_buckets = crate::uptime::bucket_count(bucket, since, until);
+    if num_buckets > MAX_UPTIME_BUCKETS {
+        return Err(ApiError::BadRequest(format!(
+            "requested range yields {num_buckets} buckets, exceeding the limit \
+             of {MAX_UPTIME_BUCKETS}; widen `bucket` or narrow the \
+             `since`/`until` range"
+        )));
+    }
+
+    let response = sessions.uptime_buckets(&session_id, bucket, since, until)?;
+    Ok(Json(response))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Turn-message recording (shared between sync + SSE turn handlers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// IO provider that mirrors every outbound message into a shared `Vec`
+/// before delegating to an inner [`HttpIOProvider`].
+///
+/// Used by [`process_turn_stream`] so the SSE handler can attach the full
+/// IO message array to the session's turn history *after* the turn ends,
+/// without the synchronous handler's "drain `output_rx`" trick (the SSE
+/// stream is consumed by Axum's response loop, not the handler body).
+struct RecordingIOProvider {
+    inner: Arc<HttpIOProvider>,
+    recorded: Arc<Mutex<Vec<IOMessage>>>,
+}
+
+impl IOProvider for RecordingIOProvider {
+    async fn send(&self, message: IOMessage) -> Result<(), IOError> {
+        self.recorded.lock().push(message.clone());
+        self.inner.send(message).await
+    }
+
+    async fn receive(&self) -> Result<IOMessage, IOError> {
+        self.inner.receive().await
+    }
+
+    async fn close(&self) {
+        self.inner.close().await;
+    }
 }

@@ -239,7 +239,46 @@ impl PersistenceAPI {
     }
 }
 
-/// Plugin that inserts [`PersistenceAPI`] into the server.
+/// Plugin that provides the [`PersistenceAPI`] for resource serialization.
+///
+/// `PersistenceAPI` is a build-time registry where plugins declare the
+/// local resources they want serialized as part of a session. Downstream
+/// crates such as [`polaris_sessions`](https://docs.rs/polaris-sessions)
+/// consume the registry during `ready()` to drive save/load of session
+/// state, so `PersistencePlugin` must be added whenever sessions or any
+/// other persistence-aware plugin is in use.
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_ | — | Persistence registration is exposed as a build-time API rather than a resource. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | [`PersistenceAPI`] | Build-time registry of [`ResourceSerializer`]s. Plugins call `register::<R>(Self::ID)` during their `ready()` to declare a [`Storable`] [`LocalResource`] type. |
+///
+/// # Dependencies
+///
+/// None.
+///
+/// # Example
+///
+/// ```
+/// use polaris_core_plugins::PersistencePlugin;
+/// use polaris_system::server::Server;
+///
+/// let mut server = Server::new();
+/// server.add_plugins(PersistencePlugin);
+/// # tokio_test::block_on(async {
+/// server.finish().await;
+/// # });
+/// ```
+///
+/// See [`PersistenceAPI::register`] for the consumer-plugin pattern that
+/// hangs a [`Storable`] resource off this API.
 pub struct PersistencePlugin;
 
 impl Plugin for PersistencePlugin {

@@ -20,4 +20,5 @@
 - [**Tools**](./reference/tools.md) — Tool definitions, `ToolRegistry`, permission model
 - [**Model Providers**](./reference/model-providers.md) — `LlmProvider` trait, adding a custom provider
 - [**DevTools**](./reference/devtools.md) — `SystemInfo`, event tracing, debugging graph execution
+- [**Typegen**](./reference/typegen.md) — `ts-rs` derives, generated TypeScript bindings, `@polaris/types` package
 - [**Testing**](./reference/testing.md) — Testing strategy per architecture layer

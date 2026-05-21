@@ -170,6 +170,15 @@ struct PluginEntry {
     plugin: Box<dyn DynPlugin>,
 }
 
+/// A default plugin awaiting auto-registration.
+struct BoxedDefault {
+    /// The plugin that offered this default — surfaced in the tracing log when
+    /// the default is actually consumed.
+    provider: PluginId,
+    /// The default plugin instance, ready to insert if its `PluginId` is missing.
+    plugin: Box<dyn DynPlugin>,
+}
+
 impl Default for Server {
     fn default() -> Self {
         Self::new()
@@ -598,6 +607,49 @@ impl Server {
         self.apis.contains_key(&TypeId::of::<A>())
     }
 
+    /// Like [`api`](Self::api), but logs a `tracing::warn!` when the API
+    /// isn't registered. Returns an owned clone wrapped in `Option`.
+    ///
+    /// Use this in `ready()` to capture an API handle that the caller treats
+    /// as **required** for correct behavior, but where falling back to a
+    /// default is safe (e.g., capturing optional instrumentation middleware).
+    /// The warning makes the silent-fallback case visible without changing
+    /// the runtime semantics.
+    ///
+    /// `purpose` is a short free-text reason ("graph span instrumentation",
+    /// "decision-outcome hooks", …) that appears in the warning so the log
+    /// line points at the caller, not just the missing type.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::server::Server;
+    /// # use polaris_system::api::API;
+    /// # #[derive(Clone)]
+    /// # struct MiddlewareAPI;
+    /// # impl API for MiddlewareAPI {}
+    /// # fn ready_example(server: &Server) {
+    /// let middleware = server.expect_api::<MiddlewareAPI>("graph span instrumentation");
+    /// // `middleware` is `None` *and* a warning was logged if no plugin
+    /// // inserted MiddlewareAPI before this point.
+    /// # let _ = middleware;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn expect_api<A: API + Clone>(&self, purpose: &'static str) -> Option<A> {
+        match self.api::<A>() {
+            Some(api) => Some(api.clone()),
+            None => {
+                tracing::warn!(
+                    api = std::any::type_name::<A>(),
+                    purpose,
+                    "expect_api: required API not registered — caller will fall back to default behavior"
+                );
+                None
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Tick Methods
     // ─────────────────────────────────────────────────────────────────────────
@@ -660,20 +712,24 @@ impl Server {
     /// Builds all plugins and prepares the server for execution.
     ///
     /// This method:
-    /// 1. Validates all plugin dependencies exist
-    /// 2. Topologically sorts plugins by dependencies
-    /// 3. Calls `build()` on each plugin in order
-    /// 4. Calls `ready()` on each plugin in order
+    /// 1. Auto-registers missing dependencies that have declared defaults
+    /// 2. Validates all plugin dependencies exist
+    /// 3. Topologically sorts plugins by dependencies
+    /// 4. Calls `build()` on each plugin in order
+    /// 5. Calls `ready()` on each plugin in order
     ///
     /// # Panics
     ///
-    /// - If a plugin's dependency is not satisfied
+    /// - If a plugin's dependency is not satisfied and no default is declared
     /// - If there is a circular dependency between plugins
     /// - If called more than once
     pub async fn finish(&mut self) {
         if self.build_state != BuildState::NotStarted {
             panic!("Server::finish() was already called. Cannot build twice.");
         }
+
+        // Phase 0: Auto-register missing dependencies that declare a default.
+        self.auto_register_default_dependencies();
 
         // Phase 1: Sort plugins by dependencies
         let sorted_plugins = self.sort_plugins_by_dependencies();
@@ -790,13 +846,80 @@ impl Server {
     // Internal: Dependency Resolution
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// Walks pending plugins' `default_dependencies()` and inserts any whose
+    /// `PluginId` is neither pending nor already built.
+    ///
+    /// Iterates to a fixed point so that an auto-registered default that itself
+    /// declares default dependencies also gets satisfied. If two plugins offer
+    /// a default for the same `PluginId`, the first one encountered wins.
+    fn auto_register_default_dependencies(&mut self) {
+        // Pre-collect each pending plugin's default offerings into a single map
+        // keyed by PluginId. Doing this once up front avoids re-invoking
+        // `default_dependencies()` repeatedly during the fixed-point loop.
+        let mut offered: HashMap<PluginId, BoxedDefault> = HashMap::new();
+        for entry in &self.pending_plugins {
+            for boxed in entry.plugin.default_dependencies().plugins {
+                // First offer wins.
+                offered.entry(boxed.id.clone()).or_insert(BoxedDefault {
+                    provider: entry.id.clone(),
+                    plugin: boxed.plugin,
+                });
+            }
+        }
+
+        // Each loop iteration scans every still-pending plugin for unsatisfied
+        // dependencies and consumes a default if available. New auto-registered
+        // plugins go to `pending_plugins`, so the next iteration sees their
+        // dependencies and can resolve them too.
+        loop {
+            let mut to_add: Vec<(PluginId, PluginId, BoxedDefault)> = Vec::new();
+            for entry in &self.pending_plugins {
+                for dep_id in entry.plugin.dependencies() {
+                    if self.plugin_ids.contains(&dep_id) {
+                        continue;
+                    }
+                    // The dep is missing — register the default if we have one,
+                    // taking it out of the `offered` map so we don't add twice.
+                    if let Some(default) = offered.remove(&dep_id) {
+                        to_add.push((dep_id, entry.id.clone(), default));
+                    }
+                }
+            }
+            if to_add.is_empty() {
+                break;
+            }
+            for (dep_id, requirer, default) in to_add {
+                tracing::info!(
+                    plugin = %dep_id,
+                    requirer = %requirer,
+                    provider = %default.provider,
+                    "auto-registering default plugin",
+                );
+                // Pull the new plugin's own defaults into the offered map so
+                // they're visible to the next iteration's pass over pending.
+                for boxed in default.plugin.default_dependencies().plugins {
+                    offered.entry(boxed.id.clone()).or_insert(BoxedDefault {
+                        provider: dep_id.clone(),
+                        plugin: boxed.plugin,
+                    });
+                }
+                self.plugin_ids.insert(dep_id.clone());
+                self.pending_plugins.push(PluginEntry {
+                    id: dep_id,
+                    plugin: default.plugin,
+                });
+            }
+        }
+    }
+
     /// Sorts pending plugins by dependencies using topological sort.
     ///
     /// Returns the sorted list of plugins.
     ///
     /// # Panics
     ///
-    /// - If a plugin's dependency is not found
+    /// - If one or more plugin dependencies are not satisfied. The panic message
+    ///   lists every missing dependency together with the plugins that required it.
     /// - If there is a circular dependency
     fn sort_plugins_by_dependencies(&mut self) -> Vec<PluginEntry> {
         if self.pending_plugins.is_empty() {
@@ -814,6 +937,9 @@ impl Server {
         let mut in_degree = vec![0usize; n];
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
 
+        // missing_id -> requirers (preserving insertion order for stable output)
+        let mut missing: Vec<(PluginId, Vec<PluginId>)> = Vec::new();
+
         for (i, entry) in self.pending_plugins.iter().enumerate() {
             for dep_id in entry.plugin.dependencies() {
                 // Find the dependency in pending plugins
@@ -821,18 +947,21 @@ impl Server {
                     // dep_idx must be built before i
                     dependents[dep_idx].push(i);
                     in_degree[i] += 1;
-                } else {
-                    // Check if already built
-                    if !self.built_plugins.iter().any(|p| p.id == dep_id) {
-                        panic!(
-                            "Plugin '{}' requires '{}' which was not added.\n\
-                             Add {} before {}, or use a plugin group that includes it.",
-                            entry.id, dep_id, dep_id, entry.id
-                        );
+                } else if !self.built_plugins.iter().any(|p| p.id == dep_id) {
+                    // Missing — record it; aggregate before panicking so the
+                    // user sees every problem at once.
+                    if let Some(slot) = missing.iter_mut().find(|(id, _)| *id == dep_id) {
+                        slot.1.push(entry.id.clone());
+                    } else {
+                        missing.push((dep_id, vec![entry.id.clone()]));
                     }
-                    // Dependency already built, no need to track
                 }
+                // else: already built, no edge needed
             }
+        }
+
+        if !missing.is_empty() {
+            panic!("{}", format_missing_dependencies(&missing));
         }
 
         // Kahn's algorithm for topological sort
@@ -893,6 +1022,40 @@ impl Server {
 
         result.into_iter().flatten().collect()
     }
+}
+
+/// Formats the panic message for one or more missing plugin dependencies.
+///
+/// Lists every missing dependency together with the plugins that required it,
+/// so the user can resolve all of them in one pass rather than rebuilding to
+/// surface each error individually.
+fn format_missing_dependencies(missing: &[(PluginId, Vec<PluginId>)]) -> String {
+    use std::fmt::Write as _;
+
+    let plural = if missing.len() == 1 { "" } else { "s" };
+    let mut msg = format!(
+        "{} plugin dependenc{} not satisfied:\n",
+        missing.len(),
+        if missing.len() == 1 { "y" } else { "ies" },
+    );
+    for (dep, requirers) in missing {
+        let requirers_str = requirers
+            .iter()
+            .map(PluginId::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(msg, "  - '{dep}' required by: {requirers_str}");
+    }
+    msg.push_str(
+        "\nFix: add the missing plugin{plural} before calling Server::finish() / Server::run(),\n\
+         either directly via add_plugins(...) or via a plugin group such as DefaultPlugins.\n\
+         Alternatively, declare a Default for the missing plugin and offer it from one of the\n\
+         dependent plugins via Plugin::default_dependencies() for auto-registration.",
+    );
+    // Replace the literal `{plural}` placeholder (the str above is not a format
+    // string). Done this way so the body reads naturally and we only pluralize
+    // once.
+    msg.replace("{plural}", plural)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

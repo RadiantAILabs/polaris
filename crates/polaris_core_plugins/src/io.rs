@@ -43,7 +43,7 @@
 //! ```
 
 use polaris_system::resource::LocalResource;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(any(test, feature = "test-utils"))]
 use std::collections::VecDeque;
@@ -91,7 +91,7 @@ pub type IOStream =
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Source of an I/O message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IOSource {
     /// From a human user.
     User,
@@ -104,7 +104,7 @@ pub enum IOSource {
 }
 
 /// Content of an I/O message, supporting multiple modalities.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IOContent {
     /// Plain text content.
     Text(String),
@@ -134,7 +134,7 @@ pub enum IOContent {
 /// let data = serde_json::json!({"result": 42});
 /// let msg = IOMessage::from_agent("planner", IOContent::Structured(data));
 /// ```
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IOMessage {
     /// Message content — supports multiple modalities.
     pub content: IOContent,

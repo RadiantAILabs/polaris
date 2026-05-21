@@ -77,6 +77,51 @@ tracing_subscriber::fmt()
 
 For structured observability in production, prefer registering your own observer hooks on the specific schedules you care about (e.g., `OnSystemError` → metrics counter, `OnGraphComplete` → histogram).
 
+## Dashboard-Feature Tracing Buffer and Span Store
+
+`TracingPlugin` ships with an additional debugging surface gated on the `dashboard` Cargo feature of `polaris_core_plugins`: an in-memory `SpanBuffer` that records every closed `SpanRecord`, plus HTTP endpoints under `/v1/tracing/*` and `/v1/sessions/{id}/usage` that project it into runs, span trees, and token-usage rollups. See the [HTTP reference](./http.md#tracing-endpoints-dashboard-feature) for the endpoint list.
+
+### Layers
+
+The tracing-subscriber pipeline writes through a `RecordingLayer` for each enabled sink:
+
+- **`SpanBuffer`** — bounded ring (default 1024 records). Cheap to query, but volatile: spans evict in FIFO order and the buffer is wiped at process exit. Backs the live `/v1/tracing/*` endpoints.
+- **`SpanStorePlugin` (optional)** — durable companion. Installs its own `RecordingLayer` and persists every record carrying a `session_id` label through a pluggable `SpanStore` trait. On `ready()` it hydrates the in-memory `SpanBuffer` from the store, so a resumed session reports non-empty runs immediately after boot. Buffer writes and store writes are independent — an unreachable store does not stall the in-memory pipeline.
+
+Two backends ship in-tree:
+
+- `InMemorySpanStore` — default for tests; exercises the trait surface without touching disk.
+- `FileSpanStore` (feature-gated on `file-store`) — one JSON-lines file per session at `<base_dir>/<session_id>.jsonl`, append-only, recoverable from a partial trailing line.
+
+Custom backends (Postgres, S3, …) implement `SpanStore` directly. Records without a `session_id` label are dropped on the storage path.
+
+```rust,ignore
+use polaris_core_plugins::{TracingPlugin, SpanStorePlugin, FileSpanStore};
+use std::sync::Arc;
+
+server
+    .add_plugins(TracingPlugin::default())
+    .add_plugins(SpanStorePlugin::new(Arc::new(
+        FileSpanStore::new("/var/lib/polaris/spans")?,
+    )));
+```
+
+### Token Usage and Pricing
+
+`TracingPlugin` registers an empty `UsagePricing` API when the `dashboard` feature is enabled. Consumer plugins populate it from their own `build()`:
+
+```rust,ignore
+use polaris_core_plugins::{ModelPricing, UsagePricing};
+
+server.api::<UsagePricing>().set(
+    "anthropic",
+    "claude-opus-4-7",
+    ModelPricing::new(15.0, 75.0),
+);
+```
+
+With at least one rate registered, the rollup endpoints surface `cost_usd` on both totals and per-(provider, model, agent-type) breakdown rows. Providers can also declare a default rate via `LlmProvider::pricing()` — `TracingLlmProvider` reads it at call time and writes `gen_ai.usage.cost_usd` on each chat span, so cost is visible in any OTel waterfall without round-tripping through the aggregator. `UsagePricing` is the consumer-side override layer at aggregation time.
+
 ## Key Files
 
 | File | Purpose |
@@ -84,3 +129,7 @@ For structured observability in production, prefer registering your own observer
 | `polaris_graph/src/dev.rs` | `DevToolsPlugin`, `SystemInfo` |
 | `polaris_graph/src/hooks/api.rs` | `HooksAPI` — the underlying hook registry |
 | `polaris_graph/src/hooks/schedule.rs` | `AllGraphSchedules`, `OnSystemStart`, etc. |
+| `polaris_core_plugins/src/tracing_plugin/buffer.rs` | `SpanBuffer`, `RunSummary`, `SpanTree` |
+| `polaris_core_plugins/src/tracing_plugin/capture.rs` | `RecordingLayer`, `SpanRecordSink` trait |
+| `polaris_core_plugins/src/tracing_plugin/span_store/` | `SpanStore` trait, `SpanStorePlugin`, `InMemorySpanStore`, `FileSpanStore` |
+| `polaris_core_plugins/src/tracing_plugin/usage_pricing.rs` | `UsagePricing` API, `ModelPricing` |

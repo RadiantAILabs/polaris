@@ -10,12 +10,50 @@ use std::time::{Duration, SystemTime};
 
 /// Plugin that provides shell command execution capabilities.
 ///
-/// Registers [`ShellExecutor`] as a global resource and [`ShellTools`] with the
-/// [`ToolRegistry`] for LLM tool invocation.
+/// Registers [`ShellExecutor`] as a global resource and a [`ShellTools`]
+/// toolset against [`ToolRegistry`] so the underlying executor is reachable
+/// both as a typed resource (`Res<ShellExecutor>`) and as LLM-invokable tools.
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | [`ShellExecutor`] | Global | Permission-gated shell command executor |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | Shell access is exposed through the [`ShellExecutor`] global resource and the [`ShellTools`] toolset registered with [`ToolRegistry`]. |
 ///
 /// # Dependencies
 ///
-/// - [`ToolsPlugin`] must be added before this plugin.
+/// - [`ToolsPlugin`] — owns the [`ToolRegistry`] this plugin registers
+///   its toolset with. Must be added before `ShellPlugin`.
+///
+/// # Tools Provided
+///
+/// Registered as the [`ShellTools`] toolset with [`ToolRegistry`].
+///
+/// | Tool | Description |
+/// |------|-------------|
+/// | `run_command` | Runs a shell command via `sh -c` (pipes, redirects, globbing supported) and returns its output, or a confirmation-required response when the command is permission-gated. |
+///
+/// # Lifecycle
+///
+/// - **`build()`** — inserts [`ShellExecutor`] as a global resource and
+///   registers the [`ShellTools`] toolset with [`ToolRegistry`].
+/// - **`cleanup()`** — when a cache directory is configured, garbage-
+///   collects expired shell overflow files (`shell_stdout_*` /
+///   `shell_stderr_*`) older than the configured overflow TTL. A no-op
+///   when no cache directory is set.
+/// - No `ready()` override; registers no tick schedules.
+///
+/// # Extends
+///
+/// - [`ToolRegistry`] (from [`ToolsPlugin`]) — registers the [`ShellTools`]
+///   toolset so an LLM agent can invoke shell commands as the
+///   `run_command` tool.
 ///
 /// # Example
 ///

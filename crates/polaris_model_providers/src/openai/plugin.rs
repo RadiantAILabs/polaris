@@ -7,12 +7,51 @@ use polaris_system::server::Server;
 
 /// Plugin providing support for `OpenAI` models via the Responses API.
 ///
+/// Registers an [`OpenAiProvider`] with the [`ModelRegistry`] during
+/// `build()`. After [`ModelsPlugin::ready`] freezes the registry, models
+/// served by this provider become resolvable through
+/// [`ModelRegistry::resolve`](polaris_models::ModelRegistry::resolve) under
+/// the `openai/<model>` identifier.
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_   | —     | This plugin only registers a provider with the [`ModelRegistry`] owned by [`ModelsPlugin`]. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | This plugin contributes a provider to [`ModelRegistry`] rather than installing its own API. |
+///
+/// # Dependencies
+///
+/// - [`ModelsPlugin`] — owns the [`ModelRegistry`] that this plugin
+///   registers itself with. Must be added before `OpenAiPlugin`.
+///
+/// # Lifecycle
+///
+/// - The plugin is gated behind the `openai` feature.
+/// - **`build()`** — constructs an `OpenAiProvider` and registers it
+///   with the [`ModelRegistry`], which is a mutable resource during the
+///   `build()` phase. Panics if [`ModelsPlugin`] was not added first.
+/// - No `ready()` or `cleanup()` behavior; registers no tick schedules.
+///
+/// # Extends
+///
+/// - [`ModelRegistry`] (from [`ModelsPlugin`]) — registers an
+///   `OpenAiProvider` so that `openai/<model>` identifiers become
+///   resolvable once `ModelsPlugin` freezes the registry in `ready()`.
+///
+/// # Example
+///
 /// ```no_run
 /// # use polaris_model_providers::OpenAiPlugin;
 /// # use polaris_models::ModelsPlugin;
 /// # use polaris_system::server::Server;
-/// # let mut server = Server::new();
-/// # server.add_plugins(ModelsPlugin);
+/// let mut server = Server::new();
+/// server.add_plugins(ModelsPlugin);
 /// server.add_plugins(OpenAiPlugin::from_env("OPENAI_API_KEY"));
 /// ```
 pub struct OpenAiPlugin {

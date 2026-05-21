@@ -3,4 +3,4 @@
 /**
  * Status of a live session.
  */
-export type SessionStatus = "active";
+export type SessionStatus = "active" | "read_only";

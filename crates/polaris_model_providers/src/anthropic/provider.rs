@@ -13,7 +13,7 @@ use futures_core::Stream;
 use polaris_models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, ImageBlock,
     ImageMediaType as PolarisImageMediaType, LlmProvider, LlmRequest, LlmResponse, LlmStream,
-    Message, StopReason, StreamEvent, ToolCall, ToolChoice, ToolFunction,
+    Message, ModelPricing, StopReason, StreamEvent, ToolCall, ToolChoice, ToolFunction,
     ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 
@@ -67,6 +67,37 @@ impl LlmProvider for AnthropicProvider {
         let raw_stream = self.client.create_message_stream(anthropic_request).await?;
 
         Ok(Box::pin(AnthropicStreamAdapter::new(raw_stream)))
+    }
+
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        // Anthropic public list prices, USD per million base input / output
+        // tokens. Cache-tier rates are intentionally omitted — `Usage`
+        // carries no cache-token breakdown. `starts_with` tolerates dated
+        // ids (e.g. `claude-opus-4-7-20260115`). List prices drift and new
+        // model ids must be added here; verify against anthropic.com/pricing
+        // before relying on the figure for billing.
+        let (input_per_million_usd, output_per_million_usd) = if model
+            .starts_with("claude-opus-4-5")
+            || model.starts_with("claude-opus-4-6")
+            || model.starts_with("claude-opus-4-7")
+        {
+            (5.0, 25.0)
+        } else if model.starts_with("claude-opus-4") {
+            // Legacy Opus 4 / 4.1.
+            (15.0, 75.0)
+        } else if model.starts_with("claude-sonnet-4") {
+            (3.0, 15.0)
+        } else if model.starts_with("claude-haiku-4") {
+            (1.0, 5.0)
+        } else if model.starts_with("claude-haiku-3-5") {
+            (0.8, 4.0)
+        } else {
+            return None;
+        };
+        Some(ModelPricing::new(
+            input_per_million_usd,
+            output_per_million_usd,
+        ))
     }
 }
 
@@ -456,6 +487,31 @@ mod tests {
         MessageDeltaPayload, MessageDeltaUsage, MessageStartPayload, StreamErrorInfo, UsageResponse,
     };
     use super::*;
+
+    #[test]
+    fn pricing_maps_claude_families_to_list_prices() {
+        let provider = AnthropicProvider::new("test-key");
+        // Opus 4.5+ is the $5 / $25 tier.
+        assert_eq!(
+            provider.pricing("claude-opus-4-7"),
+            Some(ModelPricing::new(5.0, 25.0))
+        );
+        // Legacy Opus 4.1 stays on the $15 / $75 tier.
+        assert_eq!(
+            provider.pricing("claude-opus-4-1"),
+            Some(ModelPricing::new(15.0, 75.0))
+        );
+        assert_eq!(
+            provider.pricing("claude-sonnet-4-6"),
+            Some(ModelPricing::new(3.0, 15.0))
+        );
+        // Dated ids still match the family.
+        assert_eq!(
+            provider.pricing("claude-haiku-4-5-20251001"),
+            Some(ModelPricing::new(1.0, 5.0))
+        );
+        assert_eq!(provider.pricing("some-unknown-model"), None);
+    }
 
     #[test]
     fn converts_text_stream() {

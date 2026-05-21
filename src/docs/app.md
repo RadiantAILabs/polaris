@@ -100,12 +100,14 @@ Bridges HTTP requests to the agent's `UserIO` abstraction via tokio
 channels:
 
 ```no_run
+# #[cfg(feature = "sessions-http")] {
 use polaris_ai::sessions::http::HttpIOProvider;
 # use polaris_ai::plugins::IOMessage;
 use std::sync::Arc;
 
 let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, 64);
 let provider = Arc::new(provider);
+# }
 ```
 
 # `RequestContext`

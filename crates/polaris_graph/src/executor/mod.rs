@@ -42,6 +42,7 @@ use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
 use std::any::{Any, TypeId};
 use std::time::Duration;
+use tracing::Instrument;
 
 /// Per-invocation correlation context threaded through executor internals.
 ///
@@ -664,6 +665,14 @@ impl GraphExecutor {
             labels,
         };
 
+        // Tracing span that carries `polaris.run.id` so any
+        // `tracing-subscriber` layer can correlate nested spans to this
+        // run via the parent-chain lookup. The field is part of the
+        // public tracing contract; subscribers wishing to attribute work
+        // to a run read it from the span attributes.
+        let run_span =
+            tracing::info_span!("polaris.run", polaris.run.id = run_ctx.run_id.as_str(),);
+
         let middleware_info = middleware::info::GraphInfo { node_count };
         mw.inner
             .graph_execution
@@ -672,6 +681,7 @@ impl GraphExecutor {
                 let run_ctx = run_ctx.clone();
                 Box::pin(self.execute_graph_body(graph, ctx, entry, node_count, hooks, mw, run_ctx))
             })
+            .instrument(run_span)
             .await
     }
 

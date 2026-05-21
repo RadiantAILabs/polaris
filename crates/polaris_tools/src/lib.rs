@@ -81,9 +81,6 @@ pub mod toolset;
 // Re-export core types at crate root.
 pub use builder::{LlmReasonExt, LlmRequestBuilderExt, ReasonError};
 pub use context::ToolContext;
-#[cfg(feature = "dashboard")]
-#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
-pub use dashboard::ToolsDashboardPlugin;
 pub use error::ToolError;
 pub use param::{FunctionCall, FunctionParam, InputParam};
 pub use permission::ToolPermission;

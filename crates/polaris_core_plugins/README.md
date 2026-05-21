@@ -10,7 +10,7 @@ This crate provides foundational plugins that most Polaris applications need.
 |--------|-----------|-------|---------|
 | `ServerInfoPlugin` | `ServerInfo` | Global | Server metadata (version, debug mode) |
 | `TimePlugin` | `Clock`, `Stopwatch` | Global, Local | Time utilities with mockable clock |
-| `TracingPlugin` | `TracingConfig`, `TracingLayersApi` | Global, Build-time | Logging, observability, and instrumentation via `tracing` |
+| `TracingPlugin` | `TracingConfig`, `TracingLayers` | Global, Build-time | Logging, observability, and instrumentation via `tracing` |
 | `OpenTelemetryPlugin` | — | — | OTLP trace export via `tracing-opentelemetry` |
 | I/O abstractions | `UserIO`, `IOProvider` | Local | Abstracted IO for user interaction and tool integration |
 
@@ -91,7 +91,7 @@ mock.advance(Duration::from_secs(60));
 
 Registers a shared `tracing` subscriber. No output layers are included by default — call `with_fmt` to add console output, or use `DefaultPlugins` which enables fmt automatically.
 
-Other plugins (e.g., `OpenTelemetryPlugin`) can push additional layers via `TracingLayersApi` during their `build()` phase. The subscriber is installed once in `TracingPlugin::ready()` with all accumulated layers.
+Other plugins (e.g., `OpenTelemetryPlugin`) can push additional layers via `TracingLayers` during their `build()` phase. The subscriber is installed once in `TracingPlugin::ready()` with all accumulated layers.
 
 ```rust
 use polaris_core_plugins::{TracingPlugin, FmtConfig, TracingFormat};

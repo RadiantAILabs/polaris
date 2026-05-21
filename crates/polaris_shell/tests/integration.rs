@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 #[tokio::test]
 async fn plugin_registers_run_command_tool() {
     let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(ShellConfig::new()));
     server.finish().await;
@@ -34,6 +37,9 @@ async fn plugin_registers_run_command_tool() {
 #[tokio::test]
 async fn tool_definition_has_correct_schema() {
     let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(ShellConfig::new()));
     server.finish().await;
@@ -94,6 +100,9 @@ async fn tool_definition_has_correct_schema() {
 #[tokio::test]
 async fn tool_execution_via_registry() {
     let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(
         ShellConfig::new()
@@ -127,6 +136,9 @@ async fn tool_execution_via_registry() {
 #[tokio::test]
 async fn tool_returns_error_on_denied_command() {
     let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(
         ShellConfig::new().with_denied_commands(vec!["rm *".into()]),
@@ -151,6 +163,9 @@ async fn tool_returns_error_on_denied_command() {
 #[tokio::test]
 async fn tool_returns_confirmation_required_for_unconfirmed_command() {
     let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
     server.add_plugins(ToolsPlugin);
     // No allowed or denied patterns — everything requires confirmation
     server.add_plugins(ShellPlugin::new(ShellConfig::new()));
@@ -180,6 +195,9 @@ async fn shell_executor_accessible_as_global_resource() {
     use polaris_shell::ShellExecutor;
 
     let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
     server.add_plugins(ToolsPlugin);
     server.add_plugins(ShellPlugin::new(ShellConfig::new().with_timeout(60)));
     server.finish().await;

@@ -29,3 +29,7 @@ names = { version = "0.14.0", default-features = false }
 [dev-dependencies]
 tempfile = "3.15"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
+# Needed by integration tests under `cargo test --workspace --all-features`:
+# the unified feature resolution turns on `polaris_tools/dashboard`, which
+# makes `ToolsPlugin` require `AppPlugin`.
+polaris_app = { path = "../polaris_app", default-features = false }

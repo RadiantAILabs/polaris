@@ -4,7 +4,7 @@
 //! delivery, terminal events, pre-stream error handling, and
 //! concurrency semantics.
 
-#![cfg(feature = "http")]
+#![cfg(feature = "sessions-http")]
 
 use polaris_agent::Agent;
 use polaris_app::{AppConfig, AppPlugin};
@@ -404,14 +404,15 @@ async fn stream_turn_internal_error_emits_error_event() {
     // The `FailingAgent` system returns `SystemError::ExecutionError`,
     // which surfaces through `SessionError::Execution` and maps to the
     // generic `internal_error` ApiError variant — explicitly *not*
-    // `session_busy`.
+    // `session_busy`. The detail message is not surfaced to clients;
+    // it is logged server-side via `tracing::error!`.
     assert_eq!(error_json["code"], "internal_error");
     let msg = error_json["message"]
         .as_str()
         .expect("error frame must have string message");
-    assert!(
-        msg.contains("intentional turn failure"),
-        "expected propagated system error message, got: {msg}"
+    assert_eq!(
+        msg, "internal server error",
+        "internal-error message must not leak server-side detail, got: {msg}"
     );
 
     // No `done` frame should follow an error frame.

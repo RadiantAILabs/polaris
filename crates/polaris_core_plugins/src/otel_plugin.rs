@@ -15,9 +15,9 @@
 //!
 //! let mut server = Server::new();
 //! server.add_plugins(ServerInfoPlugin);
-//! # #[cfg(feature = "models_tracing")]
+//! # #[cfg(feature = "dashboard")]
+//! # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 //! # server.add_plugins(polaris_models::ModelsPlugin);
-//! # #[cfg(feature = "tools_tracing")]
 //! # server.add_plugins(polaris_tools::ToolsPlugin);
 //! server.add_plugins(TracingPlugin::default());
 //! server.add_plugins(
@@ -29,7 +29,7 @@
 //! # });
 //! ```
 
-use crate::TracingLayersApi;
+use crate::TracingLayers;
 use crate::TracingPlugin;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
@@ -46,25 +46,63 @@ use tracing_subscriber::layer::Layer as _;
 /// Sets up OTLP trace export via `tracing-opentelemetry`. All `tracing`
 /// spans in the application are exported as OpenTelemetry traces.
 ///
-/// Depends on [`TracingPlugin`](crate::TracingPlugin) which owns the subscriber.
-///
 /// # Lifecycle
 ///
 /// - **`build()`** — builds the OTLP exporter and tracer, and pushes the
-///   `OTel` layer into [`TracingLayersApi`].
+///   `OTel` layer into [`TracingLayers`].
 /// - **`cleanup()`** — shuts down the tracer provider, flushing pending spans.
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_ | — | This plugin pushes a layer into [`TracingLayers`] (owned by [`TracingPlugin`](crate::TracingPlugin)) and registers no resources of its own. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | This plugin contributes a layer to the shared tracing subscriber and installs no APIs. |
+///
+/// # Dependencies
+///
+/// - [`TracingPlugin`](crate::TracingPlugin) — owns the subscriber and the
+///   [`TracingLayers`] this plugin pushes its layer into.
+///
+/// # Extends
+///
+/// - [`TracingLayers`] (from [`TracingPlugin`](crate::TracingPlugin)) —
+///   pushes a `tracing-opentelemetry` layer, scoped by its own
+///   [`EnvFilter`](tracing_subscriber::EnvFilter), so every `tracing`
+///   span is exported as an OpenTelemetry trace through the shared
+///   subscriber. Composes with any other layer contributor (e.g.
+///   [`SpanStorePlugin`](crate::SpanStorePlugin)) — neither knows about
+///   the other.
 ///
 /// # Example
 ///
 /// ```
-/// use polaris_core_plugins::OpenTelemetryPlugin;
+/// use polaris_system::server::Server;
+/// use polaris_core_plugins::{ServerInfoPlugin, TracingPlugin, OpenTelemetryPlugin};
 ///
+/// let mut server = Server::new();
+/// server.add_plugins(ServerInfoPlugin);
+/// # #[cfg(feature = "dashboard")]
+/// # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
+/// # server.add_plugins(polaris_models::ModelsPlugin);
+/// # server.add_plugins(polaris_tools::ToolsPlugin);
+/// server.add_plugins(TracingPlugin::default());
 /// # let api_key = "secret";
-/// OpenTelemetryPlugin::new("http://localhost:4318/v1/traces")
-///     .with_service_name("my-agent")
-///     .with_env_filter("polaris=debug,hyper=warn")
-///     .with_resource_attribute("deployment.environment.name", "production")
-///     .with_export_header("x-api-key", api_key);
+/// server.add_plugins(
+///     OpenTelemetryPlugin::new("http://localhost:4318/v1/traces")
+///         .with_service_name("my-agent")
+///         .with_env_filter("polaris=debug,hyper=warn")
+///         .with_resource_attribute("deployment.environment.name", "production")
+///         .with_export_header("x-api-key", api_key),
+/// );
+/// # tokio_test::block_on(async {
+/// server.finish().await;
+/// # });
 /// ```
 pub struct OpenTelemetryPlugin {
     endpoint: String,
@@ -210,7 +248,7 @@ impl Plugin for OpenTelemetryPlugin {
 
         // Push the `OTel` layer (with its own filter) into the shared API
         let mut api = server
-            .get_resource_mut::<TracingLayersApi>()
+            .get_resource_mut::<TracingLayers>()
             .expect("TracingPlugin must be added before OpenTelemetryPlugin");
 
         api.push(
@@ -251,6 +289,10 @@ mod tests {
     fn build_with_tracing_plugin() {
         let mut server = Server::new();
         ServerInfoPlugin.build(&mut server);
+        // Dashboard wiring inside TracingPlugin::build needs the HttpRouter API.
+        #[cfg(feature = "dashboard")]
+        polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1"))
+            .build(&mut server);
         TracingPlugin::default().build(&mut server);
 
         let plugin = OpenTelemetryPlugin::new("http://localhost:4318/v1/traces")

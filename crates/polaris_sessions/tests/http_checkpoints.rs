@@ -4,7 +4,7 @@
 //! `checkpoint`, `list_checkpoints`, `rollback`, `save_session`,
 //! `resume_session`, and `list_sessions` (store).
 
-#![cfg(feature = "http")]
+#![cfg(feature = "sessions-http")]
 
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin, Storable};

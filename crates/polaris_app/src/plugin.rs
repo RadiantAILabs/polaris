@@ -1,9 +1,8 @@
 //! [`AppPlugin`] — HTTP server lifecycle management.
 //!
-//! Registers [`AppConfig`] and [`HttpRouter`] (and
-//! [`WsRouter`](crate::ws::WsRouter) when the `ws` feature is enabled), then
-//! starts an axum server in `ready()` with all routes merged and middleware
-//! applied.
+//! Registers [`AppConfig`], [`HttpRouter`], and [`WsRouter`](crate::ws::WsRouter),
+//! then starts an axum server in `ready()` with all routes merged and
+//! middleware applied.
 
 use crate::config::AppConfig;
 use crate::middleware;
@@ -15,8 +14,78 @@ use tokio::sync::watch;
 
 /// Runtime handle for the HTTP server.
 ///
-/// Registered as an [`API`] during `ready()`. Other plugins can access it
-/// via `server.api::<ServerHandle>()` to trigger a graceful shutdown.
+/// Reach for `ServerHandle` when a plugin needs to stop the axum server
+/// programmatically — for example to trigger a graceful shutdown from its own
+/// `cleanup()`. It is the runtime control surface for the server task that
+/// [`AppPlugin`] spawns in `ready()`.
+///
+/// # Provided by
+///
+/// [`AppPlugin`], via `insert_api` during its `ready()` phase — after the axum
+/// server task has been spawned.
+///
+/// # Surface
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | [`shutdown`](ServerHandle::shutdown) | Sends the graceful-shutdown signal to the HTTP server. |
+///
+/// # Lifecycle
+///
+/// `ServerHandle` is installed in [`AppPlugin::ready`], so it is **not**
+/// available during any plugin's `build()` — `server.api::<ServerHandle>()`
+/// returns `None` until [`AppPlugin`]'s `ready()` has run. Once installed,
+/// [`shutdown`](ServerHandle::shutdown) is callable at any time (during
+/// `ready()`, `cleanup()`, or runtime). [`AppPlugin`]'s own `cleanup()` calls
+/// [`shutdown`](ServerHandle::shutdown) and then awaits a graceful drain with a
+/// 5-second timeout.
+///
+/// # Composition
+///
+/// **Provider-scoped** — only [`AppPlugin`] inserts the handle. Consumers call
+/// [`shutdown`](ServerHandle::shutdown) to operate the server but never
+/// contribute to or replace the handle.
+///
+/// # Example consumers
+///
+/// - [`AppPlugin`] itself — its `cleanup()` resolves `ServerHandle` and calls
+///   [`shutdown`](ServerHandle::shutdown) for the graceful-shutdown path.
+///
+/// No other in-workspace plugin consumes it; `ServerHandle` is the
+/// programmatic-shutdown extension point for downstream plugins, which would
+/// call [`shutdown`](ServerHandle::shutdown) from their own `cleanup()`.
+///
+/// # Example
+///
+/// ```no_run
+/// use polaris_system::plugin::{Plugin, PluginId, Version};
+/// use polaris_system::server::Server;
+/// use polaris_app::{AppPlugin, AppConfig, ServerHandle};
+///
+/// // Provider side: AppPlugin installs `ServerHandle` in `ready()`.
+/// let mut server = Server::new();
+/// server.add_plugins(AppPlugin::new(AppConfig::new().with_port(8080)));
+///
+/// // Consumer side: a plugin that shuts the server down from its `cleanup()`.
+/// struct ShutdownOnCleanup;
+///
+/// impl Plugin for ShutdownOnCleanup {
+///     const ID: &'static str = "myapp::shutdown_on_cleanup";
+///     const VERSION: Version = Version::new(0, 1, 0);
+///
+///     fn build(&self, _server: &mut Server) {}
+///
+///     async fn cleanup(&self, server: &mut Server) {
+///         if let Some(handle) = server.api::<ServerHandle>() {
+///             handle.shutdown();
+///         }
+///     }
+///
+///     fn dependencies(&self) -> Vec<PluginId> {
+///         vec![PluginId::of::<AppPlugin>()]
+///     }
+/// }
+/// ```
 pub struct ServerHandle {
     /// Shutdown signal sender.
     shutdown_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
@@ -59,13 +128,30 @@ impl ServerHandle {
 /// # Lifecycle
 ///
 /// - **`build()`** — inserts [`AppConfig`] as a global resource, registers
-///   [`HttpRouter`] as a build-time API (and [`WsRouter`](crate::ws::WsRouter)
-///   when the `ws` feature is enabled).
+///   [`HttpRouter`] and [`WsRouter`](crate::ws::WsRouter) as build-time APIs.
 /// - **`ready()`** — merges all registered HTTP and WebSocket routes, applies
 ///   middleware (CORS, tracing, request ID, optional auth), spawns the axum
 ///   server, and registers [`ServerHandle`] as a build-time API.
 /// - **`cleanup()`** — sends shutdown signal via [`ServerHandle`] and awaits
 ///   graceful drain (5-second timeout).
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | [`AppConfig`] | Global | Server bind address, CORS, and middleware configuration. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | [`HttpRouter`] | Build-time. Other plugins call [`HttpRouter::add_routes`](crate::router::HttpRouter::add_routes) or [`add_routes_with`](crate::router::HttpRouter::add_routes_with) during `build()` to register REST route fragments and optional [`AuthProvider`](crate::auth::AuthProvider). |
+/// | [`WsRouter`](crate::ws::WsRouter) | Build-time. Plugins register WebSocket upgrade routes that pass through the same middleware stack as REST. |
+/// | [`ServerHandle`] | Runtime (installed in `ready()`). Provides programmatic graceful shutdown via [`ServerHandle::shutdown`]. |
+///
+/// # Dependencies
+///
+/// None.
 ///
 /// # Example
 ///
@@ -122,7 +208,6 @@ impl Plugin for AppPlugin {
     fn build(&self, server: &mut Server) {
         server.insert_global(self.config.clone());
         server.insert_api(HttpRouter::new());
-        #[cfg(feature = "ws")]
         server.insert_api(crate::ws::WsRouter::new());
     }
 
@@ -146,18 +231,15 @@ impl Plugin for AppPlugin {
             app = app.merge(build(&*server));
         }
 
-        // Merge WebSocket route fragments (when ws feature is enabled).
-        // WS routes are merged before middleware so upgrade requests pass
-        // through the same auth, tracing, and CORS stack as REST requests.
-        #[cfg(feature = "ws")]
-        {
-            let ws_api = server
-                .api::<crate::ws::WsRouter>()
-                .expect("WsRouter API must exist (registered in build)");
-            let ws_fragments = ws_api.take_routes();
-            for fragment in ws_fragments {
-                app = app.merge(fragment);
-            }
+        // Merge WebSocket route fragments. WS routes are merged before
+        // middleware so upgrade requests pass through the same auth,
+        // tracing, and CORS stack as REST requests.
+        let ws_api = server
+            .api::<crate::ws::WsRouter>()
+            .expect("WsRouter API must exist (registered in build)");
+        let ws_fragments = ws_api.take_routes();
+        for fragment in ws_fragments {
+            app = app.merge(fragment);
         }
 
         // Apply middleware stack (including auth if registered).

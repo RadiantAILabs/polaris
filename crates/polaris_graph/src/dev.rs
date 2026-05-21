@@ -110,6 +110,37 @@ impl SystemInfo {
 /// it also registers an observer on all graph execution schedules that emits
 /// `tracing::debug!` logs for each event.
 ///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | [`SystemInfo`] | Local | Per-system execution metadata (node id, system name); inserted by the `OnSystemStart` hook on every system invocation |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | This plugin only registers hooks against [`HooksAPI`](crate::hooks::HooksAPI); it inserts no APIs of its own. |
+///
+/// # Dependencies
+///
+/// Requires [`HooksAPI`](crate::hooks::HooksAPI) from `polaris_graph`.
+/// Inserts it if not already present on the server.
+///
+/// # Hooks Registered
+///
+/// Registered via [`HooksAPI`](crate::hooks::HooksAPI).
+///
+/// | Schedule | Description |
+/// |----------|-------------|
+/// | `OnSystemStart` | `devtools_system_info` — a provider hook that injects a [`SystemInfo`] resource into the context before each system runs. |
+/// | `AllGraphSchedules` | `devtools_event_trace` — an observer that logs every graph execution event via `tracing::debug!`. Registered only when [`with_event_tracing`](Self::with_event_tracing) is enabled. |
+///
+/// # Extends
+///
+/// - [`HooksAPI`](crate::hooks::HooksAPI) — registers the hooks above.
+///   Inserts the API itself if no other plugin provided it.
+///
 /// # Example
 ///
 /// ```

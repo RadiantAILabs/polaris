@@ -15,7 +15,7 @@
 //! ```text
 //! AppPlugin (axum server lifecycle)
 //!   ├── HttpRouter API (route and auth registration)
-//!   ├── WsRouter API (WebSocket route registration, `ws` feature)
+//!   ├── WsRouter API (WebSocket route registration)
 //!   ├── AppConfig (host, port, CORS)
 //!   ├── ServerHandle (shutdown signal, API)
 //!   ├── AuthProvider trait (pluggable authentication)
@@ -37,10 +37,6 @@
 //!
 //! The pure core is [`RequestContext::from_headers`], lenient by design:
 //! missing headers become `None`, never a rejection.
-//!
-//! # Feature Flags
-//!
-//! - `ws` — enables [`WsRouter`] for plugin-contributed WebSocket routes
 //!
 //! # Quick Start
 //!
@@ -98,8 +94,6 @@ pub mod plugin;
 pub mod public_route;
 pub mod request_context;
 pub mod router;
-#[cfg(feature = "ws")]
-#[cfg_attr(docsrs_dep, doc(cfg(feature = "ws")))]
 pub mod ws;
 
 pub use auth::AuthProvider;
@@ -108,6 +102,4 @@ pub use plugin::{AppPlugin, ServerHandle};
 pub use public_route::{PublicPath, PublicPrefix, PublicRouteError};
 pub use request_context::{HttpHeaders, RequestContext, RequestContextPlugin};
 pub use router::HttpRouter;
-#[cfg(feature = "ws")]
-#[cfg_attr(docsrs_dep, doc(cfg(feature = "ws")))]
 pub use ws::WsRouter;

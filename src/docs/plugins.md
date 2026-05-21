@@ -60,7 +60,7 @@ application. Most ship via [`polaris_ai::plugins`](crate::plugins).
 |--------|-----------------|
 | [`ServerInfoPlugin`](crate::plugins::ServerInfoPlugin) | Server identity, version, and runtime metadata as a global [`ServerInfo`](crate::plugins::ServerInfo) resource. |
 | [`TimePlugin`](crate::plugins::TimePlugin) | Wall-clock time via the [`Clock`](crate::plugins::Clock) resource; mockable in tests with `MockClock`. |
-| [`TracingPlugin`](crate::plugins::TracingPlugin) | Console / structured tracing subscriber, graph and system instrumentation hooks, and the [`TracingLayersApi`](crate::plugins::TracingLayersApi) for plugins that need to push their own subscriber layer. |
+| [`TracingPlugin`](crate::plugins::TracingPlugin) | Console / structured tracing subscriber, graph and system instrumentation hooks, and the [`TracingLayers`](crate::plugins::TracingLayers) for plugins that need to push their own subscriber layer. |
 | [`PersistencePlugin`](crate::plugins::PersistencePlugin) | The [`PersistenceAPI`](crate::plugins::PersistenceAPI) — a registry of `Storable` resource serializers used by sessions and other state-bearing plugins. |
 | [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin) *(feature `otel`)* | Adds an OTLP export layer to the tracing subscriber for distributed tracing backends. |
 | [`DevToolsPlugin`](crate::graph::DevToolsPlugin) | Graph-level developer tooling: per-node [`SystemInfo`](crate::graph::SystemInfo) records, execution event tracing, and graph introspection. Lives in [`polaris_ai::graph`](crate::graph). |
@@ -71,8 +71,7 @@ Tool registry and discovery primitives.
 
 | Plugin | What it enables |
 |--------|-----------------|
-| [`ToolsPlugin`](crate::tools::ToolsPlugin) | The global [`ToolRegistry`](crate::tools::ToolRegistry) — registration, lookup, and invocation of `#[tool]` / `#[toolset]` definitions, plus the tool permission model. |
-| [`ToolsDashboardPlugin`](crate::tools::ToolsDashboardPlugin) *(feature `tools-dashboard`)* | Contributes a tools panel to the dashboard registry — registered tools, schemas, and permissions. |
+| [`ToolsPlugin`](crate::tools::ToolsPlugin) | The global [`ToolRegistry`](crate::tools::ToolRegistry) — registration, lookup, and invocation of `#[tool]` / `#[toolset]` definitions, plus the tool permission model. With the `dashboard` feature, also mounts `GET /v1/tools` — a frozen snapshot of registered tools, schemas, and permissions for an external dashboard frontend to consume. |
 
 ## Layer 3 — Models & Providers
 
@@ -80,9 +79,8 @@ Provider-agnostic LLM access plus concrete provider plugins.
 
 | Plugin | What it enables |
 |--------|-----------------|
-| [`ModelsPlugin`](crate::models::ModelsPlugin) | The global [`ModelRegistry`](crate::models::ModelRegistry) — provider-keyed model lookup so consumers depend on the registry, not on a specific provider. |
+| [`ModelsPlugin`](crate::models::ModelsPlugin) | The global [`ModelRegistry`](crate::models::ModelRegistry) — provider-keyed model lookup so consumers depend on the registry, not on a specific provider. With the `dashboard` feature, also mounts `GET /v1/models/providers` — a frozen snapshot of registered providers for an external dashboard frontend to consume. |
 | [`TokenizerPlugin`](crate::models::TokenizerPlugin) | Pluggable [`Tokenizer`](crate::models::Tokenizer) resource for token counting and prompt budgeting; backed by tiktoken when the `tiktoken` feature is on. |
-| [`ModelsDashboardPlugin`](crate::models::ModelsDashboardPlugin) *(feature `models-dashboard`)* | Contributes a models panel to the dashboard registry — registered providers and their advertised models. |
 | [`AnthropicPlugin`](crate::models::AnthropicPlugin) *(feature `anthropic`)* | Registers the Anthropic provider (Messages API, including tool use and streaming) with [`ModelRegistry`](crate::models::ModelRegistry). |
 | [`OpenAiPlugin`](crate::models::OpenAiPlugin) *(feature `openai`)* | Registers the `OpenAI` provider (Chat Completions, tool use, streaming) with [`ModelRegistry`](crate::models::ModelRegistry). |
 | [`BedrockPlugin`](crate::models::BedrockPlugin) *(feature `bedrock`)* | Registers AWS Bedrock-hosted models (Anthropic, Meta, etc.) with [`ModelRegistry`](crate::models::ModelRegistry). |
@@ -95,7 +93,6 @@ Session lifecycle, turn execution, and (optional) HTTP/dashboard surfaces.
 |--------|-----------------|
 | [`SessionsPlugin`](crate::sessions::SessionsPlugin) | The [`SessionsAPI`](crate::sessions::SessionsAPI) — agent-type registration, session creation, scoped sessions ([`SessionGuard`](crate::sessions::SessionGuard)), turn execution, checkpointing, and persistence via a pluggable [`SessionStore`](crate::sessions::SessionStore). |
 | [`HttpPlugin`](crate::sessions::HttpPlugin) *(feature `sessions-http`)* | Registers REST endpoints for sessions and an `HttpIOProvider` that bridges HTTP request/response (and SSE) to in-process [`UserIO`](crate::plugins::UserIO). Requires [`AppPlugin`](crate::app::AppPlugin). |
-| [`SessionsDashboardPlugin`](crate::sessions::SessionsDashboardPlugin) *(feature `sessions-dashboard`)* | Contributes a sessions panel to the dashboard registry — live sessions, turn history, and per-session inspection. |
 
 ## Layer 3 — HTTP App Runtime
 
@@ -103,7 +100,7 @@ Shared axum-based HTTP runtime that other plugins build on top of.
 
 | Plugin | What it enables |
 |--------|-----------------|
-| [`AppPlugin`](crate::app::AppPlugin) | The shared HTTP server: [`HttpRouter`](crate::app::HttpRouter) for plugin-composed routes, the [`ServerHandle`](crate::app::ServerHandle) global resource, the [`WsRouter`](crate::app::WsRouter) *(feature `ws`)*, and pluggable [`AuthProvider`](crate::app::AuthProvider). |
+| [`AppPlugin`](crate::app::AppPlugin) | The shared HTTP server: [`HttpRouter`](crate::app::HttpRouter) for plugin-composed routes, the [`ServerHandle`](crate::app::ServerHandle) global resource, the [`WsRouter`](crate::app::WsRouter), and pluggable [`AuthProvider`](crate::app::AuthProvider). |
 | [`RequestContextPlugin`](crate::app::RequestContextPlugin) | Per-request [`RequestContext`](crate::app::RequestContext) injection — propagates HTTP headers and identity into agent system contexts. |
 
 ## Layer 3 — Shell
@@ -114,27 +111,29 @@ Shell command execution behind the project permission model.
 |--------|-----------------|
 | [`ShellPlugin`](crate::shell::ShellPlugin) | A configured [`ShellExecutor`](crate::shell::ShellExecutor) resource and shell-execution tools, gated by [`ShellPermission`](crate::shell::ShellPermission). |
 
-## Layer 3 — Dashboard Registry
+## Layer 3 — Dashboard
 
-Cross-plugin dashboard contribution model — opt in via `dashboard-registry`,
-or any of the per-area `*-dashboard` features (which transitively enable it).
+The umbrella `dashboard` feature extends Layer-3 plugins with HTTP surfaces
+intended for an external dashboard frontend. It flips the per-crate
+`dashboard` features in `polaris_tools`, `polaris_models`, and
+`polaris_core_plugins`; the host plugins then mount their endpoints during
+`build()` and depend on [`AppPlugin`](crate::app::AppPlugin).
 
-| Plugin | What it enables |
-|--------|-----------------|
-| [`DashboardPlugin`](crate::dashboard::DashboardPlugin) *(feature `dashboard-registry`)* | The [`DashboardRegistry`](crate::dashboard::DashboardRegistry) — a typed contribution surface (`Manifest`, `NavItem`, `Panel`, `Section`, `Transport`) that other plugins extend to publish UI metadata. |
-| [`TracingDashboardPlugin`](crate::plugins::TracingDashboardPlugin) *(feature `tracing-dashboard`)* | Buffered span recording and a `/v1/tracing/spans` endpoint exposing recent execution traces to the dashboard. |
+| Plugin | What the `dashboard` feature enables |
+|--------|--------------------------------------|
+| [`TracingPlugin`](crate::plugins::TracingPlugin) | Buffered span recording and a family of `/v1/tracing/*` endpoints exposing recent execution traces, run trees, and token-usage rollups. |
+| [`SpanStorePlugin`](crate::plugins::SpanStorePlugin) | Durable span/run history through a pluggable [`SpanStore`](crate::plugins::SpanStore). The plugin compiles unconditionally; when `dashboard` is also on, `ready()` hydrates the in-memory [`SpanBuffer`](crate::plugins::SpanBuffer) from the configured store so resumed sessions retain their run history across process restart. Pair with [`FileSpanStore`](crate::plugins::FileSpanStore) (feature `file-store`) for on-disk persistence. |
 
-# Feature-Gated Observability
+# Observability
 
-Most observability features extend [`TracingPlugin`](crate::plugins::TracingPlugin)
-rather than exporting a separate plugin type.
+Graph, model, and tool tracing are always on — [`TracingPlugin`](crate::plugins::TracingPlugin)
+unconditionally registers graph middleware via [`crate::graph::MiddlewareAPI`] and
+decorates both the global [`crate::models::ModelRegistry`] and [`crate::tools::ToolRegistry`].
+With no subscriber attached the spans have no observable cost.
 
 | Feature | Public item to look for | Existing surface it changes | Runtime/API surface |
 |---------|--------------------------|----------------------------|---------------------|
-| `graph-tracing` | [`TracingPlugin`](crate::plugins::TracingPlugin) | No new plugin type; augments the existing tracing plugin | Registers graph middleware via [`crate::graph::MiddlewareAPI`] |
-| `models-tracing` | [`TracingPlugin`](crate::plugins::TracingPlugin) | No new plugin type; augments the existing tracing plugin | Decorates the global [`crate::models::ModelRegistry`] |
-| `tools-tracing` | [`TracingPlugin`](crate::plugins::TracingPlugin) | No new plugin type; augments the existing tracing plugin | Decorates the global [`crate::tools::ToolRegistry`] |
-| `otel` | [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin) | Integrates with [`TracingPlugin`](crate::plugins::TracingPlugin) and [`TracingLayersApi`](crate::plugins::TracingLayersApi) | Pushes an OTLP export layer into the tracing subscriber |
+| `otel` | [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin) | Integrates with [`TracingPlugin`](crate::plugins::TracingPlugin) and [`TracingLayers`](crate::plugins::TracingLayers) | Pushes an OTLP export layer into the tracing subscriber |
 
 If you are trying to answer "what does the `otel` feature export?", the public
 type is [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin) under

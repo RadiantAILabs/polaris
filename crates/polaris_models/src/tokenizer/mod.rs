@@ -151,6 +151,12 @@ impl std::fmt::Debug for Tokenizer {
 /// |----------|-------|-------------|
 /// | [`Tokenizer`] | Global | Model-agnostic token counter for text, messages, and requests |
 ///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | Token counting is exposed through the [`Tokenizer`] global resource rather than an API. |
+///
 /// # Dependencies
 ///
 /// None.
@@ -158,11 +164,13 @@ impl std::fmt::Debug for Tokenizer {
 /// # Example
 ///
 /// ```no_run
+/// # #[cfg(feature = "tiktoken")] {
 /// use polaris_system::server::Server;
 /// use polaris_models::tokenizer::TokenizerPlugin;
 ///
 /// let mut server = Server::new();
 /// server.add_plugins(TokenizerPlugin::default());
+/// # }
 /// ```
 pub struct TokenizerPlugin {
     counter: Arc<dyn TokenCounter>,

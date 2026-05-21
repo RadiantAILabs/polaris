@@ -14,21 +14,15 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[features]
-# Adds `Serialize` / `Deserialize` impls for cross-process correlation types
-# (`RunId`, `RunLabels`). Off by default — Layer 2 stays serde-free unless
-# downstream callers need to bridge events across process boundaries.
-serde = ["dep:serde", "hashbrown/serde"]
-
 [dependencies]
 polaris_system = { path = "../polaris_system", version = "0.4.0" }
 tokio = { version = "1", features = ["time"] }
 futures = "0.3"
-hashbrown = "0.16.1"
+hashbrown = { version = "0.17", features = ["serde"] }
 parking_lot = "0.12.5"
-nanoid = "0.4"
+nanoid = "0.5"
 tracing = "0.1"
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

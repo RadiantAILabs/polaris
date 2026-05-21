@@ -1,0 +1,13 @@
+{
+  "agent_type": "CounterAgent",
+  "turn_number": 7,
+  "created_at": "2026-05-10T14:32:11Z",
+  "resources": [
+    {
+      "plugin_id": "examples::counter",
+      "storage_key": "Counter",
+      "version": "1.0.0",
+      "data": { "value": 7 }
+    }
+  ]
+}

@@ -621,10 +621,9 @@ mod allowlist_tests {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket integration tests (gated behind the `ws` feature)
+// WebSocket integration tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "ws")]
 mod ws_tests {
     use super::*;
     use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
