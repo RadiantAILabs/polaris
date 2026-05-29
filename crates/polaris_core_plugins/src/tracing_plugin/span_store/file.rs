@@ -8,6 +8,7 @@
 
 use super::{SpanRecord, SpanStore, SpanStoreError};
 use polaris_system::system::BoxFuture;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -122,6 +123,107 @@ impl SpanStore for FileSpanStore {
                     path: path.clone(),
                     source,
                 })?;
+            // `flush` only hands the bytes to the OS; they linger in the
+            // page cache until the kernel decides to write them back. The
+            // plugin promises a record survives a restart, so force the
+            // data to stable storage before reporting success. Prefer
+            // `append_batch` on the hot path — it pays this barrier once
+            // per batch instead of once per record.
+            file.sync_data()
+                .await
+                .map_err(|source| FileSpanStoreError::Write {
+                    path: path.clone(),
+                    source,
+                })?;
+            Ok(())
+        })
+    }
+
+    fn append_batch<'a>(
+        &'a self,
+        records: &'a [(String, SpanRecord)],
+    ) -> BoxFuture<'a, Result<(), SpanStoreError>> {
+        Box::pin(async move {
+            if records.is_empty() {
+                return Ok(());
+            }
+
+            // Group by session, preserving each session's append order, so
+            // we open + `fsync` each session file once for the whole batch
+            // instead of once per record. A record that fails to serialize
+            // is skipped with a warning rather than aborting the batch.
+            let mut grouped: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+            for (session_id, record) in records {
+                let buf = grouped.entry(session_id.as_str()).or_default();
+                let mark = buf.len();
+                match serde_json::to_writer(&mut *buf, record) {
+                    Ok(()) => buf.push(b'\n'),
+                    Err(source) => {
+                        buf.truncate(mark);
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %source,
+                            "FileSpanStore: skipping unserializable record in batch",
+                        );
+                    }
+                }
+            }
+
+            tokio::fs::create_dir_all(&self.base_dir)
+                .await
+                .map_err(|source| FileSpanStoreError::CreateDir {
+                    path: self.base_dir.clone(),
+                    source,
+                })?;
+
+            for (session_id, bytes) in grouped {
+                if bytes.is_empty() {
+                    continue;
+                }
+                // A session id that fails the path-traversal check is
+                // skipped, not fatal — one hostile id must not drop the
+                // rest of the batch.
+                let path = match self.path_for(session_id) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %err,
+                            "FileSpanStore: skipping invalid session id in batch",
+                        );
+                        continue;
+                    }
+                };
+
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+                    .map_err(|source| FileSpanStoreError::Open {
+                        path: path.clone(),
+                        source,
+                    })?;
+                file.write_all(&bytes)
+                    .await
+                    .map_err(|source| FileSpanStoreError::Write {
+                        path: path.clone(),
+                        source,
+                    })?;
+                file.flush()
+                    .await
+                    .map_err(|source| FileSpanStoreError::Write {
+                        path: path.clone(),
+                        source,
+                    })?;
+                // One durability barrier per session file for the batch.
+                file.sync_data()
+                    .await
+                    .map_err(|source| FileSpanStoreError::Write {
+                        path: path.clone(),
+                        source,
+                    })?;
+            }
             Ok(())
         })
     }

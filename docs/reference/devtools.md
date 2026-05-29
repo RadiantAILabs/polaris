@@ -86,12 +86,12 @@ For structured observability in production, prefer registering your own observer
 The tracing-subscriber pipeline writes through a `RecordingLayer` for each enabled sink:
 
 - **`SpanBuffer`** — bounded ring (default 1024 records). Cheap to query, but volatile: spans evict in FIFO order and the buffer is wiped at process exit. Backs the live `/v1/tracing/*` endpoints.
-- **`SpanStorePlugin` (optional)** — durable companion. Installs its own `RecordingLayer` and persists every record carrying a `session_id` label through a pluggable `SpanStore` trait. On `ready()` it hydrates the in-memory `SpanBuffer` from the store, so a resumed session reports non-empty runs immediately after boot. Buffer writes and store writes are independent — an unreachable store does not stall the in-memory pipeline.
+- **`SpanStorePlugin` (optional)** — durable companion. Installs its own `RecordingLayer` and routes every record carrying a `session_id` label through a pluggable `SpanStore` trait. Records are enqueued onto a bounded queue and drained by a single background writer task, never written inline: the tracing hot path never blocks, bursts past the queue bound are dropped with a rate-limited warning rather than spawning unbounded work, and the writer is drained on `cleanup()` so records emitted just before shutdown still reach the store. On `ready()` it hydrates the in-memory `SpanBuffer` from the store, so a resumed session reports non-empty runs immediately after boot. Buffer writes and store writes are independent — an unreachable store does not stall the in-memory pipeline.
 
 Two backends ship in-tree:
 
 - `InMemorySpanStore` — default for tests; exercises the trait surface without touching disk.
-- `FileSpanStore` (feature-gated on `file-store`) — one JSON-lines file per session at `<base_dir>/<session_id>.jsonl`, append-only, recoverable from a partial trailing line.
+- `FileSpanStore` (feature-gated on `file-store`) — one JSON-lines file per session at `<base_dir>/<session_id>.jsonl`, append-only, recoverable from a partial trailing line. Each write is `fsync`ed before it reports success, so a record survives a crash once persisted; the writer batches records per drain so the `fsync` cost is paid once per batch rather than once per record.
 
 Custom backends (Postgres, S3, …) implement `SpanStore` directly. Records without a `session_id` label are dropped on the storage path.
 

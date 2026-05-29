@@ -78,11 +78,41 @@ pub trait SpanStore: Send + Sync + 'static {
     /// Callers should only invoke this for records that carry a
     /// `session_id` label. Implementations may treat unrelated session ids
     /// as opaque strings — no schema validation is performed.
+    ///
+    /// Implementations must persist the record durably before the returned
+    /// future resolves — a process crash immediately afterwards must not
+    /// lose it. [`SpanStorePlugin`] funnels writes through a single
+    /// background task, so the latency of that durability barrier is off
+    /// the tracing hot path.
     fn append(
         &self,
         session_id: &str,
         record: &SpanRecord,
     ) -> BoxFuture<'_, Result<(), SpanStoreError>>;
+
+    /// Append a batch of `(session_id, record)` pairs durably.
+    ///
+    /// [`SpanStorePlugin`]'s writer task coalesces records and calls this
+    /// once per drained batch. The default implementation simply replays
+    /// the batch through [`append`](Self::append) in order — correct, but
+    /// it pays each backend's per-write durability cost (e.g. an `fsync`)
+    /// once per record. Backends where that cost is significant should
+    /// override this to write the whole batch and pay it once.
+    ///
+    /// A record that cannot be persisted should be skipped, not allowed to
+    /// abort the rest of the batch — one bad record must not blank a
+    /// session's history.
+    fn append_batch<'a>(
+        &'a self,
+        records: &'a [(String, SpanRecord)],
+    ) -> BoxFuture<'a, Result<(), SpanStoreError>> {
+        Box::pin(async move {
+            for (session_id, record) in records {
+                self.append(session_id, record).await?;
+            }
+            Ok(())
+        })
+    }
 
     /// Load every record stored for `session_id`, in append order.
     fn load(&self, session_id: &str) -> BoxFuture<'_, Result<Vec<SpanRecord>, SpanStoreError>>;

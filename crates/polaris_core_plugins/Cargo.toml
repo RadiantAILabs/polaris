@@ -42,7 +42,7 @@ opentelemetry-otlp = { version = "0.31", optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
 ts-rs = { workspace = true, optional = true }
 
-tokio = { version = "1.43", features = ["rt", "sync"], default-features = false }
+tokio = { version = "1.43", features = ["rt", "sync", "time"], default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net", "fs", "io-util"] }

@@ -45,13 +45,19 @@ async fn span_store_layer_appends_through_live_tracing_subscriber() {
         tracing::info!("inside scoped span");
     }
 
-    // Spawned store appends are fire-and-forget; poll on a real timer so
-    // slow CI runners get a clear "took too long" failure rather than an
-    // exhausted-yield-budget false negative.
+    // Records reach the store asynchronously via the writer task, which
+    // coalesces them into batches. The scoped span emits two records — an
+    // event and the span-close — that can land in separate batches, so
+    // poll for the specific close record the assertion needs rather than
+    // returning on the first record to appear. Poll on a real timer so a
+    // slow CI runner gets a clear "took too long" failure.
     let records = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let records = store.load("sess-live").await.expect("load");
-            if !records.is_empty() {
+            if records
+                .iter()
+                .any(|r| r.kind == SpanKind::SpanClose && r.name == "polaris.graph.execute")
+            {
                 return records;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
