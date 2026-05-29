@@ -197,24 +197,35 @@ impl SpanBuffer {
             return;
         }
 
-        let mut guard = self.records.lock();
-        if guard.len() >= self.capacity {
-            let _ = guard.pop_front();
-            // A ring buffer at steady state is always full, so eviction is
-            // the normal case — warning per push would emit thousands of
-            // lines per second. Warn once: enough for an operator to learn
-            // history is being dropped before it can be queried, and to
-            // raise capacity if they need more retention.
-            if !self.overflow_warned.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    capacity = self.capacity,
-                    "SpanBuffer reached capacity; evicting oldest records. Older \
-                     history is dropped before it can be queried — raise capacity \
-                     via TracingPlugin::with_span_buffer_capacity for more retention."
-                );
+        let evicted = {
+            let mut guard = self.records.lock();
+            let evicted = guard.len() >= self.capacity;
+            if evicted {
+                let _ = guard.pop_front();
             }
+            guard.push_back(record);
+            evicted
+        };
+
+        // Warn *after* releasing the lock. `RecordingLayer` captures tracing
+        // events into this same buffer, so emitting while holding `records`
+        // would recurse back into `push` on the same thread — relying on
+        // `tracing-core`'s re-entrancy guard to avoid a deadlock on the
+        // non-reentrant `parking_lot::Mutex`. Logging outside the lock keeps
+        // the buffer correct on its own terms, independent of that guard.
+        //
+        // A ring buffer at steady state is always full, so eviction is the
+        // normal case — warning per push would emit thousands of lines per
+        // second. Warn once: enough for an operator to learn history is being
+        // dropped before it can be queried, and to raise capacity if needed.
+        if evicted && !self.overflow_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                capacity = self.capacity,
+                "SpanBuffer reached capacity; evicting oldest records. Older \
+                 history is dropped before it can be queried — raise capacity \
+                 via TracingPlugin::with_span_buffer_capacity for more retention."
+            );
         }
-        guard.push_back(record);
     }
 
     /// Clones up to `limit` of the most recent records in chronological order.

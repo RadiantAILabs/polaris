@@ -371,6 +371,112 @@ async fn stream_turn_busy() {
     server.cleanup().await;
 }
 
+/// Regression: a streaming turn that loses the session race must not
+/// overwrite the in-flight turn's recorded messages with an empty `Vec`.
+///
+/// Two SSE clients on one session share the same `turn_before` (neither has
+/// completed, so the turn counter has not advanced). The winner records the
+/// turn's IO messages on success; the loser gets `SessionBusy`, captures
+/// nothing, and — before the fix — unconditionally called
+/// `record_turn_messages` with an empty `Vec`, wiping the winner's history.
+///
+/// The race is made deterministic by holding the session lock with a
+/// blocking turn (so the streaming request is guaranteed to lose) and by
+/// seeding turn 0's record up front to stand in for the winner's commit.
+/// Draining the loser's full SSE body guarantees its spawned task ran the
+/// record step, which precedes the terminal event.
+#[tokio::test]
+async fn stream_turn_busy_does_not_clobber_recorded_messages() {
+    let (listener, port) = bind_ephemeral().await;
+    let mut server = test_server(listener, port).await;
+    wait_for_server(port).await;
+
+    let session_id_str = create_session(port, "BlockingAgent").await;
+    let sessions = server.api::<SessionsAPI>().unwrap().clone();
+    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+
+    // Hold the session lock with a blocking turn (turn 0). While it is in
+    // flight the turn counter stays at 0, so the racing streaming request
+    // below captures `turn_before == 0` — the same turn we seed.
+    let (provider, input_tx, mut output_rx) = polaris_sessions::http::HttpIOProvider::new(32, 32);
+    let provider = Arc::new(provider);
+    input_tx.send(IOMessage::user_text("block")).await.unwrap();
+
+    let io_provider = Arc::clone(&provider);
+    let sessions_clone = sessions.clone();
+    let sid_clone = sid.clone();
+    let blocking_handle = tokio::spawn(async move {
+        sessions_clone
+            .try_process_turn_with(&sid_clone, move |ctx| {
+                ctx.insert(UserIO::new(io_provider));
+            })
+            .await
+    });
+
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), output_rx.recv())
+        .await
+        .expect("BlockingAgent did not signal lock acquisition within 5 s")
+        .expect("output channel closed before ready signal");
+    assert!(
+        matches!(ready.content, IOContent::Text(ref t) if t == "blocking-ready"),
+        "expected blocking-ready signal, got {ready:?}"
+    );
+
+    // Stand in for the winner's success path: record turn 0's IO messages,
+    // exactly as `process_turn_stream` does on completion.
+    let winner_messages = vec![
+        IOMessage::user_text("hello"),
+        IOMessage::system_text("echo: hello"),
+    ];
+    sessions.record_turn_messages(&sid, 0, winner_messages.clone());
+    let seeded = serde_json::to_value(&winner_messages).unwrap();
+    assert_eq!(
+        serde_json::to_value(sessions.turn(&sid, 0).expect("turn 0 should exist").messages)
+            .unwrap(),
+        seeded,
+        "winner's messages should be recorded before the racing request"
+    );
+
+    // The losing streaming request: the session is busy, so it returns a
+    // `session_busy` SSE error rather than executing a turn.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/v1/sessions/{session_id_str}/turns/stream"
+        ))
+        .json(&serde_json::json!({ "message": "loser" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let frames = parse_sse_frames(&body);
+    let error_frame = frames
+        .iter()
+        .find(|f| f.event == "error")
+        .unwrap_or_else(|| panic!("expected an 'error' SSE event, got frames: {frames:?}"));
+    let error_json: serde_json::Value = serde_json::from_str(&error_frame.data).unwrap();
+    assert_eq!(error_json["code"], "session_busy");
+
+    // The winner's recorded messages must survive untouched — the loser
+    // must not have overwritten them with an empty `Vec`.
+    assert_eq!(
+        serde_json::to_value(
+            sessions
+                .turn(&sid, 0)
+                .expect("turn 0 should still exist")
+                .messages
+        )
+        .unwrap(),
+        seeded,
+        "a SessionBusy streaming request must not clobber recorded turn messages"
+    );
+
+    // Clean up: unblock the BlockingAgent so the spawned turn returns.
+    drop(input_tx);
+    let _ = blocking_handle.await;
+    server.cleanup().await;
+}
+
 /// Mid-turn `SessionError` other than `SessionBusy` surfaces through the
 /// SSE error event path. Covers the general `Err(session_err)` mapping at
 /// `handlers.rs::process_turn_stream` for non-busy execution failures.
