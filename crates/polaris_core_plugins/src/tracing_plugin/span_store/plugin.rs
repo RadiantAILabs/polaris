@@ -41,10 +41,12 @@ const SESSION_LABEL_KEY: &str = "session_id";
 ///    and tracing event is appended to the configured backend keyed by its
 ///    `session_id` label.
 /// 2. On `ready()`, replaying stored records into the [`SpanBuffer`]
-///    (when present), up to the buffer's capacity, so dashboard queries
-///    against a resumed session return non-empty immediately after boot.
-///    When the store holds more records than the buffer can retain, the
-///    excess is evicted during replay.
+///    (when present) in chronological order, up to the buffer's capacity,
+///    so dashboard queries against a resumed session return non-empty
+///    immediately after boot. When the store holds more records than the
+///    buffer can retain, the oldest are evicted during replay — the
+///    newest records deterministically win, independent of the backend's
+///    session iteration order.
 ///
 /// The plugin coexists with `OpenTelemetryPlugin` (under feature `otel`)
 /// — both plugins push independent layers into [`TracingLayers`], and
@@ -75,10 +77,12 @@ const SESSION_LABEL_KEY: &str = "session_id";
 ///   [`SpanStore`]-routing sink into [`TracingLayers`], and inserts
 ///   the [`SpanStoreHandle`] API.
 /// - **`ready()`** — when the `dashboard` feature is enabled, replays
-///   stored records into the dashboard's [`SpanBuffer`], up to the
-///   buffer's capacity, so queries against a resumed session return
-///   non-empty immediately after boot. If the store holds more records
-///   than the buffer's capacity, the excess is evicted during replay.
+///   stored records into the dashboard's [`SpanBuffer`] in chronological
+///   order (by [`SpanRecord::ts`]), up to the buffer's capacity, so
+///   queries against a resumed session return non-empty immediately after
+///   boot. If the store holds more records than the buffer's capacity, the
+///   oldest are evicted during replay so the newest records survive —
+///   deterministically, regardless of session iteration order.
 ///   Without the `dashboard` feature there is no buffer to hydrate, so
 ///   `ready()` early-returns: the store is still populated, just nothing
 ///   to replay into. Store errors during hydration (`list_sessions` /
@@ -204,15 +208,16 @@ impl Plugin for SpanStorePlugin {
                 }
             };
 
-            let mut hydrated = 0_usize;
+            // Collect every record across all sessions before replaying.
+            // `list_sessions()` order is backend-defined and unstable
+            // (`FileSpanStore` follows `read_dir`; `InMemorySpanStore`
+            // follows `HashMap` iteration), so pushing per-session would
+            // make eviction order — and thus which sessions survive a
+            // capacity overflow — nondeterministic across restarts.
+            let mut records = Vec::new();
             for session_id in sessions {
                 match store.load(&session_id).await {
-                    Ok(records) => {
-                        for record in records {
-                            buffer.push(record);
-                            hydrated += 1;
-                        }
-                    }
+                    Ok(loaded) => records.extend(loaded),
                     Err(err) => {
                         tracing::warn!(
                             session_id = %session_id,
@@ -222,6 +227,8 @@ impl Plugin for SpanStorePlugin {
                     }
                 }
             }
+
+            let hydrated = replay_into_buffer(&buffer, records);
 
             tracing::info!(
                 records = hydrated,
@@ -233,6 +240,24 @@ impl Plugin for SpanStorePlugin {
     fn dependencies(&self) -> Vec<PluginId> {
         vec![PluginId::of::<TracingPlugin>()]
     }
+}
+
+/// Replays stored records into the dashboard buffer in chronological
+/// order, returning the number pushed.
+///
+/// Sorting by [`SpanRecord::ts`] (ISO-8601 UTC, lexicographically
+/// ordered) makes replay independent of the backend's session iteration
+/// order. The buffer is a fixed-size ring, so when the record count
+/// exceeds its capacity the oldest are evicted and the newest
+/// deterministically survive.
+#[cfg(feature = "dashboard")]
+fn replay_into_buffer(buffer: &SpanBuffer, mut records: Vec<SpanRecord>) -> usize {
+    records.sort_by(|a, b| a.ts.cmp(&b.ts));
+    let hydrated = records.len();
+    for record in records {
+        buffer.push(record);
+    }
+    hydrated
 }
 
 /// Build-time handle to the configured [`SpanStore`].
@@ -423,6 +448,48 @@ mod tests {
             fields: Map::new(),
             message: None,
         }
+    }
+
+    #[cfg(feature = "dashboard")]
+    fn make_ts(ts: &str, name: &str) -> SpanRecord {
+        let mut record = make(Some("sess"), name);
+        record.ts = ts.into();
+        record
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[test]
+    fn replay_orders_records_chronologically_regardless_of_input_order() {
+        let buffer = SpanBuffer::with_capacity(8);
+        // Deliberately out of order, as cross-session loads would arrive.
+        let records = vec![
+            make_ts("2026-05-17T00:00:03.000Z", "third"),
+            make_ts("2026-05-17T00:00:01.000Z", "first"),
+            make_ts("2026-05-17T00:00:02.000Z", "second"),
+        ];
+
+        assert_eq!(replay_into_buffer(&buffer, records), 3);
+
+        let names: Vec<_> = buffer.snapshot(8).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["first", "second", "third"]);
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[test]
+    fn replay_keeps_newest_records_when_capacity_overflows() {
+        let buffer = SpanBuffer::with_capacity(2);
+        // Three records, smallest capacity: the two newest must survive,
+        // independent of the order they were collected in.
+        let records = vec![
+            make_ts("2026-05-17T00:00:02.000Z", "middle"),
+            make_ts("2026-05-17T00:00:03.000Z", "newest"),
+            make_ts("2026-05-17T00:00:01.000Z", "oldest"),
+        ];
+
+        assert_eq!(replay_into_buffer(&buffer, records), 3);
+
+        let names: Vec<_> = buffer.snapshot(8).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["middle", "newest"]);
     }
 
     #[tokio::test]
