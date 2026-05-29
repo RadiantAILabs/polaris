@@ -271,11 +271,17 @@ pub(crate) async fn process_turn_stream(
         // Close the output channel so the IOMessage stream terminates.
         provider.close().await;
 
-        // Flush captured messages to the turn history. Cloning is fine —
-        // a turn's IO volume is bounded by the agent's behavior, not by
-        // the channel buffer.
-        let captured = recorded_bg.lock().clone();
-        sessions_bg.record_turn_messages(&session_id_bg, turn_before, captured);
+        // Flush captured messages to the turn history — but only when this
+        // task actually executed the turn. If two clients race the same
+        // session the loser gets `SessionBusy` (or any error) without ever
+        // sending, so its capture is empty; recording it would clobber the
+        // winner's turn history with an empty `Vec`. Cloning is fine — a
+        // turn's IO volume is bounded by the agent's behavior, not by the
+        // channel buffer.
+        if result.is_ok() {
+            let captured = recorded_bg.lock().clone();
+            sessions_bg.record_turn_messages(&session_id_bg, turn_before, captured);
+        }
 
         // Send terminal event.
         let event = match result {

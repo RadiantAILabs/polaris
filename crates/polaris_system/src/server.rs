@@ -693,7 +693,8 @@ impl Server {
         let indices: Vec<usize> = plugin_indices.clone();
 
         for idx in indices {
-            let plugin_ptr = &self.built_plugins[idx].plugin as *const Box<dyn DynPlugin>;
+            let plugin_ptr =
+                std::ptr::from_ref::<Box<dyn DynPlugin>>(&self.built_plugins[idx].plugin);
             // SAFETY: built_plugins cannot be modified during this loop:
             // - It's a private field, inaccessible to plugin code
             // - add_plugins() during update goes to pending_plugins (build_state is Built)
@@ -746,7 +747,8 @@ impl Server {
         for i in 0..self.built_plugins.len() {
             // SAFETY: We're using index-based access to avoid borrow conflicts
             // The plugin is borrowed immutably, and we pass &mut self to ready()
-            let plugin_ptr = &self.built_plugins[i].plugin as *const Box<dyn DynPlugin>;
+            let plugin_ptr =
+                std::ptr::from_ref::<Box<dyn DynPlugin>>(&self.built_plugins[i].plugin);
             // SAFETY: We don't modify built_plugins during this loop, and the
             // pointer remains valid. The plugin's ready() may add resources but
             // shouldn't modify built_plugins.
@@ -834,7 +836,8 @@ impl Server {
     pub async fn cleanup(&mut self) {
         // Cleanup in reverse order (dependents before dependencies)
         for i in (0..self.built_plugins.len()).rev() {
-            let plugin_ptr = &self.built_plugins[i].plugin as *const Box<dyn DynPlugin>;
+            let plugin_ptr =
+                std::ptr::from_ref::<Box<dyn DynPlugin>>(&self.built_plugins[i].plugin);
             // SAFETY: Same as ready() - we don't modify built_plugins during cleanup
             unsafe {
                 (*plugin_ptr).cleanup(self).await;
