@@ -94,6 +94,31 @@ impl Agent for FailingAgent {
     }
 }
 
+/// System that emits one output message and *then* fails mid-turn, so the
+/// turn record exists with partial IO when the execution error propagates.
+#[system]
+async fn emit_then_fail(io: Res<UserIO>) -> Result<(), SystemError> {
+    let _ = io.receive().await.expect("should receive a message");
+    io.send(IOMessage::system_text("partial output before failure"))
+        .await
+        .expect("should send partial output");
+    Err(SystemError::ExecutionError(
+        "intentional failure after emitting output".into(),
+    ))
+}
+
+struct EmitThenFailAgent;
+
+impl Agent for EmitThenFailAgent {
+    fn build(&self, graph: &mut Graph) {
+        graph.add_system(emit_then_fail);
+    }
+
+    fn name(&self) -> &'static str {
+        "EmitThenFailAgent"
+    }
+}
+
 /// Binds to an ephemeral port and returns the listener with its port.
 async fn bind_ephemeral() -> (tokio::net::TcpListener, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -141,6 +166,7 @@ async fn test_server(listener: tokio::net::TcpListener, port: u16) -> Server {
     sessions.register_agent(EchoAgent).unwrap();
     sessions.register_agent(BlockingAgent).unwrap();
     sessions.register_agent(FailingAgent).unwrap();
+    sessions.register_agent(EmitThenFailAgent).unwrap();
 
     server
 }
@@ -525,6 +551,59 @@ async fn stream_turn_internal_error_emits_error_event() {
     assert!(
         frames.last().map(|f| f.event.as_str()) == Some("error"),
         "error event should be the terminal frame, got: {frames:?}"
+    );
+
+    server.cleanup().await;
+}
+
+/// A turn that *executed* but failed mid-run must still record the IO that
+/// flowed before the failure — `record_turn_messages` is gated on whether
+/// the task executed the turn, not on success. This keeps the recorded
+/// messages faithful to the turn's `Failed` status, in contrast to a
+/// `SessionBusy` loser (which never executed and must record nothing).
+#[tokio::test]
+async fn stream_turn_failed_after_emitting_records_partial_messages() {
+    let (listener, port) = bind_ephemeral().await;
+    let mut server = test_server(listener, port).await;
+    wait_for_server(port).await;
+
+    let session_id_str = create_session(port, "EmitThenFailAgent").await;
+    let sessions = server.api::<SessionsAPI>().unwrap().clone();
+    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/v1/sessions/{session_id_str}/turns/stream"
+        ))
+        .json(&serde_json::json!({ "message": "go" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Drain the full SSE body so the spawned task's record step (which
+    // precedes the terminal event) is guaranteed to have run.
+    let body = resp.text().await.unwrap();
+    let frames = parse_sse_frames(&body);
+    assert!(
+        frames.iter().any(|f| f.event == "error"),
+        "an executed-but-failed turn must still surface an error frame, got: {frames:?}"
+    );
+
+    // The partial output emitted before the failure must be recorded
+    // against turn 0, not dropped.
+    let turn = sessions.turn(&sid, 0).expect("turn 0 should exist");
+    let texts: Vec<_> = turn
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            IOContent::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|t| t == "partial output before failure"),
+        "a failed-but-executed turn must record the IO emitted before failure, got: {texts:?}"
     );
 
     server.cleanup().await;

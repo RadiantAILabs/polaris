@@ -22,6 +22,7 @@ use polaris_core_plugins::{IOError, IOMessage, IOProvider, IOSource, UserIO};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -129,22 +130,38 @@ pub(crate) async fn process_turn(
 
     // Execute the turn, injecting the IO provider and raw request headers.
     // `RequestContextPlugin`'s `OnGraphStart` hook parses `HttpHeaders` into
-    // a `RequestContext` before any system runs.
+    // a `RequestContext` before any system runs. `executed` is set inside the
+    // setup closure, which only runs once the session lock is held — proof
+    // this task owns `turn_before` (mirrors the streaming handler).
     let io_provider = Arc::clone(&provider);
+    let executed = Arc::new(AtomicBool::new(false));
+    let executed_setup = Arc::clone(&executed);
     let result = sessions
         .try_process_turn_with(&session_id, move |ctx| {
+            executed_setup.store(true, Ordering::Release);
             ctx.insert(UserIO::new(io_provider));
             ctx.insert(HttpHeaders(headers));
         })
-        .await?;
+        .await;
 
-    // Drain all output messages (already buffered after execution).
+    // Drain whatever output flowed (already buffered after execution),
+    // regardless of success or failure.
     let mut messages = Vec::new();
     while let Ok(msg) = output_rx.try_recv() {
         messages.push(msg);
     }
 
-    sessions.record_turn_messages(&session_id, turn_before, messages.clone());
+    // Record iff this task actually executed the turn. A pre-execution
+    // short-circuit (`SessionBusy`/`ReadOnly`/`SessionNotFound`) never ran
+    // `setup`, so `turn_before` is another task's record and writing our
+    // empty capture would clobber it. A turn we executed but that failed
+    // keeps its partial output, matching its `Failed` status. The error is
+    // still surfaced to the client below.
+    if executed.load(Ordering::Acquire) {
+        sessions.record_turn_messages(&session_id, turn_before, messages.clone());
+    }
+
+    let result = result?;
 
     let info = sessions.session_info(&session_id)?;
 
@@ -260,9 +277,15 @@ pub(crate) async fn process_turn_stream(
     let session_id_bg = session_id.clone();
     let recording_bg = Arc::clone(&recording);
     let recorded_bg = Arc::clone(&recorded);
+    // Set inside the setup closure, which `execute_turn` runs only after it
+    // has acquired the session lock and created the turn record. It is the
+    // proof that this task owns `turn_before`; see the recording guard below.
+    let executed = Arc::new(AtomicBool::new(false));
+    let executed_bg = Arc::clone(&executed);
     tokio::spawn(async move {
         let result = sessions_bg
             .try_process_turn_with(&session_id_bg, move |ctx| {
+                executed_bg.store(true, Ordering::Release);
                 ctx.insert(UserIO::new(recording_bg));
                 ctx.insert(HttpHeaders(headers));
             })
@@ -272,13 +295,17 @@ pub(crate) async fn process_turn_stream(
         provider.close().await;
 
         // Flush captured messages to the turn history — but only when this
-        // task actually executed the turn. If two clients race the same
-        // session the loser gets `SessionBusy` (or any error) without ever
-        // sending, so its capture is empty; recording it would clobber the
-        // winner's turn history with an empty `Vec`. Cloning is fine — a
-        // turn's IO volume is bounded by the agent's behavior, not by the
-        // channel buffer.
-        if result.is_ok() {
+        // task actually executed the turn, i.e. the setup closure ran. The
+        // pre-execution short-circuits (`SessionBusy` when another client
+        // holds the session, `ReadOnly`, `SessionNotFound`) return before
+        // `setup`, so this task never owned `turn_before`: that record
+        // belongs to someone else (e.g. the race winner's in-flight turn),
+        // and writing our empty capture would clobber it. A turn we *did*
+        // execute but that failed mid-run keeps its partial capture, so the
+        // recorded messages stay faithful to the turn's `Failed` status.
+        // Cloning is fine — a turn's IO volume is bounded by the agent's
+        // behavior, not by the channel buffer.
+        if executed.load(Ordering::Acquire) {
             let captured = recorded_bg.lock().clone();
             sessions_bg.record_turn_messages(&session_id_bg, turn_before, captured);
         }
