@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "typegen")]
 use ts_rs::TS;
 
@@ -139,6 +140,10 @@ const AGENT_TYPE_LABEL_KEY: &str = "agent_type";
 pub struct SpanBuffer {
     capacity: usize,
     records: Arc<Mutex<VecDeque<SpanRecord>>>,
+    /// Set the first time the buffer evicts a record so the
+    /// capacity-exceeded warning fires once, not per push. Shared across
+    /// clones (all clones back the same ring, so they share the signal).
+    overflow_warned: Arc<AtomicBool>,
 }
 
 impl API for SpanBuffer {}
@@ -176,6 +181,7 @@ impl SpanBuffer {
         Self {
             capacity,
             records: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
+            overflow_warned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -194,6 +200,19 @@ impl SpanBuffer {
         let mut guard = self.records.lock();
         if guard.len() >= self.capacity {
             let _ = guard.pop_front();
+            // A ring buffer at steady state is always full, so eviction is
+            // the normal case — warning per push would emit thousands of
+            // lines per second. Warn once: enough for an operator to learn
+            // history is being dropped before it can be queried, and to
+            // raise capacity if they need more retention.
+            if !self.overflow_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    capacity = self.capacity,
+                    "SpanBuffer reached capacity; evicting oldest records. Older \
+                     history is dropped before it can be queried — raise capacity \
+                     via TracingPlugin::with_span_buffer_capacity for more retention."
+                );
+            }
         }
         guard.push_back(record);
     }

@@ -228,8 +228,8 @@ pub struct SessionsResponse {
 /// membership check derived from the `polaris.label.*` fields propagated
 /// by [`SessionsAPI`](polaris_sessions::SessionsAPI). A run whose labels
 /// do not contain the named `session_id` returns 404.
-pub(crate) fn install(server: &mut Server) {
-    let buffer = SpanBuffer::with_capacity(SpanBuffer::DEFAULT_CAPACITY);
+pub(crate) fn install(server: &mut Server, capacity: usize) {
+    let buffer = SpanBuffer::with_capacity(capacity);
     server.insert_api(buffer.clone());
     server.insert_api(UsagePricing::default());
 

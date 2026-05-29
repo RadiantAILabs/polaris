@@ -177,6 +177,13 @@ pub enum TracingFormat {
 pub struct TracingConfig {
     /// The configured log level.
     pub level: Level,
+    /// Capacity of the dashboard's [`SpanBuffer`] ring — the maximum
+    /// number of recent records retained for the `/v1/tracing/*` and
+    /// `/v1/sessions/{id}/runs[/...]` endpoints. Older records are
+    /// evicted on overflow. Set via
+    /// [`TracingPlugin::with_span_buffer_capacity`].
+    #[cfg(feature = "dashboard")]
+    pub span_buffer_capacity: usize,
 }
 
 impl GlobalResource for TracingConfig {}
@@ -340,6 +347,9 @@ pub struct TracingPlugin {
     fmt: Option<FmtConfig>,
     /// Whether to capture `GenAI` content attributes on instrumentation spans.
     capture_genai_content: bool,
+    /// Capacity of the dashboard's [`SpanBuffer`] ring.
+    #[cfg(feature = "dashboard")]
+    span_buffer_capacity: usize,
 }
 
 /// Builds a `TracingPlugin` with **no output layers attached**.
@@ -356,6 +366,8 @@ impl Default for TracingPlugin {
             level: Level::INFO,
             fmt: None,
             capture_genai_content: false,
+            #[cfg(feature = "dashboard")]
+            span_buffer_capacity: SpanBuffer::DEFAULT_CAPACITY,
         }
     }
 }
@@ -443,6 +455,21 @@ impl TracingPlugin {
         self.capture_genai_content = true;
         self
     }
+
+    /// Sets the capacity of the dashboard's [`SpanBuffer`] ring.
+    ///
+    /// The buffer retains the most recent `capacity` records and evicts the
+    /// oldest on overflow. The default ([`SpanBuffer::DEFAULT_CAPACITY`], 1024)
+    /// is fine for short-lived or low-volume sessions, but a moderately active
+    /// session can exceed it within a day — at which point older history is
+    /// dropped before it can be queried (the buffer logs a one-time warning).
+    /// Raise this for deployments that need more in-memory retention.
+    #[cfg(feature = "dashboard")]
+    #[must_use]
+    pub fn with_span_buffer_capacity(mut self, capacity: usize) -> Self {
+        self.span_buffer_capacity = capacity;
+        self
+    }
 }
 
 impl Plugin for TracingPlugin {
@@ -450,7 +477,11 @@ impl Plugin for TracingPlugin {
     const VERSION: Version = Version::new(0, 1, 0);
 
     fn build(&self, server: &mut Server) {
-        server.insert_global(TracingConfig { level: self.level });
+        server.insert_global(TracingConfig {
+            level: self.level,
+            #[cfg(feature = "dashboard")]
+            span_buffer_capacity: self.span_buffer_capacity,
+        });
 
         server.insert_resource(TracingLayers::new());
 
@@ -465,7 +496,7 @@ impl Plugin for TracingPlugin {
         self.register_instrumentation(server);
 
         #[cfg(feature = "dashboard")]
-        dashboard::install(server);
+        dashboard::install(server, self.span_buffer_capacity);
     }
 
     async fn ready(&self, server: &mut Server) {
@@ -616,6 +647,39 @@ mod tests {
         assert!(
             ctx.contains_resource::<TracingConfig>(),
             "should register TracingConfig global"
+        );
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[test]
+    fn with_span_buffer_capacity_sizes_the_registered_buffer() {
+        // Build directly rather than via `finish()`: only one test per
+        // binary may install the global tracing subscriber, and AppPlugin's
+        // `build` must run first so the dashboard wiring finds HttpRouter.
+        let mut server = Server::new();
+        Plugin::build(
+            &polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")),
+            &mut server,
+        );
+        TracingPlugin::default()
+            .with_span_buffer_capacity(7)
+            .build(&mut server);
+
+        assert_eq!(
+            server
+                .get_global::<TracingConfig>()
+                .expect("TracingConfig global")
+                .span_buffer_capacity,
+            7,
+            "builder should thread capacity into TracingConfig"
+        );
+        assert_eq!(
+            server
+                .api::<SpanBuffer>()
+                .expect("SpanBuffer API")
+                .capacity(),
+            7,
+            "configured capacity should reach the registered SpanBuffer"
         );
     }
 

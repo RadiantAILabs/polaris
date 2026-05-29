@@ -40,9 +40,11 @@ const SESSION_LABEL_KEY: &str = "session_id";
 ///    sink, alongside the dashboard's own buffer layer. Each closed span
 ///    and tracing event is appended to the configured backend keyed by its
 ///    `session_id` label.
-/// 2. On `ready()`, replaying every stored record into the
-///    [`SpanBuffer`] (when present) so dashboard queries against a
-///    resumed session return non-empty immediately after boot.
+/// 2. On `ready()`, replaying stored records into the [`SpanBuffer`]
+///    (when present), up to the buffer's capacity, so dashboard queries
+///    against a resumed session return non-empty immediately after boot.
+///    When the store holds more records than the buffer can retain, the
+///    excess is evicted during replay.
 ///
 /// The plugin coexists with `OpenTelemetryPlugin` (under feature `otel`)
 /// — both plugins push independent layers into [`TracingLayers`], and
@@ -73,8 +75,10 @@ const SESSION_LABEL_KEY: &str = "session_id";
 ///   [`SpanStore`]-routing sink into [`TracingLayers`], and inserts
 ///   the [`SpanStoreHandle`] API.
 /// - **`ready()`** — when the `dashboard` feature is enabled, replays
-///   every stored record into the dashboard's [`SpanBuffer`] so queries
-///   against a resumed session return non-empty immediately after boot.
+///   stored records into the dashboard's [`SpanBuffer`], up to the
+///   buffer's capacity, so queries against a resumed session return
+///   non-empty immediately after boot. If the store holds more records
+///   than the buffer's capacity, the excess is evicted during replay.
 ///   Without the `dashboard` feature there is no buffer to hydrate, so
 ///   `ready()` early-returns: the store is still populated, just nothing
 ///   to replay into. Store errors during hydration (`list_sessions` /
