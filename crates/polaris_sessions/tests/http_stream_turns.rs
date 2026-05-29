@@ -457,8 +457,13 @@ async fn stream_turn_busy_does_not_clobber_recorded_messages() {
     sessions.record_turn_messages(&sid, 0, winner_messages.clone());
     let seeded = serde_json::to_value(&winner_messages).unwrap();
     assert_eq!(
-        serde_json::to_value(sessions.turn(&sid, 0).expect("turn 0 should exist").messages)
-            .unwrap(),
+        serde_json::to_value(
+            sessions
+                .turn(&sid, 0)
+                .expect("turn 0 should exist")
+                .messages
+        )
+        .unwrap(),
         seeded,
         "winner's messages should be recorded before the racing request"
     );
