@@ -189,6 +189,21 @@ async fn tracing_usage_endpoints_serve_aggregated_views() {
     assert_eq!(body["totals"]["output_tokens"], 145);
     assert_eq!(body["source_span_count"], 3);
 
+    // -- /v1/tracing/usage?label=<malformed> → 400 ----------------------
+    // A label filter missing its `:` separator is rejected at the
+    // extractor rather than silently falling back to an unfiltered
+    // aggregate, which would hide a caller's malformed query.
+    let resp = client
+        .get(format!("{base}/v1/tracing/usage?label=session_id"))
+        .send()
+        .await
+        .expect("malformed label usage GET");
+    assert_eq!(
+        resp.status(),
+        400,
+        "malformed ?label= (no `:`) must be a 400, not a silent unfiltered aggregate"
+    );
+
     // -- /v1/tracing/runs/{run_id}/usage --------------------------------
     let resp = client
         .get(format!("{base}/v1/tracing/runs/run-A1/usage"))

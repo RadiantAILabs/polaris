@@ -236,6 +236,21 @@ async fn tracing_dashboard_endpoints_serve_run_aware_views() {
         "structure-only must drop event payloads, got {child_events:?}"
     );
 
+    // -- /v1/tracing/runs/{id}?include=<bogus> → 400 -------------------
+    // An unrecognized `include` value must be rejected at the extractor,
+    // not silently coerced to the payloads default — otherwise a frontend
+    // typo (`?include=structurez`) quietly downloads full payloads.
+    let resp = client
+        .get(format!("{base}/v1/tracing/runs/run-1?include=structurez"))
+        .send()
+        .await
+        .expect("bogus include GET");
+    assert_eq!(
+        resp.status(),
+        400,
+        "unknown ?include= value must be a 400, not a silent default"
+    );
+
     // -- aged-out root surfaces in the orphans bucket -------------------
     let resp = client
         .get(format!("{base}/v1/tracing/runs/run-orphan"))

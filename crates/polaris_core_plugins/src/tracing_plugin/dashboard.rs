@@ -105,9 +105,10 @@ struct SessionsQuery {
 /// Selector for the `?include=` query parameter on the run-tree endpoint.
 #[derive(Debug, Default, Deserialize)]
 struct RunTreeQuery {
-    /// One of `payloads` (default) or `structure`. Unknown values fall
-    /// through to the default per the contract: opt-in to structure-only.
-    include: Option<String>,
+    /// One of `payloads` (default) or `structure`. Absent means the
+    /// default; an unrecognized value is rejected by the extractor with
+    /// `400 Bad Request` rather than silently serving payloads.
+    include: Option<TreeView>,
 }
 
 /// Selector for the `?label=key:value` query parameter on the
@@ -115,10 +116,49 @@ struct RunTreeQuery {
 #[derive(Debug, Default, Deserialize)]
 struct UsageQuery {
     /// `key:value` correlation label filter. Records whose `labels` map
-    /// contains the matching entry are included. Malformed values
-    /// (missing `:`) are ignored — the response falls back to a
-    /// buffer-wide aggregate.
-    label: Option<String>,
+    /// contains the matching entry are included. Absent means no filter;
+    /// a malformed value (missing `:` or empty key) is rejected by the
+    /// extractor with `400 Bad Request`.
+    label: Option<LabelFilter>,
+}
+
+/// A parsed `key:value` correlation-label filter.
+///
+/// Deserializes from the raw `key:value` query string via [`TryFrom`], so
+/// a malformed filter is rejected at the extractor boundary (yielding a
+/// `400`) instead of being silently dropped to an unfiltered aggregate.
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+struct LabelFilter {
+    key: String,
+    value: String,
+}
+
+impl TryFrom<String> for LabelFilter {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        let (key, value) = raw
+            .split_once(':')
+            .ok_or("label filter must be in `key:value` form")?;
+        if key.is_empty() {
+            return Err("label filter key must not be empty");
+        }
+        Ok(Self {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for LabelFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Shared axum state for the four usage handlers.
@@ -289,20 +329,10 @@ async fn run_tree_handler(
     Path(run_id): Path<String>,
     Query(query): Query<RunTreeQuery>,
 ) -> Response {
-    let view = tree_view_from_query(query.include.as_deref());
+    let view = query.include.unwrap_or(TreeView::Payloads);
     match buffer.run_tree(&run_id, view) {
         Some(tree) => Json::<SpanTree>(tree).into_response(),
         None => (StatusCode::NOT_FOUND, "run not found in buffer").into_response(),
-    }
-}
-
-/// Maps the `?include=` query parameter to a [`TreeView`]. The default
-/// (and any unrecognized value) is [`TreeView::Payloads`], matching the
-/// historical `bool` behavior.
-fn tree_view_from_query(include: Option<&str>) -> TreeView {
-    match include {
-        Some("structure") => TreeView::Structure,
-        _ => TreeView::Payloads,
     }
 }
 
@@ -341,7 +371,7 @@ async fn sessions_run_tree_handler(
     Path((session_id, run_id)): Path<(String, String)>,
     Query(query): Query<RunTreeQuery>,
 ) -> Response {
-    let view = tree_view_from_query(query.include.as_deref());
+    let view = query.include.unwrap_or(TreeView::Payloads);
     match buffer.run_tree(&run_id, view) {
         Some(tree)
             if tree
@@ -391,8 +421,10 @@ async fn usage_handler(
     Query(query): Query<UsageQuery>,
 ) -> Json<TokenUsageResponse> {
     let pricing = pricing_for_aggregate(&state.pricing);
-    let response = match query.label.as_deref().and_then(parse_label_filter) {
-        Some((key, value)) => state.buffer.aggregate_usage_by_label(key, value, pricing),
+    let response = match query.label {
+        Some(filter) => state
+            .buffer
+            .aggregate_usage_by_label(&filter.key, &filter.value, pricing),
         None => state.buffer.aggregate_usage(pricing),
     };
     Json(response)
@@ -460,17 +492,5 @@ fn pricing_for_aggregate(pricing: &UsagePricing) -> Option<&UsagePricing> {
         None
     } else {
         Some(pricing)
-    }
-}
-
-/// Splits a `key:value` filter string. Returns `None` on a missing `:`
-/// or an empty key — the handler then falls back to an unfiltered
-/// aggregate, matching the documented contract.
-fn parse_label_filter(raw: &str) -> Option<(&str, &str)> {
-    let (key, value) = raw.split_once(':')?;
-    if key.is_empty() {
-        None
-    } else {
-        Some((key, value))
     }
 }

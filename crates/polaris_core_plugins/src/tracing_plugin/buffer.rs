@@ -144,7 +144,12 @@ pub struct SpanBuffer {
 impl API for SpanBuffer {}
 
 /// Selects how much of a run [`SpanBuffer::run_tree`] materializes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Deserializes from the lowercase variant names (`payloads`, `structure`)
+/// so it can back the `?include=` query parameter directly — an unknown
+/// value is rejected by the extractor rather than silently coerced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TreeView {
     /// Embed nested event records — and their fields and messages —
     /// inside each span node. The full payload view.
