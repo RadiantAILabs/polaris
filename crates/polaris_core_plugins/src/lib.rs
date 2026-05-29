@@ -14,7 +14,17 @@
 //! # Feature Flags
 //!
 //! - `dashboard` - Extends [`TracingPlugin`] with the dashboard span
-//!   buffer, recording layer, and the `/v1/tracing/*` HTTP endpoints
+//!   buffer, recording layer, and the `/v1/tracing/*` HTTP endpoints.
+//!   These endpoints mount onto the
+//!   [`HttpRouter`](polaris_app::HttpRouter) provided by
+//!   [`AppPlugin`](polaris_app::AppPlugin), so enabling this feature adds
+//!   `AppPlugin` as a hard dependency of [`TracingPlugin`],
+//!   [`ModelsPlugin`](polaris_models::ModelsPlugin), and
+//!   [`ToolsPlugin`](polaris_tools::ToolsPlugin). `AppPlugin` requires
+//!   explicit host/port configuration, so it is **not** auto-registered as
+//!   a default dependency — you must add it yourself (even when using
+//!   [`DefaultPlugins`]). Omitting it fails server init with a
+//!   missing-dependency panic.
 //! - `otel` - Enables [`OpenTelemetryPlugin`] for OTLP trace export
 //! - `test-utils` - Enables [`MockClock`] and [`MockIOProvider`] for testing
 //!
