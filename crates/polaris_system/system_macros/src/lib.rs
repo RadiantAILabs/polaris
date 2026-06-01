@@ -328,7 +328,7 @@ impl syn::parse::Parse for PluginArgs {
         for meta in metas {
             match meta {
                 Meta::NameValue(nv) if nv.path.is_ident("id") => {
-                    id = Some(expect_lit_str(nv.value)?)
+                    id = Some(expect_lit_str(nv.value)?);
                 }
                 Meta::NameValue(nv) if nv.path.is_ident("version") => {
                     version = Some(expect_lit_str(nv.value)?);

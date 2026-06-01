@@ -768,7 +768,9 @@ impl Server {
             self.built_plugins.push(entry);
         }
 
-        // Phase 2.5: Capture the resolved capability manifest for introspection.
+        // Phase 2.5: Verify each plugin actually inserted every capability it declared
+        // it provides, then capture the resolved manifest for introspection.
+        self.verify_provided_capabilities();
         self.plugin_manifest = self.build_manifest();
 
         // Phase 3: Ready all plugins in sorted order
@@ -1023,6 +1025,51 @@ impl Server {
         }
 
         edges
+    }
+
+    /// Verifies that every capability a plugin declared it `provides` was actually
+    /// inserted by the time its `build()` returned.
+    ///
+    /// A declared `provides(T)` is a promise that some `T` exists for requirers and
+    /// extenders to consume. The resolver already guaranteed exactly one provider and
+    /// ordered it first; this closes the loop on the other side — a plugin that names a
+    /// capability in `access()` but forgets to `insert_resource` / `insert_global` /
+    /// `insert_api` it would otherwise leave its requirers fetching a value that is not
+    /// there. Capabilities can be backed by a build-phase resource, a global, or an API,
+    /// so all three stores are checked by [`TypeId`]. Runs after the build phase (so the
+    /// freeze-to-global-in-`ready` pattern still has its resource present) and aggregates
+    /// every violation into one message.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing every plugin/capability pair, if any declared `provides` was not
+    /// inserted during `build()`.
+    fn verify_provided_capabilities(&self) {
+        let mut missing: Vec<String> = Vec::new();
+        for entry in &self.built_plugins {
+            for cap in entry.plugin.access().provided() {
+                let type_id = cap.type_id();
+                let present = self.resources.contains_by_type_id(type_id)
+                    || self.global.contains_by_type_id(type_id)
+                    || self.apis.contains_key(&type_id);
+                if !present {
+                    missing.push(format!(
+                        "  - '{}' declares it provides '{}' but never inserted it during build()",
+                        entry.id,
+                        cap.name(),
+                    ));
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            panic!(
+                "{} plugin(s) declared a capability they did not provide:\n{}\n\nFix: insert \
+                 the resource/global/API in build(), or drop the provides(...) declaration.",
+                missing.len(),
+                missing.join("\n"),
+            );
+        }
     }
 
     /// Builds the resolved [`PluginManifest`] from `built_plugins`.
@@ -1373,7 +1420,9 @@ mod capability_tests {
     impl Plugin for Provider {
         const ID: &'static str = "test::provider";
         const VERSION: Version = Version::new(1, 0, 0);
-        fn build(&self, _: &mut Server) {
+        fn build(&self, server: &mut Server) {
+            // Actually insert the declared capability so post-build verification passes.
+            server.insert_resource(Registry);
             self.log.lock().unwrap().push("provider");
         }
         fn access(&self) -> PluginAccess {
@@ -1517,6 +1566,26 @@ mod capability_tests {
             log,
             req: VersionReq::caret(Version::new(2, 0, 0)),
         });
+        server.finish().await;
+    }
+
+    /// Declares it provides `Registry` but never inserts it — post-build verification
+    /// must catch the broken promise.
+    struct ForgetfulProvider;
+    impl Plugin for ForgetfulProvider {
+        const ID: &'static str = "test::forgetful_provider";
+        const VERSION: Version = Version::new(1, 0, 0);
+        fn build(&self, _: &mut Server) {}
+        fn access(&self) -> PluginAccess {
+            PluginAccess::new().provides::<Registry>(Version::new(1, 0, 0))
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "never inserted it during build()")]
+    async fn declared_but_uninserted_provider_panics() {
+        let mut server = Server::new();
+        server.add_plugins(ForgetfulProvider);
         server.finish().await;
     }
 }
