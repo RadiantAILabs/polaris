@@ -1,7 +1,7 @@
 //! Fmt console output layer construction.
 
 use super::TracingFormat;
-use super::TracingLayersApi;
+use super::TracingLayers;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -70,8 +70,8 @@ impl FmtConfig {
     }
 }
 
-/// Pushes a fmt layer into the shared [`TracingLayersApi`].
-pub(super) fn push_layer(api: &mut TracingLayersApi, config: &FmtConfig, level: Level) {
+/// Pushes a fmt layer into the shared [`TracingLayers`].
+pub(super) fn push_layer(api: &mut TracingLayers, config: &FmtConfig, level: Level) {
     let env_filter = match &config.env_filter {
         Some(filter) => {
             EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new(level.as_str()))

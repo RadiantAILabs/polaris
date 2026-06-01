@@ -4,7 +4,7 @@
 //! delivery, terminal events, pre-stream error handling, and
 //! concurrency semantics.
 
-#![cfg(feature = "http")]
+#![cfg(feature = "sessions-http")]
 
 use polaris_agent::Agent;
 use polaris_app::{AppConfig, AppPlugin};
@@ -94,6 +94,31 @@ impl Agent for FailingAgent {
     }
 }
 
+/// System that emits one output message and *then* fails mid-turn, so the
+/// turn record exists with partial IO when the execution error propagates.
+#[system]
+async fn emit_then_fail(io: Res<UserIO>) -> Result<(), SystemError> {
+    let _ = io.receive().await.expect("should receive a message");
+    io.send(IOMessage::system_text("partial output before failure"))
+        .await
+        .expect("should send partial output");
+    Err(SystemError::ExecutionError(
+        "intentional failure after emitting output".into(),
+    ))
+}
+
+struct EmitThenFailAgent;
+
+impl Agent for EmitThenFailAgent {
+    fn build(&self, graph: &mut Graph) {
+        graph.add_system(emit_then_fail);
+    }
+
+    fn name(&self) -> &'static str {
+        "EmitThenFailAgent"
+    }
+}
+
 /// Binds to an ephemeral port and returns the listener with its port.
 async fn bind_ephemeral() -> (tokio::net::TcpListener, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -141,6 +166,7 @@ async fn test_server(listener: tokio::net::TcpListener, port: u16) -> Server {
     sessions.register_agent(EchoAgent).unwrap();
     sessions.register_agent(BlockingAgent).unwrap();
     sessions.register_agent(FailingAgent).unwrap();
+    sessions.register_agent(EmitThenFailAgent).unwrap();
 
     server
 }
@@ -371,6 +397,117 @@ async fn stream_turn_busy() {
     server.cleanup().await;
 }
 
+/// Regression: a streaming turn that loses the session race must not
+/// overwrite the in-flight turn's recorded messages with an empty `Vec`.
+///
+/// Two SSE clients on one session share the same `turn_before` (neither has
+/// completed, so the turn counter has not advanced). The winner records the
+/// turn's IO messages on success; the loser gets `SessionBusy`, captures
+/// nothing, and — before the fix — unconditionally called
+/// `record_turn_messages` with an empty `Vec`, wiping the winner's history.
+///
+/// The race is made deterministic by holding the session lock with a
+/// blocking turn (so the streaming request is guaranteed to lose) and by
+/// seeding turn 0's record up front to stand in for the winner's commit.
+/// Draining the loser's full SSE body guarantees its spawned task ran the
+/// record step, which precedes the terminal event.
+#[tokio::test]
+async fn stream_turn_busy_does_not_clobber_recorded_messages() {
+    let (listener, port) = bind_ephemeral().await;
+    let mut server = test_server(listener, port).await;
+    wait_for_server(port).await;
+
+    let session_id_str = create_session(port, "BlockingAgent").await;
+    let sessions = server.api::<SessionsAPI>().unwrap().clone();
+    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+
+    // Hold the session lock with a blocking turn (turn 0). While it is in
+    // flight the turn counter stays at 0, so the racing streaming request
+    // below captures `turn_before == 0` — the same turn we seed.
+    let (provider, input_tx, mut output_rx) = polaris_sessions::http::HttpIOProvider::new(32, 32);
+    let provider = Arc::new(provider);
+    input_tx.send(IOMessage::user_text("block")).await.unwrap();
+
+    let io_provider = Arc::clone(&provider);
+    let sessions_clone = sessions.clone();
+    let sid_clone = sid.clone();
+    let blocking_handle = tokio::spawn(async move {
+        sessions_clone
+            .try_process_turn_with(&sid_clone, move |ctx| {
+                ctx.insert(UserIO::new(io_provider));
+            })
+            .await
+    });
+
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), output_rx.recv())
+        .await
+        .expect("BlockingAgent did not signal lock acquisition within 5 s")
+        .expect("output channel closed before ready signal");
+    assert!(
+        matches!(ready.content, IOContent::Text(ref t) if t == "blocking-ready"),
+        "expected blocking-ready signal, got {ready:?}"
+    );
+
+    // Stand in for the winner's success path: record turn 0's IO messages,
+    // exactly as `process_turn_stream` does on completion.
+    let winner_messages = vec![
+        IOMessage::user_text("hello"),
+        IOMessage::system_text("echo: hello"),
+    ];
+    sessions.record_turn_messages(&sid, 0, winner_messages.clone());
+    let seeded = serde_json::to_value(&winner_messages).unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            sessions
+                .turn(&sid, 0)
+                .expect("turn 0 should exist")
+                .messages
+        )
+        .unwrap(),
+        seeded,
+        "winner's messages should be recorded before the racing request"
+    );
+
+    // The losing streaming request: the session is busy, so it returns a
+    // `session_busy` SSE error rather than executing a turn.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/v1/sessions/{session_id_str}/turns/stream"
+        ))
+        .json(&serde_json::json!({ "message": "loser" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let frames = parse_sse_frames(&body);
+    let error_frame = frames
+        .iter()
+        .find(|f| f.event == "error")
+        .unwrap_or_else(|| panic!("expected an 'error' SSE event, got frames: {frames:?}"));
+    let error_json: serde_json::Value = serde_json::from_str(&error_frame.data).unwrap();
+    assert_eq!(error_json["code"], "session_busy");
+
+    // The winner's recorded messages must survive untouched — the loser
+    // must not have overwritten them with an empty `Vec`.
+    assert_eq!(
+        serde_json::to_value(
+            sessions
+                .turn(&sid, 0)
+                .expect("turn 0 should still exist")
+                .messages
+        )
+        .unwrap(),
+        seeded,
+        "a SessionBusy streaming request must not clobber recorded turn messages"
+    );
+
+    // Clean up: unblock the BlockingAgent so the spawned turn returns.
+    drop(input_tx);
+    let _ = blocking_handle.await;
+    server.cleanup().await;
+}
+
 /// Mid-turn `SessionError` other than `SessionBusy` surfaces through the
 /// SSE error event path. Covers the general `Err(session_err)` mapping at
 /// `handlers.rs::process_turn_stream` for non-busy execution failures.
@@ -404,20 +541,74 @@ async fn stream_turn_internal_error_emits_error_event() {
     // The `FailingAgent` system returns `SystemError::ExecutionError`,
     // which surfaces through `SessionError::Execution` and maps to the
     // generic `internal_error` ApiError variant — explicitly *not*
-    // `session_busy`.
+    // `session_busy`. The detail message is not surfaced to clients;
+    // it is logged server-side via `tracing::error!`.
     assert_eq!(error_json["code"], "internal_error");
     let msg = error_json["message"]
         .as_str()
         .expect("error frame must have string message");
-    assert!(
-        msg.contains("intentional turn failure"),
-        "expected propagated system error message, got: {msg}"
+    assert_eq!(
+        msg, "internal server error",
+        "internal-error message must not leak server-side detail, got: {msg}"
     );
 
     // No `done` frame should follow an error frame.
     assert!(
         frames.last().map(|f| f.event.as_str()) == Some("error"),
         "error event should be the terminal frame, got: {frames:?}"
+    );
+
+    server.cleanup().await;
+}
+
+/// A turn that *executed* but failed mid-run must still record the IO that
+/// flowed before the failure — `record_turn_messages` is gated on whether
+/// the task executed the turn, not on success. This keeps the recorded
+/// messages faithful to the turn's `Failed` status, in contrast to a
+/// `SessionBusy` loser (which never executed and must record nothing).
+#[tokio::test]
+async fn stream_turn_failed_after_emitting_records_partial_messages() {
+    let (listener, port) = bind_ephemeral().await;
+    let mut server = test_server(listener, port).await;
+    wait_for_server(port).await;
+
+    let session_id_str = create_session(port, "EmitThenFailAgent").await;
+    let sessions = server.api::<SessionsAPI>().unwrap().clone();
+    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/v1/sessions/{session_id_str}/turns/stream"
+        ))
+        .json(&serde_json::json!({ "message": "go" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Drain the full SSE body so the spawned task's record step (which
+    // precedes the terminal event) is guaranteed to have run.
+    let body = resp.text().await.unwrap();
+    let frames = parse_sse_frames(&body);
+    assert!(
+        frames.iter().any(|f| f.event == "error"),
+        "an executed-but-failed turn must still surface an error frame, got: {frames:?}"
+    );
+
+    // The partial output emitted before the failure must be recorded
+    // against turn 0, not dropped.
+    let turn = sessions.turn(&sid, 0).expect("turn 0 should exist");
+    let texts: Vec<_> = turn
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            IOContent::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|t| t == "partial output before failure"),
+        "a failed-but-executed turn must record the IO emitted before failure, got: {texts:?}"
     );
 
     server.cleanup().await;

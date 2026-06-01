@@ -40,12 +40,37 @@ impl Server {
     /// Get an immutable reference to an API.
     pub fn api<A: API>(&self) -> Option<&A>;
 
+    /// Clone an API, or `None` (and `tracing::warn!`) if it isn't registered.
+    /// `purpose` describes why the caller needs the API and is included in
+    /// the warning, so wiring breaks surface as a diagnostic instead of
+    /// silently falling back to default behavior.
+    pub fn expect_api<A: API + Clone>(&self, purpose: &'static str) -> Option<A>;
+
     /// Check if an API is available.
     pub fn contains_api<A: API>(&self) -> bool;
 }
 ```
 
-APIs are stored in a type-erased map keyed by `TypeId`. `insert_api` requires `&mut self` (available during `build` and `ready`), while `api` and `contains_api` require only `&self`.
+APIs are stored in a type-erased map keyed by `TypeId`. `insert_api` requires `&mut self` (available during `build` and `ready`), while `api`, `expect_api`, and `contains_api` require only `&self`.
+
+Reach for `expect_api` instead of `api().cloned()` whenever a `ready()` capture is *expected* to succeed (e.g. graph instrumentation grabbing `MiddlewareAPI`) — the warning makes the wiring break visible without changing the runtime semantics.
+
+## Composition Policy
+
+Interior mutability is the *mechanism* an API uses to accept contributions after
+insertion. The *policy* — who is allowed to contribute, and when — is the
+property downstream consumers actually need to know. Every API falls into one
+of three buckets:
+
+| Policy | Who may mutate | Mechanism | Examples |
+|--------|----------------|-----------|----------|
+| **Open extension** | Any plugin during `build()` (and sometimes `ready()`) | `RwLock`-guarded collection that accepts entries | [`HttpRouter`](crate::app::HttpRouter), [`MiddlewareAPI`](crate::graph::MiddlewareAPI), [`PersistenceAPI`](crate::plugins::PersistenceAPI) |
+| **Provider-scoped** | Only the providing plugin | `Arc`-wrapped inner state, public methods read-only | [`SessionsAPI`](crate::sessions::SessionsAPI) (writes go through the plugin's own systems) |
+| **Single-replace** | Replaced wholesale by a successor `insert_api` call, not contributed to | No interior mutability needed | Configuration-style APIs |
+
+State the API's policy in its rustdoc — that's the question consumers have, not
+which lock type it uses. The [Documentation Standard](#documentation-standard)
+below makes the **Composition rule** field mandatory.
 
 ## Defining an API
 
@@ -240,6 +265,38 @@ async fn ready(&self, server: &mut Server) {
 }
 ```
 
+## Documentation Standard
+
+Every `pub` type implementing [`API`] that is exported by this workspace must
+include rustdoc covering the sections below. The standard exists so downstream
+consumers can answer *"can I extend this, and if so when?"* from the API's
+documentation alone — without reading source.
+
+The catalog drift guard at `tests/api_catalog.rs` enforces that every exported
+API appears in the [API Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/apis/);
+documentation-standard conformance itself is checked by `/review-docs` on
+every PR.
+
+### Required Sections
+
+| Section | What it must contain |
+|---------|----------------------|
+| **Purpose + when-to-use** | What capability the API exposes and what consumer goal it serves. *"Reach for this when you need to add HTTP routes from a plugin"*, not *"holds a collection of routes"*. |
+| **Provided by** | The plugin that calls `insert_api` for this type during its `build()`. If no plugin registers it by default — the API is consumer-supplied — say so explicitly. |
+| **Surface** | Markdown table with columns `Method \| Description`. One line per `pub` method. This is what consumers read to know what they can do; if a method takes a closure or a builder, surface that in the Description column rather than expecting consumers to read the signature. |
+| **Lifecycle** | When each method may be called: `build()` only, `ready()` only, `build()` + `ready()`, or runtime. State the consequence of calling outside the window (panic, no-op, late-but-OK). |
+| **Composition rule** | One of: **Open extension** (any plugin may contribute), **Provider-scoped** (only the providing plugin mutates), or **Single-replace** (subsequent `insert_api` replaces). See [Composition Policy](#composition-policy). |
+| **Example consumers** | Inline list of 1–3 concrete plugins in this workspace that consume this API, with what they contribute. Not exhaustive — a couple of representative examples is enough. The catalog and grep cover completeness. |
+| **Example** | Rustdoc code block (`no_run` acceptable) showing both the provider's `insert_api` call **and** a consumer's `server.api::<T>()` access in one snippet. Two halves of one example, not two examples. |
+
+### Canonical Exemplars
+
+These APIs satisfy the standard and can be copied as a starting point:
+
+- [`HttpRouter`](crate::app::HttpRouter) — open-extension API: any plugin contributes routes.
+- [`PersistenceAPI`](crate::plugins::PersistenceAPI) — open-extension API: any plugin registers serializers.
+- [`SessionsAPI`](crate::sessions::SessionsAPI) — provider-scoped: the API exposes operations (create session, run turn), but writes flow through `SessionsPlugin`'s own machinery.
+
 ## Summary
 
 | Step | What to do | Where |
@@ -249,3 +306,4 @@ async fn ready(&self, server: &mut Server) {
 | **Consume** | Call `server.api::<T>()` to get `Option<&T>` | Consumer plugin's `build()` or `ready()` |
 | **Mutate** | Use interior mutability (`RwLock`, `Arc`) | Within the API struct |
 | **Depend** | Declare `PluginId::of::<ProviderPlugin>()` | Consumer plugin's `dependencies()` |
+| **Document** | Follow the [Documentation Standard](#documentation-standard) | API rustdoc |

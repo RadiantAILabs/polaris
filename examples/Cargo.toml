@@ -16,7 +16,7 @@ missing_docs = "allow"
 [dependencies]
 polaris = { path = "..", package = "polaris-ai" }
 polaris_app = { path = "../crates/polaris_app", default-features = false }
-polaris_sessions = { path = "../crates/polaris_sessions", features = ["http"] }
+polaris_sessions = { path = "../crates/polaris_sessions", features = ["sessions-http"] }
 axum = "0.8"
 dotenvy = "0.15"
 rustyline = "17.0.2"

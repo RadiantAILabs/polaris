@@ -28,6 +28,15 @@ pub enum SessionError {
     #[error("session busy: {0}")]
     SessionBusy(SessionId),
 
+    /// The session is read-only and rejects mutation.
+    ///
+    /// Returned by methods that would change session state (e.g.
+    /// `process_turn`, `rollback`, `setup_session`, `resume_session`,
+    /// `with_context`) when invoked against a session preserved by
+    /// [`SessionsAPI::run_oneshot_preserved`](crate::SessionsAPI::run_oneshot_preserved).
+    #[error("session is read-only: {0}")]
+    ReadOnly(SessionId),
+
     /// A session with the given ID already exists.
     #[error("session already exists: {0}")]
     SessionAlreadyExists(SessionId),
@@ -61,4 +70,26 @@ pub enum SessionError {
     /// The graph completed but did not produce the expected output type.
     #[error("output not found: expected {0}")]
     OutputNotFound(&'static str),
+}
+
+/// Errors returned by [`SessionsAPI`](crate::SessionsAPI) plugin-wiring
+/// methods when the same wiring step is performed twice.
+///
+/// Returned by [`SessionsAPI::set_graph_apis`](crate::SessionsAPI::set_graph_apis)
+/// and [`SessionsAPI::set_context_factory`](crate::SessionsAPI::set_context_factory).
+/// `SessionsPlugin` itself invokes the setters once during `ready()`, so this
+/// error only surfaces for callers wiring `SessionsAPI` manually outside the
+/// plugin.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WiringError {
+    /// Graph hooks API was already wired.
+    #[error("graph hooks API already wired")]
+    HooksAlreadySet,
+    /// Graph middleware API was already wired.
+    #[error("graph middleware API already wired")]
+    MiddlewareAlreadySet,
+    /// Context factory was already wired.
+    #[error("context factory already wired")]
+    ContextFactoryAlreadySet,
 }

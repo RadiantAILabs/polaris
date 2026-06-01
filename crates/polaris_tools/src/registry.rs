@@ -278,9 +278,45 @@ impl ToolRegistry {
 /// |----------|-------|-------------|
 /// | [`ToolRegistry`] | Global | Registry of tools keyed by name, with permission overrides |
 ///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | [`ToolsSnapshot`](crate::dashboard::ToolsSnapshot) *(feature `dashboard`)* | Frozen tools snapshot consumed by `GET /v1/tools`. |
+///
 /// # Dependencies
 ///
-/// None.
+/// - [`AppPlugin`](polaris_app::AppPlugin) — only when the `dashboard` feature is enabled.
+///
+/// # Routes Provided
+///
+/// Mounted only when the `dashboard` feature is enabled, against the
+/// [`HttpRouter`](polaris_app::HttpRouter) owned by `AppPlugin`.
+///
+/// | Method | Path | Description |
+/// |--------|------|-------------|
+/// | `GET` | `/v1/tools` | Frozen snapshot of registered tool definitions and effective permissions. Takes no parameters — the handler reads only its axum `State`. |
+///
+/// # Lifecycle
+///
+/// - **`build()`** — inserts an empty [`ToolRegistry`] as a mutable
+///   resource so other plugins can register tools during their own
+///   `build()`. With the `dashboard` feature on, also installs the
+///   [`ToolsSnapshot`](crate::dashboard::ToolsSnapshot) API and the
+///   `GET /v1/tools` route.
+/// - **`ready()`** — moves the [`ToolRegistry`] from a mutable resource to
+///   an immutable global for read-only system access. With the `dashboard`
+///   feature on, freezes the tool snapshot from the now-globalized
+///   registry.
+/// - The `dashboard` feature gates the `AppPlugin` dependency, the
+///   `ToolsSnapshot` API, and the route above.
+/// - Registers no tick schedules.
+///
+/// # Extends
+///
+/// - [`HttpRouter`](polaris_app::HttpRouter) (from
+///   [`AppPlugin`](polaris_app::AppPlugin)) *(feature `dashboard`)* —
+///   mounts the `GET /v1/tools` snapshot route.
 ///
 /// # Example
 ///
@@ -300,6 +336,9 @@ impl Plugin for ToolsPlugin {
 
     fn build(&self, server: &mut Server) {
         server.insert_resource(ToolRegistry::new());
+
+        #[cfg(feature = "dashboard")]
+        crate::dashboard::install(server);
     }
 
     async fn ready(&self, server: &mut Server) {
@@ -307,6 +346,14 @@ impl Plugin for ToolsPlugin {
             .remove_resource::<ToolRegistry>()
             .expect("ToolRegistry should exist from build phase");
         server.insert_global(registry);
+
+        #[cfg(feature = "dashboard")]
+        crate::dashboard::freeze(server);
+    }
+
+    #[cfg(feature = "dashboard")]
+    fn dependencies(&self) -> Vec<polaris_system::plugin::PluginId> {
+        vec![polaris_system::plugin::PluginId::of::<polaris_app::AppPlugin>()]
     }
 }
 

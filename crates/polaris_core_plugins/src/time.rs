@@ -260,9 +260,15 @@ impl Default for Stopwatch {
 /// | [`Clock`] | Global | Time provider, mockable for testing |
 /// | [`Stopwatch`] | Local | Per-context execution timer |
 ///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | Time access is exposed through the [`Clock`] and [`Stopwatch`] resources rather than an API. |
+///
 /// # Dependencies
 ///
-/// - [`ServerInfoPlugin`]
+/// - [`ServerInfoPlugin`](crate::ServerInfoPlugin)
 ///
 /// # Example
 ///

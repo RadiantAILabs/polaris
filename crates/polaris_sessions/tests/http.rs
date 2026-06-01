@@ -1,9 +1,9 @@
 //! Integration tests for the session HTTP endpoints.
 //!
-//! Requires the `http` feature. Verifies CRUD operations, error responses,
+//! Requires the `sessions-http` feature. Verifies CRUD operations, error responses,
 //! and status codes for the session REST API.
 
-#![cfg(feature = "http")]
+#![cfg(feature = "sessions-http")]
 
 use polaris_agent::Agent;
 use polaris_app::{AppConfig, AppPlugin};

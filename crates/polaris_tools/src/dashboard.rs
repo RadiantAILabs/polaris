@@ -1,4 +1,9 @@
-//! Dashboard contributions and snapshot endpoint for tools.
+//! Dashboard snapshot endpoint for the tool registry.
+//!
+//! Activated by the `dashboard` feature. When the feature is on,
+//! [`ToolsPlugin`](crate::ToolsPlugin) mounts `GET /v1/tools` and freezes a
+//! pre-serialized snapshot of the registered tools during its `ready()`
+//! phase.
 
 use crate::ToolRegistry;
 use axum::{
@@ -9,11 +14,9 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use polaris_app::{AppPlugin, HttpRouter};
-use polaris_dashboard::{DashboardPlugin, DashboardRegistry, NavItem, Panel, Section, Transport};
+use polaris_app::HttpRouter;
 use polaris_models::llm::ToolDefinition;
 use polaris_system::api::API;
-use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::server::Server;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
@@ -21,11 +24,64 @@ use std::sync::{Arc, OnceLock};
 const TOOLS_PATH: &str = "/v1/tools";
 const EMPTY_TOOLS_RESPONSE: &[u8] = br#"{"items":[]}"#;
 
-/// Build-time snapshot API for the dashboard tools endpoint.
+/// Build-time snapshot API backing the dashboard tools endpoint.
 ///
-/// [`ToolsDashboardPlugin`] registers this API during `build()`, then freezes
-/// the tool list once in `ready()` after [`crate::ToolsPlugin`] has globalized
-/// the registry. The HTTP handler serves the pre-serialized bytes lock-free.
+/// This is an internal coordination API, not a type a downstream consumer
+/// reaches for directly. It carries a pre-serialized JSON snapshot of the
+/// registered tools from [`ToolsPlugin`](crate::ToolsPlugin)'s `ready()` phase
+/// to the `GET /v1/tools` route handler. Consumers who want the tool list
+/// should call that HTTP endpoint, not resolve this API.
+///
+/// # Provided by
+///
+/// [`ToolsPlugin`](crate::ToolsPlugin) inserts it via `insert_api` during
+/// `build()`, gated on the `dashboard` Cargo feature. Without that feature the
+/// API is never registered and does not exist on the server.
+///
+/// # Surface
+///
+/// The type exposes **no public methods**. It is an internal coordination API
+/// between [`ToolsPlugin`](crate::ToolsPlugin)'s `build()`/`ready()` phases and
+/// the [`tools_snapshot_handler`] route handler, which holds it as axum
+/// handler `State`.
+///
+/// # Lifecycle
+///
+/// - **`build()`** (feature `dashboard`) — [`ToolsPlugin`](crate::ToolsPlugin)
+///   inserts the API and mounts the route with the snapshot as handler state.
+/// - **`ready()`** — the snapshot is frozen exactly once from the globalized
+///   [`ToolRegistry`]. Freezing is idempotent; the first freeze wins.
+/// - **Runtime** — [`tools_snapshot_handler`] reads the frozen bytes
+///   lock-free. Before the freeze the endpoint returns an empty
+///   `{"items":[]}` envelope.
+///
+/// # Composition
+///
+/// **Single-replace** — only [`ToolsPlugin`](crate::ToolsPlugin) inserts this
+/// API. It is never contributed to by other plugins.
+///
+/// # Example consumers
+///
+/// - [`tools_snapshot_handler`] — the `GET /v1/tools` route handler, which
+///   receives the snapshot as axum `State` and serves its JSON bytes. No
+///   plugin resolves this API via `server.api::<T>()`.
+///
+/// # Example
+///
+/// Adding [`ToolsPlugin`](crate::ToolsPlugin) is what makes this API exist
+/// (with the `dashboard` feature on). It has no `server.api()` consumer in the
+/// workspace — the snapshot is consumed internally by the `GET /v1/tools`
+/// route handler:
+///
+/// ```no_run
+/// use polaris_tools::ToolsPlugin;
+/// use polaris_system::server::Server;
+///
+/// let mut server = Server::new();
+/// server.add_plugins(ToolsPlugin);
+/// // With the `dashboard` feature enabled, ToolsPlugin inserts the
+/// // ToolsSnapshot API internally and serves it at GET /v1/tools.
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct ToolsSnapshot {
     frozen: Arc<OnceLock<Bytes>>,
@@ -92,116 +148,41 @@ fn to_wire_definition(registry: &ToolRegistry, definition: ToolDefinition) -> To
     }
 }
 
-/// Plugin that contributes the canonical tools dashboard view and mounts
-/// `GET /v1/tools`.
-///
-/// Uses a small [`ToolsSnapshot`] API to pre-serialize the tools response
-/// during `ready()`, so requests only clone shared [`Bytes`] from an
-/// [`OnceLock`].
-///
-/// If you also enable `polaris_core_plugins/tools_tracing`, add
-/// `TracingPlugin` before `ToolsDashboardPlugin` so the snapshot captures the
-/// tracing-decorated registry.
-///
-/// # Resources Provided
-///
-/// | Resource | Scope | Description |
-/// |----------|-------|-------------|
-/// | _none_   | —     | This plugin contributes dashboard descriptors and an HTTP route only. |
-///
-/// # APIs Provided
-///
-/// | API | Description |
-/// |-----|-------------|
-/// | [`ToolsSnapshot`] | Frozen tools snapshot consumed by `GET /v1/tools`. |
-///
-/// # Dependencies
-///
-/// - [`AppPlugin`]
-/// - [`DashboardPlugin`]
-/// - [`crate::ToolsPlugin`]
-///
-/// # Example
-///
-/// ```no_run
-/// use polaris_app::{AppConfig, AppPlugin};
-/// use polaris_dashboard::DashboardPlugin;
-/// use polaris_system::server::Server;
-/// use polaris_tools::{ToolsDashboardPlugin, ToolsPlugin};
-///
-/// # async fn run() {
-/// let mut server = Server::new();
-/// server
-///     .add_plugins(ToolsPlugin)
-///     .add_plugins(AppPlugin::new(AppConfig::new()))
-///     .add_plugins(DashboardPlugin)
-///     .add_plugins(ToolsDashboardPlugin);
-/// server.run().await;
-/// # }
-/// ```
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ToolsDashboardPlugin;
+/// Installs the dashboard snapshot API and HTTP route during
+/// [`ToolsPlugin::build`](crate::ToolsPlugin).
+pub(crate) fn install(server: &mut Server) {
+    server.insert_api(ToolsSnapshot::new());
 
-impl Plugin for ToolsDashboardPlugin {
-    const ID: &'static str = "polaris::tools::dashboard";
-    const VERSION: Version = Version::new(0, 0, 1);
+    server
+        .api::<HttpRouter>()
+        .expect("AppPlugin must be added before ToolsPlugin when `dashboard` is enabled")
+        .add_routes_with(|server| {
+            let snapshot = server
+                .api::<ToolsSnapshot>()
+                .expect("ToolsSnapshot must exist (registered in build)")
+                .clone();
+            Router::new()
+                .route(TOOLS_PATH, get(tools_snapshot_handler))
+                .with_state(snapshot)
+        });
+}
 
-    fn build(&self, server: &mut Server) {
-        server.insert_api(ToolsSnapshot::new());
+/// Freezes the snapshot from the now-globalized registry during
+/// [`ToolsPlugin::ready`](crate::ToolsPlugin).
+pub(crate) fn freeze(server: &Server) {
+    let registry = server
+        .get_global::<ToolRegistry>()
+        .expect("ToolsPlugin must globalize ToolRegistry before dashboard freeze");
+    let definitions = registry
+        .definitions()
+        .into_iter()
+        .map(|definition| to_wire_definition(&registry, definition))
+        .collect();
 
-        server
-            .api::<HttpRouter>()
-            .expect("AppPlugin must be added before ToolsDashboardPlugin")
-            .add_routes_with(|server| {
-                let snapshot = server
-                    .api::<ToolsSnapshot>()
-                    .expect("ToolsSnapshot must exist (registered in build)")
-                    .clone();
-                Router::new()
-                    .route(TOOLS_PATH, get(tools_snapshot_handler))
-                    .with_state(snapshot)
-            });
-
-        server
-            .api::<DashboardRegistry>()
-            .expect("DashboardPlugin must be added before ToolsDashboardPlugin")
-            .add_nav_item(NavItem::new("tools", "Tools"))
-            .add_section(Section::new("tools-overview", "tools", "Overview"))
-            .add_panel(
-                Panel::new(
-                    "tools-list",
-                    "Available tools",
-                    "list",
-                    TOOLS_PATH,
-                    Transport::Rest,
-                )
-                .with_section("tools-overview"),
-            );
-    }
-
-    async fn ready(&self, server: &mut Server) {
-        let registry = server
-            .get_global::<ToolRegistry>()
-            .expect("ToolsPlugin must globalize ToolRegistry before dashboard ready");
-        let definitions = registry
-            .definitions()
-            .into_iter()
-            .map(|definition| to_wire_definition(&registry, definition))
-            .collect();
-
-        server
-            .api::<ToolsSnapshot>()
-            .expect("ToolsSnapshot must exist from build phase")
-            .freeze(definitions);
-    }
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![
-            PluginId::of::<AppPlugin>(),
-            PluginId::of::<DashboardPlugin>(),
-            PluginId::of::<crate::ToolsPlugin>(),
-        ]
-    }
+    server
+        .api::<ToolsSnapshot>()
+        .expect("ToolsSnapshot must exist from build phase")
+        .freeze(definitions);
 }
 
 /// `GET /v1/tools` — returns the frozen dashboard tool snapshot as JSON.

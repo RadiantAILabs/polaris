@@ -37,25 +37,21 @@
 //! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
 pub mod api;
-#[cfg(feature = "dashboard")]
-#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
-pub mod dashboard;
 pub mod error;
 pub mod guard;
-#[cfg(feature = "http")]
+#[cfg(feature = "sessions-http")]
 pub mod http;
 pub mod info;
 pub mod store;
+#[cfg(feature = "sessions-http")]
+mod uptime;
 
 pub use api::{SessionsAPI, SessionsPlugin};
-#[cfg(feature = "dashboard")]
-#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
-pub use dashboard::SessionsDashboardPlugin;
-pub use error::SessionError;
+pub use error::{SessionError, WiringError};
 pub use guard::SessionGuard;
-#[cfg(feature = "http")]
+#[cfg(feature = "sessions-http")]
 pub use http::HttpPlugin;
-pub use info::{SessionInfo, SessionMetadata};
+pub use info::{SessionInfo, SessionMetadata, SessionStatus};
 pub use store::memory::InMemoryStore;
 pub use store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber};
 
@@ -67,9 +63,9 @@ pub mod prelude {
     pub use polaris_system::system::BoxFuture;
 
     pub use crate::api::{SessionsAPI, SessionsPlugin};
-    pub use crate::error::SessionError;
+    pub use crate::error::{SessionError, WiringError};
     pub use crate::guard::SessionGuard;
-    pub use crate::info::{SessionInfo, SessionMetadata};
+    pub use crate::info::{SessionInfo, SessionMetadata, SessionStatus};
     pub use crate::store::memory::InMemoryStore;
     pub use crate::store::{
         AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber,

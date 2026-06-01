@@ -6,6 +6,7 @@ on:
     paths:
       - "crates/**/*.rs"
       - "examples/**/*.rs"
+      - "tools/**/*.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
       - "Makefile.toml"
@@ -70,3 +71,6 @@ jobs:
 
       - name: Check each feature in isolation
         run: cargo hack --each-feature --no-dev-deps check
+
+      - name: Check feature propagation to umbrella
+        run: cargo run -p feature-parity

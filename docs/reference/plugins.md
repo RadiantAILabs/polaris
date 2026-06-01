@@ -59,7 +59,7 @@ The server calls `cleanup()` on each plugin in reverse dependency order. Plugins
 
 ## Dependencies
 
-Plugins declare their dependencies by returning a list of plugin IDs from `dependencies()`. The server validates that all declared dependencies are present and creates the dependency graph to determine execution order across all lifecycle phases. If a dependency is missing, the server will panic.
+Plugins declare their dependencies by returning a list of plugin IDs from `dependencies()`. The server validates that all declared dependencies are present and creates the dependency graph to determine execution order across all lifecycle phases.
 
 ```rust
 impl Plugin for ToolsPlugin {
@@ -75,6 +75,28 @@ impl Plugin for ToolsPlugin {
     }
 }
 ```
+
+If one or more dependencies are missing when `Server::finish()` runs, the server panics with a message listing **every** missing dependency and the plugins that required it — so all problems can be fixed in one pass rather than one rebuild at a time.
+
+### Auto-registering defaults
+
+A plugin can offer zero-config defaults for its dependencies via `default_dependencies()`. Each offered plugin must implement `Default`. During `finish()`, before dependency validation, the server walks these offers and auto-registers any declared dependency the user did not add explicitly. Auto-registration is recursive (an auto-registered default may pull in its own defaults) and emits a `tracing::info!` so the applied defaults are visible. An explicitly added plugin always wins over a default.
+
+```rust
+impl Plugin for SessionsPlugin {
+    fn build(&self, server: &mut Server) { /* ... */ }
+
+    fn dependencies(&self) -> Vec<PluginId> {
+        vec![PluginId::of::<PersistencePlugin>()]
+    }
+
+    fn default_dependencies(&self) -> DefaultDependencies {
+        DefaultDependencies::new().add::<PersistencePlugin>()
+    }
+}
+```
+
+Use this only when the dependency has a sensible default. Dependencies without a default still panic when missing.
 
 ## Server Access
 
@@ -301,8 +323,66 @@ mod tests {
 }
 ```
 
+## Documentation Standard
+
+Every `pub` `Plugin` struct exported by this workspace must include rustdoc
+covering the sections below. The standard exists so downstream consumers can
+answer *"which plugin do I need for X?"* from a plugin's documentation alone —
+without reading source.
+
+The catalog drift guard at `tests/plugin_catalog.rs` enforces that every plugin
+appears in the [Plugin Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/plugins/);
+documentation-standard conformance itself is checked by `/review-docs` on every
+PR.
+
+### Required Sections
+
+| Section | What it must contain |
+|---------|----------------------|
+| **Summary + when-to-use** | Opening paragraph describing what the plugin does and the situation in which a consumer should reach for it. |
+| **Resources Provided** | Markdown table with columns `Resource \| Scope \| Description`. If the plugin registers no resources, include the section with a single `_none_` row explaining why (e.g., *"only mounts HTTP routes"* or *"only extends another plugin's API"*). |
+| **APIs Provided** | Markdown table with columns `API \| Description`. Same `_none_` convention. |
+| **Dependencies** | Either `None.` or a list of required plugins. If `default_dependencies()` is used to auto-register defaults, say so. |
+| **Example** | A rustdoc code block (`no_run` acceptable) showing registration alongside dependencies and a typical usage pattern — a system that reads the resource, a request that hits a route, etc. |
+
+### Conditional Sections
+
+Include only when the plugin actually provides that kind of capability.
+Omitting empty sections keeps docs tight; the alternative (`_none_` rows
+everywhere) bloats every plugin.
+
+| Section | Include when | What it must contain |
+|---------|--------------|----------------------|
+| **Routes Provided** | The plugin calls [`HttpRouter::add_routes`](crate::app::HttpRouter) (or `_with`) | Table with columns `Method \| Path \| Description`. Note the route prefix and which `axum::extract` types each handler reads. |
+| **Tools Provided** | The plugin registers `#[tool]` definitions with [`ToolRegistry`](crate::tools::ToolRegistry) | Table with columns `Tool \| Description`. |
+| **Hooks Registered** | The plugin registers hooks via `HooksAPI` | Table with columns `Schedule \| Description`. |
+| **Middleware Registered** | The plugin registers middleware via [`MiddlewareAPI`](crate::graph::MiddlewareAPI) | Table with columns `Target \| Behavior \| Description`. |
+| **Lifecycle** | The plugin uses `tick_schedules()` **or** is feature-gated **or** has non-trivial `ready()` / `cleanup()` behavior | Bullet list naming the tick schedules subscribed to, the `cfg` feature flags that gate the plugin, and any cross-plugin work done in `ready()` (e.g., decorating another plugin's registry). |
+| **Extends** | The plugin contributes to another plugin's API surface — adds routes to [`HttpRouter`](crate::app::HttpRouter), registers a provider with [`ModelRegistry`](crate::models::ModelRegistry), pushes a layer through [`TracingLayers`](crate::plugins::TracingLayers), etc. | List of other plugins this plugin composes with and what it contributes. This is the discoverability signal that flags the plugin as a composer rather than a standalone provider — it lets a consumer answer *"what plugins decorate the model registry?"* by grepping the docs. |
+
+### Canonical Exemplars
+
+These plugins satisfy the standard and can be copied as a starting point:
+
+- [`ServerInfoPlugin`](crate::plugins::ServerInfoPlugin) — minimal plugin: registers one resource, no APIs, no dependencies.
+- [`SessionsPlugin`](crate::sessions::SessionsPlugin) — full plugin: registers an API, has dependencies, uses `default_dependencies()`.
+- [`HttpPlugin`](crate::sessions::HttpPlugin) *(feature `sessions-http`)* — extender: provides no resources or APIs of its own, contributes routes to [`HttpRouter`](crate::app::HttpRouter) and uses the **Extends** section.
+- [`AnthropicPlugin`](crate::models::AnthropicPlugin) *(feature `anthropic`)* — feature-gated extender: contributes a provider to [`ModelRegistry`](crate::models::ModelRegistry).
+
+### Why this matters
+
+The framework's discoverability promise — *"a consumer with goal X can find which
+plugins, APIs, and resources to combine"* — only holds if every plugin
+describes what it provides, depends on, and extends. The
+[integration guide](./guide.md) and the [Plugin Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/plugins/)
+can route a consumer to the right plugin, but they land on its rustdoc page
+needing to confirm fit in one glance. Missing sections force them to read
+source.
+
 ## Anti-Patterns
 
 **Relying on insertion order instead of dependencies.** If a plugin requires another plugin's resources, that relationship should be declared in `dependencies()` rather than assumed from the order of `add_plugins()` calls.
 
 **Circular dependencies.** If two plugins depend on each other, the shared functionality should be factored into a third plugin that both depend on.
+
+**Documenting only the happy path.** If a plugin can fail at `build()` (e.g., missing config), warn in `ready()` (e.g., `expect_api` miss), or no-op without a feature flag, surface those behaviors in the rustdoc. A plugin's documentation is what downstream consumers debug against when wiring breaks.

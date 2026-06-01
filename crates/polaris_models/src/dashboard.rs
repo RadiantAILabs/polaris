@@ -1,4 +1,9 @@
-//! Dashboard contributions and snapshot endpoint for model providers.
+//! Dashboard snapshot endpoint for the model provider registry.
+//!
+//! Activated by the `dashboard` feature. When the feature is on,
+//! [`ModelsPlugin`](crate::ModelsPlugin) mounts `GET /v1/models/providers`
+//! and freezes a pre-serialized snapshot of registered LLM providers during
+//! its `ready()` phase.
 
 use crate::ModelRegistry;
 use axum::{
@@ -9,10 +14,8 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use polaris_app::{AppPlugin, HttpRouter};
-use polaris_dashboard::{DashboardPlugin, DashboardRegistry, NavItem, Panel, Section, Transport};
+use polaris_app::HttpRouter;
 use polaris_system::api::API;
-use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::server::Server;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
@@ -20,11 +23,64 @@ use std::sync::{Arc, OnceLock};
 const PROVIDERS_PATH: &str = "/v1/models/providers";
 const EMPTY_PROVIDERS_RESPONSE: &[u8] = br#"{"items":[]}"#;
 
-/// Build-time snapshot API for the dashboard model-provider endpoint.
+/// Build-time snapshot API backing the dashboard model-provider endpoint.
 ///
-/// [`ModelsDashboardPlugin`] registers this API during `build()`, then
-/// populates it in `ready()` after [`crate::ModelsPlugin`] has globalized the
-/// registry.
+/// This is an internal coordination API, not a type a downstream consumer
+/// reaches for directly. It carries a pre-serialized JSON snapshot of the
+/// registered LLM providers from [`ModelsPlugin`](crate::ModelsPlugin)'s
+/// `ready()` phase to the `GET /v1/models/providers` route handler. Consumers
+/// who want provider data should call that HTTP endpoint, not resolve this API.
+///
+/// # Provided by
+///
+/// [`ModelsPlugin`](crate::ModelsPlugin) inserts it via `insert_api` during
+/// `build()`, gated on the `dashboard` Cargo feature. Without that feature the
+/// API is never registered and does not exist on the server.
+///
+/// # Surface
+///
+/// The type exposes **no public methods**. It is an internal coordination API
+/// between [`ModelsPlugin`](crate::ModelsPlugin)'s `build()`/`ready()` phases
+/// and the [`models_snapshot_handler`] route handler, which holds it as axum
+/// handler `State`.
+///
+/// # Lifecycle
+///
+/// - **`build()`** (feature `dashboard`) — [`ModelsPlugin`](crate::ModelsPlugin)
+///   inserts the API and mounts the route with the snapshot as handler state.
+/// - **`ready()`** — the snapshot is frozen exactly once from the globalized
+///   [`ModelRegistry`]. Freezing is idempotent; the first freeze wins.
+/// - **Runtime** — [`models_snapshot_handler`] reads the frozen bytes
+///   lock-free. Before the freeze the endpoint returns an empty
+///   `{"items":[]}` envelope.
+///
+/// # Composition
+///
+/// **Single-replace** — only [`ModelsPlugin`](crate::ModelsPlugin) inserts
+/// this API. It is never contributed to by other plugins.
+///
+/// # Example consumers
+///
+/// - [`models_snapshot_handler`] — the `GET /v1/models/providers` route
+///   handler, which receives the snapshot as axum `State` and serves its
+///   JSON bytes. No plugin resolves this API via `server.api::<T>()`.
+///
+/// # Example
+///
+/// Adding [`ModelsPlugin`](crate::ModelsPlugin) is what makes this API exist
+/// (with the `dashboard` feature on). It has no `server.api()` consumer in the
+/// workspace — the snapshot is consumed internally by the
+/// `GET /v1/models/providers` route handler:
+///
+/// ```no_run
+/// use polaris_models::ModelsPlugin;
+/// use polaris_system::server::Server;
+///
+/// let mut server = Server::new();
+/// server.add_plugins(ModelsPlugin);
+/// // With the `dashboard` feature enabled, ModelsPlugin inserts the
+/// // ModelsSnapshot API internally and serves it at GET /v1/models/providers.
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct ModelsSnapshot {
     frozen: Arc<OnceLock<Bytes>>,
@@ -72,116 +128,42 @@ fn serialize_models_response(response: &ModelsProvidersResponse) -> Bytes {
     Bytes::from(bytes)
 }
 
-/// Plugin that contributes the canonical model-provider dashboard view and
-/// mounts `GET /v1/models/providers`.
-///
-/// Uses [`ModelsSnapshot`] to pre-serialize the provider list during `ready()`
-/// and serves the cached bytes directly from the handler.
-///
-/// If you also enable `polaris_core_plugins/models_tracing`, add
-/// `TracingPlugin` before `ModelsDashboardPlugin` so the snapshot captures the
-/// tracing-decorated registry.
-///
-/// # Resources Provided
-///
-/// | Resource | Scope | Description |
-/// |----------|-------|-------------|
-/// | _none_   | —     | This plugin contributes dashboard descriptors and an HTTP route only. |
-///
-/// # APIs Provided
-///
-/// | API | Description |
-/// |-----|-------------|
-/// | [`ModelsSnapshot`] | Frozen provider snapshot consumed by `GET /v1/models/providers`. |
-///
-/// # Dependencies
-///
-/// - [`AppPlugin`]
-/// - [`DashboardPlugin`]
-/// - [`crate::ModelsPlugin`]
-///
-/// # Example
-///
-/// ```no_run
-/// use polaris_app::{AppConfig, AppPlugin};
-/// use polaris_dashboard::DashboardPlugin;
-/// use polaris_models::{ModelsDashboardPlugin, ModelsPlugin};
-/// use polaris_system::server::Server;
-///
-/// # async fn run() {
-/// let mut server = Server::new();
-/// server
-///     .add_plugins(ModelsPlugin)
-///     .add_plugins(AppPlugin::new(AppConfig::new()))
-///     .add_plugins(DashboardPlugin)
-///     .add_plugins(ModelsDashboardPlugin);
-/// server.run().await;
-/// # }
-/// ```
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ModelsDashboardPlugin;
+/// Installs the dashboard snapshot API and HTTP route during
+/// [`ModelsPlugin::build`](crate::ModelsPlugin).
+pub(crate) fn install(server: &mut Server) {
+    server.insert_api(ModelsSnapshot::new());
 
-impl Plugin for ModelsDashboardPlugin {
-    const ID: &'static str = "polaris::models::dashboard";
-    const VERSION: Version = Version::new(0, 0, 1);
+    server
+        .api::<HttpRouter>()
+        .expect("AppPlugin must be added before ModelsPlugin when `dashboard` is enabled")
+        .add_routes_with(|server| {
+            let snapshot = server
+                .api::<ModelsSnapshot>()
+                .expect("ModelsSnapshot must exist (registered in build)")
+                .clone();
+            Router::new()
+                .route(PROVIDERS_PATH, get(models_snapshot_handler))
+                .with_state(snapshot)
+        });
+}
 
-    fn build(&self, server: &mut Server) {
-        server.insert_api(ModelsSnapshot::new());
+/// Freezes the snapshot from the now-globalized registry during
+/// [`ModelsPlugin::ready`](crate::ModelsPlugin).
+pub(crate) fn freeze(server: &Server) {
+    let registry = server
+        .get_global::<ModelRegistry>()
+        .expect("ModelsPlugin must globalize ModelRegistry before dashboard freeze");
+    let mut names = registry.llm_provider_names();
+    names.sort();
+    let items = names
+        .into_iter()
+        .map(|name| ModelProviderWire { name })
+        .collect();
 
-        server
-            .api::<HttpRouter>()
-            .expect("AppPlugin must be added before ModelsDashboardPlugin")
-            .add_routes_with(|server| {
-                let snapshot = server
-                    .api::<ModelsSnapshot>()
-                    .expect("ModelsSnapshot must exist (registered in build)")
-                    .clone();
-                Router::new()
-                    .route(PROVIDERS_PATH, get(models_snapshot_handler))
-                    .with_state(snapshot)
-            });
-
-        server
-            .api::<DashboardRegistry>()
-            .expect("DashboardPlugin must be added before ModelsDashboardPlugin")
-            .add_nav_item(NavItem::new("models", "Models"))
-            .add_section(Section::new("models-overview", "models", "Overview"))
-            .add_panel(
-                Panel::new(
-                    "models-providers",
-                    "LLM providers",
-                    "list",
-                    PROVIDERS_PATH,
-                    Transport::Rest,
-                )
-                .with_section("models-overview"),
-            );
-    }
-
-    async fn ready(&self, server: &mut Server) {
-        let registry = server
-            .get_global::<ModelRegistry>()
-            .expect("ModelsPlugin must globalize ModelRegistry before dashboard ready");
-        let mut names = registry.llm_provider_names();
-        names.sort();
-        let items = names
-            .into_iter()
-            .map(|name| ModelProviderWire { name })
-            .collect();
-
-        server
-            .api::<ModelsSnapshot>()
-            .expect("ModelsSnapshot must exist from build phase")
-            .freeze(items);
-    }
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![
-            PluginId::of::<AppPlugin>(),
-            PluginId::of::<DashboardPlugin>(),
-            PluginId::of::<crate::ModelsPlugin>(),
-        ]
-    }
+    server
+        .api::<ModelsSnapshot>()
+        .expect("ModelsSnapshot must exist from build phase")
+        .freeze(items);
 }
 
 /// `GET /v1/models/providers` — returns the frozen provider snapshot as JSON.

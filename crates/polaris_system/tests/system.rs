@@ -238,7 +238,7 @@ fn duplicate_unique_plugin_panics() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "requires")]
+#[should_panic(expected = "not satisfied")]
 async fn missing_dependency_panics() {
     let mut server = Server::new();
     server.add_plugins(PluginB); // Requires PluginA
@@ -1383,4 +1383,240 @@ async fn context_factory_during_ready_does_not_block_insert_global() {
         .get_resource::<LateGlobal>()
         .expect("LateGlobal missing");
     assert_eq!(late.value, 42);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// expect_api Tests
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+struct DummyExpectApi(u32);
+impl API for DummyExpectApi {}
+
+#[derive(Clone)]
+struct MissingExpectApi;
+impl API for MissingExpectApi {}
+
+#[test]
+fn expect_api_returns_some_when_registered() {
+    let mut server = Server::new();
+    server.insert_api(DummyExpectApi(7));
+
+    assert_eq!(
+        server.expect_api::<DummyExpectApi>("test"),
+        Some(DummyExpectApi(7))
+    );
+}
+
+#[test]
+fn expect_api_returns_none_when_missing() {
+    // Return-value only; the visible-warning contract is asserted by
+    // `expect_api_emits_warning_when_missing` below.
+    let server = Server::new();
+    assert!(server.expect_api::<MissingExpectApi>("test").is_none());
+}
+
+/// Minimal [`tracing::Subscriber`] that records the rendered fields of every
+/// `WARN`-level event. Installed per-thread via
+/// [`tracing::subscriber::with_default`], so it never races other tests.
+struct WarnCapture {
+    warnings: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut fields = CollectFields(String::new());
+        event.record(&mut fields);
+        self.warnings.lock().unwrap().push(fields.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Flattens an event's fields into one string for substring assertions.
+struct CollectFields(String);
+
+impl tracing::field::Visit for CollectFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value:?} ", field.name());
+    }
+}
+
+#[test]
+fn expect_api_emits_warning_when_missing() {
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let result = tracing::subscriber::with_default(
+        WarnCapture {
+            warnings: std::sync::Arc::clone(&warnings),
+        },
+        || {
+            let server = Server::new();
+            server.expect_api::<MissingExpectApi>("graph span instrumentation")
+        },
+    );
+
+    assert!(result.is_none(), "a missing API must resolve to None");
+
+    let warnings = warnings.lock().unwrap();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expect_api must emit exactly one WARN event; captured: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("graph span instrumentation"),
+        "the warning must name the caller's `purpose`; got: {}",
+        warnings[0]
+    );
+    assert!(
+        warnings[0].contains("MissingExpectApi"),
+        "the warning must name the missing API type; got: {}",
+        warnings[0]
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Auto-registration of default dependencies
+// ─────────────────────────────────────────────────────────────────────────
+
+use polaris_system::plugin::DefaultDependencies;
+
+/// A leaf plugin with a `Default` impl, suitable for auto-registration.
+#[derive(Default)]
+struct AutoLeaf;
+impl Plugin for AutoLeaf {
+    const ID: &'static str = "test::auto_leaf";
+    const VERSION: Version = Version::new(0, 0, 1);
+    fn build(&self, server: &mut Server) {
+        server.insert_resource(TestResource { value: 99 });
+    }
+}
+
+/// Depends on `AutoLeaf` and offers it as a default.
+struct AutoConsumer;
+impl Plugin for AutoConsumer {
+    const ID: &'static str = "test::auto_consumer";
+    const VERSION: Version = Version::new(0, 0, 1);
+    fn build(&self, _server: &mut Server) {}
+    fn dependencies(&self) -> Vec<PluginId> {
+        vec![PluginId::of::<AutoLeaf>()]
+    }
+    fn default_dependencies(&self) -> DefaultDependencies {
+        DefaultDependencies::new().add::<AutoLeaf>()
+    }
+}
+
+#[tokio::test]
+async fn default_dependency_auto_registered_when_missing() {
+    let mut server = Server::new();
+    server.add_plugins(AutoConsumer); // AutoLeaf not added explicitly
+    server.finish().await;
+
+    assert!(server.has_plugin::<AutoLeaf>());
+    assert!(server.has_plugin::<AutoConsumer>());
+    // AutoLeaf's build() ran.
+    assert!(server.contains_resource::<TestResource>());
+}
+
+#[tokio::test]
+async fn explicit_plugin_wins_over_default() {
+    // AutoLeaf is added explicitly; AutoConsumer also offers it as a default.
+    // The default must be skipped — otherwise a duplicate-plugin panic fires.
+    let mut server = Server::new();
+    server.add_plugins(AutoLeaf);
+    server.add_plugins(AutoConsumer);
+    server.finish().await;
+
+    assert!(server.has_plugin::<AutoLeaf>());
+    assert!(server.contains_resource::<TestResource>());
+}
+
+#[tokio::test]
+async fn auto_registration_is_recursive() {
+    // MidPlugin depends on AutoLeaf and offers it; TopPlugin depends on
+    // MidPlugin and offers it. Only TopPlugin is added explicitly.
+    #[derive(Default)]
+    struct MidPlugin;
+    impl Plugin for MidPlugin {
+        const ID: &'static str = "test::auto_mid";
+        const VERSION: Version = Version::new(0, 0, 1);
+        fn build(&self, _server: &mut Server) {}
+        fn dependencies(&self) -> Vec<PluginId> {
+            vec![PluginId::of::<AutoLeaf>()]
+        }
+        fn default_dependencies(&self) -> DefaultDependencies {
+            DefaultDependencies::new().add::<AutoLeaf>()
+        }
+    }
+
+    struct TopPlugin;
+    impl Plugin for TopPlugin {
+        const ID: &'static str = "test::auto_top";
+        const VERSION: Version = Version::new(0, 0, 1);
+        fn build(&self, _server: &mut Server) {}
+        fn dependencies(&self) -> Vec<PluginId> {
+            vec![PluginId::of::<MidPlugin>()]
+        }
+        fn default_dependencies(&self) -> DefaultDependencies {
+            DefaultDependencies::new().add::<MidPlugin>()
+        }
+    }
+
+    let mut server = Server::new();
+    server.add_plugins(TopPlugin);
+    server.finish().await;
+
+    assert!(server.has_plugin::<TopPlugin>());
+    assert!(server.has_plugin::<MidPlugin>());
+    assert!(server.has_plugin::<AutoLeaf>());
+}
+
+#[tokio::test]
+#[should_panic(expected = "2 plugin dependencies not satisfied")]
+async fn multiple_missing_dependencies_aggregated() {
+    // Two consumer plugins, each requiring a distinct dependency that was
+    // never added. The panic should report both at once rather than failing
+    // on the first one encountered.
+    struct NeedsX;
+    impl Plugin for NeedsX {
+        const ID: &'static str = "test::needs_x";
+        const VERSION: Version = Version::new(0, 0, 1);
+        fn build(&self, _server: &mut Server) {}
+        fn dependencies(&self) -> Vec<PluginId> {
+            vec![PluginId::new("test::missing_x")]
+        }
+    }
+
+    struct NeedsY;
+    impl Plugin for NeedsY {
+        const ID: &'static str = "test::needs_y";
+        const VERSION: Version = Version::new(0, 0, 1);
+        fn build(&self, _server: &mut Server) {}
+        fn dependencies(&self) -> Vec<PluginId> {
+            vec![PluginId::new("test::missing_y")]
+        }
+    }
+
+    let mut server = Server::new();
+    server.add_plugins(NeedsX);
+    server.add_plugins(NeedsY);
+    server.finish().await;
 }

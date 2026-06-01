@@ -47,6 +47,7 @@ use polaris_system::resource::LocalResource;
 use polaris_system::server::Server;
 use std::any::TypeId;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-request context carrying trace and correlation identifiers.
 ///
@@ -139,12 +140,14 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestContext {
 
 fn generate_trace_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let thread_id = std::thread::current().id();
-    format!("{nanos:x}-{thread_id:?}")
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{thread_id:?}-{seq:x}")
 }
 
 /// Raw HTTP headers inserted by an axum handler for the current turn.
@@ -174,11 +177,32 @@ impl LocalResource for HttpHeaders {}
 /// | Resource | Scope | Description |
 /// |----------|-------|-------------|
 /// | [`RequestContext`] | Local | Trace, correlation, and request IDs |
+/// | [`HttpHeaders`] | Local | Optional — inserted by HTTP handlers; read by the `OnGraphStart` hook |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | Request metadata is exposed through the [`RequestContext`] local resource rather than an API. |
 ///
 /// # Dependencies
 ///
-/// Requires [`HooksAPI`] from `polaris_graph`. Inserts it if not already
-/// present on the server.
+/// Requires [`HooksAPI`](polaris_graph::hooks::HooksAPI) from `polaris_graph`.
+/// Inserts it if not already present on the server.
+///
+/// # Hooks Registered
+///
+/// Registered via [`HooksAPI`](polaris_graph::hooks::HooksAPI).
+///
+/// | Schedule | Description |
+/// |----------|-------------|
+/// | `OnGraphStart` | `request_context_from_headers` — when [`HttpHeaders`] has been inserted into the context, replaces the default [`RequestContext`] with one parsed from those headers. No-op for non-HTTP graph runs. |
+///
+/// # Extends
+///
+/// - [`HooksAPI`](polaris_graph::hooks::HooksAPI) — registers the
+///   `OnGraphStart` hook above. Inserts the API itself if no other
+///   plugin provided it.
 ///
 /// # Example
 ///

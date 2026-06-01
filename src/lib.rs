@@ -28,7 +28,7 @@
 //! |-------|------|---------|-------|
 //! | **1** | System Framework | [`system`] | Systems, resources, plugins, server |
 //! | **2** | Graph Execution | [`graph`], [`agent`] | Directed-graph model, agent trait |
-//! | **3** | Plugins | [`tools`], [`models`], [`plugins`], [`sessions`], [`app`], [`shell`], [`dashboard`] | LLM providers, tools, HTTP, sessions, dashboard contributions |
+//! | **3** | Plugins | [`tools`], [`models`], [`plugins`], [`sessions`], [`app`], [`shell`] | LLM providers, tools, HTTP, sessions |
 //!
 //! **Layer 1** provides the ECS-inspired primitives: systems as pure async
 //! functions, resources as shared state, dependency injection via typed
@@ -211,7 +211,6 @@
 //! | [`sessions`] | `polaris_sessions` | Session management and orchestration |
 //! | [`shell`] | `polaris_shell` | Shell command execution with permission model |
 //! | [`app`] | `polaris_app` | HTTP server runtime with plugin integration |
-//! | [`dashboard`] | `polaris_dashboard` | Cross-plugin dashboard contribution registry |
 //!
 //! # Exploration Map
 //!
@@ -245,12 +244,15 @@
 //!
 //! ## Observability
 //!
+//! Graph, model, and tool tracing are always on — [`plugins::TracingPlugin`]
+//! unconditionally registers graph middleware and decorates the global
+//! [`models::ModelRegistry`] and [`tools::ToolRegistry`]. With no subscriber
+//! attached the spans have no observable cost.
+//!
 //! | Feature | Exported item | Effect |
 //! |---------|---------------|--------|
-//! | `graph-tracing` | No new public type | Extends [`plugins::TracingPlugin`] with graph-execution spans |
-//! | `models-tracing` | No new public type | Extends [`plugins::TracingPlugin`] to decorate model providers |
-//! | `tools-tracing` | No new public type | Extends [`plugins::TracingPlugin`] to decorate tools |
 //! | `otel` | [`plugins::OpenTelemetryPlugin`] | Adds OTLP export via the tracing subscriber and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names |
+//! | `dashboard` | [`plugins::SpanBuffer`], [`plugins::SpanStorePlugin`], [`plugins::UsagePricing`] | Mounts `/v1/tracing/*` endpoints on [`plugins::TracingPlugin`], and turns on the equivalent surfaces in [`tools::ToolsPlugin`] / [`models::ModelsPlugin`] |
 //!
 //! ## Tokenization
 //!
@@ -264,12 +266,6 @@
 //! |---------|---------------|---------------|
 //! | `sessions-http` | [`sessions::HttpPlugin`] and [`sessions::http`] | [`sessions`] |
 //! | `file-store` *(default)* | [`sessions::FileStore`] | [`sessions`] |
-//!
-//! ## HTTP App Runtime
-//!
-//! | Feature | Exported item | Effect |
-//! |---------|---------------|--------|
-//! | `ws` | [`app::WsRouter`] | Adds the WebSocket router and the dashboard event-stream surface |
 //!
 //! ## Testing
 //!
@@ -287,14 +283,12 @@
 //! | `anthropic` | [`models::anthropic`], [`models::AnthropicPlugin`] | Makes the `anthropic/...` provider family available through [`models::ModelRegistry`] once registered | [`models::AnthropicPlugin`] registers the Anthropic provider |
 //! | `openai` | [`models::openai`], [`models::OpenAiPlugin`] | Makes the `openai/...` provider family available through [`models::ModelRegistry`] once registered | [`models::OpenAiPlugin`] registers the `OpenAI` provider |
 //! | `bedrock` | [`models::bedrock`], [`models::BedrockPlugin`] | Makes the `bedrock/...` provider family available through [`models::ModelRegistry`] once registered | [`models::BedrockPlugin`] registers the Bedrock provider |
-//! | `graph-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only; no separate `GraphTracingPlugin` exists | [`plugins::TracingPlugin`] registers graph middleware through [`graph::MiddlewareAPI`] |
-//! | `models-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only | [`plugins::TracingPlugin`] decorates the global [`models::ModelRegistry`] |
-//! | `tools-tracing` | No new public item | Extends [`plugins::TracingPlugin`] only | [`plugins::TracingPlugin`] decorates the global [`tools::ToolRegistry`] |
-//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Integrates with [`plugins::TracingPlugin`] / [`plugins::TracingLayersApi`] and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names | [`plugins::OpenTelemetryPlugin`] pushes an OTLP export layer into the tracing subscriber; [`app::AppPlugin`] emits spans with `http.request.method` / `url.path` / `http.response.status_code` fields (plus `otel.name` / `otel.kind`) instead of the `polaris.http.*` defaults. Does not extract W3C `traceparent` headers — incoming requests start a fresh trace. |
+//! | `otel` | [`plugins::OpenTelemetryPlugin`] | Integrates with [`plugins::TracingPlugin`] / [`plugins::TracingLayers`] and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names | [`plugins::OpenTelemetryPlugin`] pushes an OTLP export layer into the tracing subscriber; [`app::AppPlugin`] emits spans with `http.request.method` / `url.path` / `http.response.status_code` fields (plus `otel.name` / `otel.kind`) instead of the `polaris.http.*` defaults. Does not extract W3C `traceparent` headers — incoming requests start a fresh trace. |
 //! | `tiktoken` | [`models::tokenizer::TiktokenCounter`], [`models::tokenizer::EncodingFamily`] | Adds [`Default`] for [`models::TokenizerPlugin`] and changes what [`models::TokenizerPlugin::default`] builds | [`models::TokenizerPlugin::default`] registers a global [`models::Tokenizer`] backed by [`models::tokenizer::TiktokenCounter`] |
 //! | `sessions-http` | [`sessions::http`], [`sessions::HttpPlugin`], [`sessions::http::models`] | Adds request/response model types and HTTP-facing session APIs under [`sessions`] | [`sessions::HttpPlugin`] registers routes through [`app::HttpRouter`] and depends on [`app::AppPlugin`] + [`sessions::SessionsPlugin`] |
-//! | `file-store` *(default)* | [`sessions::FileStore`] | Pulls `tokio/fs` into the dep graph | Lets [`sessions::SessionsPlugin`] use a filesystem-backed [`sessions::SessionStore`] |
-//! | `ws` | [`app::WsRouter`] | Enables `axum/ws` and gates WebSocket route registration on [`app::AppPlugin`] | [`app::AppPlugin`] mounts the [`app::WsRouter`]; required by the dashboard event stream |
+//! | `file-store` *(default)* | [`sessions::FileStore`], [`plugins::FileSpanStore`] | Pulls `tokio/fs` into the dep graph | Lets [`sessions::SessionsPlugin`] use a filesystem-backed [`sessions::SessionStore`], and (when `dashboard` is also on) [`plugins::SpanStorePlugin`] use a filesystem-backed span store |
+//! | `dashboard` | [`plugins::SpanBuffer`], [`plugins::SpanStorePlugin`], [`plugins::UsagePricing`], [`plugins::RecordingLayer`], `/v1/tracing/*` and `/v1/sessions/{id}/usage` endpoints | Activates the per-crate `dashboard` features on [`tools::ToolsPlugin`], [`models::ModelsPlugin`], and [`plugins::TracingPlugin`] so each host plugin mounts its dashboard HTTP surface | [`plugins::TracingPlugin`] mounts the tracing-buffer endpoints, [`tools::ToolsPlugin`] mounts a frozen-snapshot `/v1/tools` endpoint, and [`models::ModelsPlugin`] mounts `/v1/models/providers` |
+//! | `typegen` | None at runtime | Enables `ts-rs` derives on canonical wire types (`SessionMetadata`, `SessionStatus`, span/run/usage projections, …) | Running `cargo test --features typegen` regenerates the TypeScript bindings under `bindings/ts/src/` |
 //! | `test-utils` | [`plugins::MockClock`], [`plugins::MockIOProvider`] | None at runtime | Provides mocks for downstream test suites that exercise [`plugins::TimePlugin`] / [`plugins::IOProvider`] |
 
 // Re-export crates under their original names so proc-macro-generated code
@@ -375,9 +369,8 @@ pub mod app {
     pub use polaris_internal::app::*;
 }
 
-#[cfg(feature = "dashboard-registry")]
-#[doc = include_str!("docs/dashboard.md")]
-pub mod dashboard {
-    #[doc(inline)]
-    pub use polaris_internal::dashboard::*;
-}
+#[doc = include_str!("docs/apis.md")]
+pub mod apis {}
+
+#[doc = include_str!("docs/resources.md")]
+pub mod resources {}

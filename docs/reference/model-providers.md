@@ -59,10 +59,14 @@ pub trait LlmProvider: Send + Sync + 'static {
     ) -> impl Future<Output = Result<LlmStream, GenerationError>> + Send {
         async { Err(GenerationError::UnsupportedOperation("stream")) }
     }
+
+    fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+        None
+    }
 }
 ```
 
-The `name()` must be stable and lowercase — it becomes the prefix in `"<name>/<model>"`. `stream()` has a default implementation that returns `UnsupportedOperation`; override it to support streaming.
+The `name()` must be stable and lowercase — it becomes the prefix in `"<name>/<model>"`. `stream()` has a default implementation that returns `UnsupportedOperation`; override it to support streaming. `pricing()` is optional — return `Some(ModelPricing::new(input_per_million_usd, output_per_million_usd))` to publish per-million-token rates for a given model; the tracing decorator multiplies token counts by the rate and records `gen_ai.usage.cost_usd` on chat spans. The defaulted `None` means cost stays `null` end-to-end. Provider-declared rates are the producer-side default; the `UsagePricing` API (registered by `TracingPlugin` under the `dashboard` feature) lets consumer plugins override at aggregation time without recompiling providers.
 
 ## Building a Provider
 

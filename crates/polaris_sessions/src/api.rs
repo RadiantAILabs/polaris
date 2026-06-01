@@ -4,14 +4,25 @@
 //! It is registered as an [`API`](polaris_system::api::API) by [`SessionsPlugin`]
 //! and accessed via `server.api::<SessionsAPI>()`.
 
-use crate::error::SessionError;
+use crate::error::{SessionError, WiringError};
 use crate::guard::SessionGuard;
+#[cfg(feature = "sessions-http")]
+use crate::http::models::{BucketGranularity, SessionUptimeResponse};
+#[cfg(feature = "sessions-http")]
+use crate::http::models::{Turn, TurnStatus, TurnSummary};
 use crate::info::{SessionInfo, SessionMetadata, SessionStatus};
 use crate::store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber};
+#[cfg(feature = "sessions-http")]
+use crate::uptime::{LifecycleKind, UptimeRecorder};
+#[cfg(feature = "sessions-http")]
+use chrono::DateTime;
+use chrono::Utc;
 use hashbrown::{HashMap, hash_map::Entry};
 use parking_lot::RwLock;
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin, ResourceSerializer};
+#[cfg(feature = "sessions-http")]
+use polaris_core_plugins::{IOContent, IOMessage};
 use polaris_graph::MiddlewareAPI;
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::{ExecutionResult, Graph, GraphExecutor, RunLabels};
@@ -20,10 +31,25 @@ use polaris_system::param::SystemContext;
 use polaris_system::plugin::{Plugin, PluginId, Version};
 use polaris_system::resource::Output;
 use polaris_system::server::{ContextFactory, Server};
+#[cfg(feature = "sessions-http")]
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tracing::Instrument;
+
+/// Soft cap on turn history retained per session.
+///
+/// Each completed turn produces one [`TurnHistoryEntry`]. Bounding the
+/// deque prevents an unbounded-running session from leaking memory; the
+/// oldest entries are evicted first when the cap is reached.
+#[cfg(feature = "sessions-http")]
+const MAX_TURN_HISTORY: usize = 256;
+
+/// Max characters retained from the most recent IO message in a turn's
+/// `last_message_preview`.
+#[cfg(feature = "sessions-http")]
+const PREVIEW_MAX_CHARS: usize = 120;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Checkpoint (internal)
@@ -52,10 +78,33 @@ struct SessionState {
     turn_number: AtomicU32,
     checkpoints: parking_lot::Mutex<Vec<Checkpoint>>,
     created_at: String,
+    /// Read-only sessions reject all mutation paths but stay queryable.
+    /// Set by [`SessionsAPI::run_oneshot_preserved`] after the terminal
+    /// turn completes.
+    read_only: AtomicBool,
     /// Pre-built `(session_id, agent_type)` labels shared across every turn.
     /// `RunLabels` is `Arc`-backed, so per-turn cost is one `Arc::clone`
     /// instead of allocating a fresh `HashMap`.
     labels: RunLabels,
+    /// Per-session turn history used by the dashboard endpoints.
+    ///
+    /// Bounded ring; oldest entries are evicted once
+    /// [`MAX_TURN_HISTORY`] entries accumulate.
+    #[cfg(feature = "sessions-http")]
+    turns: parking_lot::Mutex<VecDeque<TurnHistoryEntry>>,
+}
+
+/// In-memory record for one turn, used as the source-of-truth for
+/// [`SessionsAPI::turn_history`] and [`SessionsAPI::turn`].
+#[cfg(feature = "sessions-http")]
+#[derive(Debug, Clone)]
+struct TurnHistoryEntry {
+    turn: TurnNumber,
+    started_at: String,
+    finished_at: Option<String>,
+    status: TurnStatus,
+    messages: Vec<IOMessage>,
+    last_message_preview: Option<String>,
 }
 
 fn build_session_labels(id: &SessionId, agent_type: &AgentTypeId) -> RunLabels {
@@ -63,6 +112,14 @@ fn build_session_labels(id: &SessionId, agent_type: &AgentTypeId) -> RunLabels {
         ("session_id", id.as_str().to_owned()),
         ("agent_type", agent_type.as_str().to_owned()),
     ])
+}
+
+fn status_for(state: &SessionState) -> SessionStatus {
+    if state.read_only.load(Ordering::Acquire) {
+        SessionStatus::ReadOnly
+    } else {
+        SessionStatus::Active
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,12 +136,119 @@ struct SessionsInner {
     hooks: OnceLock<HooksAPI>,
     middleware: OnceLock<MiddlewareAPI>,
     context_factory: OnceLock<ContextFactory>,
+    /// Lifecycle recorder backing the per-session uptime endpoint.
+    #[cfg(feature = "sessions-http")]
+    uptime: UptimeRecorder,
 }
 
 /// Server API for session lifecycle management.
 ///
-/// Provides methods to register agents, create/resume sessions, execute turns,
-/// checkpoint/rollback state, and persist sessions to a [`SessionStore`].
+/// Reach for `SessionsAPI` whenever application code — an HTTP handler, a
+/// background job, a test — needs to drive agents: register agent
+/// patterns, create or resume sessions, execute turns, checkpoint and
+/// roll back state, and persist sessions to a [`SessionStore`].
+///
+/// # Provided by
+///
+/// [`SessionsPlugin`], which calls
+/// [`Server::insert_api`](polaris_system::server::Server::insert_api) with
+/// the configured [`SessionStore`] during its `build()` phase. The plugin
+/// completes wiring (graph APIs, context factory, resource serializers) in
+/// `ready()` — see [Lifecycle](#lifecycle).
+///
+/// # Surface
+///
+/// **Agent registration & lookup**
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | `register_agent` | Registers an agent pattern under its type id. |
+/// | `registered_agents` | Lists the names of registered agent types. |
+/// | `find_agent_type` | Resolves an [`AgentTypeId`] from an agent name. |
+///
+/// **Session lifecycle**
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | `create_context` | Creates a fresh system context for a session. |
+/// | `create_session` | Creates a session bound to an agent type. |
+/// | `create_session_with` | Creates a session, running a setup closure over its context. |
+/// | `create_session_with_executor` | Creates a session with a caller-supplied graph executor. |
+/// | `setup_session` | Re-runs the agent's setup phase (e.g. after a rollback). |
+/// | `delete_session` | Removes a live session and frees its resources. |
+/// | `scoped_session` | Creates a [`SessionGuard`] that deletes its session on drop. |
+///
+/// **Turn execution**
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | `process_turn` | Executes one agent turn. |
+/// | `process_turn_with` | Executes one turn after a per-turn setup closure. |
+/// | `try_process_turn` | Like `process_turn`, but returns `SessionBusy` instead of waiting when a turn is already running. |
+/// | `try_process_turn_with` | `try_process_turn` plus a per-turn setup closure. |
+/// | `run_oneshot` | Creates an ephemeral session, runs one turn, returns typed output, deletes the session. |
+/// | `run_oneshot_preserved` | Like `run_oneshot`, but keeps the session alive read-only for later inspection. |
+/// | `with_context` | Runs a closure against a live session's context to read or inject resources. |
+///
+/// **Checkpoints & rollback**
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | `checkpoint` | Snapshots the session's resources at the current turn. |
+/// | `list_checkpoints` | Lists the turn numbers that have checkpoints. |
+/// | `rollback` | Restores the session's resources to a checkpointed turn. |
+/// | `set_auto_checkpoint` | Enables or disables automatic post-turn checkpoints. |
+///
+/// **Persistence**
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | `save_session` | Persists a session's state to the backing [`SessionStore`]. |
+/// | `resume_session` | Reconstructs a session from the store. |
+/// | `resume_session_with` | `resume_session` plus a setup closure. |
+/// | `resume_session_with_executor` | `resume_session` with a caller-supplied executor. |
+///
+/// **Introspection**
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | `list_sessions` | Lists session ids known to the backing store. |
+/// | `list_live_sessions` | Lists ids of sessions currently held in memory. |
+/// | `session_info` | Returns metadata for one live session. |
+/// | `list_session_metadata` | Returns metadata for every live session. |
+/// | `turn_history` *(feature `sessions-http`)* | Returns recorded turn summaries. |
+/// | `turn` *(feature `sessions-http`)* | Returns the detail of one recorded turn. |
+/// | `uptime_buckets` *(feature `sessions-http`)* | Returns a bucketed session-lifecycle series. |
+///
+/// **Plugin wiring** — called by [`SessionsPlugin`] / the HTTP layer, not
+/// by general consumers:
+///
+/// | Method | Description |
+/// |--------|-------------|
+/// | `new` | Constructs the API over a [`SessionStore`]. |
+/// | `set_serializers` | Snapshots the resource serializers from [`PersistenceAPI`]. |
+/// | `set_graph_apis` | Stores the hooks/middleware APIs used during turn execution. |
+/// | `set_context_factory` | Stores the factory used to build fresh contexts. |
+/// | `record_turn_messages` *(feature `sessions-http`)* | Attaches IO messages observed during a turn to turn history. |
+///
+/// # Lifecycle
+///
+/// The wiring methods (`set_serializers`, `set_graph_apis`,
+/// `set_context_factory`) are called once by [`SessionsPlugin`] during its
+/// `ready()` phase; `set_graph_apis` and `set_context_factory` return
+/// [`WiringError`](crate::WiringError) if invoked a second time.
+/// `register_agent` is intended to be called after
+/// `ready()` and before the first turn. Every other method — session
+/// creation, turn execution, checkpoints, persistence, introspection — is
+/// a runtime operation, valid for the lifetime of the server once the
+/// plugin is ready. All methods take `&self`.
+///
+/// # Composition
+///
+/// **Provider-scoped.** Only [`SessionsPlugin`] inserts this API and
+/// performs the build-time wiring. Consumers invoke its operations
+/// (create a session, run a turn, checkpoint) but do not contribute to
+/// it. The API is cheaply cloneable; see [Interior Mutability](#interior-mutability).
 ///
 /// # Cloning
 ///
@@ -164,6 +328,8 @@ impl SessionsAPI {
                 hooks: OnceLock::new(),
                 middleware: OnceLock::new(),
                 context_factory: OnceLock::new(),
+                #[cfg(feature = "sessions-http")]
+                uptime: UptimeRecorder::new(),
             }),
         }
     }
@@ -196,22 +362,29 @@ impl SessionsAPI {
     ///
     /// Called during the plugin ready phase.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if hooks or middleware have already been set.
-    pub fn set_graph_apis(&self, hooks: Option<HooksAPI>, middleware: Option<MiddlewareAPI>) {
+    /// Returns [`WiringError::HooksAlreadySet`] or
+    /// [`WiringError::MiddlewareAlreadySet`] if the corresponding API has
+    /// already been wired.
+    pub fn set_graph_apis(
+        &self,
+        hooks: Option<HooksAPI>,
+        middleware: Option<MiddlewareAPI>,
+    ) -> Result<(), WiringError> {
         if let Some(hooks) = hooks {
             self.inner
                 .hooks
                 .set(hooks)
-                .unwrap_or_else(|_| panic!("hooks already set"));
+                .map_err(|_| WiringError::HooksAlreadySet)?;
         }
         if let Some(middleware) = middleware {
             self.inner
                 .middleware
                 .set(middleware)
-                .unwrap_or_else(|_| panic!("middleware already set"));
+                .map_err(|_| WiringError::MiddlewareAlreadySet)?;
         }
+        Ok(())
     }
 
     /// Sets the context factory used to create fresh system contexts.
@@ -219,14 +392,15 @@ impl SessionsAPI {
     /// Called automatically by [`SessionsPlugin::ready()`]. Only call this
     /// manually if you are not using `SessionsPlugin`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if a factory has already been set.
-    pub fn set_context_factory(&self, factory: ContextFactory) {
+    /// Returns [`WiringError::ContextFactoryAlreadySet`] if the factory has
+    /// already been wired.
+    pub fn set_context_factory(&self, factory: ContextFactory) -> Result<(), WiringError> {
         self.inner
             .context_factory
             .set(factory)
-            .unwrap_or_else(|_| panic!("context factory already set"));
+            .map_err(|_| WiringError::ContextFactoryAlreadySet)
     }
 
     /// Creates a fresh [`SystemContext`] using the stored
@@ -506,13 +680,18 @@ impl SessionsAPI {
             turn_number: AtomicU32::new(0),
             checkpoints: parking_lot::Mutex::new(Vec::new()),
             created_at: utc_now_iso8601(),
+            read_only: AtomicBool::new(false),
             labels: build_session_labels(id, agent_type),
+            #[cfg(feature = "sessions-http")]
+            turns: parking_lot::Mutex::new(VecDeque::with_capacity(MAX_TURN_HISTORY)),
         });
 
         match self.inner.sessions.write().entry(id.clone()) {
             Entry::Occupied(_) => return Err(SessionError::SessionAlreadyExists(id.clone())),
             Entry::Vacant(entry) => entry.insert(state),
         };
+        #[cfg(feature = "sessions-http")]
+        self.inner.uptime.record(id, LifecycleKind::Created);
         Ok(())
     }
 
@@ -577,6 +756,9 @@ impl SessionsAPI {
         setup: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<ExecutionResult, SessionError> {
         let state = self.get_state(id)?;
+        if state.read_only.load(Ordering::Acquire) {
+            return Err(SessionError::ReadOnly(id.clone()));
+        }
         let mut ctx = state.ctx.lock().await;
         self.execute_turn(id, &state, &mut ctx, setup).await
     }
@@ -645,6 +827,9 @@ impl SessionsAPI {
         setup: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<ExecutionResult, SessionError> {
         let state = self.get_state(id)?;
+        if state.read_only.load(Ordering::Acquire) {
+            return Err(SessionError::ReadOnly(id.clone()));
+        }
         let mut ctx = state
             .ctx
             .try_lock()
@@ -673,18 +858,63 @@ impl SessionsAPI {
         let hooks = self.inner.hooks.get();
         let middleware = self.inner.middleware.get();
 
+        // Per-turn labels — extends the session-wide labels with the
+        // current turn number. Threading `turn` here lets dashboards
+        // join a tracing run back to a turn without a separate index,
+        // since the same labels surface on both `GraphEvent`s and on
+        // `polaris.label.*` tracing fields below.
+        let turn_str = turn.to_string();
+        let labels = RunLabels::from(
+            state
+                .labels
+                .iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .chain(std::iter::once(("turn".to_owned(), turn_str.clone()))),
+        );
+
+        // The `polaris.label.*` fields below piggyback on the tracing
+        // span chain so child graph spans inherit the same labels via
+        // `RecordingLayer`, letting `/v1/sessions/{id}/runs` filter
+        // recorded runs by `session_id`.
         let turn_span = tracing::info_span!(
             "polaris.session.turn",
             polaris.session.id = %id,
             polaris.session.turn_number = turn,
             polaris.session.agent_type = %state.agent_type,
+            polaris.label.session_id = id.as_str(),
+            polaris.label.agent_type = state.agent_type.as_str(),
+            polaris.label.turn = %turn_str,
         );
 
-        let result = state
+        // Start turn history + lifecycle recording before executor runs so
+        // a Running entry is visible from the dashboard the moment a turn
+        // is in flight.
+        #[cfg(feature = "sessions-http")]
+        {
+            self.start_turn_record(state, turn);
+            self.inner.uptime.record(id, LifecycleKind::Active);
+        }
+
+        let exec_result = state
             .executor
-            .execute_with_labels(&state.graph, ctx, hooks, middleware, state.labels.clone())
+            .execute_with_labels(&state.graph, ctx, hooks, middleware, labels)
             .instrument(turn_span)
-            .await?;
+            .await;
+
+        // Finalize lifecycle + turn record regardless of success/failure,
+        // so the dashboard reflects what actually happened.
+        #[cfg(feature = "sessions-http")]
+        {
+            let status = if exec_result.is_ok() {
+                TurnStatus::Completed
+            } else {
+                TurnStatus::Failed
+            };
+            self.finish_turn_record(state, turn, status);
+            self.inner.uptime.record(id, LifecycleKind::Idle);
+        }
+
+        let result = exec_result?;
 
         state.turn_number.store(turn + 1, Ordering::Release);
 
@@ -808,6 +1038,9 @@ impl SessionsAPI {
     /// ```
     pub async fn rollback(&self, id: &SessionId, turn: TurnNumber) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
+        if state.read_only.load(Ordering::Acquire) {
+            return Err(SessionError::ReadOnly(id.clone()));
+        }
         let mut ctx = state.ctx.lock().await;
 
         let mut checkpoints = state.checkpoints.lock();
@@ -1004,10 +1237,23 @@ impl SessionsAPI {
             turn_number: AtomicU32::new(data.turn_number),
             checkpoints: parking_lot::Mutex::new(Vec::new()),
             created_at: data.created_at.clone(),
+            read_only: AtomicBool::new(false),
             labels: build_session_labels(id, &agent_type),
+            #[cfg(feature = "sessions-http")]
+            turns: parking_lot::Mutex::new(VecDeque::with_capacity(MAX_TURN_HISTORY)),
         });
 
-        self.inner.sessions.write().insert(id.clone(), state);
+        {
+            let mut sessions = self.inner.sessions.write();
+            if let Some(existing) = sessions.get(id)
+                && existing.read_only.load(Ordering::Acquire)
+            {
+                return Err(SessionError::ReadOnly(id.clone()));
+            }
+            sessions.insert(id.clone(), state);
+        }
+        #[cfg(feature = "sessions-http")]
+        self.inner.uptime.record(id, LifecycleKind::Created);
         Ok(())
     }
 
@@ -1033,6 +1279,9 @@ impl SessionsAPI {
     /// ```
     pub async fn setup_session(&self, id: &SessionId) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
+        if state.read_only.load(Ordering::Acquire) {
+            return Err(SessionError::ReadOnly(id.clone()));
+        }
         let agent = self
             .inner
             .agents
@@ -1066,7 +1315,16 @@ impl SessionsAPI {
     /// # }
     /// ```
     pub async fn delete_session(&self, id: &SessionId) -> Result<(), SessionError> {
-        self.inner.sessions.write().remove(id);
+        let removed = self.inner.sessions.write().remove(id).is_some();
+        #[cfg(feature = "sessions-http")]
+        if removed {
+            // Record the terminal transition before forgetting the
+            // session so any in-flight uptime query sees the final state.
+            self.inner.uptime.record(id, LifecycleKind::Terminated);
+            self.inner.uptime.forget(id);
+        }
+        #[cfg(not(feature = "sessions-http"))]
+        let _ = removed;
         self.inner.store.delete(id).await
     }
 
@@ -1134,7 +1392,7 @@ impl SessionsAPI {
             agent_type: state.agent_type,
             turn_number: state.turn_number.load(Ordering::Acquire),
             created_at: state.created_at.clone(),
-            status: SessionStatus::Active,
+            status: status_for(&state),
         })
     }
 
@@ -1164,7 +1422,7 @@ impl SessionsAPI {
                 agent_type: state.agent_type,
                 turn_number: state.turn_number.load(Ordering::Acquire),
                 created_at: state.created_at.clone(),
-                status: SessionStatus::Active,
+                status: status_for(state),
             })
             .collect()
     }
@@ -1207,6 +1465,9 @@ impl SessionsAPI {
         f: impl FnOnce(&mut SystemContext<'static>) -> R,
     ) -> Result<R, SessionError> {
         let state = self.get_state(id)?;
+        if state.read_only.load(Ordering::Acquire) {
+            return Err(SessionError::ReadOnly(id.clone()));
+        }
         let mut ctx = state.ctx.lock().await;
         Ok(f(&mut ctx))
     }
@@ -1310,6 +1571,219 @@ impl SessionsAPI {
         result
     }
 
+    /// Executes a one-shot turn and preserves the finished session as
+    /// read-only.
+    ///
+    /// Identical to [`run_oneshot`](Self::run_oneshot) up to the terminal
+    /// turn: a transient session is created, one turn runs, and the typed
+    /// output is extracted. Instead of deleting the session afterward,
+    /// it is marked read-only and remains in the live map.
+    ///
+    /// Read-only sessions stay queryable through every read surface —
+    /// [`session_info`](Self::session_info),
+    /// [`list_live_sessions`](Self::list_live_sessions),
+    /// [`turn_history`](Self::turn_history),
+    /// [`list_checkpoints`](Self::list_checkpoints),
+    /// [`uptime_buckets`](Self::uptime_buckets) — and accept
+    /// [`save_session`](Self::save_session) and
+    /// [`delete_session`](Self::delete_session). Any method that mutates
+    /// session state returns [`SessionError::ReadOnly`].
+    ///
+    /// On execution failure, the session is deleted (matching
+    /// [`run_oneshot`] cleanup semantics — there is no useful read-only
+    /// state to preserve).
+    ///
+    /// Returns the generated [`SessionId`] alongside the output so the
+    /// caller can address the preserved session later.
+    ///
+    /// # Type Parameters
+    ///
+    /// `T` — the output type produced by the agent's terminal system.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`run_oneshot`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, AgentTypeId};
+    /// # #[derive(Clone)] struct MyOutput;
+    /// # async fn example(sessions: &SessionsAPI) -> Result<(), Box<dyn std::error::Error>> {
+    /// let agent_type = AgentTypeId::from_name("MyAgent");
+    /// let (session_id, output): (_, MyOutput) = sessions
+    ///     .run_oneshot_preserved(&agent_type, |_| {})
+    ///     .await?;
+    /// // Session is still listed as read-only; query history via session_id.
+    /// let meta = sessions.session_info(&session_id)?;
+    /// # let _ = (output, meta);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_oneshot_preserved<T: Output + Clone>(
+        &self,
+        agent_type: &AgentTypeId,
+        setup: impl FnOnce(&mut SystemContext<'static>),
+    ) -> Result<(SessionId, T), SessionError> {
+        let id = SessionId::default();
+        let ctx = self.create_context();
+        self.create_session_with(ctx, &id, agent_type, setup)?;
+
+        let outcome = async {
+            let exec_result = self.process_turn(&id).await?;
+            exec_result
+                .output::<T>()
+                .cloned()
+                .ok_or(SessionError::OutputNotFound(std::any::type_name::<T>()))
+        }
+        .await;
+
+        match outcome {
+            Ok(output) => {
+                // Flip the session to read-only. Subsequent mutation
+                // attempts return SessionError::ReadOnly.
+                if let Ok(state) = self.get_state(&id) {
+                    state.read_only.store(true, Ordering::Release);
+                }
+                Ok((id, output))
+            }
+            Err(err) => {
+                // Match run_oneshot cleanup semantics on failure.
+                let _ = self.delete_session(&id).await;
+                Err(err)
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Dashboard queries (A9)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Returns recorded turn summaries for a live session.
+    ///
+    /// Entries are returned oldest first. If `include_messages` is `true`,
+    /// each [`TurnSummary`] embeds the full [`IOMessage`] array recorded
+    /// for that turn; otherwise [`TurnSummary::messages`] is omitted.
+    ///
+    /// Messages are only captured for turns whose IO was driven through
+    /// the HTTP handlers (which call [`record_turn_messages`] post-turn).
+    /// Programmatic callers that drive `process_turn` themselves will see
+    /// `io_message_count = 0` unless they call [`record_turn_messages`].
+    ///
+    /// [`record_turn_messages`]: SessionsAPI::record_turn_messages
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionNotFound`] if the session does not exist.
+    #[cfg(feature = "sessions-http")]
+    pub fn turn_history(
+        &self,
+        id: &SessionId,
+        include_messages: bool,
+    ) -> Result<Vec<TurnSummary>, SessionError> {
+        let state = self.get_state(id)?;
+        let turns = state.turns.lock();
+        Ok(turns
+            .iter()
+            .map(|entry| entry.to_summary(include_messages))
+            .collect())
+    }
+
+    /// Returns the full payload for a single recorded turn.
+    ///
+    /// If multiple records exist for the same turn number (e.g. a failed
+    /// turn followed by a successful retry), the most recent record wins
+    /// — matching what [`turn_history`](Self::turn_history) lists last.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionNotFound`] if the session does not
+    /// exist, or [`SessionError::TurnNotFound`] if no record exists for
+    /// the requested turn number.
+    #[cfg(feature = "sessions-http")]
+    pub fn turn(&self, id: &SessionId, turn: TurnNumber) -> Result<Turn, SessionError> {
+        let state = self.get_state(id)?;
+        let turns = state.turns.lock();
+        turns
+            .iter()
+            .rev()
+            .find(|entry| entry.turn == turn)
+            .map(TurnHistoryEntry::to_turn)
+            .ok_or(SessionError::TurnNotFound(turn))
+    }
+
+    /// Attaches IO messages observed during a turn to the turn history.
+    ///
+    /// Called by the HTTP layer after a turn completes (both the
+    /// synchronous and SSE-streaming variants) so the dashboard can
+    /// surface the messages that flowed through `UserIO`. No-op if the
+    /// session no longer exists or the turn record has aged out of the
+    /// per-session ring.
+    #[cfg(feature = "sessions-http")]
+    pub fn record_turn_messages(&self, id: &SessionId, turn: TurnNumber, messages: Vec<IOMessage>) {
+        let Ok(state) = self.get_state(id) else {
+            return;
+        };
+        let preview = messages.last().and_then(preview_from_message);
+        let mut turns = state.turns.lock();
+        // Most recent first — the entry we want is typically near the back.
+        if let Some(entry) = turns.iter_mut().rev().find(|entry| entry.turn == turn) {
+            entry.messages = messages;
+            entry.last_message_preview = preview;
+        }
+    }
+
+    /// Returns the bucketed uptime time-series for a session.
+    ///
+    /// `since`/`until` are inclusive/exclusive; the response always
+    /// contains `ceil((until − since) / bucket)` buckets. Returns an
+    /// empty buckets vector when `until <= since`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionNotFound`] if the session does not
+    /// exist. (Lifecycle history is dropped on
+    /// [`delete_session`](Self::delete_session), so terminated sessions
+    /// are not queryable.)
+    #[cfg(feature = "sessions-http")]
+    pub fn uptime_buckets(
+        &self,
+        id: &SessionId,
+        bucket: BucketGranularity,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<SessionUptimeResponse, SessionError> {
+        // Validate the session exists so the endpoint can 404 properly.
+        let _ = self.get_state(id)?;
+        Ok(self.inner.uptime.buckets_for(id, bucket, since, until))
+    }
+
+    #[cfg(feature = "sessions-http")]
+    fn start_turn_record(&self, state: &SessionState, turn: TurnNumber) {
+        let entry = TurnHistoryEntry {
+            turn,
+            started_at: utc_now_iso8601(),
+            finished_at: None,
+            status: TurnStatus::Running,
+            messages: Vec::new(),
+            last_message_preview: None,
+        };
+        let mut turns = state.turns.lock();
+        if turns.len() >= MAX_TURN_HISTORY {
+            turns.pop_front();
+        }
+        turns.push_back(entry);
+    }
+
+    #[cfg(feature = "sessions-http")]
+    fn finish_turn_record(&self, state: &SessionState, turn: TurnNumber, status: TurnStatus) {
+        let mut turns = state.turns.lock();
+        if let Some(entry) = turns.iter_mut().rev().find(|entry| entry.turn == turn) {
+            entry.finished_at = Some(utc_now_iso8601());
+            entry.status = status;
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Helpers
     // ─────────────────────────────────────────────────────────────────────
@@ -1325,9 +1799,54 @@ impl SessionsAPI {
     }
 }
 
+#[cfg(feature = "sessions-http")]
+impl TurnHistoryEntry {
+    fn to_summary(&self, include_messages: bool) -> TurnSummary {
+        TurnSummary {
+            turn: self.turn,
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            status: self.status,
+            io_message_count: u32::try_from(self.messages.len()).unwrap_or(u32::MAX),
+            last_message_preview: self.last_message_preview.clone(),
+            messages: include_messages.then(|| self.messages.clone()),
+        }
+    }
+
+    fn to_turn(&self) -> Turn {
+        Turn {
+            turn: self.turn,
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            status: self.status,
+            messages: self.messages.clone(),
+        }
+    }
+}
+
+/// Renders a short, single-line preview of the last text payload in a
+/// turn's message stream. Non-text content yields `None` so the
+/// dashboard renders a placeholder instead of a misleading excerpt.
+#[cfg(feature = "sessions-http")]
+fn preview_from_message(msg: &IOMessage) -> Option<String> {
+    let IOContent::Text(text) = &msg.content else {
+        return None;
+    };
+    let trimmed: String = text.split('\n').next().unwrap_or("").trim().to_owned();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= PREVIEW_MAX_CHARS {
+        return Some(trimmed);
+    }
+    // Truncate on a char boundary so we never split a multi-byte codepoint.
+    let truncated: String = trimmed.chars().take(PREVIEW_MAX_CHARS).collect();
+    Some(format!("{truncated}…"))
+}
+
 /// Returns the current UTC time formatted as ISO 8601 (e.g. `2026-03-31T12:00:00Z`).
 fn utc_now_iso8601() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1386,7 +1905,11 @@ fn deserialize_into_context(
 
 /// Plugin that provides session management via [`SessionsAPI`].
 ///
-/// Requires [`PersistencePlugin`] to be present for resource serialization.
+/// Use this whenever an application needs multi-turn agent execution with
+/// persistence, checkpoints, or HTTP-driven turn handling. `SessionsAPI` is
+/// the entry point for [`run_oneshot`](SessionsAPI::run_oneshot),
+/// [`process_turn`](SessionsAPI::process_turn), checkpoint management, and
+/// scoped sessions.
 ///
 /// # Auto-Checkpoint
 ///
@@ -1394,7 +1917,38 @@ fn deserialize_into_context(
 /// [`process_turn`](SessionsAPI::process_turn). Call
 /// [`without_auto_checkpoint`](Self::without_auto_checkpoint) to disable.
 ///
-/// # Examples
+/// # Lifecycle
+///
+/// - **`build()`** — constructs a [`SessionsAPI`] backed by the configured
+///   [`SessionStore`] and inserts it as a build-time API.
+/// - **`ready()`** — wires the API into the rest of the server by attaching
+///   [`PersistenceAPI`](polaris_core_plugins::PersistenceAPI) serializers,
+///   [`HooksAPI`](polaris_graph::hooks::HooksAPI),
+///   [`MiddlewareAPI`](polaris_graph::middleware::MiddlewareAPI), and the
+///   [`ContextFactory`](polaris_system::server::ContextFactory).
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_ | — | Session state lives behind the [`SessionsAPI`] handle rather than as a context-scoped resource. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | [`SessionsAPI`] | Session lifecycle entry point — register agents, create sessions, run one-shot or multi-turn execution, manage checkpoints, and persist or resume sessions. |
+///
+/// # Dependencies
+///
+/// - [`PersistencePlugin`] — owns the [`PersistenceAPI`](polaris_core_plugins::PersistenceAPI)
+///   used during `ready()` to gather resource serializers for checkpointing.
+/// - [`HooksAPI`](polaris_graph::hooks::HooksAPI) and
+///   [`MiddlewareAPI`](polaris_graph::middleware::MiddlewareAPI) from
+///   `polaris_graph` — fetched during `ready()` (`Server::expect_api`); the
+///   server panics with a helpful message if they are missing.
+///
+/// # Example
 ///
 /// ```
 /// use std::sync::Arc;
@@ -1471,11 +2025,15 @@ impl Plugin for SessionsPlugin {
             .api::<SessionsAPI>()
             .expect("SessionsAPI should be present after build");
         sessions.set_serializers(persistence.serializers());
-        sessions.set_graph_apis(
-            server.api::<HooksAPI>().cloned(),
-            server.api::<MiddlewareAPI>().cloned(),
-        );
-        sessions.set_context_factory(server.context_factory());
+        sessions
+            .set_graph_apis(
+                server.expect_api::<HooksAPI>("graph hook fan-out"),
+                server.expect_api::<MiddlewareAPI>("graph span instrumentation"),
+            )
+            .expect("SessionsPlugin::ready called twice");
+        sessions
+            .set_context_factory(server.context_factory())
+            .expect("SessionsPlugin::ready called twice");
     }
 
     fn dependencies(&self) -> Vec<PluginId> {

@@ -96,6 +96,12 @@ impl Default for ServerInfo {
 /// |----------|-------|-------------|
 /// | [`ServerInfo`] | Global | Server metadata and runtime information |
 ///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | Server metadata is exposed as a [`ServerInfo`] global resource, not as an API. |
+///
 /// # Dependencies
 ///
 /// None. This is a foundational plugin with no dependencies.

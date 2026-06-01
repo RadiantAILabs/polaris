@@ -29,6 +29,14 @@ impl LocalResource for SessionInfo {}
 pub enum SessionStatus {
     /// The session is active and ready to process turns.
     Active,
+    /// The session is preserved but cannot accept further turns.
+    ///
+    /// Set when a session is finalized by
+    /// [`SessionsAPI::run_oneshot_preserved`](crate::SessionsAPI::run_oneshot_preserved).
+    /// Query surfaces (turn history, metadata, persistence) remain
+    /// available; any method that would mutate session state returns
+    /// [`SessionError::ReadOnly`](crate::SessionError::ReadOnly).
+    ReadOnly,
 }
 
 /// Metadata about a session returned by

@@ -82,14 +82,12 @@ impl std::fmt::Display for RunId {
     }
 }
 
-#[cfg(feature = "serde")]
 impl serde::Serialize for RunId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
     }
 }
 
-#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for RunId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
@@ -162,14 +160,12 @@ where
     }
 }
 
-#[cfg(feature = "serde")]
 impl serde::Serialize for RunLabels {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         (*self.inner).serialize(serializer)
     }
 }
 
-#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for RunLabels {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let map = <HashMap<String, String> as serde::Deserialize>::deserialize(deserializer)?;
@@ -751,7 +747,7 @@ impl std::fmt::Display for GraphEvent {
     }
 }
 
-#[cfg(all(test, feature = "serde"))]
+#[cfg(test)]
 mod serde_tests {
     use super::*;
 

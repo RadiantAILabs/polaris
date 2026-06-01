@@ -344,6 +344,53 @@ pub trait Plugin: Send + Sync + 'static {
     fn dependencies(&self) -> Vec<PluginId> {
         Vec::new()
     }
+
+    /// Plugins this plugin can auto-register if they are not already added.
+    ///
+    /// Each entry must implement [`Default`]. During [`Server::finish()`](crate::server::Server::finish)
+    /// the server walks every pending plugin's `default_dependencies()` and, for any
+    /// declared [`dependencies()`](Self::dependencies) that the user did not provide
+    /// explicitly, inserts the matching default instance. An auto-registration emits
+    /// a `tracing::info!` so the user can see which defaults were applied.
+    ///
+    /// Use this for plugins whose dependency has a reasonable zero-config default
+    /// (e.g. an LLM provider whose API key is read from the environment). It removes
+    /// the "missing plugin Y" puzzle for new users while still letting power-users
+    /// override by adding their preferred plugin explicitly.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::plugin::{DefaultDependencies, Plugin, PluginId, Version};
+    /// # use polaris_system::server::Server;
+    /// #[derive(Default)]
+    /// struct TracingPlugin;
+    ///
+    /// impl Plugin for TracingPlugin {
+    ///     const ID: &'static str = "tracing";
+    ///     const VERSION: Version = Version::new(0, 0, 1);
+    ///     fn build(&self, _: &mut Server) {}
+    /// }
+    ///
+    /// struct ToolsPlugin;
+    ///
+    /// impl Plugin for ToolsPlugin {
+    ///     const ID: &'static str = "tools";
+    ///     const VERSION: Version = Version::new(0, 0, 1);
+    ///     fn build(&self, _: &mut Server) {}
+    ///
+    ///     fn dependencies(&self) -> Vec<PluginId> {
+    ///         vec![PluginId::of::<TracingPlugin>()]
+    ///     }
+    ///
+    ///     fn default_dependencies(&self) -> DefaultDependencies {
+    ///         DefaultDependencies::new().add::<TracingPlugin>()
+    ///     }
+    /// }
+    /// ```
+    fn default_dependencies(&self) -> DefaultDependencies {
+        DefaultDependencies::new()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -380,6 +427,8 @@ pub(crate) trait DynPlugin: Send + Sync + 'static {
     fn tick_schedules(&self) -> Vec<ScheduleId>;
     /// See [`Plugin::dependencies`].
     fn dependencies(&self) -> Vec<PluginId>;
+    /// See [`Plugin::default_dependencies`].
+    fn default_dependencies(&self) -> DefaultDependencies;
 }
 
 impl<T: Plugin> DynPlugin for T {
@@ -412,6 +461,94 @@ impl<T: Plugin> DynPlugin for T {
     }
     fn dependencies(&self) -> Vec<PluginId> {
         Plugin::dependencies(self)
+    }
+    fn default_dependencies(&self) -> DefaultDependencies {
+        Plugin::default_dependencies(self)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DefaultDependencies
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Set of plugins to auto-register when they are missing from the server.
+///
+/// Returned from [`Plugin::default_dependencies`]. Each entry pairs a
+/// [`PluginId`] with a boxed default instance; the server consumes the boxed
+/// plugin only when no plugin of the same ID has been explicitly added.
+///
+/// # Example
+///
+/// ```
+/// # use polaris_system::plugin::{DefaultDependencies, Plugin, Version};
+/// # use polaris_system::server::Server;
+/// # #[derive(Default)] struct TracingPlugin;
+/// # impl Plugin for TracingPlugin {
+/// #     const ID: &'static str = "tracing";
+/// #     const VERSION: Version = Version::new(0, 0, 1);
+/// #     fn build(&self, _: &mut Server) {}
+/// # }
+/// # #[derive(Default)] struct TimePlugin;
+/// # impl Plugin for TimePlugin {
+/// #     const ID: &'static str = "time";
+/// #     const VERSION: Version = Version::new(0, 0, 1);
+/// #     fn build(&self, _: &mut Server) {}
+/// # }
+/// let defaults = DefaultDependencies::new()
+///     .add::<TracingPlugin>()
+///     .add::<TimePlugin>();
+/// assert_eq!(defaults.len(), 2);
+/// ```
+#[derive(Default)]
+pub struct DefaultDependencies {
+    pub(crate) plugins: Vec<BoxedPlugin>,
+}
+
+impl DefaultDependencies {
+    /// Creates an empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            plugins: Vec::new(),
+        }
+    }
+
+    /// Adds `P` to the auto-registration set.
+    ///
+    /// `P` must implement [`Default`]. If multiple plugins offer a default for
+    /// the same `PluginId`, the first one encountered during `finish()` wins.
+    #[must_use]
+    pub fn add<P: Plugin + Default>(mut self) -> Self {
+        self.plugins.push(BoxedPlugin {
+            id: PluginId::of::<P>(),
+            plugin: Box::new(P::default()),
+        });
+        self
+    }
+
+    /// Returns the number of default plugins in this set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.plugins.len()
+    }
+
+    /// Returns true if no default plugins have been declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.plugins.is_empty()
+    }
+}
+
+impl std::fmt::Debug for DefaultDependencies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `BoxedPlugin` holds a `dyn DynPlugin` with no `Debug` bound; list
+        // the captured `PluginId`s instead.
+        f.debug_struct("DefaultDependencies")
+            .field(
+                "plugins",
+                &self.plugins.iter().map(|p| &p.id).collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 

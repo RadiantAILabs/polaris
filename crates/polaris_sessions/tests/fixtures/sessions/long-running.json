@@ -1,0 +1,34 @@
+{
+  "agent_type": "ReActAgent",
+  "turn_number": 42,
+  "created_at": "2026-04-02T08:15:00Z",
+  "resources": [
+    {
+      "plugin_id": "examples::react",
+      "storage_key": "ContextManager",
+      "version": "1.0.0",
+      "data": {
+        "messages": [
+          { "role": "user", "content": [ { "type": "text", "text": "Hi, I want help drafting a quarterly planning doc." } ] },
+          { "role": "assistant", "id": "msg_a01", "content": [ { "type": "text", "text": "Sure — what team and what quarter?" } ] },
+          { "role": "user", "content": [ { "type": "text", "text": "Platform team, Q3 2026." } ] },
+          { "role": "assistant", "id": "msg_a02", "content": [ { "type": "text", "text": "Got it. What are the top 2 themes you want to highlight?" } ] },
+          { "role": "user", "content": [ { "type": "text", "text": "Latency wins and a migration off the legacy job runner." } ] },
+          { "role": "assistant", "id": "msg_a03", "content": [ { "type": "text", "text": "Outline drafted. Want me to expand each section now?" } ] }
+        ]
+      }
+    },
+    {
+      "plugin_id": "examples::react",
+      "storage_key": "AgentNotes",
+      "version": "1.0.0",
+      "data": {
+        "notes": [
+          "User is on the Platform team",
+          "Drafting Q3 2026 planning doc",
+          "Themes: latency wins, legacy job runner migration"
+        ]
+      }
+    }
+  ]
+}

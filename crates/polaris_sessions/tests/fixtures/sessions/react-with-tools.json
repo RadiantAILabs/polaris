@@ -1,0 +1,87 @@
+{
+  "agent_type": "ReActAgent",
+  "turn_number": 3,
+  "created_at": "2026-05-15T11:08:42Z",
+  "resources": [
+    {
+      "plugin_id": "examples::react",
+      "storage_key": "ContextManager",
+      "version": "1.0.0",
+      "data": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              { "type": "text", "text": "What's the weather in San Francisco, and is it warmer than London?" }
+            ]
+          },
+          {
+            "role": "assistant",
+            "id": "msg_01",
+            "content": [
+              {
+                "type": "reasoning",
+                "id": null,
+                "reasoning": ["I should fetch the temperature for both cities, then compare."],
+                "signature": null
+              },
+              {
+                "type": "tool_call",
+                "id": "call_sf",
+                "call_id": null,
+                "function": { "name": "get_weather", "arguments": { "city": "San Francisco" } },
+                "signature": null,
+                "additional_params": null
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "id": "call_sf",
+                "call_id": null,
+                "content": { "Text": "62°F, partly cloudy" },
+                "status": "success"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "id": "msg_02",
+            "content": [
+              {
+                "type": "tool_call",
+                "id": "call_ldn",
+                "call_id": null,
+                "function": { "name": "get_weather", "arguments": { "city": "London" } },
+                "signature": null,
+                "additional_params": null
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "id": "call_ldn",
+                "call_id": null,
+                "content": { "Text": "54°F, light rain" },
+                "status": "success"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "id": "msg_03",
+            "content": [
+              { "type": "text", "text": "San Francisco is 62°F and partly cloudy, London is 54°F with light rain — SF is about 8 degrees warmer." }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

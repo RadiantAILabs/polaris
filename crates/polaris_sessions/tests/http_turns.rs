@@ -3,7 +3,7 @@
 //! Verifies IO bridging via [`HttpIOProvider`]: user messages reach the
 //! agent, agent responses are collected, and concurrency is handled.
 
-#![cfg(feature = "http")]
+#![cfg(feature = "sessions-http")]
 
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin};

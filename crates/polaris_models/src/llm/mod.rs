@@ -21,6 +21,7 @@ pub use error::{ExtractionError, GenerationError};
 pub use model::Llm;
 pub use provider::DynLlmProvider;
 pub use provider::LlmProvider;
+pub use provider::ModelPricing;
 pub use types::{
     AssistantBlock, AudioBlock, AudioMediaType, ContentBlockDelta, ContentBlockStartData,
     DocumentBlock, DocumentMediaType, DocumentSource, ImageBlock, ImageMediaType, LlmRequest,

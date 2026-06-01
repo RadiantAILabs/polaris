@@ -7,11 +7,51 @@ use polaris_system::server::Server;
 
 /// Plugin providing support for Anthropic models.
 ///
+/// Registers an [`AnthropicProvider`] with the [`ModelRegistry`] during
+/// `build()`. After [`ModelsPlugin::ready`] freezes the registry, models
+/// served by this provider become resolvable through
+/// [`ModelRegistry::resolve`](polaris_models::ModelRegistry::resolve) under
+/// the `anthropic/<model>` identifier.
+///
+/// # Resources Provided
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_   | —     | This plugin only registers a provider with the [`ModelRegistry`] owned by [`ModelsPlugin`]. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | This plugin contributes a provider to [`ModelRegistry`] rather than installing its own API. |
+///
+/// # Dependencies
+///
+/// - [`ModelsPlugin`] — owns the [`ModelRegistry`] that this plugin
+///   registers itself with. Must be added before `AnthropicPlugin`.
+///
+/// # Lifecycle
+///
+/// - The plugin is gated behind the `anthropic` feature.
+/// - **`build()`** — constructs an `AnthropicProvider` and registers it
+///   with the [`ModelRegistry`], which is a mutable resource during the
+///   `build()` phase. Panics if [`ModelsPlugin`] was not added first.
+/// - No `ready()` or `cleanup()` behavior; registers no tick schedules.
+///
+/// # Extends
+///
+/// - [`ModelRegistry`] (from [`ModelsPlugin`]) — registers an
+///   `AnthropicProvider` so that `anthropic/<model>` identifiers become
+///   resolvable once `ModelsPlugin` freezes the registry in `ready()`.
+///
+/// # Example
+///
 /// ```no_run
 /// # use polaris_model_providers::anthropic::AnthropicPlugin;
+/// # use polaris_models::ModelsPlugin;
 /// # use polaris_system::server::Server;
-/// # let mut server = Server::new();
-///
+/// let mut server = Server::new();
+/// server.add_plugins(ModelsPlugin);
 /// server.add_plugins(AnthropicPlugin::from_env("ANTHROPIC_API_KEY"));
 /// ```
 pub struct AnthropicPlugin {

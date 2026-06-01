@@ -131,6 +131,13 @@ async fn tools_plugin_lifecycle() {
     use polaris_system::server::Server;
 
     let mut server = Server::new();
+    // Under `--all-features`, `ToolsPlugin::build` reaches for the
+    // HttpRouter API from `AppPlugin`. Add it first.
+    #[cfg(feature = "dashboard")]
+    Plugin::build(
+        &polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")),
+        &mut server,
+    );
     let plugin = ToolsPlugin;
 
     // build: inserts mutable resource

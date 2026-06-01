@@ -16,8 +16,8 @@ use core::task::{Context, Poll};
 use futures_core::Stream;
 use polaris_models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, ImageMediaType,
-    LlmProvider, LlmRequest, LlmResponse, LlmStream, Message, ReasoningBlock, StopReason,
-    StreamEvent, TextBlock, ToolCall, ToolChoice, ToolFunction,
+    LlmProvider, LlmRequest, LlmResponse, LlmStream, Message, ModelPricing, ReasoningBlock,
+    StopReason, StreamEvent, TextBlock, ToolCall, ToolChoice, ToolFunction,
     ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 use std::collections::{HashMap, VecDeque};
@@ -79,6 +79,26 @@ impl LlmProvider for OpenAiProvider {
             .map_err(convert_error)?;
 
         Ok(Box::pin(OpenAiStreamAdapter::new(raw_stream)))
+    }
+
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        // OpenAI public list prices, USD per million base input / output
+        // tokens. Cached-input rates are intentionally omitted — `Usage`
+        // carries no cache breakdown. `starts_with` tolerates dated id
+        // suffixes. List prices drift; new model ids must be added here.
+        let (input_per_million_usd, output_per_million_usd) = if model.starts_with("gpt-5.5") {
+            (5.0, 30.0)
+        } else if model.starts_with("gpt-5.4-mini") {
+            (0.75, 4.5)
+        } else if model.starts_with("gpt-5.4") {
+            (2.5, 15.0)
+        } else {
+            return None;
+        };
+        Some(ModelPricing::new(
+            input_per_million_usd,
+            output_per_million_usd,
+        ))
     }
 }
 
@@ -868,6 +888,25 @@ mod tests {
         ResponseRefusalDeltaEvent, ResponseRefusalDoneEvent, ResponseTextDeltaEvent,
         ResponseTextDoneEvent, ResponseUsage, Status,
     };
+
+    #[test]
+    fn pricing_maps_gpt5_families_to_list_prices() {
+        let provider = OpenAiProvider::new("test-key");
+        assert_eq!(
+            provider.pricing("gpt-5.5"),
+            Some(ModelPricing::new(5.0, 30.0))
+        );
+        // The mini variant must match before the bare gpt-5.4 prefix.
+        assert_eq!(
+            provider.pricing("gpt-5.4-mini"),
+            Some(ModelPricing::new(0.75, 4.5))
+        );
+        assert_eq!(
+            provider.pricing("gpt-5.4-2026-04-01"),
+            Some(ModelPricing::new(2.5, 15.0))
+        );
+        assert_eq!(provider.pricing("gpt-3.5-turbo"), None);
+    }
 
     /// Builds a minimal [`Response`] for use in terminal events.
     fn stub_response(status: Status, usage: Option<ResponseUsage>) -> Response {

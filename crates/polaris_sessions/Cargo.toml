@@ -21,11 +21,10 @@ workspace = true
 [features]
 default = ["file-store"]
 file-store = ["tokio/fs"]
-http = ["dep:polaris_app", "dep:axum", "dep:tokio-stream"]
+sessions-http = ["dep:polaris_app", "dep:axum", "dep:tokio-stream"]
 # Generates TypeScript bindings for `SessionMetadata` and friends.
 # Off by default so release builds do not pull `ts-rs` into the dep graph.
 typegen = ["dep:ts-rs"]
-dashboard = ["http", "dep:polaris_dashboard"]
 
 [dependencies]
 polaris_system = { path = "../polaris_system", version = "0.4.0" }
@@ -42,11 +41,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
 
-# Optional HTTP dependencies (enabled by `http` feature)
+# Optional HTTP dependencies (enabled by `sessions-http` feature)
 polaris_app = { path = "../polaris_app", version = "0.4.0", optional = true, default-features = false }
 axum = { version = "0.8", features = ["tokio"], optional = true }
 tokio-stream = { version = "0.1", optional = true }
-polaris_dashboard = { path = "../polaris_dashboard", version = "0.4.0", optional = true }
 
 # Optional typegen dependency (enabled by `typegen` feature)
 ts-rs = { workspace = true, optional = true }
@@ -57,3 +55,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tokio-test = "0.4"
 reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1"
+# Used by tests/tracing_dashboard_integration.rs. The regular
+# `polaris_core_plugins` dep does not enable `dashboard`, so we re-declare
+# it here with that feature so the `SpanBuffer` API and dashboard HTTP
+# routes (mounted by `TracingPlugin` under the feature) are visible to
+# test code. `polaris_models` and `polaris_tools` are needed because
+# `TracingPlugin` requires their plugins as dependencies for LLM and
+# tool instrumentation decoration.
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4.0", features = ["dashboard"] }
+polaris_models = { path = "../polaris_models", version = "0.4.0" }
+polaris_tools = { path = "../polaris_tools", version = "0.4.0" }

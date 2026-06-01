@@ -24,10 +24,11 @@ members = [
     # All of Polaris internal crates
     "crates/*",
     "examples",
+    "tools/feature-parity",
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris"
@@ -112,9 +113,6 @@ default = ["file-store"]
 anthropic = ["polaris_internal/anthropic"]
 bedrock = ["polaris_internal/bedrock"]
 openai = ["polaris_internal/openai"]
-graph-tracing = ["polaris_internal/graph-tracing"]
-models-tracing = ["polaris_internal/models-tracing"]
-tools-tracing = ["polaris_internal/tools-tracing"]
 tiktoken = ["polaris_internal/tiktoken"]
 # Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s
 # HTTP request spans to OTel HTTP semantic-convention field names
@@ -123,8 +121,6 @@ tiktoken = ["polaris_internal/tiktoken"]
 # fresh trace.
 otel = ["polaris_internal/otel"]
 sessions-http = ["polaris_internal/sessions-http"]
-# WebSocket router (`app::WsRouter`) and the dashboard event-stream surface.
-ws = ["polaris_internal/ws"]
 # `MockClock` and `MockIOProvider` re-exports for downstream test code.
 test-utils = ["polaris_internal/test-utils"]
 # Filesystem-backed `SessionStore` (brings in `tokio/fs`). On by default; set
@@ -135,18 +131,6 @@ file-store = ["polaris_internal/file-store"]
 # Enabling this and running `cargo test --features typegen` writes `.ts`
 # files into `bindings/ts/src/` (the `@polaris/types` npm package).
 typegen = ["polaris_internal/typegen"]
-# Cross-plugin dashboard contribution registry. Pulls `polaris_dashboard`
-# (and its `axum` runtime dep) into the dep graph; opt in only when you
-# intend to mount `DashboardPlugin` or any `*-dashboard` contribution.
-dashboard-registry = ["polaris_internal/dashboard-registry"]
-sessions-dashboard = ["polaris_internal/sessions-dashboard"]
-# Adds `Serialize` / `Deserialize` to the graph correlation types
-# (`graph::hooks::events::RunId`, `RunLabels`) so events can flow across
-# process boundaries. Pulls `serde` into the dep graph.
-serde = ["polaris_internal/serde"]
-tools-dashboard = ["polaris_internal/tools-dashboard"]
-models-dashboard = ["polaris_internal/models-dashboard"]
-tracing-dashboard = ["polaris_internal/tracing-dashboard"]
 dashboard = ["polaris_internal/dashboard"]
 
 [dependencies]

@@ -54,4 +54,4 @@ CI runs `git diff --exit-code bindings/`, so any uncommitted regeneration drift 
 
 `src/index.ts` is hand-maintained. After adding a `#[derive(TS)]` to a Rust type, regenerate (above), then add the corresponding `export type` line to `src/index.ts`. Keep entries alphabetized.
 
-See the workspace `typegen` reference for the full workflow.
+See [`docs/reference/typegen.md`](../../docs/reference/typegen.md) for the full workflow.
