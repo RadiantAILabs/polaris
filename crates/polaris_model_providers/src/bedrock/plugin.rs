@@ -3,9 +3,8 @@
 use super::provider::BedrockProvider;
 use aws_sdk_bedrockruntime::Client;
 use polaris_models::ModelRegistry;
-use polaris_models::ModelsPlugin;
-use polaris_system::plugin::{Plugin, PluginId, Version};
-use polaris_system::server::Server;
+use polaris_system::plugin;
+use polaris_system::plugin::{Extends, Plugin};
 use std::sync::Arc;
 
 /// Plugin providing support for AWS Bedrock models.
@@ -100,15 +99,14 @@ impl Default for BedrockPlugin {
     }
 }
 
+// The `Extends<ModelRegistry>` parameter is both the declaration (the macro derives
+// `access().extends::<ModelRegistry>(...)` from it) and the access: the resolver orders
+// this plugin after whichever plugin provides `ModelRegistry`, verifies the contract
+// version, and guarantees the registry is present — so the parameter is an infallible
+// `&mut ModelRegistry` and the old "add ModelsPlugin first" panic is gone.
+#[plugin(id = "polaris::provider::bedrock", version = "0.0.1")]
 impl Plugin for BedrockPlugin {
-    const ID: &'static str = "polaris::provider::bedrock";
-    const VERSION: Version = Version::new(0, 0, 1);
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<ModelsPlugin>()]
-    }
-
-    fn build(&self, server: &mut Server) {
+    fn build(&self, mut registry: Extends<ModelRegistry>) {
         let sdk_config = match &self.sdk_config {
             Some(config) => config.clone(),
             None => std::thread::scope(|s| {
@@ -123,12 +121,6 @@ impl Plugin for BedrockPlugin {
         };
 
         let client = Client::new(&sdk_config);
-        let provider = BedrockProvider::new(Arc::new(client));
-
-        let Some(mut registry) = server.get_resource_mut::<ModelRegistry>() else {
-            panic!("ModelRegistry not found. Make sure to add ModelsPlugin before BedrockPlugin.");
-        };
-
-        registry.register_llm_provider(provider);
+        registry.register_llm_provider(BedrockProvider::new(Arc::new(client)));
     }
 }

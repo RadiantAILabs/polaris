@@ -14,7 +14,7 @@ use crate::tool::Tool;
 use crate::toolset::Toolset;
 use indexmap::IndexMap;
 use polaris_models::llm::ToolDefinition;
-use polaris_system::plugin::{Plugin, Version};
+use polaris_system::plugin::{Contract, Plugin, PluginAccess, Version};
 use polaris_system::resource::GlobalResource;
 use polaris_system::server::Server;
 use std::future::Future;
@@ -69,6 +69,13 @@ impl std::fmt::Debug for ToolRegistry {
 }
 
 impl GlobalResource for ToolRegistry {}
+
+/// The contract version at which [`ToolRegistry`] is exposed as a capability. Extender
+/// plugins (e.g. `ShellPlugin`) declare a requirement against this version; bump it when
+/// the registry's public surface changes incompatibly.
+impl Contract for ToolRegistry {
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+}
 
 impl ToolRegistry {
     /// Creates an empty registry.
@@ -333,6 +340,13 @@ pub struct ToolsPlugin;
 impl Plugin for ToolsPlugin {
     const ID: &'static str = "polaris::tools";
     const VERSION: Version = Version::new(0, 1, 0);
+
+    fn access(&self) -> PluginAccess {
+        // Declares the `ToolRegistry` capability so extender plugins (e.g. `ShellPlugin`)
+        // can depend on the registry type rather than naming `ToolsPlugin`. The registry
+        // is inserted imperatively in `build()` below.
+        PluginAccess::new().provides::<ToolRegistry>(ToolRegistry::CONTRACT_VERSION)
+    }
 
     fn build(&self, server: &mut Server) {
         server.insert_resource(ToolRegistry::new());

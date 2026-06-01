@@ -8,7 +8,7 @@ use crate::config::AppConfig;
 use crate::middleware;
 use crate::router::HttpRouter;
 use polaris_system::api::API;
-use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_system::plugin::{Contract, Plugin, PluginAccess, PluginId, Version};
 use polaris_system::server::Server;
 use tokio::sync::watch;
 
@@ -204,6 +204,13 @@ impl AppPlugin {
 impl Plugin for AppPlugin {
     const ID: &'static str = "polaris::app";
     const VERSION: Version = Version::new(0, 0, 1);
+
+    fn access(&self) -> PluginAccess {
+        // Declares the `HttpRouter` capability so route-mounting plugins (e.g. the session
+        // `HttpPlugin`) can depend on the router type rather than naming `AppPlugin`. The
+        // API is inserted imperatively in `build()` below.
+        PluginAccess::new().provides::<HttpRouter>(HttpRouter::CONTRACT_VERSION)
+    }
 
     fn build(&self, server: &mut Server) {
         server.insert_global(self.config.clone());

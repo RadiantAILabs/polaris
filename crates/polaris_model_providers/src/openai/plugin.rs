@@ -1,9 +1,9 @@
 //! `OpenAI` provider plugin.
 
 use super::provider::OpenAiProvider;
-use polaris_models::{ModelRegistry, ModelsPlugin};
-use polaris_system::plugin::{Plugin, PluginId, Version};
-use polaris_system::server::Server;
+use polaris_models::ModelRegistry;
+use polaris_system::plugin;
+use polaris_system::plugin::{Extends, Plugin};
 
 /// Plugin providing support for `OpenAI` models via the Responses API.
 ///
@@ -73,21 +73,14 @@ impl OpenAiPlugin {
     }
 }
 
+// The `Extends<ModelRegistry>` parameter is both the declaration (the macro derives
+// `access().extends::<ModelRegistry>(...)` from it) and the access: the resolver orders
+// this plugin after whichever plugin provides `ModelRegistry`, verifies the contract
+// version, and guarantees the registry is present — so the parameter is an infallible
+// `&mut ModelRegistry` and the old "add ModelsPlugin first" panic is gone.
+#[plugin(id = "polaris::provider::openai", version = "0.0.1")]
 impl Plugin for OpenAiPlugin {
-    const ID: &'static str = "polaris::provider::openai";
-    const VERSION: Version = Version::new(0, 0, 1);
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<ModelsPlugin>()]
-    }
-
-    fn build(&self, server: &mut Server) {
-        let provider = OpenAiProvider::new(self.api_key.clone());
-
-        let Some(mut registry) = server.get_resource_mut::<ModelRegistry>() else {
-            panic!("ModelRegistry not found. Make sure to add ModelsPlugin before OpenAiPlugin.");
-        };
-
-        registry.register_llm_provider(provider);
+    fn build(&self, mut registry: Extends<ModelRegistry>) {
+        registry.register_llm_provider(OpenAiProvider::new(self.api_key.clone()));
     }
 }

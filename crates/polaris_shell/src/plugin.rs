@@ -2,9 +2,9 @@
 
 use crate::executor::{ShellConfig, ShellExecutor};
 use crate::tools::ShellTools;
-use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_system::plugin::{Contract, Plugin, PluginAccess, Version, VersionReq};
 use polaris_system::server::Server;
-use polaris_tools::{ToolRegistry, ToolsPlugin};
+use polaris_tools::ToolRegistry;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -100,8 +100,16 @@ impl Plugin for ShellPlugin {
     const ID: &'static str = "polaris::shell";
     const VERSION: Version = Version::new(0, 0, 1);
 
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<ToolsPlugin>()]
+    fn access(&self) -> PluginAccess {
+        // Declares that this plugin extends the `ToolRegistry` capability rather than
+        // naming `ToolsPlugin`: the resolver orders this plugin after whichever plugin
+        // provides `ToolRegistry`, verifies the contract version, and guarantees it is
+        // present — so the `get_resource_mut` below cannot actually fail in a resolved
+        // server. `build` keeps a `&mut Server` parameter (rather than an `Extends`
+        // build-param) because it also inserts the `ShellExecutor` global, which needs
+        // mutable server access alongside the registry.
+        PluginAccess::new()
+            .extends::<ToolRegistry>(VersionReq::caret(ToolRegistry::CONTRACT_VERSION))
     }
 
     fn build(&self, server: &mut Server) {
@@ -109,10 +117,11 @@ impl Plugin for ShellPlugin {
 
         server.insert_global(executor.clone());
 
-        // Register tools with the ToolRegistry
+        // Register tools with the ToolRegistry. The capability resolver guarantees a
+        // provider built first, so this lookup is infallible in a resolved server.
         let mut registry = server
             .get_resource_mut::<ToolRegistry>()
-            .expect("ToolsPlugin must be added before ShellPlugin");
+            .expect("ToolRegistry capability must be provided before ShellPlugin");
         registry.register_toolset(ShellTools::new(executor));
     }
 

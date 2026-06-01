@@ -30,13 +30,13 @@
 //! ```
 
 use crate::TracingLayers;
-use crate::TracingPlugin;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::Mutex;
-use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_system::plugin;
+use polaris_system::plugin::{Extends, Plugin};
 use polaris_system::server::Server;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::Layer as _;
@@ -185,11 +185,14 @@ impl OpenTelemetryPlugin {
     }
 }
 
+// The `Extends<TracingLayers>` parameter is both the declaration (the macro derives
+// `access().extends::<TracingLayers>(...)` from it) and the access: the resolver orders
+// this plugin after whichever plugin provides `TracingLayers` (today `TracingPlugin`),
+// verifies the contract version, and guarantees the registry is present — so the parameter
+// is an infallible `&mut TracingLayers` and the old "add TracingPlugin first" panic is gone.
+#[plugin(id = "polaris::otel", version = "0.0.1")]
 impl Plugin for OpenTelemetryPlugin {
-    const ID: &'static str = "polaris::otel";
-    const VERSION: Version = Version::new(0, 0, 1);
-
-    fn build(&self, server: &mut Server) {
+    fn build(&self, mut layers: Extends<TracingLayers>) {
         // Install the W3C trace-context propagator so HTTP boundary extractors
         // (e.g. `polaris_app::middleware`) can parent spans on upstream traces.
         opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
@@ -246,12 +249,8 @@ impl Plugin for OpenTelemetryPlugin {
             None => EnvFilter::new("info"),
         };
 
-        // Push the `OTel` layer (with its own filter) into the shared API
-        let mut api = server
-            .get_resource_mut::<TracingLayers>()
-            .expect("TracingPlugin must be added before OpenTelemetryPlugin");
-
-        api.push(
+        // Push the `OTel` layer (with its own filter) into the shared registry.
+        layers.push(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
                 .with_filter(env_filter),
@@ -274,16 +273,12 @@ impl Plugin for OpenTelemetryPlugin {
             tracing::warn!(error = %otel_err, "OTel provider shutdown error");
         }
     }
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<TracingPlugin>()]
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerInfoPlugin;
+    use crate::{ServerInfoPlugin, TracingPlugin};
 
     #[test]
     fn build_with_tracing_plugin() {

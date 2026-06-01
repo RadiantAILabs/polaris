@@ -35,6 +35,7 @@
 use crate::auth::AuthProvider;
 use parking_lot::{Mutex, RwLock};
 use polaris_system::api::API;
+use polaris_system::plugin::{Contract, Version};
 use polaris_system::server::Server;
 use std::sync::Arc;
 
@@ -70,6 +71,13 @@ impl std::fmt::Debug for HttpRouter {
 }
 
 impl API for HttpRouter {}
+
+/// The contract version at which [`HttpRouter`] is exposed as a capability. Plugins that
+/// mount routes (e.g. `HttpPlugin`) declare a requirement against this version; bump it
+/// when the route-registration surface changes incompatibly.
+impl Contract for HttpRouter {
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+}
 
 impl HttpRouter {
     /// Creates a new empty router registry.

@@ -28,7 +28,7 @@ use polaris_graph::hooks::HooksAPI;
 use polaris_graph::{ExecutionResult, Graph, GraphExecutor, RunLabels};
 use polaris_system::api::API;
 use polaris_system::param::SystemContext;
-use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_system::plugin::{Contract, Plugin, PluginAccess, PluginId, Version};
 use polaris_system::resource::Output;
 use polaris_system::server::{ContextFactory, Server};
 #[cfg(feature = "sessions-http")]
@@ -301,6 +301,13 @@ impl std::fmt::Debug for SessionsAPI {
 }
 
 impl API for SessionsAPI {}
+
+/// The contract version at which [`SessionsAPI`] is exposed as a capability. Plugins that
+/// consume it (e.g. the session `HttpPlugin`) declare a requirement against this version;
+/// bump it when the API's public surface changes incompatibly.
+impl Contract for SessionsAPI {
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+}
 
 impl SessionsAPI {
     /// Creates a new sessions API with the given store backend.
@@ -2010,6 +2017,14 @@ impl SessionsPlugin {
 impl Plugin for SessionsPlugin {
     const ID: &'static str = "polaris::sessions";
     const VERSION: Version = Version::new(0, 0, 1);
+
+    fn access(&self) -> PluginAccess {
+        // Declares the `SessionsAPI` capability so consumers (e.g. the session
+        // `HttpPlugin`) can depend on the API type rather than naming `SessionsPlugin`.
+        // The API is inserted imperatively in `build()` below. The `PersistenceAPI` this
+        // plugin reads in `ready()` remains expressed via `dependencies()`.
+        PluginAccess::new().provides::<SessionsAPI>(SessionsAPI::CONTRACT_VERSION)
+    }
 
     fn build(&self, server: &mut Server) {
         let api = SessionsAPI::new(Arc::clone(&self.store));

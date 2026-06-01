@@ -52,7 +52,7 @@ mod handlers;
 mod io;
 pub mod models;
 
-use crate::api::{SessionsAPI, SessionsPlugin};
+use crate::api::SessionsAPI;
 use axum::Router;
 use axum::routing::{get, post};
 pub use io::HttpIOProvider;
@@ -61,8 +61,8 @@ pub use models::{
     ListSessionsResponse, ListStoredSessionsResponse, ProcessTurnRequest, ProcessTurnResponse,
     RollbackRequest, StreamTurnDone, TurnExecutionMetadata,
 };
-use polaris_app::{AppPlugin, HttpRouter};
-use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_app::HttpRouter;
+use polaris_system::plugin::{Contract, Plugin, PluginAccess, Version, VersionReq};
 use polaris_system::server::Server;
 
 /// Plugin that exposes session management over HTTP.
@@ -83,18 +83,22 @@ use polaris_system::server::Server;
 /// # APIs Provided
 ///
 /// None. State for the routes is the [`SessionsAPI`] handle obtained
-/// from [`SessionsPlugin`].
+/// from [`SessionsPlugin`](crate::SessionsPlugin).
 ///
 /// # Dependencies
 ///
-/// - [`AppPlugin`] — provides the [`HttpRouter`] the routes are mounted on.
-/// - [`SessionsPlugin`] — provides the [`SessionsAPI`] used as handler state.
+/// Expressed as capabilities (see [`Plugin::access`]):
+///
+/// - extends [`HttpRouter`] (from [`AppPlugin`](polaris_app::AppPlugin)) —
+///   the router the routes are mounted on.
+/// - requires [`SessionsAPI`] (from [`SessionsPlugin`](crate::SessionsPlugin))
+///   — used as handler state.
 ///
 /// See the [module-level documentation](self) for the endpoint table.
 ///
 /// # Extends
 ///
-/// - [`HttpRouter`] (from [`AppPlugin`]) — registers the session REST
+/// - [`HttpRouter`] (from [`AppPlugin`](polaris_app::AppPlugin)) — registers the session REST
 ///   endpoints listed in the [module-level documentation](self) via an
 ///   `add_routes_with` closure, so the [`SessionsAPI`] handler state is
 ///   resolved during the app's `ready()` phase. This plugin provides no
@@ -136,14 +140,26 @@ impl Plugin for HttpPlugin {
     const ID: &'static str = "polaris::sessions::http";
     const VERSION: Version = Version::new(0, 0, 1);
 
+    fn access(&self) -> PluginAccess {
+        // Declares the capability relationships rather than naming `AppPlugin` /
+        // `SessionsPlugin`: extends the `HttpRouter` it mounts routes on, and requires the
+        // `SessionsAPI` used as handler state. Both are APIs (not resources), so they are
+        // declared here and accessed imperatively in `build()` via `server.api::<_>()`
+        // rather than through typed `Extends`/`Requires` build parameters. The resolver
+        // orders both providers first and guarantees their presence.
+        PluginAccess::new()
+            .extends::<HttpRouter>(VersionReq::caret(HttpRouter::CONTRACT_VERSION))
+            .requires::<SessionsAPI>(VersionReq::caret(SessionsAPI::CONTRACT_VERSION))
+    }
+
     fn build(&self, server: &mut Server) {
         server
             .api::<HttpRouter>()
-            .expect("AppPlugin must be added before HttpPlugin")
+            .expect("HttpRouter capability must be provided before HttpPlugin")
             .add_routes_with(|server| {
                 let sessions = server
                     .api::<SessionsAPI>()
-                    .expect("SessionsPlugin must be added before HttpPlugin")
+                    .expect("SessionsAPI capability must be provided before HttpPlugin")
                     .clone();
                 Router::new()
                     .route(
@@ -177,12 +193,5 @@ impl Plugin for HttpPlugin {
                     .route("/v1/sessions/{id}/resume", post(handlers::resume_session))
                     .with_state(sessions)
             });
-    }
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![
-            PluginId::of::<AppPlugin>(),
-            PluginId::of::<SessionsPlugin>(),
-        ]
     }
 }

@@ -49,7 +49,9 @@ pub use usage_pricing::{ModelPricing, UsagePricing};
 
 use crate::ServerInfoPlugin;
 use crate::tracing_plugin::instrument::llm::TracingLlmProvider;
-use polaris_system::plugin::{DefaultDependencies, Plugin, PluginId, Version};
+use polaris_system::plugin::{
+    Contract, DefaultDependencies, Plugin, PluginAccess, PluginId, Version,
+};
 use polaris_system::resource::GlobalResource;
 use polaris_system::server::Server;
 use tracing::Level;
@@ -129,6 +131,13 @@ impl TracingLayers {
     fn install(self) -> Result<(), tracing_subscriber::util::TryInitError> {
         tracing_subscriber::registry().with(self.layers).try_init()
     }
+}
+
+/// The contract version at which [`TracingLayers`] is exposed as a capability. Layer
+/// contributors (e.g. `OpenTelemetryPlugin`) declare a requirement against this version;
+/// bump it when the layer-registration surface changes incompatibly.
+impl Contract for TracingLayers {
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -475,6 +484,15 @@ impl TracingPlugin {
 impl Plugin for TracingPlugin {
     const ID: &'static str = "polaris::tracing";
     const VERSION: Version = Version::new(0, 1, 0);
+
+    fn access(&self) -> PluginAccess {
+        // Declares the `TracingLayers` capability so layer contributors (e.g.
+        // `OpenTelemetryPlugin`) can depend on the layer-registry type rather than naming
+        // `TracingPlugin`. The registry is inserted imperatively in `build()`. The other
+        // relationships this plugin has (decorating the model/tool registries in `ready()`,
+        // the dashboard route under `HttpRouter`) remain expressed via `dependencies()`.
+        PluginAccess::new().provides::<TracingLayers>(TracingLayers::CONTRACT_VERSION)
+    }
 
     fn build(&self, server: &mut Server) {
         server.insert_global(TracingConfig {
