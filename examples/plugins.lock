@@ -1,0 +1,7 @@
+# Resolved plugin capability graph. Regenerate with `POLARIS_BLESS_PLUGINS_LOCK=1 cargo test -p examples --test plugins_lock`.
+polaris::models @ 0.0.1
+  provides polaris_models::registry::ModelRegistry@0.1.0
+polaris::shell @ 0.0.1
+  extends  polaris_tools::registry::ToolRegistry (>=0.1.0, <0.2.0) ← polaris::tools (0.1.0)
+polaris::tools @ 0.1.0
+  provides polaris_tools::registry::ToolRegistry@0.1.0
