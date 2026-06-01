@@ -1,8 +1,8 @@
 //! Anthropic provider plugin.
 
 use super::provider::AnthropicProvider;
-use polaris_models::{ModelRegistry, ModelsPlugin};
-use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_models::ModelRegistry;
+use polaris_system::plugin::{Plugin, PluginAccess, Version, VersionReq};
 use polaris_system::server::Server;
 
 /// Plugin providing support for Anthropic models.
@@ -77,8 +77,12 @@ impl Plugin for AnthropicPlugin {
     const ID: &'static str = "polaris::provider::anthropic";
     const VERSION: Version = Version::new(0, 0, 1);
 
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<ModelsPlugin>()]
+    /// Declares that this plugin extends the [`ModelRegistry`] capability. The resolver
+    /// orders this plugin after whichever plugin provides `ModelRegistry` (no longer
+    /// naming `ModelsPlugin`), and verifies the provider's contract version is compatible.
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new()
+            .extends::<ModelRegistry>(VersionReq::caret(ModelRegistry::CONTRACT_VERSION))
     }
 
     fn build(&self, server: &mut Server) {

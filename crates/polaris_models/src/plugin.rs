@@ -1,7 +1,7 @@
 //! Provides the [`ModelRegistry`] global resource.
 
 use crate::registry::ModelRegistry;
-use polaris_system::plugin::{Plugin, Version};
+use polaris_system::plugin::{Plugin, PluginAccess, Version};
 use polaris_system::server::Server;
 
 /// Plugin that provides the [`ModelRegistry`] for provider-agnostic model access.
@@ -94,6 +94,12 @@ impl Plugin for ModelsPlugin {
 
         #[cfg(feature = "dashboard")]
         crate::dashboard::freeze(server);
+    }
+
+    /// Declares that this plugin provides the [`ModelRegistry`] capability, so provider
+    /// plugins can declare they extend it instead of naming `ModelsPlugin` directly.
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new().provides::<ModelRegistry>(ModelRegistry::CONTRACT_VERSION)
     }
 
     #[cfg(feature = "dashboard")]

@@ -61,7 +61,10 @@
 
 use crate::api::API;
 use crate::param::SystemContext;
-use crate::plugin::{DynPlugin, Plugin, PluginId, Plugins, Schedule, ScheduleId};
+use crate::plugin::{
+    Capability, CapabilityReq, DynPlugin, Plugin, PluginId, PluginManifest, PluginManifestEntry,
+    Plugins, ResolvedReq, Schedule, ScheduleId, Version,
+};
 use crate::resource::{
     GlobalResource, LocalResource, Resource, ResourceRef, ResourceRefMut, Resources,
 };
@@ -157,6 +160,11 @@ pub struct Server {
     /// during the `ready()` phase can resolve globals without bumping the
     /// `Arc` reference count on [`global`](Self::global) prematurely.
     deferred_globals: Arc<OnceLock<Arc<Resources>>>,
+
+    /// Resolved capability manifest, built during [`finish()`](Self::finish).
+    ///
+    /// Exposed via [`plugin_manifest()`](Self::plugin_manifest) for introspection.
+    plugin_manifest: PluginManifest,
 }
 
 /// Internal entry for a registered plugin.
@@ -202,6 +210,7 @@ impl Server {
             schedule_registry: HashMap::new(),
             build_state: BuildState::NotStarted,
             deferred_globals: Arc::new(OnceLock::new()),
+            plugin_manifest: PluginManifest::default(),
         }
     }
 
@@ -538,6 +547,18 @@ impl Server {
         self.build_state == BuildState::Built
     }
 
+    /// Returns the resolved capability manifest.
+    ///
+    /// Populated during [`finish()`](Self::finish); empty before then. The manifest lists
+    /// every plugin in resolution order with the capabilities it provides, extends, and
+    /// requires (each resolved to its provider) — the introspection surface for answering
+    /// "what does this set of plugins provide, and what depends on what". Render it with
+    /// [`PluginManifest::to_dot`](crate::plugin::PluginManifest::to_dot) or `Display`.
+    #[must_use]
+    pub fn plugin_manifest(&self) -> &PluginManifest {
+        &self.plugin_manifest
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // API Access
     // ─────────────────────────────────────────────────────────────────────────
@@ -732,8 +753,13 @@ impl Server {
         // Phase 0: Auto-register missing dependencies that declare a default.
         self.auto_register_default_dependencies();
 
-        // Phase 1: Sort plugins by dependencies
-        let sorted_plugins = self.sort_plugins_by_dependencies();
+        // Phase 0.5: Resolve capability declarations (provides/extends/requires).
+        // Validates providers/versions and yields extra ordering edges that fold into
+        // the topological sort below. Panics with an aggregated message on any conflict.
+        let capability_edges = self.resolve_capabilities();
+
+        // Phase 1: Sort plugins by dependencies (legacy plugin-id edges + capability edges)
+        let sorted_plugins = self.sort_plugins_by_dependencies(&capability_edges);
 
         // Phase 2: Build all plugins in sorted order
         self.build_state = BuildState::Building;
@@ -741,6 +767,9 @@ impl Server {
             entry.plugin.build(self);
             self.built_plugins.push(entry);
         }
+
+        // Phase 2.5: Capture the resolved capability manifest for introspection.
+        self.plugin_manifest = self.build_manifest();
 
         // Phase 3: Ready all plugins in sorted order
         // We need to iterate by index since ready() takes &mut Server
@@ -915,7 +944,132 @@ impl Server {
         }
     }
 
+    /// Validates capability declarations and computes ordering edges.
+    ///
+    /// Builds a provider map (capability `TypeId` → providing plugin), erroring on
+    /// duplicate providers. For each pending plugin's `extends`/`requires`, verifies a
+    /// version-compatible provider exists and emits a `(provider, dependent)` edge so the
+    /// provider builds first. Optional requirements only emit an edge / version check when
+    /// a provider is present.
+    ///
+    /// Edges are indices into `pending_plugins`.
+    ///
+    /// # Panics
+    ///
+    /// Aggregates and reports every capability conflict (duplicate provider, missing
+    /// provider, version mismatch) in a single message.
+    fn resolve_capabilities(&self) -> Vec<(usize, usize)> {
+        // capability TypeId → provider (plugin id, version, pending index if not yet built)
+        let mut providers: HashMap<TypeId, CapabilityProvider> = HashMap::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        // Already-built plugins are providers too, but have no pending index (no edge).
+        for entry in &self.built_plugins {
+            for cap in entry.plugin.access().provided() {
+                register_provider(&mut providers, &mut errors, cap, &entry.id, None);
+            }
+        }
+        for (idx, entry) in self.pending_plugins.iter().enumerate() {
+            for cap in entry.plugin.access().provided() {
+                register_provider(&mut providers, &mut errors, cap, &entry.id, Some(idx));
+            }
+        }
+
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for (idx, entry) in self.pending_plugins.iter().enumerate() {
+            let access = entry.plugin.access();
+            let mut check = |req: &CapabilityReq, kind: &str, optional: bool| {
+                match providers.get(&req.type_id()) {
+                    None => {
+                        if !optional {
+                            errors.push(format!(
+                                "  - '{}' {kind} capability '{}' but no plugin provides it",
+                                entry.id, req,
+                            ));
+                        }
+                    }
+                    Some(provider) => {
+                        if req.req().matches(provider.version) {
+                            if let Some(provider_idx) = provider.pending_index {
+                                edges.push((provider_idx, idx));
+                            }
+                        } else {
+                            errors.push(format!(
+                                "  - '{}' {kind} '{}' but provider '{}' offers version {}",
+                                entry.id, req, provider.id, provider.version,
+                            ));
+                        }
+                    }
+                }
+            };
+            for req in access.extended() {
+                check(req, "extends", false);
+            }
+            for req in access.required() {
+                check(req, "requires", false);
+            }
+            for req in access.optionals() {
+                check(req, "optionally requires", true);
+            }
+        }
+
+        if !errors.is_empty() {
+            panic!(
+                "{} plugin capability conflict(s):\n{}\n\nFix: ensure each required or \
+                 extended capability has exactly one provider at a compatible version.",
+                errors.len(),
+                errors.join("\n"),
+            );
+        }
+
+        edges
+    }
+
+    /// Builds the resolved [`PluginManifest`] from `built_plugins`.
+    ///
+    /// Called after the build phase, when the resolved order and providers are final.
+    fn build_manifest(&self) -> PluginManifest {
+        let mut providers: HashMap<TypeId, (PluginId, Version)> = HashMap::new();
+        for entry in &self.built_plugins {
+            for cap in entry.plugin.access().provided() {
+                providers.insert(cap.type_id(), (entry.id.clone(), cap.version()));
+            }
+        }
+
+        let resolve = |req: &CapabilityReq| -> ResolvedReq {
+            let found = providers.get(&req.type_id());
+            ResolvedReq {
+                req: *req,
+                provider: found.map(|(id, _)| id.clone()),
+                provider_version: found.map(|(_, version)| *version),
+            }
+        };
+
+        let entries = self
+            .built_plugins
+            .iter()
+            .map(|entry| {
+                let access = entry.plugin.access();
+                PluginManifestEntry {
+                    id: entry.id.clone(),
+                    version: entry.plugin.version(),
+                    provides: access.provided().to_vec(),
+                    extends: access.extended().iter().map(&resolve).collect(),
+                    requires: access.required().iter().map(&resolve).collect(),
+                    optional: access.optionals().iter().map(&resolve).collect(),
+                }
+            })
+            .collect();
+
+        PluginManifest { entries }
+    }
+
     /// Sorts pending plugins by dependencies using topological sort.
+    ///
+    /// Edges come from two sources: legacy [`Plugin::dependencies`] (plugin-id edges) and
+    /// `capability_edges` (provider → extender/requirer pairs, already validated by
+    /// [`resolve_capabilities`](Self::resolve_capabilities)). Each pair `(from, to)` is an
+    /// index into `pending_plugins` meaning `from` must build before `to`.
     ///
     /// Returns the sorted list of plugins.
     ///
@@ -924,7 +1078,10 @@ impl Server {
     /// - If one or more plugin dependencies are not satisfied. The panic message
     ///   lists every missing dependency together with the plugins that required it.
     /// - If there is a circular dependency
-    fn sort_plugins_by_dependencies(&mut self) -> Vec<PluginEntry> {
+    fn sort_plugins_by_dependencies(
+        &mut self,
+        capability_edges: &[(usize, usize)],
+    ) -> Vec<PluginEntry> {
         if self.pending_plugins.is_empty() {
             return Vec::new();
         }
@@ -940,6 +1097,10 @@ impl Server {
         let mut in_degree = vec![0usize; n];
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
 
+        // Track edges so capability edges that duplicate a legacy dependency edge
+        // (or each other) don't inflate in-degrees and stall Kahn's algorithm.
+        let mut edge_set: HashSet<(usize, usize)> = HashSet::new();
+
         // missing_id -> requirers (preserving insertion order for stable output)
         let mut missing: Vec<(PluginId, Vec<PluginId>)> = Vec::new();
 
@@ -948,8 +1109,10 @@ impl Server {
                 // Find the dependency in pending plugins
                 if let Some(&dep_idx) = id_to_index.get(&dep_id) {
                     // dep_idx must be built before i
-                    dependents[dep_idx].push(i);
-                    in_degree[i] += 1;
+                    if edge_set.insert((dep_idx, i)) {
+                        dependents[dep_idx].push(i);
+                        in_degree[i] += 1;
+                    }
                 } else if !self.built_plugins.iter().any(|p| p.id == dep_id) {
                     // Missing — record it; aggregate before panicking so the
                     // user sees every problem at once.
@@ -965,6 +1128,15 @@ impl Server {
 
         if !missing.is_empty() {
             panic!("{}", format_missing_dependencies(&missing));
+        }
+
+        // Fold in capability edges (provider -> extender/requirer), skipping any that
+        // duplicate a legacy dependency edge or point a node at itself.
+        for &(from, to) in capability_edges {
+            if from != to && edge_set.insert((from, to)) {
+                dependents[from].push(to);
+                in_degree[to] += 1;
+            }
         }
 
         // Kahn's algorithm for topological sort
@@ -1024,6 +1196,43 @@ impl Server {
         }
 
         result.into_iter().flatten().collect()
+    }
+}
+
+/// A resolved provider of a capability, used during capability resolution.
+struct CapabilityProvider {
+    /// The id of the plugin that provides the capability.
+    id: PluginId,
+    /// The contract version the provider exposes.
+    version: Version,
+    /// Index into `pending_plugins`, or `None` if the provider is already built.
+    pending_index: Option<usize>,
+}
+
+/// Records `cap`'s provider, appending a duplicate-provider error if one already exists.
+fn register_provider(
+    providers: &mut HashMap<TypeId, CapabilityProvider>,
+    errors: &mut Vec<String>,
+    cap: &Capability,
+    provider_id: &PluginId,
+    pending_index: Option<usize>,
+) {
+    if let Some(existing) = providers.get(&cap.type_id()) {
+        errors.push(format!(
+            "  - capability '{}' is provided by both '{}' and '{}' (exactly one provider allowed)",
+            cap.name(),
+            existing.id,
+            provider_id,
+        ));
+    } else {
+        providers.insert(
+            cap.type_id(),
+            CapabilityProvider {
+                id: provider_id.clone(),
+                version: cap.version(),
+                pending_index,
+            },
+        );
     }
 }
 
@@ -1141,5 +1350,173 @@ impl ContextFactory {
             ctx.insert_boxed(*type_id, factory());
         }
         ctx
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::Server;
+    use crate::plugin::{Plugin, PluginAccess, Version, VersionReq};
+    use std::sync::{Arc, Mutex};
+
+    // Marker capability types (need only be `'static`).
+    struct Registry;
+    struct OtherCap;
+
+    /// Build-order recorder shared by the test plugins.
+    type BuildLog = Arc<Mutex<Vec<&'static str>>>;
+
+    struct Provider {
+        log: BuildLog,
+        version: Version,
+    }
+    impl Plugin for Provider {
+        const ID: &'static str = "test::provider";
+        const VERSION: Version = Version::new(1, 0, 0);
+        fn build(&self, _: &mut Server) {
+            self.log.lock().unwrap().push("provider");
+        }
+        fn access(&self) -> PluginAccess {
+            PluginAccess::new().provides::<Registry>(self.version)
+        }
+    }
+
+    struct Extender {
+        log: BuildLog,
+        req: VersionReq,
+    }
+    impl Plugin for Extender {
+        const ID: &'static str = "test::extender";
+        const VERSION: Version = Version::new(1, 0, 0);
+        fn build(&self, _: &mut Server) {
+            self.log.lock().unwrap().push("extender");
+        }
+        fn access(&self) -> PluginAccess {
+            PluginAccess::new().extends::<Registry>(self.req)
+        }
+    }
+
+    struct Requirer;
+    impl Plugin for Requirer {
+        const ID: &'static str = "test::requirer";
+        const VERSION: Version = Version::new(1, 0, 0);
+        fn build(&self, _: &mut Server) {}
+        fn access(&self) -> PluginAccess {
+            PluginAccess::new().requires::<Registry>(VersionReq::any())
+        }
+    }
+
+    /// A second provider of `Registry`, for the duplicate-provider test.
+    struct DuplicateProvider;
+    impl Plugin for DuplicateProvider {
+        const ID: &'static str = "test::duplicate_provider";
+        const VERSION: Version = Version::new(1, 0, 0);
+        fn build(&self, _: &mut Server) {}
+        fn access(&self) -> PluginAccess {
+            PluginAccess::new().provides::<Registry>(Version::new(1, 0, 0))
+        }
+    }
+
+    /// A plugin whose optional requirement has no provider — must not fail resolution.
+    struct OptionalConsumer;
+    impl Plugin for OptionalConsumer {
+        const ID: &'static str = "test::optional_consumer";
+        const VERSION: Version = Version::new(1, 0, 0);
+        fn build(&self, _: &mut Server) {}
+        fn access(&self) -> PluginAccess {
+            PluginAccess::new().optionally_requires::<OtherCap>(VersionReq::any())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_is_ordered_before_extender_regardless_of_add_order() {
+        let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        // Add extender BEFORE provider — the resolver must still build provider first.
+        server.add_plugins(Extender {
+            log: log.clone(),
+            req: VersionReq::caret(Version::new(1, 0, 0)),
+        });
+        server.add_plugins(Provider {
+            log: log.clone(),
+            version: Version::new(1, 0, 0),
+        });
+        server.finish().await;
+
+        assert_eq!(*log.lock().unwrap(), vec!["provider", "extender"]);
+    }
+
+    #[tokio::test]
+    async fn manifest_resolves_requirement_to_provider() {
+        let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        server.add_plugins(Provider {
+            log: log.clone(),
+            version: Version::new(1, 0, 0),
+        });
+        server.add_plugins(Requirer);
+        server.finish().await;
+
+        let manifest = server.plugin_manifest();
+        let requirer = manifest
+            .entry(&crate::plugin::PluginId::new("test::requirer"))
+            .expect("requirer in manifest");
+        assert_eq!(requirer.requires.len(), 1);
+        let resolved = &requirer.requires[0];
+        assert_eq!(
+            resolved.provider,
+            Some(crate::plugin::PluginId::new("test::provider"))
+        );
+        assert_eq!(resolved.provider_version, Some(Version::new(1, 0, 0)));
+    }
+
+    #[tokio::test]
+    async fn optional_requirement_without_provider_is_ok() {
+        let mut server = Server::new();
+        server.add_plugins(OptionalConsumer);
+        server.finish().await;
+        assert!(server.is_built());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "no plugin provides it")]
+    async fn missing_provider_panics() {
+        let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        server.add_plugins(Extender {
+            log,
+            req: VersionReq::any(),
+        });
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "exactly one provider allowed")]
+    async fn duplicate_provider_panics() {
+        let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        server.add_plugins(Provider {
+            log,
+            version: Version::new(1, 0, 0),
+        });
+        server.add_plugins(DuplicateProvider);
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "offers version")]
+    async fn version_mismatch_panics() {
+        let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        // Provider exposes 1.0.0 but extender needs ^2.0.0.
+        server.add_plugins(Provider {
+            log: log.clone(),
+            version: Version::new(1, 0, 0),
+        });
+        server.add_plugins(Extender {
+            log,
+            req: VersionReq::caret(Version::new(2, 0, 0)),
+        });
+        server.finish().await;
     }
 }

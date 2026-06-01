@@ -34,6 +34,10 @@ pub trait Plugin: Send + Sync + 'static {
     /// Declares plugins that must be added before this one.
     /// The server will panic if dependencies are not satisfied.
     fn dependencies(&self) -> Vec<PluginId> { Vec::new() }
+
+    /// Declares the capabilities (resource/API types) this plugin provides,
+    /// extends, and requires. See "Capability-Based Dependencies" below.
+    fn access(&self) -> PluginAccess { PluginAccess::new() }
 }
 ```
 
@@ -97,6 +101,117 @@ impl Plugin for SessionsPlugin {
 ```
 
 Use this only when the dependency has a sensible default. Dependencies without a default still panic when missing.
+
+## Capability-Based Dependencies
+
+Naming a concrete plugin in `dependencies()` couples a consumer to one specific provider and splits a single fact across two places: the `get_resource_mut::<T>()` call that does the work, and the hand-written `dependencies()` entry that stands in for it. The two can drift, and the relationship can no longer be satisfied by an *alternative* provider of the same resource.
+
+Capabilities make the **resource or API type** the unit of dependency instead. A plugin declares its relationships to capability types through `access()`, and the server resolves and orders plugins by those declarations — without either side naming the other.
+
+```rust
+use polaris_system::plugin::{Plugin, PluginAccess, Version, VersionReq};
+use polaris_models::ModelRegistry;
+
+impl Plugin for AnthropicPlugin {
+    const ID: &'static str = "polaris::provider::anthropic";
+    const VERSION: Version = Version::new(0, 1, 0);
+
+    fn build(&self, server: &mut Server) {
+        // The ModelRegistry is guaranteed present and mutable here, because the
+        // resolver ordered its provider before this plugin.
+        let mut registry = server.get_resource_mut::<ModelRegistry>().unwrap();
+        registry.register_llm_provider(AnthropicProvider::new(self.api_key.clone()));
+    }
+
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new()
+            .extends::<ModelRegistry>(VersionReq::caret(ModelRegistry::CONTRACT_VERSION))
+    }
+}
+```
+
+### The three relationships
+
+| Method | Meaning | Cardinality |
+|--------|---------|-------------|
+| `provides::<T>(version)` | Inserts a **new** capability `T` at a contract version. | exactly one provider per `T` |
+| `extends::<T>(req)` | **Mutates** a `T` that another plugin provides (the registrar / decorator pattern — e.g. registering an LLM provider with `ModelRegistry`, or routes with `HttpRouter`). | many extenders per `T` |
+| `requires::<T>(req)` | **Reads** `T` to do its own work. | many requirers per `T` |
+| `optionally_requires::<T>(req)` | Reads `T` when present; degrades gracefully when no provider exists. | many |
+
+A provider declares its half, e.g.:
+
+```rust
+impl Plugin for ModelsPlugin {
+    // ...
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new().provides::<ModelRegistry>(ModelRegistry::CONTRACT_VERSION)
+    }
+}
+```
+
+### Contract versions
+
+The version belongs to the **capability**, not the plugin — it is the contract a consumer builds against, independent of any one provider's release version. The convention is a `CONTRACT_VERSION` associated constant on the capability type so providers and consumers reference one source:
+
+```rust
+impl ModelRegistry {
+    pub const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+}
+```
+
+`VersionReq` provides the usual constructors: `caret` (Cargo-style `^`, the common case), `exact`, `at_least`, and `any`.
+
+### Resolution and validation
+
+During `finish()`, before building, the server:
+
+- builds a provider map from every plugin's `provides`, and
+- for each `extends` / `requires` (and each satisfiable `optionally_requires`), verifies a version-compatible provider exists and adds a **provider → consumer** ordering edge that folds into the same topological sort as `dependencies()`.
+
+It aggregates and panics on any of these conflicts, naming the offending plugins:
+
+- a capability provided by **more than one** plugin,
+- a required or extended capability with **no** provider,
+- a provider whose contract version **does not satisfy** the requirement.
+
+The ordering guarantee (provider before its extenders and requirers) is what lets the `build()` body above access the registry infallibly, and it composes with the `build → ready` lifecycle: an extender mutates the still-mutable resource in `build()`, and the provider can freeze it to a global in `ready()` (which always runs after every `build()`).
+
+### Composing and swapping
+
+Because consumers depend on capabilities rather than plugin types, an implementation can be swapped without touching anything downstream. Any plugin that provides `ModelRegistry` satisfies a consumer's `requires::<ModelRegistry>()`:
+
+```rust
+server
+    .add_plugins(ModelsPlugin)
+    // Swap the default provider for an internal gateway — downstream plugins
+    // that require ModelRegistry are unaffected.
+    .add_plugins(GatewayProviderPlugin::new(url));
+```
+
+The same holds inside a [plugin group](#plugin-groups): `group.build().disable::<AnthropicPlugin>().add(GatewayProviderPlugin::new(url))`.
+
+### Introspection — the resolved manifest
+
+After `finish()`, `server.plugin_manifest()` returns a `PluginManifest`: every plugin in resolution order with the capabilities it provides, extends, and requires, each resolved to its provider. This answers "what does this set of plugins provide, and what depends on what" without reading source.
+
+```rust
+// Human-readable
+println!("{}", server.plugin_manifest());
+
+// Graphviz digraph of capability edges (provider → consumer), for `dot -Tsvg`
+let dot = server.plugin_manifest().to_dot();
+```
+
+### Relationship to `dependencies()`
+
+Both mechanisms work and combine — capability edges and plugin-id edges feed the same sort. Prefer capabilities for any relationship that is really about a resource or API type; reserve `dependencies()` for the rare case of pure ordering that maps to no capability. Duplicate edges between the two are de-duplicated.
+
+> **Planned ergonomics.** A `#[plugin]` attribute macro will let `build()` take typed
+> `Requires<T>` / `Extends<T>` / `Optional<T>` parameters and derive `access()` from them,
+> making the declaration and the usage a single source of truth (mirroring the `#[system]`
+> macro) and removing the manual `get_resource_mut().unwrap()`. Until then, declare
+> `access()` by hand as shown above.
 
 ## Server Access
 
@@ -381,7 +496,7 @@ source.
 
 ## Anti-Patterns
 
-**Relying on insertion order instead of dependencies.** If a plugin requires another plugin's resources, that relationship should be declared in `dependencies()` rather than assumed from the order of `add_plugins()` calls.
+**Relying on insertion order instead of declared dependencies.** If a plugin requires another plugin's resources, that relationship should be declared — preferably via [capabilities](#capability-based-dependencies) (`access()`), or via `dependencies()` for pure ordering — rather than assumed from the order of `add_plugins()` calls.
 
 **Circular dependencies.** If two plugins depend on each other, the shared functionality should be factored into a third plugin that both depend on.
 

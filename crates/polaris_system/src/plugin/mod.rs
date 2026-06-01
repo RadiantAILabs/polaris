@@ -49,11 +49,15 @@
 //! # });
 //! ```
 
+mod capability;
+mod manifest;
 mod schedule;
 
 use crate::server::Server;
 use core::future::Future;
 use core::pin::Pin;
+pub use capability::{Capability, CapabilityReq, PluginAccess, VersionReq};
+pub use manifest::{PluginManifest, PluginManifestEntry, ResolvedReq};
 pub use schedule::{IntoScheduleIds, Schedule, ScheduleId};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,7 +74,7 @@ pub use schedule::{IntoScheduleIds, Schedule, ScheduleId};
 /// let v = Version::new(1, 2, 3);
 /// assert_eq!(v.to_string(), "1.2.3");
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
     /// Breaking changes.
     pub major: u64,
@@ -391,6 +395,40 @@ pub trait Plugin: Send + Sync + 'static {
     fn default_dependencies(&self) -> DefaultDependencies {
         DefaultDependencies::new()
     }
+
+    /// Declares the capabilities this plugin provides, extends, and requires.
+    ///
+    /// Capabilities are resource/API *types* rather than plugin names, so a consumer
+    /// depends on what it actually uses (`ModelRegistry`) instead of who supplies it
+    /// (`ModelsPlugin`). The server resolver uses these declarations to order plugins
+    /// (provider before extenders and requirers), to verify every required or extended
+    /// capability has a compatible provider, and to power introspection via
+    /// [`Server::plugin_manifest`](crate::server::Server::plugin_manifest).
+    ///
+    /// Returns an empty [`PluginAccess`] by default, so existing plugins that rely on
+    /// [`dependencies()`](Self::dependencies) keep working unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::plugin::{Plugin, PluginAccess, Version, VersionReq};
+    /// # use polaris_system::server::Server;
+    /// # struct ModelRegistry;
+    /// struct AnthropicPlugin;
+    ///
+    /// impl Plugin for AnthropicPlugin {
+    ///     const ID: &'static str = "polaris::provider::anthropic";
+    ///     const VERSION: Version = Version::new(0, 1, 0);
+    ///     fn build(&self, _: &mut Server) {}
+    ///
+    ///     fn access(&self) -> PluginAccess {
+    ///         PluginAccess::new().extends::<ModelRegistry>(VersionReq::caret(Version::new(0, 1, 0)))
+    ///     }
+    /// }
+    /// ```
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,7 +447,6 @@ pub(crate) trait DynPlugin: Send + Sync + 'static {
     /// Returns this plugin's [`PluginId`].
     fn id(&self) -> PluginId;
     /// Returns this plugin's [`Version`].
-    #[expect(dead_code, reason = "reserved for future use by server introspection")]
     fn version(&self) -> Version;
     /// See [`Plugin::build`].
     fn build(&self, server: &mut Server);
@@ -429,6 +466,8 @@ pub(crate) trait DynPlugin: Send + Sync + 'static {
     fn dependencies(&self) -> Vec<PluginId>;
     /// See [`Plugin::default_dependencies`].
     fn default_dependencies(&self) -> DefaultDependencies;
+    /// See [`Plugin::access`].
+    fn access(&self) -> PluginAccess;
 }
 
 impl<T: Plugin> DynPlugin for T {
@@ -464,6 +503,9 @@ impl<T: Plugin> DynPlugin for T {
     }
     fn default_dependencies(&self) -> DefaultDependencies {
         Plugin::default_dependencies(self)
+    }
+    fn access(&self) -> PluginAccess {
+        Plugin::access(self)
     }
 }
 
