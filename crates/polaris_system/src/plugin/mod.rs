@@ -49,14 +49,16 @@
 //! # });
 //! ```
 
+mod build_param;
 mod capability;
 mod manifest;
 mod schedule;
 
 use crate::server::Server;
+pub use build_param::{BuildParam, BuildParamError, Extends, Optional, Requires};
+pub use capability::{Capability, CapabilityReq, Contract, PluginAccess, VersionReq};
 use core::future::Future;
 use core::pin::Pin;
-pub use capability::{Capability, CapabilityReq, PluginAccess, VersionReq};
 pub use manifest::{PluginManifest, PluginManifestEntry, ResolvedReq};
 pub use schedule::{IntoScheduleIds, Schedule, ScheduleId};
 

@@ -172,9 +172,10 @@ These map high-level goals to the files and patterns needed:
 1. Create `crates/polaris_core_plugins/src/my_plugin.rs`
 2. Define resource type implementing `GlobalResource` or `LocalResource`
 3. Implement `Plugin` trait with `build()`, `ready()`, `cleanup()`
-4. Add `mod my_plugin;` and re-export in `crates/polaris_core_plugins/src/lib.rs`
-5. Optionally add to `DefaultPlugins` or `MinimalPlugins`
-6. Add full doc comment on the plugin struct (see below)
+4. Declare capability relationships: a provider declares `provides(...)`; a consumer takes typed `build` parameters (`Requires<T>` / `Extends<T>` / `Optional<T>`). Prefer the `#[plugin]` macro, which derives `access()` from those parameters + `provides(...)` (see `docs/reference/plugins.md` → "The `#[plugin]` macro"); the macro-free form declares `access()` by hand. Capability `T` types implement `Contract` for their version. Reserve `dependencies()` for pure ordering that maps to no capability.
+5. Add `mod my_plugin;` and re-export in `crates/polaris_core_plugins/src/lib.rs`
+6. Optionally add to `DefaultPlugins` or `MinimalPlugins`
+7. Add full doc comment on the plugin struct (see below)
 
 **Plugin documentation standard** - every exported `Plugin` struct must include:
 

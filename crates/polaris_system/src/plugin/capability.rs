@@ -26,6 +26,37 @@ use std::any::TypeId;
 use std::fmt;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Contract
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A resource or API type that is exposed as a versioned capability.
+///
+/// The contract version belongs to the *type* — the stable public surface that
+/// downstream plugins build against — not to whichever plugin happens to provide it.
+/// Bump [`CONTRACT_VERSION`](Self::CONTRACT_VERSION) when the type's public API changes
+/// incompatibly. Implementing this trait is what lets a type be used with the typed
+/// build parameters [`Requires`](super::Requires), [`Extends`](super::Extends), and
+/// [`Optional`](super::Optional), and with the `provides(...)` form of the `#[plugin]`
+/// macro: the requirement / declaration version is derived from this constant, so a
+/// consumer never restates it.
+///
+/// # Example
+///
+/// ```
+/// use polaris_system::plugin::{Contract, Version};
+///
+/// struct ModelRegistry;
+///
+/// impl Contract for ModelRegistry {
+///     const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+/// }
+/// ```
+pub trait Contract: 'static {
+    /// The contract version at which this capability type is exposed.
+    const CONTRACT_VERSION: Version;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // VersionReq
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -366,7 +397,10 @@ mod tests {
         let cap = Capability::of::<CapA>(Version::new(1, 0, 0));
         let req = CapabilityReq::of::<CapA>(VersionReq::any());
         assert_eq!(cap.type_id(), req.type_id());
-        assert_ne!(cap.type_id(), CapabilityReq::of::<CapB>(VersionReq::any()).type_id());
+        assert_ne!(
+            cap.type_id(),
+            CapabilityReq::of::<CapB>(VersionReq::any()).type_id()
+        );
     }
 
     #[test]

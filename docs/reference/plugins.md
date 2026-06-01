@@ -152,15 +152,17 @@ impl Plugin for ModelsPlugin {
 
 ### Contract versions
 
-The version belongs to the **capability**, not the plugin — it is the contract a consumer builds against, independent of any one provider's release version. The convention is a `CONTRACT_VERSION` associated constant on the capability type so providers and consumers reference one source:
+The version belongs to the **capability**, not the plugin — it is the contract a consumer builds against, independent of any one provider's release version. A capability type carries its version by implementing the `Contract` trait, so providers and consumers reference one source:
 
 ```rust
-impl ModelRegistry {
-    pub const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+use polaris_system::plugin::{Contract, Version};
+
+impl Contract for ModelRegistry {
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
 }
 ```
 
-`VersionReq` provides the usual constructors: `caret` (Cargo-style `^`, the common case), `exact`, `at_least`, and `any`.
+`VersionReq` provides the usual constructors: `caret` (Cargo-style `^`, the common case), `exact`, `at_least`, and `any`. Implementing `Contract` is also what lets a type be used with the typed build parameters and the `#[plugin]` macro (below), which derive the version requirement from `CONTRACT_VERSION` automatically.
 
 ### Resolution and validation
 
@@ -207,11 +209,57 @@ let dot = server.plugin_manifest().to_dot();
 
 Both mechanisms work and combine — capability edges and plugin-id edges feed the same sort. Prefer capabilities for any relationship that is really about a resource or API type; reserve `dependencies()` for the rare case of pure ordering that maps to no capability. Duplicate edges between the two are de-duplicated.
 
-> **Planned ergonomics.** A `#[plugin]` attribute macro will let `build()` take typed
-> `Requires<T>` / `Extends<T>` / `Optional<T>` parameters and derive `access()` from them,
-> making the declaration and the usage a single source of truth (mirroring the `#[system]`
-> macro) and removing the manual `get_resource_mut().unwrap()`. Until then, declare
-> `access()` by hand as shown above.
+### The `#[plugin]` macro — typed build parameters
+
+The `access()` declaration above and the `get_resource_mut::<T>().unwrap()` call in `build()` are the same fact written twice; they can drift. The `#[plugin]` attribute macro makes the `build` parameter list the single source of truth, exactly as `#[system]` does for a system's `Res<T>` / `ResMut<T>` parameters. Apply it to `impl Plugin for YourPlugin`, omit `ID` / `VERSION` / `access`, and declare what `build` consumes as typed parameters:
+
+```rust
+use polaris_system::plugin::{self, Extends, Plugin};
+use polaris_models::ModelRegistry;
+
+#[plugin(id = "polaris::provider::anthropic", version = "0.1.0")]
+impl Plugin for AnthropicPlugin {
+    // `Extends<ModelRegistry>` is the declaration *and* the access. The macro derives
+    // `access().extends::<ModelRegistry>(caret(CONTRACT_VERSION))` from it; the resolver
+    // orders the provider first, so this is an infallible `&mut ModelRegistry` — no
+    // `get_resource_mut().unwrap()` and no `.expect("add ModelsPlugin first")`.
+    fn build(&self, mut registry: Extends<ModelRegistry>) {
+        registry.register_llm_provider(AnthropicProvider::new(self.api_key.clone()));
+    }
+}
+```
+
+The build parameters mirror the three relationships:
+
+| Parameter | Yields | Derived declaration |
+|-----------|--------|---------------------|
+| `Requires<T>` | `&T` | `requires::<T>(caret(T::CONTRACT_VERSION))` |
+| `Extends<T>` | `&mut T` | `extends::<T>(caret(T::CONTRACT_VERSION))` |
+| `Optional<T>` | `Option<&T>` (`.get()` / `.is_present()`) | `optionally_requires::<T>(...)` |
+
+Each `T` must implement `Contract`. Because you can only obtain a reference to a capability you declared as a parameter, a plugin **cannot touch an undeclared capability** — the declaration and usage can no longer drift.
+
+A **provider** inserts a new capability, and those inserts stay imperative (a plugin may insert several resources and APIs, conditionally, across `build()` and `ready()`). So a provider keeps a `&mut Server` parameter and declares what it provides through the attribute:
+
+```rust
+use polaris_system::plugin::{self, Plugin};
+
+#[plugin(id = "polaris::models", version = "0.0.1", provides(ModelRegistry))]
+impl Plugin for ModelsPlugin {
+    fn build(&self, server: &mut Server) {
+        server.insert_resource(ModelRegistry::new());
+    }
+
+    async fn ready(&self, server: &mut Server) {
+        let registry = server.remove_resource::<ModelRegistry>().unwrap();
+        server.insert_global(registry); // freeze to a read-only global
+    }
+}
+```
+
+`provides(...)` lists the capability *types*; the declared version is each type's `Contract::CONTRACT_VERSION`. Any other method (`ready`, `cleanup`, `update`, `tick_schedules`, `dependencies`) is passed through unchanged. The hand-written `Plugin` impl with an explicit `access()`, shown earlier, remains fully supported — the macro is a convenience that generates exactly that.
+
+> One import note: the `#[plugin]` macro shares its name with the `plugin` module, so bring it into scope with a plain `use polaris_system::plugin;` (as with `use polaris_system::system;`), then import trait items such as `Plugin` and `Extends` separately.
 
 ## Server Access
 

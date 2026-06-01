@@ -23,9 +23,11 @@
 //! ```
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Type, parse_macro_input,
+    Expr, ExprLit, FnArg, GenericArgument, ImplItem, ImplItemFn, ItemFn, ItemImpl, Lit, LitStr,
+    Meta, Pat, PathArguments, ReturnType, Token, Type, parse_macro_input, punctuated::Punctuated,
 };
 
 /// Transforms an async function into a System implementation.
@@ -303,6 +305,265 @@ fn extract_result_system_error(ty: &Type) -> Option<Type> {
         return None;
     };
     Some(ok_type.clone())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #[plugin] attribute macro
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parsed `#[plugin(...)]` arguments.
+struct PluginArgs {
+    id: LitStr,
+    version: LitStr,
+    provides: Vec<Type>,
+}
+
+impl syn::parse::Parse for PluginArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let metas = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
+        let mut id = None;
+        let mut version = None;
+        let mut provides = Vec::new();
+
+        for meta in metas {
+            match meta {
+                Meta::NameValue(nv) if nv.path.is_ident("id") => {
+                    id = Some(expect_lit_str(nv.value)?)
+                }
+                Meta::NameValue(nv) if nv.path.is_ident("version") => {
+                    version = Some(expect_lit_str(nv.value)?);
+                }
+                Meta::List(list) if list.path.is_ident("provides") => {
+                    let types =
+                        list.parse_args_with(Punctuated::<Type, Token![,]>::parse_terminated)?;
+                    provides.extend(types);
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        "unsupported `#[plugin]` argument; expected `id = \"...\"`, \
+                         `version = \"x.y.z\"`, or `provides(Type, ...)`",
+                    ));
+                }
+            }
+        }
+
+        let id =
+            id.ok_or_else(|| syn::Error::new(input.span(), "`#[plugin]` requires `id = \"...\"`"))?;
+        let version = version.ok_or_else(|| {
+            syn::Error::new(input.span(), "`#[plugin]` requires `version = \"x.y.z\"`")
+        })?;
+
+        Ok(Self {
+            id,
+            version,
+            provides,
+        })
+    }
+}
+
+/// Extracts a string literal from an attribute value expression.
+fn expect_lit_str(expr: Expr) -> syn::Result<LitStr> {
+    if let Expr::Lit(ExprLit {
+        lit: Lit::Str(lit), ..
+    }) = expr
+    {
+        Ok(lit)
+    } else {
+        Err(syn::Error::new_spanned(expr, "expected a string literal"))
+    }
+}
+
+/// Parses a `"major.minor.patch"` literal into its three components.
+fn parse_version(lit: &LitStr) -> syn::Result<(u64, u64, u64)> {
+    let raw = lit.value();
+    let parts: Vec<&str> = raw.split('.').collect();
+    let invalid = || syn::Error::new_spanned(lit, "version must be in `major.minor.patch` form");
+    if parts.len() != 3 {
+        return Err(invalid());
+    }
+    let major = parts[0].parse().map_err(|_| invalid())?;
+    let minor = parts[1].parse().map_err(|_| invalid())?;
+    let patch = parts[2].parse().map_err(|_| invalid())?;
+    Ok((major, minor, patch))
+}
+
+/// Generates a [`Plugin`](polaris_system::plugin::Plugin) impl from an `impl` block whose
+/// `build` method declares its capability needs as typed parameters.
+///
+/// `#[plugin]` is to a plugin what [`macro@system`] is to a system: the `build` method's
+/// parameter list is the single source of truth for what the plugin consumes, so the
+/// declaration cannot drift from the access. The macro derives
+/// [`Plugin::access`](polaris_system::plugin::Plugin::access) from those parameters plus
+/// the `provides(...)` attribute, and supplies the `ID`/`VERSION` constants.
+///
+/// # Usage
+///
+/// Apply it to `impl Plugin for YourPlugin`, omitting `ID`, `VERSION`, and `access`:
+///
+/// ```ignore
+/// #[plugin(id = "polaris::provider::anthropic", version = "0.1.0")]
+/// impl Plugin for AnthropicPlugin {
+///     // `Extends<ModelRegistry>` yields an infallible `&mut ModelRegistry`; the resolver
+///     // guarantees a provider built first, so no `.expect("ModelsPlugin first")` is needed.
+///     fn build(&self, mut registry: Extends<ModelRegistry>) {
+///         registry.register_llm_provider(AnthropicProvider::new(self.api_key.clone()));
+///     }
+/// }
+/// ```
+///
+/// A provider plugin that inserts a new capability keeps a `&mut Server` parameter (the
+/// inserts stay imperative) and declares what it provides via the attribute:
+///
+/// ```ignore
+/// #[plugin(id = "polaris::models", version = "0.0.1", provides(ModelRegistry))]
+/// impl Plugin for ModelsPlugin {
+///     fn build(&self, server: &mut Server) {
+///         server.insert_resource(ModelRegistry::new());
+///     }
+///     async fn ready(&self, server: &mut Server) { /* freeze to global */ }
+/// }
+/// ```
+///
+/// Build parameters: [`Requires<T>`](polaris_system::plugin::Requires) → `&T`,
+/// [`Extends<T>`](polaris_system::plugin::Extends) → `&mut T`,
+/// [`Optional<T>`](polaris_system::plugin::Optional) → `Option<&T>`. Each `T` must
+/// implement [`Contract`](polaris_system::plugin::Contract); the version requirement is
+/// the caret range of its contract version. Any other method (`ready`, `cleanup`,
+/// `update`, `tick_schedules`, `dependencies`) is passed through unchanged.
+#[proc_macro_attribute]
+pub fn plugin(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as PluginArgs);
+    let mut item_impl = parse_macro_input!(item as ItemImpl);
+
+    let ps = polaris_macro_utils::resolve_crate_path(polaris_macro_utils::PolarisCrate::System);
+
+    let (major, minor, patch) = match parse_version(&args.version) {
+        Ok(parts) => parts,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    // Rewrite the `build` method's typed parameters into the standard
+    // `build(&self, server: &mut Server)` signature, collecting the build-param types so
+    // their access declarations can be folded into the generated `access()`.
+    let mut build_param_types: Vec<Type> = Vec::new();
+    let mut found_build = false;
+    for impl_item in &mut item_impl.items {
+        if let ImplItem::Fn(method) = impl_item
+            && method.sig.ident == "build"
+        {
+            found_build = true;
+            match rewrite_build(method, &ps) {
+                Ok(types) => build_param_types = types,
+                Err(err) => return err.to_compile_error().into(),
+            }
+        }
+    }
+
+    if !found_build {
+        return syn::Error::new_spanned(
+            &item_impl,
+            "`#[plugin]` requires a `build` method in the impl block",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let id_lit = &args.id;
+    let provided = &args.provides;
+    let provides_stmts = provided.iter().map(|ty| {
+        quote! {
+            access = access.provides::<#ty>(<#ty as #ps::plugin::Contract>::CONTRACT_VERSION);
+        }
+    });
+    let access_stmts = build_param_types.iter().map(|ty| {
+        quote! {
+            <#ty as #ps::plugin::BuildParam>::contribute_access(&mut access);
+        }
+    });
+
+    // Inject the generated trait items alongside the user's (rewritten) ones.
+    let generated: ImplItem = syn::parse_quote! {
+        const ID: &'static str = #id_lit;
+    };
+    item_impl.items.push(generated);
+    let version_item: ImplItem = syn::parse_quote! {
+        const VERSION: #ps::plugin::Version = #ps::plugin::Version::new(#major, #minor, #patch);
+    };
+    item_impl.items.push(version_item);
+    let access_item: ImplItem = syn::parse_quote! {
+        fn access(&self) -> #ps::plugin::PluginAccess {
+            let mut access = #ps::plugin::PluginAccess::new();
+            #(#provides_stmts)*
+            #(#access_stmts)*
+            access
+        }
+    };
+    item_impl.items.push(access_item);
+
+    quote!(#item_impl).into()
+}
+
+/// Rewrites a plugin `build` method in place: replaces its typed parameters with the
+/// canonical `(&self, server: &mut Server)` signature and prepends the binding statements
+/// that fetch each parameter from the server. Returns the build-param types (everything
+/// that is not a raw `&Server`/`&mut Server`) so the caller can derive `access()`.
+fn rewrite_build(method: &mut ImplItemFn, ps: &TokenStream2) -> syn::Result<Vec<Type>> {
+    let mut bindings: Vec<TokenStream2> = Vec::new();
+    let mut build_param_types: Vec<Type> = Vec::new();
+
+    for arg in method.sig.inputs.iter().skip(1) {
+        let FnArg::Typed(pat_type) = arg else {
+            continue;
+        };
+        let pat = &pat_type.pat;
+        let ty = &*pat_type.ty;
+
+        if let Type::Reference(reference) = ty {
+            // A raw `&mut Server` / `&Server` parameter — pass the server through so the
+            // provide side can keep inserting resources imperatively.
+            if reference.mutability.is_some() {
+                bindings.push(quote! { let #pat = &mut *_server; });
+            } else {
+                bindings.push(quote! { let #pat = &*_server; });
+            }
+        } else {
+            // A typed build parameter (`Requires`/`Extends`/`Optional`): fetch it, panicking
+            // with a named message if the resolver-guaranteed provider was somehow absent.
+            bindings.push(quote! {
+                let #pat = match <#ty as #ps::plugin::BuildParam>::fetch(&*_server) {
+                    ::std::result::Result::Ok(value) => value,
+                    ::std::result::Result::Err(err) => ::std::panic!(
+                        "plugin `{}` could not resolve a build dependency: {}",
+                        <Self as #ps::plugin::Plugin>::ID,
+                        err
+                    ),
+                };
+            });
+            build_param_types.push(ty.clone());
+        }
+    }
+
+    // Replace the parameter list with `(&self, _server: &mut Server)`.
+    let receiver =
+        method.sig.inputs.first().cloned().ok_or_else(|| {
+            syn::Error::new_spanned(&method.sig, "plugin `build` must take `&self`")
+        })?;
+    let mut new_inputs: Punctuated<FnArg, Token![,]> = Punctuated::new();
+    new_inputs.push(receiver);
+    new_inputs.push(syn::parse_quote! { _server: &mut #ps::server::Server });
+    method.sig.inputs = new_inputs;
+
+    // Prepend the bindings to the original body.
+    let original_stmts = std::mem::take(&mut method.block.stmts);
+    let mut new_stmts: Vec<syn::Stmt> = Vec::new();
+    for binding in bindings {
+        new_stmts.push(syn::parse2(binding)?);
+    }
+    new_stmts.extend(original_stmts);
+    method.block.stmts = new_stmts;
+
+    Ok(build_param_types)
 }
 
 /// Converts `snake_case` to `PascalCase`.

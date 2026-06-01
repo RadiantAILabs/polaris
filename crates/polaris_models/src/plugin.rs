@@ -1,7 +1,8 @@
 //! Provides the [`ModelRegistry`] global resource.
 
 use crate::registry::ModelRegistry;
-use polaris_system::plugin::{Plugin, PluginAccess, Version};
+use polaris_system::plugin;
+use polaris_system::plugin::Plugin;
 use polaris_system::server::Server;
 
 /// Plugin that provides the [`ModelRegistry`] for provider-agnostic model access.
@@ -77,10 +78,12 @@ use polaris_system::server::Server;
 #[derive(Debug, Default, Copy, Clone)]
 pub struct ModelsPlugin;
 
+// `provides(ModelRegistry)` declares that this plugin inserts the `ModelRegistry`
+// capability (at its `Contract::CONTRACT_VERSION`), so extender plugins declare they
+// extend it instead of naming `ModelsPlugin`. The inserts stay imperative in `build()`,
+// so the plugin keeps a `&mut Server` parameter.
+#[plugin(id = "polaris::models", version = "0.0.1", provides(ModelRegistry))]
 impl Plugin for ModelsPlugin {
-    const ID: &'static str = "polaris::models";
-    const VERSION: Version = Version::new(0, 0, 1);
-
     fn build(&self, server: &mut Server) {
         server.insert_resource(ModelRegistry::new());
 
@@ -96,14 +99,8 @@ impl Plugin for ModelsPlugin {
         crate::dashboard::freeze(server);
     }
 
-    /// Declares that this plugin provides the [`ModelRegistry`] capability, so provider
-    /// plugins can declare they extend it instead of naming `ModelsPlugin` directly.
-    fn access(&self) -> PluginAccess {
-        PluginAccess::new().provides::<ModelRegistry>(ModelRegistry::CONTRACT_VERSION)
-    }
-
     #[cfg(feature = "dashboard")]
-    fn dependencies(&self) -> Vec<polaris_system::plugin::PluginId> {
-        vec![polaris_system::plugin::PluginId::of::<polaris_app::AppPlugin>()]
+    fn dependencies(&self) -> Vec<plugin::PluginId> {
+        vec![plugin::PluginId::of::<polaris_app::AppPlugin>()]
     }
 }

@@ -978,27 +978,27 @@ impl Server {
         let mut edges: Vec<(usize, usize)> = Vec::new();
         for (idx, entry) in self.pending_plugins.iter().enumerate() {
             let access = entry.plugin.access();
-            let mut check = |req: &CapabilityReq, kind: &str, optional: bool| {
-                match providers.get(&req.type_id()) {
-                    None => {
-                        if !optional {
-                            errors.push(format!(
-                                "  - '{}' {kind} capability '{}' but no plugin provides it",
-                                entry.id, req,
-                            ));
-                        }
+            let mut check = |req: &CapabilityReq, kind: &str, optional: bool| match providers
+                .get(&req.type_id())
+            {
+                None => {
+                    if !optional {
+                        errors.push(format!(
+                            "  - '{}' {kind} capability '{}' but no plugin provides it",
+                            entry.id, req,
+                        ));
                     }
-                    Some(provider) => {
-                        if req.req().matches(provider.version) {
-                            if let Some(provider_idx) = provider.pending_index {
-                                edges.push((provider_idx, idx));
-                            }
-                        } else {
-                            errors.push(format!(
-                                "  - '{}' {kind} '{}' but provider '{}' offers version {}",
-                                entry.id, req, provider.id, provider.version,
-                            ));
+                }
+                Some(provider) => {
+                    if req.req().matches(provider.version) {
+                        if let Some(provider_idx) = provider.pending_index {
+                            edges.push((provider_idx, idx));
                         }
+                    } else {
+                        errors.push(format!(
+                            "  - '{}' {kind} '{}' but provider '{}' offers version {}",
+                            entry.id, req, provider.id, provider.version,
+                        ));
                     }
                 }
             };
@@ -1518,5 +1518,83 @@ mod capability_tests {
             req: VersionReq::caret(Version::new(2, 0, 0)),
         });
         server.finish().await;
+    }
+}
+
+#[cfg(test)]
+mod plugin_macro_tests {
+    use super::Server;
+    use crate::plugin;
+    use crate::plugin::{Contract, Extends, Optional, Plugin, PluginId, Version};
+
+    // A capability type the macro-generated plugins share.
+    #[derive(Default)]
+    struct Counter {
+        value: u32,
+    }
+    impl Contract for Counter {
+        const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+    }
+
+    // Provider keeps a raw `&mut Server` (inserts stay imperative) and declares the
+    // capability through the attribute.
+    struct CounterProvider;
+    #[plugin(id = "test::macro::provider", version = "0.1.0", provides(Counter))]
+    impl Plugin for CounterProvider {
+        fn build(&self, server: &mut Server) {
+            server.insert_resource(Counter::default());
+        }
+    }
+
+    // Extender consumes through a typed param — no `.expect()`, infallible `&mut`.
+    struct CounterExtender;
+    #[plugin(id = "test::macro::extender", version = "0.1.0")]
+    impl Plugin for CounterExtender {
+        fn build(&self, mut counter: Extends<Counter>) {
+            counter.value += 1;
+        }
+    }
+
+    // Optional consumer reads the capability if present.
+    struct OptionalReader;
+    #[plugin(id = "test::macro::optional", version = "0.1.0")]
+    impl Plugin for OptionalReader {
+        fn build(&self, counter: Optional<Counter>) {
+            assert!(counter.is_present());
+        }
+    }
+
+    #[tokio::test]
+    async fn macro_derives_access_orders_provider_first_and_yields_mut() {
+        let mut server = Server::new();
+        // Add consumers before the provider — the resolver must still build provider first.
+        server.add_plugins(CounterExtender);
+        server.add_plugins(OptionalReader);
+        server.add_plugins(CounterProvider);
+        server.finish().await;
+
+        // The extender's infallible `&mut` mutated the provider's inserted resource.
+        assert_eq!(server.get_resource::<Counter>().unwrap().value, 1);
+
+        // `access()` was derived entirely by the macro from the attribute + params.
+        let manifest = server.plugin_manifest();
+        let provider = manifest
+            .entry(&PluginId::new("test::macro::provider"))
+            .expect("provider in manifest");
+        assert_eq!(provider.provides.len(), 1);
+
+        let extender = manifest
+            .entry(&PluginId::new("test::macro::extender"))
+            .expect("extender in manifest");
+        assert_eq!(extender.extends.len(), 1);
+        assert_eq!(
+            extender.extends[0].provider,
+            Some(PluginId::new("test::macro::provider"))
+        );
+
+        let optional = manifest
+            .entry(&PluginId::new("test::macro::optional"))
+            .expect("optional reader in manifest");
+        assert_eq!(optional.optional.len(), 1);
     }
 }

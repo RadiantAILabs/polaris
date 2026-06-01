@@ -2,8 +2,8 @@
 
 use super::provider::AnthropicProvider;
 use polaris_models::ModelRegistry;
-use polaris_system::plugin::{Plugin, PluginAccess, Version, VersionReq};
-use polaris_system::server::Server;
+use polaris_system::plugin;
+use polaris_system::plugin::{Extends, Plugin};
 
 /// Plugin providing support for Anthropic models.
 ///
@@ -73,27 +73,14 @@ impl AnthropicPlugin {
     }
 }
 
+// The `Extends<ModelRegistry>` parameter is both the declaration (the macro derives
+// `access().extends::<ModelRegistry>(...)` from it) and the access: the resolver orders
+// this plugin after whichever plugin provides `ModelRegistry`, verifies the contract
+// version, and guarantees the registry is present — so the parameter is an infallible
+// `&mut ModelRegistry` and the old "add ModelsPlugin first" panic is gone.
+#[plugin(id = "polaris::provider::anthropic", version = "0.0.1")]
 impl Plugin for AnthropicPlugin {
-    const ID: &'static str = "polaris::provider::anthropic";
-    const VERSION: Version = Version::new(0, 0, 1);
-
-    /// Declares that this plugin extends the [`ModelRegistry`] capability. The resolver
-    /// orders this plugin after whichever plugin provides `ModelRegistry` (no longer
-    /// naming `ModelsPlugin`), and verifies the provider's contract version is compatible.
-    fn access(&self) -> PluginAccess {
-        PluginAccess::new()
-            .extends::<ModelRegistry>(VersionReq::caret(ModelRegistry::CONTRACT_VERSION))
-    }
-
-    fn build(&self, server: &mut Server) {
-        let provider = AnthropicProvider::new(self.api_key.clone());
-
-        let Some(mut registry) = server.get_resource_mut::<ModelRegistry>() else {
-            panic!(
-                "ModelRegistry not found. Make sure to add ModelsPlugin before AnthropicPlugin."
-            );
-        };
-
-        registry.register_llm_provider(provider);
+    fn build(&self, mut registry: Extends<ModelRegistry>) {
+        registry.register_llm_provider(AnthropicProvider::new(self.api_key.clone()));
     }
 }

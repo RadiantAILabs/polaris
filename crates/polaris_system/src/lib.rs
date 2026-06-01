@@ -78,6 +78,9 @@ pub mod system;
 /// Re-export the `#[system]` attribute macro.
 pub use polaris_system_macros::system;
 
+/// Re-export the `#[plugin]` attribute macro.
+pub use polaris_system_macros::plugin;
+
 /// Re-export all common types for easy access.
 pub mod prelude {
     pub use crate::api::*;

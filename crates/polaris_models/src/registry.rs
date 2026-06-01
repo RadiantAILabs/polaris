@@ -2,6 +2,7 @@
 
 use crate::error::CreateModelError;
 use crate::llm::{DynLlmProvider, Llm};
+use polaris_system::plugin::{Contract, Version};
 use polaris_system::resource::GlobalResource;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,17 +72,18 @@ impl std::fmt::Debug for ModelRegistry {
 
 impl GlobalResource for ModelRegistry {}
 
-impl ModelRegistry {
-    /// Contract version of the [`ModelRegistry`] capability.
-    ///
-    /// This is the version a provider (e.g. [`ModelsPlugin`](crate::ModelsPlugin))
-    /// exposes when it provides the registry, and the version provider plugins match
-    /// against when they declare they extend it. Versioning the capability — rather than
-    /// the plugin — lets any plugin that satisfies this contract supply or extend the
-    /// registry. Bump it when the registry's public API changes incompatibly.
-    pub const CONTRACT_VERSION: polaris_system::plugin::Version =
-        polaris_system::plugin::Version::new(0, 1, 0);
+/// Exposes [`ModelRegistry`] as a versioned capability.
+///
+/// The version a provider (e.g. [`ModelsPlugin`](crate::ModelsPlugin)) exposes when it
+/// provides the registry, and the version extender plugins match against when they declare
+/// they extend it. Versioning the capability — rather than the plugin — lets any plugin
+/// that satisfies this contract supply or extend the registry. Bump it when the registry's
+/// public API changes incompatibly.
+impl Contract for ModelRegistry {
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+}
 
+impl ModelRegistry {
     /// Creates an empty registry.
     #[must_use]
     pub fn new() -> Self {
