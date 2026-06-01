@@ -179,6 +179,8 @@ It aggregates and panics on any of these conflicts, naming the offending plugins
 
 The ordering guarantee (provider before its extenders and requirers) is what lets the `build()` body above access the registry infallibly, and it composes with the `build → ready` lifecycle: an extender mutates the still-mutable resource in `build()`, and the provider can freeze it to a global in `ready()` (which always runs after every `build()`).
 
+After the build phase, the server also **verifies the other side of the promise**: every capability a plugin declared in `provides(...)` must actually have been inserted (as a build-phase resource, a global, or an API — all three stores are checked). A plugin that declares `provides::<T>()` but forgets to insert `T` would leave its requirers fetching a value that is not there; resolution panics, naming the plugin and capability, rather than letting the gap surface as a deeper failure later.
+
 ### Composing and swapping
 
 Because consumers depend on capabilities rather than plugin types, an implementation can be swapped without touching anything downstream. Any plugin that provides `ModelRegistry` satisfies a consumer's `requires::<ModelRegistry>()`:
@@ -203,6 +205,14 @@ println!("{}", server.plugin_manifest());
 
 // Graphviz digraph of capability edges (provider → consumer), for `dot -Tsvg`
 let dot = server.plugin_manifest().to_dot();
+```
+
+### Pinning the graph — `plugins.lock`
+
+Because the manifest is a deterministic function of the assembled plugin set, it can be serialised and checked in as a lockfile, then re-derived in a test to catch accidental drift. `examples/plugins.lock` pins a representative, hermetic plugin set; `examples/tests/plugins_lock.rs` re-resolves it, serialises the manifest into a sorted, order-independent form, and asserts equality. A change to any plugin's `provides` / `extends` / `requires`, a contract-version bump, or a requirement resolving to a different provider all change the serialisation and fail the test — the capability-graph analog of the `tests/plugin_catalog.rs` documentation drift guard. When a change is intentional, regenerate the lock:
+
+```bash
+POLARIS_BLESS_PLUGINS_LOCK=1 cargo test -p examples --test plugins_lock
 ```
 
 ### Relationship to `dependencies()`
