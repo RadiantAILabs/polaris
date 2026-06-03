@@ -28,7 +28,7 @@ While unpublished, depend on the package via a workspace path or a Git submodule
 // dashboard repo's package.json
 {
   "dependencies": {
-    "@polaris/types": "file:../polar-rs/bindings/ts"
+    "@polaris/types": "file:../polaris/bindings/ts"
   }
 }
 ```
@@ -44,11 +44,13 @@ Modern bundlers (Vite, esbuild, swc) consume `.ts` directly via the `"types"` an
 From the workspace root:
 
 ```bash
-cargo test --features typegen
+cargo make gen-bindings
 git add bindings/ts/src
 ```
 
-CI runs `git diff --exit-code bindings/`, so any uncommitted regeneration drift fails the build.
+`cargo make test` regenerates the bindings as part of its `--all-features` run and
+then fails (via the `test-bindings` task) if anything drifted, so CI catches stale
+bindings even if you forget to regenerate.
 
 ## Adding a new type to the barrel
 

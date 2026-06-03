@@ -50,8 +50,14 @@ The `typegen` feature is gated at the workspace root and is **off by default** s
 cargo build
 
 # Regenerate `.ts` files in bindings/.
-cargo test --features typegen
+cargo make gen-bindings
 ```
+
+> **Note:** plain `cargo test --features typegen` from the workspace root does
+> **not** regenerate the bindings — it only runs the root package's tests, not
+> the `export_bindings_*` tests inside `polaris_sessions` / `polaris_core_plugins`.
+> Use `cargo make gen-bindings`, which runs those export tests across the whole
+> workspace.
 
 The feature flows from `polaris-ai` → `polaris_internal` → individual crates (currently `polaris_sessions` and `polaris_core_plugins`). Each crate that derives `TS` declares its own crate-level `typegen` feature that pulls `ts-rs` as an optional dep.
 
@@ -121,7 +127,7 @@ Hook event payloads land here as the corresponding crates ship.
 Locally, after touching any `TS`-derived type:
 
 ```bash
-cargo test --features typegen
+cargo make gen-bindings
 git add bindings/ts/src
 # If you added a new type, also update bindings/ts/src/index.ts.
 ```
