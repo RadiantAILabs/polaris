@@ -16,12 +16,26 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The --all-features build (opentelemetry, aws-lc-sys, ring, dashboard, ...)
+  # is large enough that full debuginfo can exhaust the runner's disk. Test
+  # binaries don't need debuginfo, so drop it to shrink the target dir.
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
+      - name: Free up disk space
+        run: |
+          # The default ubuntu runner ships ~25GB of preinstalled SDKs we
+          # never use; removing them avoids "No space left on device" while
+          # compiling the --all-features test binaries.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
@@ -45,14 +59,8 @@ jobs:
       - name: Check examples
         run: cargo check --manifest-path examples/Cargo.toml
 
-      - name: Verify generated TS bindings are up to date
-        run: |
-          if [ -n "$(git status --porcelain bindings/)" ]; then
-            echo "::error::Generated bindings/ are stale. Run 'cargo test --features typegen' and commit the result."
-            git status --porcelain bindings/
-            git diff bindings/
-            exit 1
-          fi
+      # Note: stale-bindings drift is enforced by the `test-bindings` task inside
+      # `cargo make test` above, so no separate verification step is needed here.
 
   feature-matrix:
     name: Feature matrix
