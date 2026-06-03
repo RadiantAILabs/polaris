@@ -133,7 +133,7 @@ const AGENT_TYPE_LABEL_KEY: &str = "agent_type";
 ///     // Provider: TracingPlugin inserts the SpanBuffer API.
 ///     .add_plugins(TracingPlugin::new())
 ///     .add_plugins(RunCountPlugin);
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # }
 /// ```
 #[derive(Debug, Clone)]

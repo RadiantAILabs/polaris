@@ -26,7 +26,7 @@ async fn get_llm(model_id: &str) -> Llm {
     let mut server = Server::new();
     server.add_plugins(ModelsPlugin);
     server.add_plugins(AnthropicPlugin::from_env("ANTHROPIC_API_KEY"));
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let registry = server
         .get_global::<ModelRegistry>()

@@ -54,7 +54,7 @@ async fn process_turn_emits_spans_to_dashboard_span_buffer() {
         .add_plugins(TracingPlugin::new())
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let sessions = server
         .api::<SessionsAPI>()

@@ -30,7 +30,7 @@
 //! let mut server = Server::new();
 //! server.add_plugins(RequestContextPlugin);
 //! # tokio_test::block_on(async {
-//! server.finish().await;
+//! server.finish().await.unwrap();
 //! # });
 //! ```
 
@@ -187,12 +187,12 @@ impl LocalResource for HttpHeaders {}
 ///
 /// # Dependencies
 ///
-/// Requires [`HooksAPI`](polaris_graph::hooks::HooksAPI) from `polaris_graph`.
+/// Requires [`HooksAPI`] from `polaris_graph`.
 /// Inserts it if not already present on the server.
 ///
 /// # Hooks Registered
 ///
-/// Registered via [`HooksAPI`](polaris_graph::hooks::HooksAPI).
+/// Registered via [`HooksAPI`].
 ///
 /// | Schedule | Description |
 /// |----------|-------------|
@@ -200,7 +200,7 @@ impl LocalResource for HttpHeaders {}
 ///
 /// # Extends
 ///
-/// - [`HooksAPI`](polaris_graph::hooks::HooksAPI) — registers the
+/// - [`HooksAPI`] — registers the
 ///   `OnGraphStart` hook above. Inserts the API itself if no other
 ///   plugin provided it.
 ///
@@ -213,7 +213,7 @@ impl LocalResource for HttpHeaders {}
 /// let mut server = Server::new();
 /// server.add_plugins(RequestContextPlugin);
 /// # tokio_test::block_on(async {
-/// server.finish().await;
+/// server.finish().await.unwrap();
 /// # });
 ///
 /// let ctx = server.create_context();
@@ -306,7 +306,7 @@ mod tests {
     async fn plugin_registers_local_resource() {
         let mut server = Server::new();
         server.add_plugins(RequestContextPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<RequestContext>());
@@ -318,7 +318,7 @@ mod tests {
     async fn injected_context_overrides_default() {
         let mut server = Server::new();
         server.add_plugins(RequestContextPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let mut ctx = server.create_context();
         ctx.insert(RequestContext {
@@ -338,7 +338,7 @@ mod tests {
 
         let mut server = Server::new();
         server.add_plugins(RequestContextPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert("x-trace-id", HeaderValue::from_static("from-header"));
@@ -389,7 +389,7 @@ mod tests {
 
         let mut server = Server::new();
         server.add_plugins(RequestContextPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let mut ctx = server.create_context();
         let original_trace_id = ctx

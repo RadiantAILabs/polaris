@@ -388,26 +388,33 @@ fn parse_version(lit: &LitStr) -> syn::Result<(u64, u64, u64)> {
     Ok((major, minor, patch))
 }
 
-/// Generates a [`Plugin`](polaris_system::plugin::Plugin) impl from an `impl` block whose
+/// Generates a `Plugin` impl from an `impl` block whose
 /// `build` method declares its capability needs as typed parameters.
 ///
 /// `#[plugin]` is to a plugin what [`macro@system`] is to a system: the `build` method's
 /// parameter list is the single source of truth for what the plugin consumes, so the
 /// declaration cannot drift from the access. The macro derives
-/// [`Plugin::access`](polaris_system::plugin::Plugin::access) from those parameters plus
+/// `Plugin::access` from those parameters plus
 /// the `provides(...)` attribute, and supplies the `ID`/`VERSION` constants.
 ///
 /// # Usage
 ///
 /// Apply it to `impl Plugin for YourPlugin`, omitting `ID`, `VERSION`, and `access`:
 ///
-/// ```ignore
+/// ```no_run
+/// # use polaris_system::plugin;
+/// # use polaris_system::plugin::{Contract, Extends, Plugin, Version};
+/// # use polaris_system::server::Server;
+/// # struct ModelRegistry { providers: u32 }
+/// # impl Contract for ModelRegistry { const CONTRACT_VERSION: Version = Version::new(0, 1, 0); }
+/// struct AnthropicPlugin;
+///
 /// #[plugin(id = "polaris::provider::anthropic", version = "0.1.0")]
 /// impl Plugin for AnthropicPlugin {
 ///     // `Extends<ModelRegistry>` yields an infallible `&mut ModelRegistry`; the resolver
 ///     // guarantees a provider built first, so no `.expect("ModelsPlugin first")` is needed.
 ///     fn build(&self, mut registry: Extends<ModelRegistry>) {
-///         registry.register_llm_provider(AnthropicProvider::new(self.api_key.clone()));
+///         registry.providers += 1;
 ///     }
 /// }
 /// ```
@@ -415,20 +422,28 @@ fn parse_version(lit: &LitStr) -> syn::Result<(u64, u64, u64)> {
 /// A provider plugin that inserts a new capability keeps a `&mut Server` parameter (the
 /// inserts stay imperative) and declares what it provides via the attribute:
 ///
-/// ```ignore
+/// ```no_run
+/// # use polaris_system::plugin;
+/// # use polaris_system::plugin::{Contract, Plugin, Version};
+/// # use polaris_system::server::Server;
+/// # struct ModelRegistry;
+/// # impl ModelRegistry { fn new() -> Self { Self } }
+/// # impl Contract for ModelRegistry { const CONTRACT_VERSION: Version = Version::new(0, 1, 0); }
+/// struct ModelsPlugin;
+///
 /// #[plugin(id = "polaris::models", version = "0.0.1", provides(ModelRegistry))]
 /// impl Plugin for ModelsPlugin {
 ///     fn build(&self, server: &mut Server) {
 ///         server.insert_resource(ModelRegistry::new());
 ///     }
-///     async fn ready(&self, server: &mut Server) { /* freeze to global */ }
+///     async fn ready(&self, _server: &mut Server) { /* freeze to global */ }
 /// }
 /// ```
 ///
-/// Build parameters: [`Requires<T>`](polaris_system::plugin::Requires) → `&T`,
-/// [`Extends<T>`](polaris_system::plugin::Extends) → `&mut T`,
-/// [`Optional<T>`](polaris_system::plugin::Optional) → `Option<&T>`. Each `T` must
-/// implement [`Contract`](polaris_system::plugin::Contract); the version requirement is
+/// Build parameters: `Requires<T>` → `&T`,
+/// `Extends<T>` → `&mut T`,
+/// `Optional<T>` → `Option<&T>`. Each `T` must
+/// implement `Contract`; the version requirement is
 /// the caret range of its contract version. Any other method (`ready`, `cleanup`,
 /// `update`, `tick_schedules`, `dependencies`) is passed through unchanged.
 #[proc_macro_attribute]
@@ -519,9 +534,15 @@ fn rewrite_build(method: &mut ImplItemFn, ps: &TokenStream2) -> syn::Result<Vec<
         let pat = &pat_type.pat;
         let ty = &*pat_type.ty;
 
-        if let Type::Reference(reference) = ty {
+        if let Type::Reference(reference) = ty
+            && type_is_server(&reference.elem)
+        {
             // A raw `&mut Server` / `&Server` parameter — pass the server through so the
-            // provide side can keep inserting resources imperatively.
+            // provide side can keep inserting resources imperatively. Only a reference
+            // whose referent is `Server` is treated this way; any other reference falls
+            // through to the build-param branch below, where it must implement
+            // `BuildParam` (so e.g. a stray `&Config` fails with a clear trait bound
+            // rather than silently binding to the server).
             if reference.mutability.is_some() {
                 bindings.push(quote! { let #pat = &mut *_server; });
             } else {
@@ -564,6 +585,14 @@ fn rewrite_build(method: &mut ImplItemFn, ps: &TokenStream2) -> syn::Result<Vec<
     method.block.stmts = new_stmts;
 
     Ok(build_param_types)
+}
+
+/// Returns `true` if `ty` names the `Server` type (bare or path-qualified, e.g.
+/// `Server` or `polaris_system::server::Server`), so the `#[plugin]` macro can pass it
+/// through as the imperative build handle rather than fetching it as a build parameter.
+fn type_is_server(ty: &Type) -> bool {
+    matches!(ty, Type::Path(type_path)
+        if type_path.path.segments.last().is_some_and(|seg| seg.ident == "Server"))
 }
 
 /// Converts `snake_case` to `PascalCase`.

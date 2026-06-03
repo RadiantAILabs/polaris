@@ -106,7 +106,7 @@ async fn plugin_registers_routes_and_server_responds() {
             .with_listener(listener),
     );
     server.add_plugins(TestRoutePlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     wait_for_server(port).await;
 
@@ -146,7 +146,7 @@ async fn multiple_plugins_register_routes() {
     );
     server.add_plugins(TestRoutePlugin);
     server.add_plugins(AnotherRoutePlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     wait_for_server(port).await;
 
@@ -174,7 +174,7 @@ async fn request_id_header_is_present() {
             .with_listener(listener),
     );
     server.add_plugins(TestRoutePlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     wait_for_server(port).await;
 
@@ -283,7 +283,7 @@ async fn sse_streams_io_messages() {
             .with_listener(listener),
     );
     server.add_plugins(SseTestPlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     wait_for_server(port).await;
 
@@ -390,7 +390,7 @@ mod allowlist_tests {
             AppPlugin::new(config.with_host("127.0.0.1").with_port(port)).with_listener(listener),
         );
         server.add_plugins(AllowlistRoutesPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
         wait_for_server(port).await;
         (server, port)
     }
@@ -679,7 +679,7 @@ mod ws_tests {
                 .with_listener(listener),
         );
         server.add_plugins(WsEchoPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         wait_for_server(port).await;
 
@@ -772,7 +772,7 @@ mod ws_tests {
             .with_listener(listener),
         );
         server.add_plugins(AuthWsPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         wait_for_server(port).await;
 

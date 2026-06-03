@@ -43,7 +43,7 @@
 //!     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())))
 //!     .add_plugins(AppPlugin::new(AppConfig::new()))
 //!     .add_plugins(HttpPlugin::new());
-//! server.run().await;
+//! server.run().await.unwrap();
 //! # }
 //! ```
 
@@ -122,7 +122,7 @@ use polaris_system::server::Server;
 ///     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())))
 ///     .add_plugins(AppPlugin::new(AppConfig::new()))
 ///     .add_plugins(HttpPlugin::new());
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # }
 /// ```
 #[derive(Debug, Default)]

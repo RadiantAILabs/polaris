@@ -23,7 +23,7 @@
 //! let mut server = Server::new();
 //! server.add_plugins(ServerInfoPlugin);
 //! # tokio_test::block_on(async {
-//! server.finish().await;
+//! server.finish().await.unwrap();
 //! # });
 //!
 //! // Access ServerInfo from a context
@@ -128,7 +128,7 @@ impl Default for ServerInfo {
 /// let mut server = Server::new();
 /// server.add_plugins(ServerInfoPlugin);
 /// # tokio_test::block_on(async {
-/// server.finish().await;
+/// server.finish().await.unwrap();
 /// # });
 /// ```
 #[derive(Debug, Default, Clone, Copy)]
@@ -157,7 +157,7 @@ mod tests {
     async fn server_info_plugin_registers_resource() {
         let mut server = Server::new();
         server.add_plugins(ServerInfoPlugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<ServerInfo>());

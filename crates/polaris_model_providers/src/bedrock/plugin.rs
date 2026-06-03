@@ -10,16 +10,16 @@ use std::sync::Arc;
 /// Plugin providing support for AWS Bedrock models.
 ///
 /// Registers a [`BedrockProvider`] with the [`ModelRegistry`] during
-/// `build()`. After [`ModelsPlugin::ready`] freezes the registry, models
+/// `build()`. After [`ModelsPlugin::ready`](polaris_models::ModelsPlugin::ready) freezes the registry, models
 /// served by this provider become resolvable through
-/// [`ModelRegistry::resolve`](polaris_models::ModelRegistry::resolve) under
+/// [`ModelRegistry::llm`](polaris_models::ModelRegistry::llm) under
 /// the `bedrock/<model>` identifier.
 ///
 /// # Resources Provided
 ///
 /// | Resource | Scope | Description |
 /// |----------|-------|-------------|
-/// | _none_   | —     | This plugin only registers a provider with the [`ModelRegistry`] owned by [`ModelsPlugin`]. |
+/// | _none_   | —     | This plugin only registers a provider with the [`ModelRegistry`] owned by [`ModelsPlugin`](polaris_models::ModelsPlugin). |
 ///
 /// # APIs Provided
 ///
@@ -29,8 +29,9 @@ use std::sync::Arc;
 ///
 /// # Dependencies
 ///
-/// - [`ModelsPlugin`] — owns the [`ModelRegistry`] that this plugin
-///   registers itself with. Must be added before `BedrockPlugin`.
+/// - [`ModelsPlugin`](polaris_models::ModelsPlugin) — owns the [`ModelRegistry`] that this plugin
+///   registers itself with. The capability resolver orders `ModelsPlugin`
+///   (the provider) before this plugin regardless of `add_plugins` order.
 ///
 /// # Lifecycle
 ///
@@ -40,13 +41,14 @@ use std::sync::Arc;
 ///   [`from_env`](Self::from_env), the default credential chain loaded on
 ///   a dedicated thread with its own tokio runtime), builds a Bedrock
 ///   client, and registers a `BedrockProvider` with the [`ModelRegistry`].
-///   Panics if [`ModelsPlugin`] was not added first, if AWS config
+///   The `Extends<ModelRegistry>` build param has the resolver guarantee
+///   the registry is present and provider-ordered. Panics if AWS config
 ///   loading fails, or if the config-loading thread panics.
 /// - No `ready()` or `cleanup()` behavior; registers no tick schedules.
 ///
 /// # Extends
 ///
-/// - [`ModelRegistry`] (from [`ModelsPlugin`]) — registers a
+/// - [`ModelRegistry`] (from [`ModelsPlugin`](polaris_models::ModelsPlugin)) — registers a
 ///   `BedrockProvider` so that `bedrock/<model>` identifiers become
 ///   resolvable once `ModelsPlugin` freezes the registry in `ready()`.
 ///

@@ -25,7 +25,7 @@
 //!         .with_service_name("my-agent")
 //! );
 //! # tokio_test::block_on(async {
-//! server.finish().await;
+//! server.finish().await.unwrap();
 //! # });
 //! ```
 
@@ -101,7 +101,7 @@ use tracing_subscriber::layer::Layer as _;
 ///         .with_export_header("x-api-key", api_key),
 /// );
 /// # tokio_test::block_on(async {
-/// server.finish().await;
+/// server.finish().await.unwrap();
 /// # });
 /// ```
 pub struct OpenTelemetryPlugin {

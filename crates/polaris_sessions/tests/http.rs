@@ -79,7 +79,7 @@ async fn test_server(listener: tokio::net::TcpListener, port: u16) -> Server {
                 .with_listener(listener),
         )
         .add_plugins(HttpPlugin::new());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let sessions = server.api::<SessionsAPI>().unwrap();
     sessions.register_agent(NoOpAgent).unwrap();

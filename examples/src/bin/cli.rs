@@ -214,7 +214,7 @@ async fn main() {
         server.add_plugins(OpenTelemetryPlugin::new(endpoint));
     }
 
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Set serializers after all plugins have registered their resources.
     let persistence = server.api::<PersistenceAPI>().unwrap();

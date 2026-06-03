@@ -62,7 +62,7 @@
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut server = Server::new();
 //! server.add_plugins(MinimalPlugins.build());
-//! server.finish().await;
+//! server.finish().await.unwrap();
 //!
 //! let graph = {
 //!     let mut g = Graph::new();

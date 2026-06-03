@@ -32,7 +32,7 @@ pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &str { std::any::type_name::<Self>() }
 
     /// Declares plugins that must be added before this one.
-    /// The server will panic if dependencies are not satisfied.
+    /// `Server::finish()` returns a `ServerBuildError` if dependencies are not satisfied.
     fn dependencies(&self) -> Vec<PluginId> { Vec::new() }
 
     /// Declares the capabilities (resource/API types) this plugin provides,
@@ -47,7 +47,7 @@ The `Plugin` trait exposes lifecycle methods that the server calls at different 
 
 ### Startup
 
-The server resolves dependencies before calling any lifecycle methods. It ensures that every plugin ID returned by `dependencies()` corresponds to a registered plugin. If any dependency is missing, or a circular dependency is detected, the server will panic.
+The server resolves dependencies before calling any lifecycle methods. It ensures that every plugin ID returned by `dependencies()` corresponds to a registered plugin. If any dependency is missing, or a circular dependency is detected, `Server::finish()` returns a `ServerBuildError` (`MissingDependencies` / `CircularDependency`).
 
 The server then calls `build()` on each plugin in the order they are registered.
 
@@ -80,7 +80,7 @@ impl Plugin for ToolsPlugin {
 }
 ```
 
-If one or more dependencies are missing when `Server::finish()` runs, the server panics with a message listing **every** missing dependency and the plugins that required it — so all problems can be fixed in one pass rather than one rebuild at a time.
+If one or more dependencies are missing when `Server::finish()` runs, it returns `ServerBuildError::MissingDependencies` with a message listing **every** missing dependency and the plugins that required it — so all problems can be fixed in one pass rather than one rebuild at a time.
 
 ### Auto-registering defaults
 
@@ -100,7 +100,7 @@ impl Plugin for SessionsPlugin {
 }
 ```
 
-Use this only when the dependency has a sensible default. Dependencies without a default still panic when missing.
+Use this only when the dependency has a sensible default. Dependencies without a default still cause `finish()` to return a `ServerBuildError` when missing.
 
 ## Capability-Based Dependencies
 
@@ -171,7 +171,7 @@ During `finish()`, before building, the server:
 - builds a provider map from every plugin's `provides`, and
 - for each `extends` / `requires` (and each satisfiable `optionally_requires`), verifies a version-compatible provider exists and adds a **provider → consumer** ordering edge that folds into the same topological sort as `dependencies()`.
 
-It aggregates and panics on any of these conflicts, naming the offending plugins:
+It aggregates these conflicts into a `ServerBuildError::CapabilityConflicts` returned from `finish()`, naming the offending plugins:
 
 - a capability provided by **more than one** plugin,
 - a required or extended capability with **no** provider,
@@ -179,7 +179,7 @@ It aggregates and panics on any of these conflicts, naming the offending plugins
 
 The ordering guarantee (provider before its extenders and requirers) is what lets the `build()` body above access the registry infallibly, and it composes with the `build → ready` lifecycle: an extender mutates the still-mutable resource in `build()`, and the provider can freeze it to a global in `ready()` (which always runs after every `build()`).
 
-After the build phase, the server also **verifies the other side of the promise**: every capability a plugin declared in `provides(...)` must actually have been inserted (as a build-phase resource, a global, or an API — all three stores are checked). A plugin that declares `provides::<T>()` but forgets to insert `T` would leave its requirers fetching a value that is not there; resolution panics, naming the plugin and capability, rather than letting the gap surface as a deeper failure later.
+After the build phase, the server also **verifies the other side of the promise**: every capability a plugin declared in `provides(...)` must actually have been inserted (as a build-phase resource, a global, or an API — all three stores are checked). A plugin that declares `provides::<T>()` but forgets to insert `T` would leave its requirers fetching a value that is not there; `finish()` returns `ServerBuildError::UnprovidedCapabilities`, naming the plugin and capability, rather than letting the gap surface as a deeper failure later.
 
 ### Composing and swapping
 
@@ -476,7 +476,7 @@ mod tests {
         let mut server = Server::new();
         server.add_plugins(MinimalPlugins.build());
         server.add_plugins(MyPlugin { api_key: "test".into() });
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<MyConfig>());

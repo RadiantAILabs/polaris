@@ -12,7 +12,7 @@
 //!
 //! Regression context: a downstream consumer reported that neither span
 //! reached the buffer in their dashboard build. This test pins the
-//! polar-rs side of that contract.
+//! polaris side of that contract.
 
 #![cfg(feature = "dashboard")]
 
@@ -36,7 +36,7 @@ async fn executor_spans_reach_dashboard_span_buffer() {
     server
         .add_plugins(AppPlugin::new(AppConfig::new().with_host("127.0.0.1")))
         .add_plugins(TracingPlugin::new().with_fmt(FmtConfig::default()));
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let buffer = server
         .api::<SpanBuffer>()

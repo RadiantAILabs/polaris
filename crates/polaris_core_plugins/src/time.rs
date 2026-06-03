@@ -33,7 +33,7 @@
 //! server.add_plugins(ServerInfoPlugin);
 //! server.add_plugins(TimePlugin::default());
 //! # tokio_test::block_on(async {
-//! server.finish().await;
+//! server.finish().await.unwrap();
 //! # });
 //! ```
 
@@ -293,7 +293,7 @@ impl Default for Stopwatch {
 /// server.add_plugins(ServerInfoPlugin);
 /// server.add_plugins(TimePlugin::default());
 /// # tokio_test::block_on(async {
-/// server.finish().await;
+/// server.finish().await.unwrap();
 /// # });
 /// ```
 ///
@@ -317,7 +317,7 @@ impl Default for Stopwatch {
 /// server.add_plugins(ServerInfoPlugin);
 /// server.add_plugins(plugin);
 /// # tokio_test::block_on(async {
-/// server.finish().await;
+/// server.finish().await.unwrap();
 /// # });
 ///
 /// // Advance time in tests without waiting
@@ -537,7 +537,7 @@ mod tests {
         let mut server = Server::new();
         server.add_plugins(ServerInfoPlugin);
         server.add_plugins(plugin);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<Clock>());

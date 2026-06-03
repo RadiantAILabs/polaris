@@ -13,7 +13,7 @@
 //! Server::new()
 //!     .add_plugins(DefaultPlugins)
 //!     .run()
-//!     .await;
+//!     .await.unwrap();
 //! # });
 //! ```
 //!
@@ -21,9 +21,9 @@
 //!
 //! The server distinguishes between two resource scopes:
 //!
-//! - **Global resources** ([`GlobalResource`](crate::resource::GlobalResource)) —
+//! - **Global resources** ([`GlobalResource`]) —
 //!   server-lifetime, read-only via [`Res<T>`](crate::param::Res)
-//! - **Local resources** ([`LocalResource`](crate::resource::LocalResource)) —
+//! - **Local resources** ([`LocalResource`]) —
 //!   per-context, mutable via [`ResMut<T>`](crate::param::ResMut)
 //!
 //! ```
@@ -46,7 +46,7 @@
 //! let ctx = server.create_context();
 //! ```
 //!
-//! See [`SystemContext`](crate::param::SystemContext) for how systems resolve
+//! See [`SystemContext`] for how systems resolve
 //! parameters from contexts.
 //!
 //! # Lifecycle
@@ -84,6 +84,52 @@ type LocalFactory = Arc<dyn Fn() -> BoxedResource + Send + Sync>;
 
 /// Type-erased API for dynamic storage.
 type BoxedAPI = Box<dyn std::any::Any + Send + Sync>;
+
+/// Error returned by [`Server::finish`] (and [`run`](Server::run) /
+/// [`run_once`](Server::run_once)) when the plugin graph cannot be assembled.
+///
+/// These are *startup-configuration* failures — a plugin asked for a
+/// capability nobody provides, two plugins provide the same one, a dependency
+/// is missing, or the dependency graph has a cycle. Returning them rather than
+/// panicking lets a host report the problem and exit cleanly. Calling
+/// `finish()` more than once is a *programmer* error and still panics.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ServerBuildError {
+    /// One or more capability requirements could not be satisfied: a required
+    /// or extended capability had no provider, the same capability was
+    /// provided by more than one plugin, or a provider's version did not
+    /// satisfy the requirement. Each entry describes one conflict.
+    #[error(
+        "{} plugin capability conflict(s):\n{}\n\nFix: ensure each required or \
+         extended capability has exactly one provider at a compatible version.",
+        .0.len(),
+        .0.join("\n")
+    )]
+    CapabilityConflicts(Vec<String>),
+
+    /// One or more plugins declared (via `provides(...)`) a capability they
+    /// never inserted during `build()`. Each entry names one offender.
+    #[error(
+        "{} plugin(s) declared a capability they did not provide:\n{}\n\nFix: insert \
+         the resource/global/API in build(), or drop the provides(...) declaration.",
+        .0.len(),
+        .0.join("\n")
+    )]
+    UnprovidedCapabilities(Vec<String>),
+
+    /// One or more plugin dependencies were not satisfied. The message lists
+    /// every missing dependency together with the plugins that required it.
+    #[error("{0}")]
+    MissingDependencies(String),
+
+    /// A circular dependency was detected among the listed plugins.
+    #[error(
+        "Circular dependency detected among plugins: {0:?}\n\
+         Break the cycle by extracting shared functionality into a separate plugin."
+    )]
+    CircularDependency(Vec<String>),
+}
 
 /// Represents the build state of the server.
 ///
@@ -740,12 +786,28 @@ impl Server {
     /// 4. Calls `build()` on each plugin in order
     /// 5. Calls `ready()` on each plugin in order
     ///
+    /// # Errors
+    ///
+    /// Returns [`ServerBuildError`] when the plugin graph cannot be assembled:
+    ///
+    /// - A plugin's dependency is not satisfied and no default is declared
+    ///   ([`MissingDependencies`](ServerBuildError::MissingDependencies))
+    /// - There is a circular dependency between plugins
+    ///   ([`CircularDependency`](ServerBuildError::CircularDependency))
+    /// - A required or extended capability has no provider, more than one
+    ///   plugin provides the same capability, or a provider's capability
+    ///   version does not satisfy a requirement
+    ///   ([`CapabilityConflicts`](ServerBuildError::CapabilityConflicts)).
+    ///   Capabilities declared via [`Optional`](crate::plugin::Optional) are
+    ///   exempt from the missing-provider check.
+    /// - A plugin declares it `provides` a capability but never inserts it
+    ///   during `build()`
+    ///   ([`UnprovidedCapabilities`](ServerBuildError::UnprovidedCapabilities))
+    ///
     /// # Panics
     ///
-    /// - If a plugin's dependency is not satisfied and no default is declared
-    /// - If there is a circular dependency between plugins
-    /// - If called more than once
-    pub async fn finish(&mut self) {
+    /// - If called more than once (a programmer error, not a configuration one)
+    pub async fn finish(&mut self) -> Result<(), ServerBuildError> {
         if self.build_state != BuildState::NotStarted {
             panic!("Server::finish() was already called. Cannot build twice.");
         }
@@ -755,11 +817,11 @@ impl Server {
 
         // Phase 0.5: Resolve capability declarations (provides/extends/requires).
         // Validates providers/versions and yields extra ordering edges that fold into
-        // the topological sort below. Panics with an aggregated message on any conflict.
-        let capability_edges = self.resolve_capabilities();
+        // the topological sort below. Errors with an aggregated message on any conflict.
+        let capability_edges = self.resolve_capabilities()?;
 
         // Phase 1: Sort plugins by dependencies (legacy plugin-id edges + capability edges)
-        let sorted_plugins = self.sort_plugins_by_dependencies(&capability_edges);
+        let sorted_plugins = self.sort_plugins_by_dependencies(&capability_edges)?;
 
         // Phase 2: Build all plugins in sorted order
         self.build_state = BuildState::Building;
@@ -770,7 +832,7 @@ impl Server {
 
         // Phase 2.5: Verify each plugin actually inserted every capability it declared
         // it provides, then capture the resolved manifest for introspection.
-        self.verify_provided_capabilities();
+        self.verify_provided_capabilities()?;
         self.plugin_manifest = self.build_manifest();
 
         // Phase 3: Ready all plugins in sorted order
@@ -796,6 +858,7 @@ impl Server {
         let _ = self.deferred_globals.set(Arc::clone(&self.global));
 
         self.build_state = BuildState::Built;
+        Ok(())
     }
 
     /// Builds the schedule registry from plugin `tick_schedules()` declarations.
@@ -821,11 +884,15 @@ impl Server {
     /// This is a convenience method that calls `finish()` and then returns.
     /// The full run loop with `update()` calls will be added in Layer 2.
     ///
+    /// # Errors
+    ///
+    /// Same as [`finish()`](Self::finish).
+    ///
     /// # Panics
     ///
     /// Same as [`finish()`](Self::finish).
-    pub async fn run(&mut self) {
-        self.finish().await;
+    pub async fn run(&mut self) -> Result<(), ServerBuildError> {
+        self.finish().await
         // Run loop will be added in Layer 2
     }
 
@@ -851,13 +918,17 @@ impl Server {
     /// # tokio_test::block_on(async {
     /// let mut server = Server::new();
     /// server.add_plugins(MyPlugin);
-    /// server.run_once().await;
+    /// server.run_once().await.unwrap();
     ///
     /// assert!(server.contains_resource::<MyResource>());
     /// # });
     /// ```
-    pub async fn run_once(&mut self) {
-        self.finish().await;
+    ///
+    /// # Errors
+    ///
+    /// Same as [`finish()`](Self::finish).
+    pub async fn run_once(&mut self) -> Result<(), ServerBuildError> {
+        self.finish().await
     }
 
     /// Cleans up all plugins in reverse dependency order.
@@ -956,11 +1027,12 @@ impl Server {
     ///
     /// Edges are indices into `pending_plugins`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Aggregates and reports every capability conflict (duplicate provider, missing
-    /// provider, version mismatch) in a single message.
-    fn resolve_capabilities(&self) -> Vec<(usize, usize)> {
+    /// Aggregates every capability conflict (duplicate provider, missing
+    /// provider, version mismatch) into a single
+    /// [`ServerBuildError::CapabilityConflicts`].
+    fn resolve_capabilities(&self) -> Result<Vec<(usize, usize)>, ServerBuildError> {
         // capability TypeId → provider (plugin id, version, pending index if not yet built)
         let mut providers: HashMap<TypeId, CapabilityProvider> = HashMap::new();
         let mut errors: Vec<String> = Vec::new();
@@ -1016,15 +1088,10 @@ impl Server {
         }
 
         if !errors.is_empty() {
-            panic!(
-                "{} plugin capability conflict(s):\n{}\n\nFix: ensure each required or \
-                 extended capability has exactly one provider at a compatible version.",
-                errors.len(),
-                errors.join("\n"),
-            );
+            return Err(ServerBuildError::CapabilityConflicts(errors));
         }
 
-        edges
+        Ok(edges)
     }
 
     /// Verifies that every capability a plugin declared it `provides` was actually
@@ -1040,11 +1107,12 @@ impl Server {
     /// freeze-to-global-in-`ready` pattern still has its resource present) and aggregates
     /// every violation into one message.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics, listing every plugin/capability pair, if any declared `provides` was not
-    /// inserted during `build()`.
-    fn verify_provided_capabilities(&self) {
+    /// Returns [`ServerBuildError::UnprovidedCapabilities`], listing every
+    /// plugin/capability pair, if any declared `provides` was not inserted
+    /// during `build()`.
+    fn verify_provided_capabilities(&self) -> Result<(), ServerBuildError> {
         let mut missing: Vec<String> = Vec::new();
         for entry in &self.built_plugins {
             for cap in entry.plugin.access().provided() {
@@ -1063,13 +1131,10 @@ impl Server {
         }
 
         if !missing.is_empty() {
-            panic!(
-                "{} plugin(s) declared a capability they did not provide:\n{}\n\nFix: insert \
-                 the resource/global/API in build(), or drop the provides(...) declaration.",
-                missing.len(),
-                missing.join("\n"),
-            );
+            return Err(ServerBuildError::UnprovidedCapabilities(missing));
         }
+
+        Ok(())
     }
 
     /// Builds the resolved [`PluginManifest`] from `built_plugins`.
@@ -1120,17 +1185,18 @@ impl Server {
     ///
     /// Returns the sorted list of plugins.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// - If one or more plugin dependencies are not satisfied. The panic message
-    ///   lists every missing dependency together with the plugins that required it.
-    /// - If there is a circular dependency
+    /// - [`ServerBuildError::MissingDependencies`] if one or more plugin
+    ///   dependencies are not satisfied. The message lists every missing
+    ///   dependency together with the plugins that required it.
+    /// - [`ServerBuildError::CircularDependency`] if there is a cycle.
     fn sort_plugins_by_dependencies(
         &mut self,
         capability_edges: &[(usize, usize)],
-    ) -> Vec<PluginEntry> {
+    ) -> Result<Vec<PluginEntry>, ServerBuildError> {
         if self.pending_plugins.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Build a map of plugin id -> index for dependency lookup
@@ -1161,7 +1227,7 @@ impl Server {
                         in_degree[i] += 1;
                     }
                 } else if !self.built_plugins.iter().any(|p| p.id == dep_id) {
-                    // Missing — record it; aggregate before panicking so the
+                    // Missing — record it; aggregate before returning so the
                     // user sees every problem at once.
                     if let Some(slot) = missing.iter_mut().find(|(id, _)| *id == dep_id) {
                         slot.1.push(entry.id.clone());
@@ -1174,7 +1240,9 @@ impl Server {
         }
 
         if !missing.is_empty() {
-            panic!("{}", format_missing_dependencies(&missing));
+            return Err(ServerBuildError::MissingDependencies(
+                format_missing_dependencies(&missing),
+            ));
         }
 
         // Fold in capability edges (provider -> extender/requirer), skipping any that
@@ -1217,11 +1285,7 @@ impl Server {
                 .map(|(i, _)| self.pending_plugins[i].id.to_string())
                 .collect();
 
-            panic!(
-                "Circular dependency detected among plugins: {:?}\n\
-                 Break the cycle by extracting shared functionality into a separate plugin.",
-                in_cycle
-            );
+            return Err(ServerBuildError::CircularDependency(in_cycle));
         }
 
         // Extract plugins in sorted order
@@ -1242,7 +1306,7 @@ impl Server {
             result[new_pos] = Some(entry);
         }
 
-        result.into_iter().flatten().collect()
+        Ok(result.into_iter().flatten().collect())
     }
 }
 
@@ -1402,7 +1466,7 @@ impl ContextFactory {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::Server;
+    use super::{Server, ServerBuildError};
     use crate::plugin::{Plugin, PluginAccess, Version, VersionReq};
     use std::sync::{Arc, Mutex};
 
@@ -1490,7 +1554,7 @@ mod capability_tests {
             log: log.clone(),
             version: Version::new(1, 0, 0),
         });
-        server.finish().await;
+        server.finish().await.unwrap();
 
         assert_eq!(*log.lock().unwrap(), vec!["provider", "extender"]);
     }
@@ -1504,44 +1568,47 @@ mod capability_tests {
             version: Version::new(1, 0, 0),
         });
         server.add_plugins(Requirer);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let manifest = server.plugin_manifest();
         let requirer = manifest
             .entry(&crate::plugin::PluginId::new("test::requirer"))
             .expect("requirer in manifest");
-        assert_eq!(requirer.requires.len(), 1);
-        let resolved = &requirer.requires[0];
+        assert_eq!(requirer.requires().len(), 1);
+        let resolved = &requirer.requires()[0];
         assert_eq!(
-            resolved.provider,
-            Some(crate::plugin::PluginId::new("test::provider"))
+            resolved.provider(),
+            Some(&crate::plugin::PluginId::new("test::provider"))
         );
-        assert_eq!(resolved.provider_version, Some(Version::new(1, 0, 0)));
+        assert_eq!(resolved.provider_version(), Some(Version::new(1, 0, 0)));
     }
 
     #[tokio::test]
     async fn optional_requirement_without_provider_is_ok() {
         let mut server = Server::new();
         server.add_plugins(OptionalConsumer);
-        server.finish().await;
+        server.finish().await.unwrap();
         assert!(server.is_built());
     }
 
     #[tokio::test]
-    #[should_panic(expected = "no plugin provides it")]
-    async fn missing_provider_panics() {
+    async fn missing_provider_errors() {
         let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
         let mut server = Server::new();
         server.add_plugins(Extender {
             log,
             req: VersionReq::any(),
         });
-        server.finish().await;
+        let err = server.finish().await.unwrap_err();
+        assert!(
+            matches!(err, ServerBuildError::CapabilityConflicts(_)),
+            "expected CapabilityConflicts, got {err:?}"
+        );
+        assert!(err.to_string().contains("no plugin provides it"));
     }
 
     #[tokio::test]
-    #[should_panic(expected = "exactly one provider allowed")]
-    async fn duplicate_provider_panics() {
+    async fn duplicate_provider_errors() {
         let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
         let mut server = Server::new();
         server.add_plugins(Provider {
@@ -1549,12 +1616,16 @@ mod capability_tests {
             version: Version::new(1, 0, 0),
         });
         server.add_plugins(DuplicateProvider);
-        server.finish().await;
+        let err = server.finish().await.unwrap_err();
+        assert!(
+            matches!(err, ServerBuildError::CapabilityConflicts(_)),
+            "expected CapabilityConflicts, got {err:?}"
+        );
+        assert!(err.to_string().contains("exactly one provider allowed"));
     }
 
     #[tokio::test]
-    #[should_panic(expected = "offers version")]
-    async fn version_mismatch_panics() {
+    async fn version_mismatch_errors() {
         let log: BuildLog = Arc::new(Mutex::new(Vec::new()));
         let mut server = Server::new();
         // Provider exposes 1.0.0 but extender needs ^2.0.0.
@@ -1566,7 +1637,12 @@ mod capability_tests {
             log,
             req: VersionReq::caret(Version::new(2, 0, 0)),
         });
-        server.finish().await;
+        let err = server.finish().await.unwrap_err();
+        assert!(
+            matches!(err, ServerBuildError::CapabilityConflicts(_)),
+            "expected CapabilityConflicts, got {err:?}"
+        );
+        assert!(err.to_string().contains("offers version"));
     }
 
     /// Declares it provides `Registry` but never inserts it — post-build verification
@@ -1582,11 +1658,15 @@ mod capability_tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "never inserted it during build()")]
-    async fn declared_but_uninserted_provider_panics() {
+    async fn declared_but_uninserted_provider_errors() {
         let mut server = Server::new();
         server.add_plugins(ForgetfulProvider);
-        server.finish().await;
+        let err = server.finish().await.unwrap_err();
+        assert!(
+            matches!(err, ServerBuildError::UnprovidedCapabilities(_)),
+            "expected UnprovidedCapabilities, got {err:?}"
+        );
+        assert!(err.to_string().contains("never inserted it during build()"));
     }
 }
 
@@ -1640,7 +1720,7 @@ mod plugin_macro_tests {
         server.add_plugins(CounterExtender);
         server.add_plugins(OptionalReader);
         server.add_plugins(CounterProvider);
-        server.finish().await;
+        server.finish().await.unwrap();
 
         // The extender's infallible `&mut` mutated the provider's inserted resource.
         assert_eq!(server.get_resource::<Counter>().unwrap().value, 1);
@@ -1650,20 +1730,20 @@ mod plugin_macro_tests {
         let provider = manifest
             .entry(&PluginId::new("test::macro::provider"))
             .expect("provider in manifest");
-        assert_eq!(provider.provides.len(), 1);
+        assert_eq!(provider.provides().len(), 1);
 
         let extender = manifest
             .entry(&PluginId::new("test::macro::extender"))
             .expect("extender in manifest");
-        assert_eq!(extender.extends.len(), 1);
+        assert_eq!(extender.extends().len(), 1);
         assert_eq!(
-            extender.extends[0].provider,
-            Some(PluginId::new("test::macro::provider"))
+            extender.extends()[0].provider(),
+            Some(&PluginId::new("test::macro::provider"))
         );
 
         let optional = manifest
             .entry(&PluginId::new("test::macro::optional"))
             .expect("optional reader in manifest");
-        assert_eq!(optional.optional.len(), 1);
+        assert_eq!(optional.optional().len(), 1);
     }
 }

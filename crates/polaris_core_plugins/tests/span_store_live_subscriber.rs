@@ -30,7 +30,7 @@ async fn span_store_layer_appends_through_live_tracing_subscriber() {
         .add_plugins(AppPlugin::new(AppConfig::new().with_host("127.0.0.1")))
         .add_plugins(TracingPlugin::new())
         .add_plugins(SpanStorePlugin::new(store.clone()));
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Drive a session-labeled span through the global subscriber. The
     // RecordingLayer installed by SpanStorePlugin should pick it up,

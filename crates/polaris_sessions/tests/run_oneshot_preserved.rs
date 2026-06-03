@@ -53,7 +53,7 @@ async fn test_server() -> Server {
     server
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(store).without_auto_checkpoint());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let persistence = server.api::<PersistenceAPI>().unwrap();
     persistence.register::<Counter>("test");

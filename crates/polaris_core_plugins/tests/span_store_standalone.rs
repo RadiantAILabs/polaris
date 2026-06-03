@@ -49,7 +49,7 @@ async fn span_store_plugin_runs_without_dashboard_buffer() {
         // Deliberately *no* AppPlugin — the `dashboard` feature is off
         // for this test, so SpanBuffer is not in the public API surface.
         .add_plugins(SpanStorePlugin::new(store.clone()));
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Without the `dashboard` feature, `ready()` is a no-op: the seeded
     // record must still be the only one in the store — no double-hydration,

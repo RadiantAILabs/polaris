@@ -80,7 +80,7 @@ async fn test_server(store: Arc<InMemoryStore>) -> Server {
     server
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(store).without_auto_checkpoint());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let sessions = server.api::<SessionsAPI>().unwrap();
     let persistence = server.api::<PersistenceAPI>().unwrap();

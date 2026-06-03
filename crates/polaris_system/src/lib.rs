@@ -4,7 +4,7 @@
 //!
 //! - [`api`] - API trait for capability registration
 //! - [`param`] - System parameters and dependency injection
-//! - [`plugin`] - Plugin trait for extensible functionality
+//! - [`mod@plugin`] - Plugin trait for extensible functionality
 //! - [`resource`] - Shared state management (Resources and Outputs)
 //! - [`server`] - Server runtime for plugin orchestration
 //! - [`mod@system`] - System trait and async function conversion
@@ -49,7 +49,7 @@
 //! Server::new()
 //!     .add_plugins(MyPlugin)
 //!     .run()
-//!     .await;
+//!     .await.unwrap();
 //! # });
 //! ```
 
@@ -57,22 +57,11 @@
 // within this crate.
 extern crate self as polaris_system;
 
-/// API trait for capability registration.
 pub mod api;
-
-/// System parameters and dependency injection.
 pub mod param;
-
-/// Plugin trait for extensible functionality.
 pub mod plugin;
-
-/// Resource and output container management.
 pub mod resource;
-
-/// Server runtime for plugin orchestration.
 pub mod server;
-
-/// System execution primitives.
 pub mod system;
 
 /// Re-export the `#[system]` attribute macro.

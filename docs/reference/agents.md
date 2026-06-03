@@ -112,7 +112,7 @@ Executing an agent is the responsibility of the caller. The typical pattern is t
 let mut server = Server::new();
 server.add_plugins(DefaultPlugins);
 server.add_plugins(MyModelPlugin);
-server.finish().await;
+server.finish().await.unwrap();
 
 let graph = ReActAgent.to_graph();
 let mut ctx = server.create_context();

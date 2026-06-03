@@ -160,7 +160,7 @@ async fn test_server(listener: tokio::net::TcpListener, port: u16) -> Server {
                 .with_listener(listener),
         )
         .add_plugins(HttpPlugin::new());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let sessions = server.api::<SessionsAPI>().unwrap();
     sessions.register_agent(EchoAgent).unwrap();
@@ -500,6 +500,91 @@ async fn stream_turn_busy_does_not_clobber_recorded_messages() {
         .unwrap(),
         seeded,
         "a SessionBusy streaming request must not clobber recorded turn messages"
+    );
+
+    // Clean up: unblock the BlockingAgent so the spawned turn returns.
+    drop(input_tx);
+    let _ = blocking_handle.await;
+    server.cleanup().await;
+}
+
+/// The non-streaming counterpart of
+/// [`stream_turn_busy_does_not_clobber_recorded_messages`]: a `SessionBusy`
+/// loser on `POST /turns` must not overwrite another task's recorded turn
+/// with its own empty capture. Pins the `executed`-guard in
+/// `handlers.rs::process_turn` (the non-stream handler), mirroring the
+/// stream handler's guard.
+#[tokio::test]
+async fn turn_busy_does_not_clobber_recorded_messages() {
+    let (listener, port) = bind_ephemeral().await;
+    let mut server = test_server(listener, port).await;
+    wait_for_server(port).await;
+
+    let session_id_str = create_session(port, "BlockingAgent").await;
+    let sessions = server.api::<SessionsAPI>().unwrap().clone();
+    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+
+    // Hold the session lock with a blocking turn (turn 0). While it is in
+    // flight the turn counter stays at 0, so the racing request below reads
+    // `turn_before == 0` — the same turn we seed.
+    let (provider, input_tx, mut output_rx) = polaris_sessions::http::HttpIOProvider::new(32, 32);
+    let provider = Arc::new(provider);
+    input_tx.send(IOMessage::user_text("block")).await.unwrap();
+
+    let io_provider = Arc::clone(&provider);
+    let sessions_clone = sessions.clone();
+    let sid_clone = sid.clone();
+    let blocking_handle = tokio::spawn(async move {
+        sessions_clone
+            .try_process_turn_with(&sid_clone, move |ctx| {
+                ctx.insert(UserIO::new(io_provider));
+            })
+            .await
+    });
+
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), output_rx.recv())
+        .await
+        .expect("BlockingAgent did not signal lock acquisition within 5 s")
+        .expect("output channel closed before ready signal");
+    assert!(
+        matches!(ready.content, IOContent::Text(ref t) if t == "blocking-ready"),
+        "expected blocking-ready signal, got {ready:?}"
+    );
+
+    // Stand in for the winner's success path: record turn 0's IO messages.
+    let winner_messages = vec![
+        IOMessage::user_text("hello"),
+        IOMessage::system_text("echo: hello"),
+    ];
+    sessions.record_turn_messages(&sid, 0, winner_messages.clone());
+    let seeded = serde_json::to_value(&winner_messages).unwrap();
+
+    // The losing non-streaming request: the session is busy, so the handler
+    // short-circuits with 409 `session_busy` before executing a turn.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/v1/sessions/{session_id_str}/turns"
+        ))
+        .json(&serde_json::json!({ "message": "loser" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let error_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(error_json["error"]["code"], "session_busy");
+
+    // The winner's recorded messages must survive untouched — the loser's
+    // `executed` flag stayed false, so it must not have written an empty Vec.
+    assert_eq!(
+        serde_json::to_value(
+            sessions
+                .turn(&sid, 0)
+                .expect("turn 0 should still exist")
+                .messages
+        )
+        .unwrap(),
+        seeded,
+        "a SessionBusy non-streaming request must not clobber recorded turn messages"
     );
 
     // Clean up: unblock the BlockingAgent so the spawned turn returns.

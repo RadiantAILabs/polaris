@@ -113,7 +113,7 @@ async fn test_server(store: Arc<InMemoryStore>) -> Server {
     server
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(store).without_auto_checkpoint());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let persistence = server.api::<PersistenceAPI>().unwrap();
     persistence.register::<Counter>("test");
@@ -512,7 +512,7 @@ async fn process_turn_labels_events_with_session_and_agent_type() {
         })
         .unwrap();
 
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let sessions = server.api::<SessionsAPI>().unwrap();
     sessions.register_agent(CounterAgent).unwrap();

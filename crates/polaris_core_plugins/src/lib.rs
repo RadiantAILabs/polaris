@@ -23,8 +23,11 @@
 //!   [`ToolsPlugin`](polaris_tools::ToolsPlugin). `AppPlugin` requires
 //!   explicit host/port configuration, so it is **not** auto-registered as
 //!   a default dependency — you must add it yourself (even when using
-//!   [`DefaultPlugins`]). Omitting it fails server init with a
-//!   missing-dependency panic.
+//!   [`DefaultPlugins`]). Omitting it fails server init —
+//!   [`Server::finish`](polaris_system::server::Server::finish) (and
+//!   [`run`](polaris_system::server::Server::run) /
+//!   [`run_once`](polaris_system::server::Server::run_once)) returns
+//!   [`ServerBuildError::MissingDependencies`](polaris_system::server::ServerBuildError::MissingDependencies).
 //! - `otel` - Enables [`OpenTelemetryPlugin`] for OTLP trace export
 //! - `test-utils` - Enables [`MockClock`] and [`MockIOProvider`] for testing
 //!
@@ -42,7 +45,7 @@
 //! # server.add_plugins(polaris_tools::ToolsPlugin);
 //! server.add_plugins(DefaultPlugins::new().build());
 //! # tokio_test::block_on(async {
-//! server.run().await;
+//! server.run().await.unwrap();
 //! # });
 //! ```
 //!
@@ -68,7 +71,7 @@
 //!         .with_fmt(FmtConfig::default())
 //! );
 //! # tokio_test::block_on(async {
-//! server.run().await;
+//! server.run().await.unwrap();
 //! # });
 //! ```
 //!
@@ -161,7 +164,7 @@ use tracing::Level;
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// server.add_plugins(DefaultPlugins::new().build());
 /// # tokio_test::block_on(async {
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # });
 /// ```
 ///
@@ -191,7 +194,7 @@ use tracing::Level;
 ///         .build()
 /// );
 /// # tokio_test::block_on(async {
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # });
 /// ```
 ///
@@ -213,7 +216,7 @@ use tracing::Level;
 /// server
 ///     .add_plugins(DefaultPlugins::new().build())
 ///     .add_plugins(OpenTelemetryPlugin::new("http://localhost:4318/v1/traces"))
-///     .run().await;
+///     .run().await.unwrap();
 /// # });
 /// # }
 /// ```
@@ -289,7 +292,7 @@ impl PluginGroup for DefaultPlugins {
 /// # tokio_test::block_on(async {
 /// Server::new()
 ///     .add_plugins(MinimalPlugins.build())
-///     .run().await;
+///     .run().await.unwrap();
 /// # });
 /// ```
 pub struct MinimalPlugins;
@@ -337,7 +340,7 @@ mod tests {
     async fn server_with_minimal_plugins() {
         let mut server = Server::new();
         server.add_plugins(MinimalPlugins.build());
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(ctx.contains_resource::<ServerInfo>());

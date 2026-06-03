@@ -114,7 +114,7 @@ pub use polaris_models::llm::ModelPricing;
 ///     // Provider: TracingPlugin inserts an empty `UsagePricing` API.
 ///     .add_plugins(TracingPlugin::new())
 ///     .add_plugins(PricingSeedPlugin);
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # }
 /// ```
 #[derive(Debug, Clone, Default)]

@@ -8,16 +8,16 @@ use polaris_system::plugin::{Extends, Plugin};
 /// Plugin providing support for `OpenAI` models via the Responses API.
 ///
 /// Registers an [`OpenAiProvider`] with the [`ModelRegistry`] during
-/// `build()`. After [`ModelsPlugin::ready`] freezes the registry, models
+/// `build()`. After [`ModelsPlugin::ready`](polaris_models::ModelsPlugin::ready) freezes the registry, models
 /// served by this provider become resolvable through
-/// [`ModelRegistry::resolve`](polaris_models::ModelRegistry::resolve) under
+/// [`ModelRegistry::llm`](polaris_models::ModelRegistry::llm) under
 /// the `openai/<model>` identifier.
 ///
 /// # Resources Provided
 ///
 /// | Resource | Scope | Description |
 /// |----------|-------|-------------|
-/// | _none_   | —     | This plugin only registers a provider with the [`ModelRegistry`] owned by [`ModelsPlugin`]. |
+/// | _none_   | —     | This plugin only registers a provider with the [`ModelRegistry`] owned by [`ModelsPlugin`](polaris_models::ModelsPlugin). |
 ///
 /// # APIs Provided
 ///
@@ -27,20 +27,22 @@ use polaris_system::plugin::{Extends, Plugin};
 ///
 /// # Dependencies
 ///
-/// - [`ModelsPlugin`] — owns the [`ModelRegistry`] that this plugin
-///   registers itself with. Must be added before `OpenAiPlugin`.
+/// - [`ModelsPlugin`](polaris_models::ModelsPlugin) — owns the [`ModelRegistry`] that this plugin
+///   registers itself with. The capability resolver orders `ModelsPlugin`
+///   (the provider) before this plugin regardless of `add_plugins` order.
 ///
 /// # Lifecycle
 ///
 /// - The plugin is gated behind the `openai` feature.
 /// - **`build()`** — constructs an `OpenAiProvider` and registers it
 ///   with the [`ModelRegistry`], which is a mutable resource during the
-///   `build()` phase. Panics if [`ModelsPlugin`] was not added first.
+///   `build()` phase. The `Extends<ModelRegistry>` build param has the
+///   resolver guarantee the registry is present and provider-ordered.
 /// - No `ready()` or `cleanup()` behavior; registers no tick schedules.
 ///
 /// # Extends
 ///
-/// - [`ModelRegistry`] (from [`ModelsPlugin`]) — registers an
+/// - [`ModelRegistry`] (from [`ModelsPlugin`](polaris_models::ModelsPlugin)) — registers an
 ///   `OpenAiProvider` so that `openai/<model>` identifiers become
 ///   resolvable once `ModelsPlugin` freezes the registry in `ready()`.
 ///

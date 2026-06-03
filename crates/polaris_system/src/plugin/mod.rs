@@ -45,7 +45,7 @@
 //!     .add_plugins(TracingPlugin)
 //!     .add_plugins(MyPlugin { config: "test".into() })
 //!     .run()
-//!     .await;
+//!     .await.unwrap();
 //! # });
 //! ```
 
@@ -320,7 +320,10 @@ pub trait Plugin: Send + Sync + 'static {
 
     /// Declares plugins that must be added before this one.
     ///
-    /// The server will panic if dependencies are not satisfied when `run()` is called.
+    /// If a declared dependency was never added, building the server fails with
+    /// [`ServerBuildError::MissingDependencies`](crate::server::ServerBuildError::MissingDependencies)
+    /// (returned from [`Server::finish`](crate::server::Server::finish), and therefore
+    /// from `run()` / `run_once()`).
     ///
     /// # Example
     ///
@@ -679,7 +682,7 @@ impl Plugins for PluginGroupBuilder {
 ///             .build()
 ///     )
 ///     .finish()
-///     .await;
+///     .await.unwrap();
 /// # });
 /// ```
 pub trait PluginGroup {

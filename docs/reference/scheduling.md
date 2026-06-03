@@ -18,7 +18,7 @@ The server progresses through a linear state machine: `NotStarted` → `Building
 ```text
 1. Dependency Resolution
    └── Topologically sort plugins by declared dependencies
-       └── Panics on missing dependencies or circular references
+       └── Returns ServerBuildError on missing dependencies or circular references
 
 2. Build Phase (build_state = Building)
    └── Call plugin.build() on each plugin in dependency order
@@ -150,8 +150,8 @@ fn dependencies(&self) -> Vec<PluginId> {
 ```
 
 The server performs topological sort before the build phase:
-- **Missing dependency** → panic with the missing plugin name
-- **Circular dependency** → panic (detected during topological sort)
+- **Missing dependency** → `finish()` returns `ServerBuildError::MissingDependencies` with the missing plugin name
+- **Circular dependency** → `finish()` returns `ServerBuildError::CircularDependency` (detected during topological sort)
 - **No dependencies** → plugins with no declared dependencies run in registration order relative to each other
 
 ## Hook Schedules vs Plugin Schedules

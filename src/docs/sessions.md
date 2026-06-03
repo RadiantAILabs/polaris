@@ -19,7 +19,7 @@ use polaris_ai::sessions::store::memory::InMemoryStore;
 # server.add_plugins(MinimalPlugins.build());
 # server.add_plugins(PersistencePlugin);
 server.add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
-server.finish().await;
+server.finish().await.unwrap();
 
 let sessions = server.api::<SessionsAPI>().unwrap();
 # Ok(())

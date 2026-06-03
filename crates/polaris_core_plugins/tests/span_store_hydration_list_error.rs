@@ -69,7 +69,7 @@ async fn ready_tolerates_list_sessions_error() {
     // Core contract: `server.finish()` returns. A regression to
     // `list_sessions().unwrap()` (or `?` against the outer `Result`)
     // would panic the runtime here.
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Sanity: the plugin still publishes its API even when hydration
     // bails — downstream consumers that resolve `SpanStoreHandle` must

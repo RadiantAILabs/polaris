@@ -172,7 +172,7 @@ async fn main() {
         .add_plugins(HttpPlugin::new())
         .add_plugins(ExampleRoutesPlugin::new(agents));
 
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Register the agent so the HTTP session endpoints can create sessions for it.
     let sessions = server.api::<SessionsAPI>().unwrap();

@@ -97,7 +97,7 @@ async fn tracing_dashboard_endpoints_serve_run_aware_views() {
                 .with_listener(listener),
         )
         .add_plugins(TracingPlugin::new());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Seed synthetic records into the shared SpanBuffer. Each scenario
     // uses a distinct run id so they don't cross-contaminate.

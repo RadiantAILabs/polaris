@@ -165,7 +165,7 @@ enum WriterCommand {
 ///     .add_plugins(ServerInfoPlugin)
 ///     .add_plugins(TracingPlugin::new())
 ///     .add_plugins(SpanStorePlugin::new(store));
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # }
 /// # }
 /// ```
@@ -187,7 +187,7 @@ enum WriterCommand {
 ///     .add_plugins(ServerInfoPlugin)
 ///     .add_plugins(TracingPlugin::new())
 ///     .add_plugins(SpanStorePlugin::new(store));
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # }
 /// ```
 pub struct SpanStorePlugin {
@@ -495,7 +495,7 @@ fn replay_into_buffer(buffer: &SpanBuffer, mut records: Vec<SpanRecord>) -> usiz
 ///     .add_plugins(TracingPlugin::new())
 ///     .add_plugins(SpanStorePlugin::new(Arc::new(InMemorySpanStore::new())))
 ///     .add_plugins(HistoryReportPlugin);
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # }
 /// ```
 #[derive(Clone)]

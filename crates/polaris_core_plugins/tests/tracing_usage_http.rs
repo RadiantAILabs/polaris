@@ -96,7 +96,7 @@ async fn tracing_usage_endpoints_serve_aggregated_views() {
                 .with_listener(listener),
         )
         .add_plugins(TracingPlugin::new());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Seed the shared SpanBuffer with a mix of session-scoped and
     // unattributed LLM calls.

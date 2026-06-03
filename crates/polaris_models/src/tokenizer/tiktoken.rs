@@ -1038,7 +1038,7 @@ mod tests {
 
         let mut server = Server::new();
         server.add_plugins(TokenizerPlugin::default());
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(
@@ -1089,7 +1089,7 @@ mod tests {
         let custom = Arc::new(FixedCounter);
         let mut server = Server::new();
         server.add_plugins(TokenizerPlugin::new(custom));
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(

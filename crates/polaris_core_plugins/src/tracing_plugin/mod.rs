@@ -108,7 +108,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// server.add_plugins(TracingPlugin::new());
 /// server.add_plugins(MyPlugin);
 /// # tokio_test::block_on(async {
-/// server.run_once().await;
+/// server.run_once().await.unwrap();
 /// # });
 /// ```
 pub struct TracingLayers {
@@ -345,7 +345,7 @@ impl GlobalResource for TracingConfig {}
 ///         .with_fmt(FmtConfig::default().format(TracingFormat::Json))
 /// );
 /// # tokio_test::block_on(async {
-/// server.run().await;
+/// server.run().await.unwrap();
 /// # });
 /// ```
 #[derive(Debug, Clone)]
@@ -659,7 +659,7 @@ mod tests {
         server.add_plugins(polaris_models::ModelsPlugin);
         server.add_plugins(polaris_tools::ToolsPlugin);
         server.add_plugins(TracingPlugin::default());
-        server.finish().await;
+        server.finish().await.unwrap();
 
         let ctx = server.create_context();
         assert!(

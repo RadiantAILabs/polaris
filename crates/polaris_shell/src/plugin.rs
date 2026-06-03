@@ -28,8 +28,10 @@ use std::time::{Duration, SystemTime};
 ///
 /// # Dependencies
 ///
-/// - [`ToolsPlugin`] — owns the [`ToolRegistry`] this plugin registers
-///   its toolset with. Must be added before `ShellPlugin`.
+/// - [`ToolsPlugin`](polaris_tools::ToolsPlugin) — owns the [`ToolRegistry`] this plugin registers
+///   its toolset with. This plugin declares `extends::<ToolRegistry>()` in
+///   its [`access`](Plugin::access), so the capability resolver orders the
+///   provider before this plugin regardless of `add_plugins` order.
 ///
 /// # Tools Provided
 ///
@@ -51,7 +53,7 @@ use std::time::{Duration, SystemTime};
 ///
 /// # Extends
 ///
-/// - [`ToolRegistry`] (from [`ToolsPlugin`]) — registers the [`ShellTools`]
+/// - [`ToolRegistry`] (from [`ToolsPlugin`](polaris_tools::ToolsPlugin)) — registers the [`ShellTools`]
 ///   toolset so an LLM agent can invoke shell commands as the
 ///   `run_command` tool.
 ///
@@ -72,7 +74,7 @@ use std::time::{Duration, SystemTime};
 ///         .with_denied_commands(vec!["rm -rf *".into()])
 ///         .with_allowed_dirs(vec!["/home/user/project".into()])
 /// ));
-/// server.finish().await;
+/// server.finish().await.unwrap();
 /// # }
 /// ```
 #[derive(Debug)]

@@ -1,7 +1,7 @@
 //! Sessions API, plugin, and internal session state.
 //!
 //! [`SessionsAPI`] is the primary interface for managing agent sessions.
-//! It is registered as an [`API`](polaris_system::api::API) by [`SessionsPlugin`]
+//! It is registered as an [`API`] by [`SessionsPlugin`]
 //! and accessed via `server.api::<SessionsAPI>()`.
 
 use crate::error::{SessionError, WiringError};
@@ -236,7 +236,7 @@ struct SessionsInner {
 /// The wiring methods (`set_serializers`, `set_graph_apis`,
 /// `set_context_factory`) are called once by [`SessionsPlugin`] during its
 /// `ready()` phase; `set_graph_apis` and `set_context_factory` return
-/// [`WiringError`](crate::WiringError) if invoked a second time.
+/// [`WiringError`] if invoked a second time.
 /// `register_agent` is intended to be called after
 /// `ready()` and before the first turn. Every other method — session
 /// creation, turn execution, checkpoints, persistence, introspection — is
@@ -411,7 +411,7 @@ impl SessionsAPI {
     }
 
     /// Creates a fresh [`SystemContext`] using the stored
-    /// [`ContextFactory`](polaris_system::server::ContextFactory).
+    /// [`ContextFactory`].
     ///
     /// # Panics
     ///
@@ -431,7 +431,7 @@ impl SessionsAPI {
     /// server
     ///     .add_plugins(PersistencePlugin)
     ///     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
-    /// server.finish().await;
+    /// server.finish().await.unwrap();
     ///
     /// let sessions = server.api::<SessionsAPI>().unwrap();
     /// let ctx = sessions.create_context();
@@ -1597,7 +1597,7 @@ impl SessionsAPI {
     /// session state returns [`SessionError::ReadOnly`].
     ///
     /// On execution failure, the session is deleted (matching
-    /// [`run_oneshot`] cleanup semantics — there is no useful read-only
+    /// [`run_oneshot`](Self::run_oneshot) cleanup semantics — there is no useful read-only
     /// state to preserve).
     ///
     /// Returns the generated [`SessionId`] alongside the output so the
@@ -1609,7 +1609,7 @@ impl SessionsAPI {
     ///
     /// # Errors
     ///
-    /// Same as [`run_oneshot`].
+    /// Same as [`run_oneshot`](Self::run_oneshot).
     ///
     /// # Example
     ///
@@ -1929,10 +1929,10 @@ fn deserialize_into_context(
 /// - **`build()`** — constructs a [`SessionsAPI`] backed by the configured
 ///   [`SessionStore`] and inserts it as a build-time API.
 /// - **`ready()`** — wires the API into the rest of the server by attaching
-///   [`PersistenceAPI`](polaris_core_plugins::PersistenceAPI) serializers,
-///   [`HooksAPI`](polaris_graph::hooks::HooksAPI),
-///   [`MiddlewareAPI`](polaris_graph::middleware::MiddlewareAPI), and the
-///   [`ContextFactory`](polaris_system::server::ContextFactory).
+///   [`PersistenceAPI`] serializers,
+///   [`HooksAPI`],
+///   [`MiddlewareAPI`], and the
+///   [`ContextFactory`].
 ///
 /// # Resources Provided
 ///
@@ -1948,10 +1948,10 @@ fn deserialize_into_context(
 ///
 /// # Dependencies
 ///
-/// - [`PersistencePlugin`] — owns the [`PersistenceAPI`](polaris_core_plugins::PersistenceAPI)
+/// - [`PersistencePlugin`] — owns the [`PersistenceAPI`]
 ///   used during `ready()` to gather resource serializers for checkpointing.
-/// - [`HooksAPI`](polaris_graph::hooks::HooksAPI) and
-///   [`MiddlewareAPI`](polaris_graph::middleware::MiddlewareAPI) from
+/// - [`HooksAPI`] and
+///   [`MiddlewareAPI`] from
 ///   `polaris_graph` — fetched during `ready()` (`Server::expect_api`); the
 ///   server panics with a helpful message if they are missing.
 ///

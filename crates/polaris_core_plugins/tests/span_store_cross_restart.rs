@@ -84,7 +84,7 @@ async fn span_buffer_rehydrates_session_runs_across_restart() {
         .add_plugins(AppPlugin::new(AppConfig::new().with_host("127.0.0.1")))
         .add_plugins(TracingPlugin::new())
         .add_plugins(SpanStorePlugin::new(store));
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let buffer = server
         .api::<SpanBuffer>()

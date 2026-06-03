@@ -5,6 +5,7 @@
 
 use polaris_system::plugin::{Plugin, PluginGroup, PluginId, Version};
 use polaris_system::prelude::*;
+use polaris_system::server::ServerBuildError;
 use std::sync::atomic::AtomicBool;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -153,7 +154,7 @@ fn server_remove_resource() {
 async fn plugin_build_inserts_resource() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let res = server.get_resource::<TestResource>().unwrap();
     assert_eq!(res.value, 1);
@@ -166,7 +167,7 @@ async fn plugins_build_in_dependency_order() {
     server.add_plugins(PluginC);
     server.add_plugins(PluginA);
     server.add_plugins(PluginB);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // A sets to 1, B adds 10 (=11), C multiplies by 2 (=22)
     let res = server.get_resource::<TestResource>().unwrap();
@@ -177,7 +178,7 @@ async fn plugins_build_in_dependency_order() {
 async fn plugin_ready_is_called() {
     let mut server = Server::new();
     server.add_plugins(ReadyPlugin::default());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Ready should have inserted the resource
     assert!(server.contains_resource::<AnotherResource>());
@@ -189,7 +190,7 @@ async fn plugin_ready_is_called() {
 async fn plugin_cleanup_is_called() {
     let mut server = Server::new();
     server.add_plugins(CleanupPlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Resource exists after build
     assert!(server.contains_resource::<TestResource>());
@@ -204,7 +205,7 @@ async fn plugin_cleanup_is_called() {
 async fn server_run_calls_finish() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.run().await;
+    server.run().await.unwrap();
 
     assert!(server.is_built());
     assert!(server.contains_resource::<TestResource>());
@@ -214,7 +215,7 @@ async fn server_run_calls_finish() {
 async fn server_run_once_calls_finish() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.run_once().await;
+    server.run_once().await.unwrap();
 
     assert!(server.is_built());
     assert!(server.contains_resource::<TestResource>());
@@ -238,16 +239,19 @@ fn duplicate_unique_plugin_panics() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "not satisfied")]
-async fn missing_dependency_panics() {
+async fn missing_dependency_errors() {
     let mut server = Server::new();
     server.add_plugins(PluginB); // Requires PluginA
-    server.finish().await; // Should panic
+    let err = server.finish().await.unwrap_err();
+    assert!(
+        matches!(err, ServerBuildError::MissingDependencies(_)),
+        "expected MissingDependencies, got {err:?}"
+    );
+    assert!(err.to_string().contains("not satisfied"));
 }
 
 #[tokio::test]
-#[should_panic(expected = "Circular dependency")]
-async fn circular_dependency_panics() {
+async fn circular_dependency_errors() {
     // Create plugins with circular dependency
     struct CycleA;
     impl Plugin for CycleA {
@@ -272,7 +276,12 @@ async fn circular_dependency_panics() {
     let mut server = Server::new();
     server.add_plugins(CycleA);
     server.add_plugins(CycleB);
-    server.finish().await; // Should panic
+    let err = server.finish().await.unwrap_err();
+    assert!(
+        matches!(err, ServerBuildError::CircularDependency(_)),
+        "expected CircularDependency, got {err:?}"
+    );
+    assert!(err.to_string().contains("Circular dependency"));
 }
 
 #[tokio::test]
@@ -280,8 +289,8 @@ async fn circular_dependency_panics() {
 async fn double_finish_panics() {
     let mut server = Server::new();
     server.add_plugins(PluginA);
-    server.finish().await;
-    server.finish().await; // Should panic
+    server.finish().await.unwrap();
+    server.finish().await.unwrap(); // Should panic
 }
 
 #[tokio::test]
@@ -298,7 +307,7 @@ async fn sub_plugin_added_during_build() {
 
     let mut server = Server::new();
     server.add_plugins(ParentPlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // PluginA should have been built
     assert!(server.contains_resource::<TestResource>());
@@ -318,7 +327,7 @@ impl PluginGroup for TestPluginGroup {
 async fn plugin_group_adds_all_plugins() {
     let mut server = Server::new();
     server.add_plugins(TestPluginGroup.build());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Both plugins should have run
     let res = server.get_resource::<TestResource>().unwrap();
@@ -374,7 +383,7 @@ async fn cleanup_in_reverse_order() {
         order: cleanup_order.clone(),
         my_order: second_cleanup.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
     server.cleanup().await;
 
     // B depends on A, so B should be cleaned up first (reverse order)
@@ -654,7 +663,7 @@ async fn plugin_registers_for_schedule_gets_ticked() {
     server.add_plugins(TickCountingPlugin {
         count: tick_count.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     assert_eq!(tick_count.load(Ordering::SeqCst), 0);
 
@@ -695,7 +704,7 @@ async fn plugin_not_registered_for_schedule_not_ticked() {
     server.add_plugins(SelectivePlugin {
         count: tick_count.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Tick with ScheduleB - plugin should NOT be ticked
     server.tick::<TestScheduleB>();
@@ -769,7 +778,7 @@ async fn multiple_plugins_same_schedule_all_ticked_in_order() {
         order: order.clone(),
         my_order: first_order.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     server.tick::<TestScheduleA>();
 
@@ -817,7 +826,7 @@ async fn plugin_multiple_schedules() {
         count_a: count_a.clone(),
         count_b: count_b.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     server.tick::<TestScheduleA>();
     assert_eq!(count_a.load(Ordering::SeqCst), 1);
@@ -833,7 +842,7 @@ async fn tick_unregistered_schedule_is_noop() {
     // Just verify it doesn't panic
     let mut server = Server::new();
     server.add_plugins(PluginA); // PluginA doesn't register for any schedules
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // This should be a no-op (no plugins registered for this schedule)
     server.tick::<TestScheduleA>();
@@ -871,7 +880,7 @@ async fn schedule_passed_to_update_matches_triggered() {
     server.add_plugins(ScheduleCheckPlugin {
         correct: received_correct_schedule.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     server.tick::<TestScheduleA>();
 
@@ -980,7 +989,7 @@ async fn plugin_inserts_api_in_build() {
 
     let mut server = Server::new();
     server.add_plugins(APIProviderPlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let api = server.api::<TestAPI>().unwrap();
     assert_eq!(api.name, "from-plugin");
@@ -1030,7 +1039,7 @@ async fn plugin_accesses_api_in_ready() {
     server.add_plugins(APIConsumerPlugin {
         accessed: api_accessed.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     assert!(api_accessed.load(Ordering::SeqCst));
 }
@@ -1222,7 +1231,7 @@ async fn tick_schedule_uses_schedule_id_directly() {
     server.add_plugins(ScheduleIdPlugin {
         count: tick_count.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Use tick_schedule with ScheduleId directly
     let schedule_id = ScheduleId::of::<TestScheduleA>();
@@ -1263,7 +1272,7 @@ async fn update_receives_correct_schedule_id() {
     server.add_plugins(ScheduleTrackingPlugin {
         received: received_schedules.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     server.tick::<TestScheduleA>();
     server.tick::<TestScheduleB>();
@@ -1304,7 +1313,7 @@ async fn plugins_with_no_tick_schedules_never_updated() {
     server.add_plugins(NoSchedulePlugin {
         count: update_count.clone(),
     });
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // Tick various schedules
     server.tick::<TestScheduleA>();
@@ -1374,7 +1383,7 @@ async fn context_factory_during_ready_does_not_block_insert_global() {
             factory: Arc::clone(&factory_holder),
         })
         .add_plugins(LatePlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     // The deferred factory should now be usable.
     let factory = factory_holder.get().expect("factory was not set");
@@ -1528,7 +1537,7 @@ impl Plugin for AutoConsumer {
 async fn default_dependency_auto_registered_when_missing() {
     let mut server = Server::new();
     server.add_plugins(AutoConsumer); // AutoLeaf not added explicitly
-    server.finish().await;
+    server.finish().await.unwrap();
 
     assert!(server.has_plugin::<AutoLeaf>());
     assert!(server.has_plugin::<AutoConsumer>());
@@ -1543,7 +1552,7 @@ async fn explicit_plugin_wins_over_default() {
     let mut server = Server::new();
     server.add_plugins(AutoLeaf);
     server.add_plugins(AutoConsumer);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     assert!(server.has_plugin::<AutoLeaf>());
     assert!(server.contains_resource::<TestResource>());
@@ -1582,7 +1591,7 @@ async fn auto_registration_is_recursive() {
 
     let mut server = Server::new();
     server.add_plugins(TopPlugin);
-    server.finish().await;
+    server.finish().await.unwrap();
 
     assert!(server.has_plugin::<TopPlugin>());
     assert!(server.has_plugin::<MidPlugin>());
@@ -1590,10 +1599,9 @@ async fn auto_registration_is_recursive() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "2 plugin dependencies not satisfied")]
 async fn multiple_missing_dependencies_aggregated() {
     // Two consumer plugins, each requiring a distinct dependency that was
-    // never added. The panic should report both at once rather than failing
+    // never added. The error should report both at once rather than failing
     // on the first one encountered.
     struct NeedsX;
     impl Plugin for NeedsX {
@@ -1618,5 +1626,13 @@ async fn multiple_missing_dependencies_aggregated() {
     let mut server = Server::new();
     server.add_plugins(NeedsX);
     server.add_plugins(NeedsY);
-    server.finish().await;
+    let err = server.finish().await.unwrap_err();
+    assert!(
+        matches!(err, ServerBuildError::MissingDependencies(_)),
+        "expected MissingDependencies, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("2 plugin dependencies not satisfied")
+    );
 }

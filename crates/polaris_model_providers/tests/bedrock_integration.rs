@@ -25,7 +25,7 @@ async fn get_llm(model_id: &str) -> Llm {
     let mut server = Server::new();
     server.add_plugins(ModelsPlugin);
     server.add_plugins(BedrockPlugin::from_env());
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let registry = server
         .get_global::<ModelRegistry>()

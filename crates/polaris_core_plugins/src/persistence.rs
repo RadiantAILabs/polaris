@@ -273,7 +273,7 @@ impl PersistenceAPI {
 /// let mut server = Server::new();
 /// server.add_plugins(PersistencePlugin);
 /// # tokio_test::block_on(async {
-/// server.finish().await;
+/// server.finish().await.unwrap();
 /// # });
 /// ```
 ///
@@ -342,7 +342,7 @@ mod tests {
         };
 
         let mut server = Server::new();
-        server.finish().await;
+        server.finish().await.unwrap();
         let mut ctx = server.create_context();
         ctx.insert(original.clone());
 
@@ -386,7 +386,7 @@ mod tests {
         api.register::<Memory>("test.plugin");
 
         let mut server = Server::new();
-        server.finish().await;
+        server.finish().await.unwrap();
         let ctx = server.create_context();
 
         let serializers = api.serializers();

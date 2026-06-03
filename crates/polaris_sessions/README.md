@@ -26,7 +26,7 @@ server
     .add_plugins(PersistencePlugin)
     .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
 
-server.run().await;
+server.run().await.unwrap();
 
 let sessions = server.api::<SessionsAPI>().unwrap();
 ```

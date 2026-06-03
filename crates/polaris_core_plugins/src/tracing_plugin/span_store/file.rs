@@ -539,4 +539,105 @@ mod tests {
             "oversized file should surface as a backend error, got {err:?}"
         );
     }
+
+    #[tokio::test]
+    async fn append_batch_persists_each_session_in_append_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSpanStore::new(dir.path());
+
+        // Interleave two sessions in one batch. Each session's file must
+        // preserve the batch's relative order, while each file is opened and
+        // `fsync`'d once for the whole batch (the per-record cost amortized).
+        let batch = vec![
+            ("s1".to_string(), make("s1", "a")),
+            ("s2".to_string(), make("s2", "x")),
+            ("s1".to_string(), make("s1", "b")),
+            ("s2".to_string(), make("s2", "y")),
+            ("s1".to_string(), make("s1", "c")),
+        ];
+        store.append_batch(&batch).await.unwrap();
+
+        let s1: Vec<_> = store
+            .load("s1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        let s2: Vec<_> = store
+            .load("s2")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(s1, ["a", "b", "c"]);
+        assert_eq!(s2, ["x", "y"]);
+    }
+
+    #[tokio::test]
+    async fn append_batch_appends_onto_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSpanStore::new(dir.path());
+
+        // A prior single append, then a batch for the same session: the
+        // batch must append, not truncate.
+        store.append("s", &make("s", "first")).await.unwrap();
+        store
+            .append_batch(&[
+                ("s".to_string(), make("s", "second")),
+                ("s".to_string(), make("s", "third")),
+            ])
+            .await
+            .unwrap();
+
+        let names: Vec<_> = store
+            .load("s")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn append_batch_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSpanStore::new(dir.path());
+        store.append_batch(&[]).await.unwrap();
+        assert!(store.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_batch_skips_invalid_session_id_without_dropping_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSpanStore::new(dir.path());
+
+        // A hostile id containing a path separator must be skipped with a
+        // warning — not abort the batch — so the valid session still
+        // persists. (An unserializable record is skipped the same way, but
+        // that branch is unreachable for a real `SpanRecord`: every field
+        // serializes and `serde_json::Value` cannot hold a NaN/Infinity.)
+        let batch = vec![
+            ("../escape".to_string(), make("../escape", "evil")),
+            ("ok".to_string(), make("ok", "good")),
+        ];
+        store.append_batch(&batch).await.unwrap();
+
+        let ok: Vec<_> = store
+            .load("ok")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            ok,
+            ["good"],
+            "valid session must survive a hostile sibling in the batch"
+        );
+        // The escaped id wrote nothing inside (or outside) base_dir.
+        assert_eq!(store.list_sessions().await.unwrap(), vec!["ok".to_string()]);
+    }
 }

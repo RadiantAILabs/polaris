@@ -65,7 +65,7 @@ async fn run_oneshot_session_remains_visible_via_distinct_sessions() {
         .add_plugins(TracingPlugin::new())
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())));
-    server.finish().await;
+    server.finish().await.unwrap();
 
     let sessions = server
         .api::<SessionsAPI>()
