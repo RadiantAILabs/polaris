@@ -9,7 +9,7 @@ use proc_macro::TokenStream;
 
 /// Derive macro for the `Storable` trait.
 ///
-/// Generates an implementation of [`polaris_core_plugins::persistence::Storable`] for the
+/// Generates an implementation of `polaris_core_plugins::persistence::Storable` for the
 /// annotated struct, providing a stable storage key and schema version for
 /// resource persistence.
 ///

@@ -1,7 +1,7 @@
 //! LLM-facing tool wrappers for shell command execution.
 //!
 //! Provides [`ShellTools`], a [`Toolset`](polaris_tools::Toolset) that exposes
-//! [`ShellExecutor`](crate::ShellExecutor) functionality as tools for LLM agents.
+//! [`ShellExecutor`] functionality as tools for LLM agents.
 
 use crate::error::ShellError;
 use crate::executor::{ExecutionResult, ShellExecutor, ShellRequest, ShellResponse};

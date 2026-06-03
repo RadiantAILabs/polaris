@@ -61,7 +61,7 @@ impl LlmProvider for OpenAiProvider {
     /// Streams a response from the `OpenAI` Responses API.
     ///
     /// Uses `async_openai`'s built-in streaming support which handles SSE parsing
-    /// and deserialization. An [`OpenAiStreamAdapter`] converts the library's
+    /// and deserialization. An `OpenAiStreamAdapter` (private) converts the library's
     /// [`ResponseStreamEvent`]s into Polaris [`StreamEvent`]s.
     ///
     /// # Errors

@@ -133,7 +133,7 @@ impl FileTools {
     }
 }
 
-/// Plugin that registers [`FileTools`] with the [`ToolRegistry`].
+/// Plugin that registers `FileTools` with the [`ToolRegistry`].
 pub struct FileToolsPlugin {
     /// Configuration for the file tools.
     config: FileToolsConfig,

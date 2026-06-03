@@ -1,14 +1,14 @@
 //! System execution primitives.
 //!
 //! A [`System`] is an async function that receives dependencies via parameter
-//! injection from a [`SystemContext`](crate::param::SystemContext) and produces
+//! injection from a [`SystemContext`] and produces
 //! a typed output. All dependencies are declared as parameters, making data
 //! flow explicit and systems composable across different execution contexts
 //! (graph nodes, hooks, standalone invocations).
 //!
 //! See [`System`] for the full trait definition and examples.
 //!
-//! Use the [`#[system]`](crate::system) attribute macro to define systems from
+//! Use the [`#[system]`](macro@crate::system) attribute macro to define systems from
 //! regular async functions:
 //!
 //! ```
@@ -51,9 +51,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// An async unit of computation that receives dependencies via
 /// [`SystemParam`](crate::param::SystemParam) injection and produces a typed
-/// [`Output`](crate::resource::Output).
+/// [`Output`].
 ///
-/// Most users define systems with the [`#[system]`](crate::system) macro
+/// Most users define systems with the [`#[system]`](macro@crate::system) macro
 /// rather than implementing this trait directly:
 ///
 /// ```
@@ -204,7 +204,7 @@ impl<S: System> ErasedSystem for S {
 /// Converts a type into a [`System`].
 ///
 /// Implemented for async functions (via [`FunctionSystem`]) and for factory
-/// functions produced by the [`#[system]`](crate::system) macro (via
+/// functions produced by the [`#[system]`](macro@crate::system) macro (via
 /// [`SystemFnMarker`]). See [`System`] for a usage example.
 pub trait IntoSystem<Marker>: Sized {
     /// The resulting system type.

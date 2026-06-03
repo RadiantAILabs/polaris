@@ -9,7 +9,7 @@ use polaris_system::server::Server;
 ///
 /// Use this whenever an agent needs to resolve an LLM by string identifier
 /// such as `"anthropic/claude-sonnet-4-6"`. Provider plugins
-/// (e.g., [`AnthropicPlugin`](polaris_model_providers::AnthropicPlugin))
+/// (e.g., `AnthropicPlugin`)
 /// register themselves with the registry; consumers later resolve typed
 /// model handles via `Res<ModelRegistry>`.
 ///

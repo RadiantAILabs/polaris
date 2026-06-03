@@ -503,7 +503,7 @@ impl Resources {
     /// a clone function to be registered via [`register_clone_fn`](Self::register_clone_fn).
     /// The caller supplies the clone function directly, which is useful when the
     /// concrete type (and its `Clone` impl) was captured at an earlier compile-time
-    /// boundary — e.g., in [`ContextPolicy::forward`](crate::ContextPolicy::forward).
+    /// boundary — e.g., in `ContextPolicy::forward` (defined in the graph crate).
     ///
     /// Returns `None` if the resource does not exist or is currently write-locked.
     #[must_use]

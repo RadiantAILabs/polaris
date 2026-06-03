@@ -127,11 +127,11 @@ impl ModelRegistry {
 
     /// Registers an LLM provider.
     ///
-    /// The provider's [`LlmProvider::name()`] is used as the registry key
+    /// The provider's [`LlmProvider::name()`](crate::llm::LlmProvider::name) is used as the registry key
     /// (e.g., `"openai"` for `"openai/gpt-4o"`).
     ///
     /// This method may only be called during the `build()` phase when the registry is
-    /// available as a mutable resource via [`Server::get_resource_mut`]. After the
+    /// available as a mutable resource via [`Server::get_resource_mut`](polaris_system::server::Server::get_resource_mut). After the
     /// `ready()` phase, the registry becomes an immutable global and registration is
     /// no longer possible.
     ///

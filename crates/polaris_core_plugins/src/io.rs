@@ -328,8 +328,8 @@ impl<T: IOProvider> ErasedProvider for T {
 /// I/O isolation while optionally sharing the underlying provider via `Arc`.
 ///
 /// Registered by concrete communication plugins using
-/// [`Server::register_local`] with a factory that captures a shared
-/// provider. See the [module-level documentation](self) for a full example.
+/// [`Server::register_local`](polaris_system::server::Server::register_local) with a factory that captures a shared
+/// provider. See the [crate-level documentation](crate) for a full example.
 ///
 /// # Example
 ///

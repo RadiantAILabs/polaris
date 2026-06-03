@@ -120,16 +120,16 @@ impl SystemInfo {
 ///
 /// | API | Description |
 /// |-----|-------------|
-/// | _none_ | This plugin only registers hooks against [`HooksAPI`](crate::hooks::HooksAPI); it inserts no APIs of its own. |
+/// | _none_ | This plugin only registers hooks against [`HooksAPI`]; it inserts no APIs of its own. |
 ///
 /// # Dependencies
 ///
-/// Requires [`HooksAPI`](crate::hooks::HooksAPI) from `polaris_graph`.
+/// Requires [`HooksAPI`] from `polaris_graph`.
 /// Inserts it if not already present on the server.
 ///
 /// # Hooks Registered
 ///
-/// Registered via [`HooksAPI`](crate::hooks::HooksAPI).
+/// Registered via [`HooksAPI`].
 ///
 /// | Schedule | Description |
 /// |----------|-------------|
@@ -138,7 +138,7 @@ impl SystemInfo {
 ///
 /// # Extends
 ///
-/// - [`HooksAPI`](crate::hooks::HooksAPI) — registers the hooks above.
+/// - [`HooksAPI`] — registers the hooks above.
 ///   Inserts the API itself if no other plugin provided it.
 ///
 /// # Example

@@ -129,7 +129,7 @@ impl Graph {
     ///
     /// # Custom schedules
     ///
-    /// Custom [`Schedule`] types can be attached to a system by passing a
+    /// Custom [`Schedule`](polaris_system::plugin::Schedule) types can be attached to a system by passing a
     /// `(custom_schedules, system)` tuple. System lifecycle events are then
     /// re-emitted on those schedules, allowing hooks to subscribe to events
     /// for this system only.

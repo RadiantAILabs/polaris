@@ -272,7 +272,7 @@ impl ToolRegistry {
 ///
 /// Registers an empty [`ToolRegistry`] during `build()` as a mutable resource so
 /// other plugins can register tools in their own `build()` phase, then freezes
-/// it into a [`GlobalResource`](polaris_system::resource::GlobalResource) during
+/// it into a [`GlobalResource`] during
 /// `ready()` for read-only access by systems via `Res<ToolRegistry>`.
 ///
 /// Use this plugin whenever an agent needs a `ToolRegistry` — either to expose

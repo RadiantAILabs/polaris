@@ -2,10 +2,10 @@
 //!
 //! # Crate Structure
 //!
-//! - [`agent`] — ReAct agent graph definition and systems
-//! - [`config`] — Agent configuration
-//! - [`context`] — Conversation history management
-//! - [`state`] — Agent loop state tracking
+//! - `agent` — ReAct agent graph definition and systems
+//! - `config` — Agent configuration
+//! - `context` — Conversation history management
+//! - `state` — Agent loop state tracking
 
 mod agent;
 mod config;

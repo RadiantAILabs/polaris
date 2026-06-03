@@ -28,7 +28,7 @@ Extension points for graph traversal and observability.
 | API | Composition policy | What it enables |
 |-----|--------------------|-----------------|
 | [`MiddlewareAPI`](crate::graph::MiddlewareAPI) | Open extension | Register middleware that wraps system execution — instrumentation, retries, rate limiting. |
-| [`HooksAPI`](crate::graph::HooksAPI) | Open extension | Register lifecycle hooks fired by the executor (`OnSystemStart`, `OnSystemComplete`, `OnGraphComplete`, etc.). |
+| [`HooksAPI`](crate::graph::hooks::HooksAPI) | Open extension | Register lifecycle hooks fired by the executor (`OnSystemStart`, `OnSystemComplete`, `OnGraphComplete`, etc.). |
 
 # Layer 3 — HTTP App Runtime
 

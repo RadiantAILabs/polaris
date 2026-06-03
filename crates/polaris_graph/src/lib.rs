@@ -7,9 +7,9 @@
 //! # Core Concepts
 //!
 //! - [`Graph`] - Directed graph structure with builder API
-//! - [`Node`] - Vertices representing computation or control flow
-//! - [`Edge`] - Connections defining execution flow
-//! - [`Predicate`] - Type-safe predicates for control flow decisions
+//! - [`Node`](crate::node::Node) - Vertices representing computation or control flow
+//! - [`Edge`](crate::edge::Edge) - Connections defining execution flow
+//! - [`Predicate`](crate::predicate::Predicate) - Type-safe predicates for control flow decisions
 //! - [`GraphExecutor`] - Runtime engine for graph traversal and execution
 //!
 //! # Example
@@ -47,28 +47,20 @@
 //! For the full framework guide, architecture overview, and integration patterns,
 //! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
-/// Edge types for connecting nodes in graphs.
 pub mod edge;
 
-/// Graph execution engine.
 pub mod executor;
 
-/// Graph structure and builder API.
 pub mod graph;
 
-/// Node types for graph vertices.
 pub mod node;
 
-/// Type-safe predicates for control flow decisions.
 pub mod predicate;
 
-/// Lifecycle hooks for graph execution.
 pub mod hooks;
 
-/// Development tools for graph execution (SystemInfo, DevToolsPlugin).
 pub mod dev;
 
-/// Middleware system for graph execution.
 pub mod middleware;
 
 /// Re-export all common types for easy access.

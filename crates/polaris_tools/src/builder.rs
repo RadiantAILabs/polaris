@@ -36,7 +36,7 @@ use polaris_models::llm::{GenerationError, LlmRequestBuilder, LlmResponse};
 // Error
 // ─────────────────────
 
-/// Errors that can occur during [`LlmRequestBuilderExt::reason`].
+/// Errors that can occur during [`LlmReasonExt::reason`].
 #[derive(Debug, thiserror::Error)]
 pub enum ReasonError {
     /// The underlying generation call failed.
@@ -84,7 +84,7 @@ impl<'a, S> LlmRequestBuilderExt<'a, S> for LlmRequestBuilder<'a, S> {
 // ─────────────────────
 
 /// Extension trait for the [`reason()`](LlmReasonExt::reason) method,
-/// available only when the builder is in the [`Ready`](polaris_models::llm::builder::Ready)
+/// available only when the builder is in the [`Ready`](polaris_models::llm::Ready)
 /// state (has at least one message).
 pub trait LlmReasonExt {
     /// Sends a single LLM call with tool definitions and returns the response.

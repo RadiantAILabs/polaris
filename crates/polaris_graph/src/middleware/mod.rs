@@ -14,15 +14,15 @@
 //!
 //! | Target | Info type | Scope |
 //! |--------|-----------|-------|
-//! | [`GraphExecution`] | [`GraphInfo`] | Entire graph run |
-//! | [`System`] | [`SystemInfo`] | Single system node |
-//! | [`Loop`] | [`LoopInfo`] | Entire loop node |
-//! | [`Parallel`] | [`ParallelInfo`] | Entire parallel node |
-//! | [`Decision`] | [`DecisionInfo`] | Decision node evaluation |
-//! | [`Switch`] | [`SwitchInfo`] | Switch node evaluation |
-//! | [`LoopIteration`] | [`LoopIterationInfo`] | Single loop iteration |
-//! | [`ParallelBranch`] | [`ParallelBranchInfo`] | Single parallel branch |
-//! | [`Scope`] | [`ScopeInfo`] | Scope node execution |
+//! | [`GraphExecution`] | [`GraphInfo`](info::GraphInfo) | Entire graph run |
+//! | [`System`] | [`SystemInfo`](info::SystemInfo) | Single system node |
+//! | [`Loop`] | [`LoopInfo`](info::LoopInfo) | Entire loop node |
+//! | [`Parallel`] | [`ParallelInfo`](info::ParallelInfo) | Entire parallel node |
+//! | [`Decision`] | [`DecisionInfo`](info::DecisionInfo) | Decision node evaluation |
+//! | [`Switch`] | [`SwitchInfo`](info::SwitchInfo) | Switch node evaluation |
+//! | [`LoopIteration`] | [`LoopIterationInfo`](info::LoopIterationInfo) | Single loop iteration |
+//! | [`ParallelBranch`] | [`ParallelBranchInfo`](info::ParallelBranchInfo) | Single parallel branch |
+//! | [`Scope`] | [`ScopeInfo`](info::ScopeInfo) | Scope node execution |
 //!
 //! # Layer Ordering
 //!
@@ -39,14 +39,14 @@
 //!
 //! A handler (see [`MiddlewareHandler`]) receives three arguments:
 //!
-//! - `info` — typed metadata about the execution unit (e.g. [`SystemInfo`]).
+//! - `info` — typed metadata about the execution unit (e.g. [`SystemInfo`](info::SystemInfo)).
 //! - `ctx` — exclusive `&mut` access to the [`SystemContext`](polaris_system::param::SystemContext).
 //! - `next` — a [`Next`] value representing the rest of the chain. Call
 //!   [`Next::run`] to continue inward. Code before the call runs on the way
 //!   in, code after runs on the way out. Every handler must call
 //!   [`Next::run`] exactly once; dropping `next` without invoking it
 //!   (short-circuiting) is not permitted and will produce an
-//!   [`ExecutionError::InternalError`].
+//!   [`ExecutionError::InternalError`](crate::executor::ExecutionError::InternalError).
 //!
 //! # Example
 //!
@@ -71,44 +71,44 @@ pub use api::{MiddlewareAPI, MiddlewareError, MiddlewareHandler, Next};
 // Top-level targets
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Middleware target for the entire graph execution. See [`GraphInfo`].
+/// Middleware target for the entire graph execution. See [`GraphInfo`](info::GraphInfo).
 pub struct GraphExecution;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Node-level targets
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Middleware target for system node execution. See [`SystemInfo`].
+/// Middleware target for system node execution. See [`SystemInfo`](info::SystemInfo).
 pub struct System;
 
 /// Middleware target for the loop node as a whole, spanning every iteration
 /// from entry to termination. For per-iteration middleware, see [`LoopIteration`].
 ///
-/// See [`LoopInfo`] for the metadata available to this middleware.
+/// See [`LoopInfo`](info::LoopInfo) for the metadata available to this middleware.
 pub struct Loop;
 
 /// Middleware target for the parallel node as a whole, spanning from the initial
 /// fan-out through all branches to the final join. For per-branch middleware, see
 /// [`ParallelBranch`].
 ///
-/// See [`ParallelInfo`] for the metadata available to this middleware.
+/// See [`ParallelInfo`](info::ParallelInfo) for the metadata available to this middleware.
 pub struct Parallel;
 
-/// Middleware target for decision node evaluation. See [`DecisionInfo`].
+/// Middleware target for decision node evaluation. See [`DecisionInfo`](info::DecisionInfo).
 pub struct Decision;
 
-/// Middleware target for switch node evaluation. See [`SwitchInfo`].
+/// Middleware target for switch node evaluation. See [`SwitchInfo`](info::SwitchInfo).
 pub struct Switch;
 
-/// Middleware target for scope node execution. See [`ScopeInfo`].
+/// Middleware target for scope node execution. See [`ScopeInfo`](info::ScopeInfo).
 pub struct Scope;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-node-level targets
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Middleware target for a single loop iteration. See [`LoopIterationInfo`].
+/// Middleware target for a single loop iteration. See [`LoopIterationInfo`](info::LoopIterationInfo).
 pub struct LoopIteration;
 
-/// Middleware target for a single parallel branch. See [`ParallelBranchInfo`].
+/// Middleware target for a single parallel branch. See [`ParallelBranchInfo`](info::ParallelBranchInfo).
 pub struct ParallelBranch;

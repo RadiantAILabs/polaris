@@ -100,7 +100,7 @@
 //! presents the command to the user for approval before execution. This uses
 //! the `UserIO` resource from `polaris_core_plugins`:
 //!
-//! 1. System calls `executor.execute(request)` → gets [`ShellResponse::ConfirmationRequired(request)`]
+//! 1. System calls `executor.execute(request)` → gets [`ShellResponse::ConfirmationRequired`]`(request)`
 //! 2. System calls `user_io.send("Allow command: `rm -rf`? (y/n)")` + `user_io.receive()`
 //! 3. If approved, system calls `executor.execute_confirmed(request)`
 //!

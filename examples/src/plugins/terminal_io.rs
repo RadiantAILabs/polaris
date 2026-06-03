@@ -167,7 +167,7 @@ impl IOProvider for TerminalIOProvider {
     }
 }
 
-/// API handle for pushing messages into the [`TerminalIOProvider`] queue.
+/// API handle for pushing messages into the `TerminalIOProvider` queue.
 ///
 /// Registered by [`TerminalIOPlugin`] and accessed via
 /// [`Server::api::<TerminalIO>()`](polaris::system::server::Server::api).
@@ -186,7 +186,7 @@ impl TerminalIO {
     }
 }
 
-/// Plugin that registers [`TerminalIOProvider`] as the [`UserIO`] local
+/// Plugin that registers `TerminalIOProvider` as the [`UserIO`] local
 /// resource and exposes a [`TerminalIO`] API for injecting messages.
 pub struct TerminalIOPlugin;
 

@@ -131,7 +131,7 @@ pub enum ParamError {
 ///
 /// - **Resources** — long-lived state. Resources may be
 ///   [`GlobalResource`](crate::resource::GlobalResource) (server-level,
-///   read-only) or [`LocalResource`](crate::resource::LocalResource)
+///   read-only) or [`LocalResource`]
 ///   (per-context, mutable).
 /// - **Outputs** — ephemeral return values produced by preceding systems in
 ///   the current execution, cleared between agent runs.
@@ -219,7 +219,8 @@ impl<'parent> SystemContext<'parent> {
 
     /// Creates a new context with access to global resources.
     ///
-    /// This is typically called by [`Server::create_context()`] to create
+    /// This is typically called by
+    /// [`Server::create_context()`](crate::server::Server::create_context) to create
     /// execution contexts that can access server-level resources via `Res<T>`.
     #[must_use]
     pub fn with_globals(globals: Arc<Resources>) -> SystemContext<'static> {
@@ -279,7 +280,7 @@ impl<'parent> SystemContext<'parent> {
     /// Inserts any resource into this context's scope.
     ///
     /// This is primarily used for root contexts that hold global resources,
-    /// or for testing. For normal usage, prefer [`insert`] which enforces
+    /// or for testing. For normal usage, prefer [`insert`](Self::insert) which enforces
     /// the `LocalResource` bound.
     ///
     /// Note: Resources inserted this way can still only be mutated via
@@ -444,7 +445,7 @@ impl<'parent> SystemContext<'parent> {
     /// Unlike [`clone_local_resource`](Self::clone_local_resource), this does not
     /// require [`register_clone_fn`](Self::register_clone_fn) to have been called.
     /// The clone function is supplied by the caller — typically captured at
-    /// compile time in a [`ResourceForward`](crate::ResourceForward).
+    /// compile time in a `ResourceForward` (defined in the graph crate).
     ///
     /// Returns `None` if the resource does not exist in the local scope or is
     /// currently write-locked.
@@ -599,7 +600,7 @@ impl<'parent> SystemContext<'parent> {
 /// `Res<T>` resolves `T` by walking the full
 /// [context hierarchy](SystemContext#resource-lookup-order), making it
 /// suitable to access both [`GlobalResource`](crate::resource::GlobalResource) and
-/// [`LocalResource`](crate::resource::LocalResource) types. Multiple systems
+/// [`LocalResource`] types. Multiple systems
 /// may hold `Res<T>` to the same resource simultaneously.
 ///
 /// Implements [`Deref<Target = T>`](core::ops::Deref).
@@ -650,7 +651,7 @@ impl<'a, T: Resource> SystemParam for Res<'a, T> {
 /// Mutable access to a local resource.
 ///
 /// `ResMut<T>` provides read-write access to a
-/// [`LocalResource`](crate::resource::LocalResource) in the current
+/// [`LocalResource`] in the current
 /// [`SystemContext`] scope. Unlike [`Res<T>`], it does not walk the context
 /// hierarchy — only resources owned by the current scope can be mutated.
 ///
