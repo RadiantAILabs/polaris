@@ -3,7 +3,7 @@
 /**
  * Identifies an agent type by its stable, user-defined name.
  *
- * Wraps the `&'static str` returned by [`Agent::name`].
+ * Wraps the `&'static str` returned by [`Agent::name`](polaris_agent::Agent::name).
  *
  * # Examples
  *
