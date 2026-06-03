@@ -4,7 +4,7 @@ min_version = "0.37.0"
 
 [tasks.test]
 description = "Run all testing steps (format, clippy, markdown lint, test)"
-dependencies = ["test-format", "test-clippy", "test-markdown", "test-doc", "test-workspace"]
+dependencies = ["test-format", "test-clippy", "test-markdown", "test-rustdoc", "test-doc", "test-workspace", "test-bindings"]
 
 [tasks.build]
 description = "Build the project"
@@ -44,6 +44,40 @@ description = "Run doc tests"
 workspace = false
 command = "cargo"
 args = ["test", "--doc", "--workspace", "--all-features"]
+
+[tasks.test-rustdoc]
+description = "Build rustdoc with warnings denied (broken intra-doc links, etc.)"
+workspace = false
+command = "cargo"
+args = ["doc", "--workspace", "--no-deps", "--all-features"]
+
+[tasks.test-rustdoc.env]
+RUSTDOCFLAGS = "-D warnings"
+
+[tasks.gen-bindings]
+description = "Regenerate TypeScript bindings in bindings/ts/src from #[derive(TS)] types"
+workspace = false
+command = "cargo"
+# ts-rs emits each binding as a side effect of its `export_bindings_*` test.
+# Filtering by that name across the workspace regenerates every binding without
+# hardcoding a crate list, so new #[derive(TS)] types are picked up automatically.
+args = ["test", "--workspace", "--all-features", "export_bindings"]
+
+[tasks.test-bindings]
+description = "Verify generated TS bindings are up to date (the --all-features tests regenerate them in-tree)"
+workspace = false
+script_runner = "@shell"
+script = '''
+if [ -n "$(git status --porcelain bindings/ts/src)" ]; then
+  echo "Generated TS bindings are stale. They have already been regenerated in your"
+  echo "working tree (see the diff below) -- just review and commit them:"
+  echo "    git add bindings/ts/src && git commit"
+  echo "To regenerate manually at any time, run: cargo make gen-bindings"
+  git status --porcelain bindings/ts/src
+  git diff bindings/ts/src
+  exit 1
+fi
+'''
 
 [tasks.test-features]
 description = "Check each feature flag compiles in isolation (requires cargo-hack)"
