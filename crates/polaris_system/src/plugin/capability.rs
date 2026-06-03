@@ -342,7 +342,11 @@ impl PluginAccess {
         &self.optional
     }
 
-    /// Returns `true` if no capabilities are declared (the default for legacy plugins).
+    /// Returns `true` if no capabilities are declared.
+    ///
+    /// This is the state of a plugin that declares no `access()` (the default). The
+    /// resolver does not special-case it — an empty `PluginAccess` simply contributes no
+    /// capability edges — so this is an introspection convenience, not a resolver gate.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.provides.is_empty()

@@ -1,6 +1,6 @@
 //! Persistence trait for span/run history.
 //!
-//! Process restart wipes the in-memory in-memory span buffer, but
+//! Process restart wipes the in-memory span buffer, but
 //! `polaris_sessions::SessionStore` keeps session identity and resources
 //! alive across reboots. That mismatch leaves the dashboard unable to
 //! show run history for a resumed session — even though the session is

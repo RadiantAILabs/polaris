@@ -8,7 +8,7 @@ use crate::config::AppConfig;
 use crate::middleware;
 use crate::router::HttpRouter;
 use polaris_system::api::API;
-use polaris_system::plugin::{Contract, Plugin, PluginAccess, PluginId, Version};
+use polaris_system::plugin::{Contract, Plugin, PluginAccess, Version};
 use polaris_system::server::Server;
 use tokio::sync::watch;
 
@@ -340,10 +340,6 @@ impl Plugin for AppPlugin {
                 }
             }
         }
-    }
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        Vec::new()
     }
 }
 

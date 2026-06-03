@@ -42,13 +42,11 @@ use std::fmt;
 /// In a server whose capabilities resolved successfully this never occurs for a
 /// non-optional parameter — the resolver proves a compatible provider exists and orders
 /// it first. It exists so the generated `build()` can surface a precise, named message if
-/// a capability is somehow absent or already borrowed.
+/// a capability is somehow absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildParamError {
     /// No resource of the requested type was present during `build()`.
     NotFound(&'static str),
-    /// The resource was present but already borrowed incompatibly.
-    BorrowConflict(&'static str),
 }
 
 impl fmt::Display for BuildParamError {
@@ -56,9 +54,6 @@ impl fmt::Display for BuildParamError {
         match self {
             Self::NotFound(name) => {
                 write!(f, "capability `{name}` was not provided during build")
-            }
-            Self::BorrowConflict(name) => {
-                write!(f, "capability `{name}` was already borrowed during build")
             }
         }
     }
@@ -87,8 +82,8 @@ pub trait BuildParam {
     ///
     /// # Errors
     ///
-    /// Returns [`BuildParamError`] if a required capability is missing or already
-    /// borrowed. Optional parameters never error.
+    /// Returns [`BuildParamError`] if a required capability is missing. Optional
+    /// parameters never error.
     fn fetch(server: &Server) -> Result<Self::Item<'_>, BuildParamError>;
 
     /// Records this parameter's capability declaration into `access`.
@@ -216,5 +211,59 @@ impl<T: Resource + Contract> BuildParam for Optional<'_, T> {
     fn contribute_access(access: &mut PluginAccess) {
         let taken = std::mem::take(access);
         *access = taken.optionally_requires::<T>(VersionReq::caret(T::CONTRACT_VERSION));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::Version;
+
+    struct Registry {
+        value: u32,
+    }
+
+    impl Contract for Registry {
+        const CONTRACT_VERSION: Version = Version::new(1, 0, 0);
+    }
+
+    #[test]
+    fn requires_fetch_reads_a_present_provider() {
+        let mut server = Server::new();
+        server.insert_resource(Registry { value: 7 });
+
+        let got = Requires::<Registry>::fetch(&server).expect("registry present");
+        assert_eq!(got.value, 7);
+    }
+
+    #[test]
+    fn requires_fetch_reports_not_found_when_absent() {
+        let server = Server::new();
+
+        // `Requires` is not `Debug` (it wraps a borrow guard), so match rather than
+        // `expect_err`, which would require the `Ok` type to be `Debug`.
+        let Err(err) = Requires::<Registry>::fetch(&server) else {
+            panic!("expected NotFound for an absent registry");
+        };
+        assert!(matches!(err, BuildParamError::NotFound(_)), "got {err:?}");
+        // The message names the missing capability type.
+        assert!(err.to_string().contains("Registry"), "got {err}");
+    }
+
+    #[test]
+    fn optional_fetch_is_some_when_present_and_none_when_absent() {
+        let mut server = Server::new();
+
+        // Absent: Optional resolves to None and never errors.
+        let absent = Optional::<Registry>::fetch(&server).expect("optional never errors");
+        assert!(!absent.is_present());
+        assert!(absent.get().is_none());
+        drop(absent);
+
+        // Present: Optional yields the resource.
+        server.insert_resource(Registry { value: 42 });
+        let present = Optional::<Registry>::fetch(&server).expect("optional never errors");
+        assert!(present.is_present());
+        assert_eq!(present.get().map(|reg| reg.value), Some(42));
     }
 }
