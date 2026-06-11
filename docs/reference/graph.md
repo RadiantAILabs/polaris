@@ -145,24 +145,47 @@ For loops that should run a fixed number of times without a predicate, `add_loop
 
 ### Scope
 
-A scope node executes an embedded graph with a configurable context boundary. A `ContextPolicy` is constructed upfront and passed to `add_scope`; it determines how the parent's `SystemContext` is shared with the inner graph:
+A scope node executes an embedded graph with a configurable context boundary. A `ContextPolicy` is constructed upfront and passed to `add_scope`; it determines which resources cross from parent to child and how each one crosses.
 
-| Policy | Context | Reads | Writes | Output Merge |
-|--------|---------|-------|--------|--------------|
-| `ContextPolicy::shared()` | Same as parent | Parent's resources | Parent's resources | Shared (no merge) |
-| `ContextPolicy::inherit()` | `ctx.child()` | Walk parent chain + globals | Child's local scope | Merged back |
-| `ContextPolicy::isolated()` | Fresh context (globals only) | Only globals + forwarded | Own local scope | Merged back |
+Two constructors anchor the surface:
+
+| Constructor | Meaning |
+|---|---|
+| `ContextPolicy::shared()` | No boundary at all — the inner graph reuses the parent context. |
+| `ContextPolicy::new()` | Empty per-resource policy — nothing crosses unless added. |
+
+Compose by chaining per-resource verbs. Each acts on one resource type:
+
+| Verb | Mechanism | Requires of `T` |
+|---|---|---|
+| `share::<T>()` | Child reads via parent chain (zero copy) | nothing |
+| `forward::<T>()` | `Clone::clone` into child's local scope | `T: Clone` |
+| `fork::<T>()` | `ForkStrategy::fork(&self)` into child's local scope | `T: ForkStrategy` |
+| `forward_fresh::<T>()` | Re-invoke `T`'s registered factory | `T` registered via `Server::register_local(...)` |
+| `exclude::<T>()` | Suppress any earlier verb / `share_rest()` for `T` | nothing |
+| `share_rest()` | Apply `share` to every resource not otherwise mentioned | nothing |
+
+Verbs are applied in declaration order; later verbs override earlier ones for the same `T`.
 
 ```rust
-// Inherit mode: child reads from parent, writes locally
-graph.add_scope("sub_agent", inner_graph, ContextPolicy::inherit());
+// Sub-agent: shared registry, fresh fragment store.
+let policy = ContextPolicy::new()
+    .share::<ToolRegistry>()
+    .forward_fresh::<FragmentStore>();
+graph.add_scope("sub_agent", inner_graph, policy);
 
-// Isolated mode with resource forwarding
-let policy = ContextPolicy::isolated().forward::<Memory>();
+// Sandbox: only `Memory` is cloned across; everything else is invisible.
+let policy = ContextPolicy::new().forward::<Memory>();
 graph.add_scope("sandboxed", inner_graph, policy);
+
+// "Mostly inherit, but override one resource."
+let policy = ContextPolicy::new()
+    .fork::<FragmentStore>()
+    .share_rest();
+graph.add_scope("scope", inner_graph, policy);
 ```
 
-Resource forwarding requires the type to implement `Clone`. The clone function is captured at policy-build time, so no separate `register_clone_fn()` call is needed at runtime.
+At runtime the executor branches on the policy: `shared()` reuses the parent context; every other policy creates a child via `ctx.child_filtered(...)` so chain-reads only expose explicitly-shared types. A `share` verb (including `share_rest()`) widens that filter; pure-isolation policies (only `forward` / `fork` / `forward_fresh`) use an empty `AllowOnly` filter — the child still sees globals through the retained parent reference, but no parent local is readable. The reference is kept (rather than dropped) so a blocked read can report `ResourceOutOfScope` naming the verb that would expose it.
 
 After the inner graph completes, child outputs are merged back into the parent context. See [Execution Context — Context Flow](context.md#context-flow-through-graph-execution) for details.
 
@@ -177,7 +200,7 @@ Different node types have different relationships to the `SystemContext`:
 | **Switch** | No | Evaluates discriminator and routes in parent's context |
 | **Loop** | No | Body runs in same context across iterations; outputs persist between iterations |
 | **Parallel** | Yes (per branch) | Each branch gets `ctx.child()`; outputs merged back after all branches complete |
-| **Scope** | Depends on mode | Shared: no; Inherit: `ctx.child()`; Isolated: fresh `SystemContext::with_globals()` |
+| **Scope** | Depends on policy | `shared()`: no child; every other policy: `ctx.child_filtered(...)` (pure isolation uses an empty `AllowOnly` filter — globals only) |
 
 ## Nodes
 
@@ -448,7 +471,7 @@ Each hook is registered against one or more schedule types. The executor invokes
 
 **Parallel:** `OnParallelStart`, `OnParallelComplete` — fired before parallel branches start and after all branches complete.
 
-**Scope:** `OnScopeStart`, `OnScopeComplete` — fired before scope entry and after scope completion. Includes `context_mode` and inner node count.
+**Scope:** `OnScopeStart`, `OnScopeComplete` — fired before scope entry and after scope completion. Includes `mode` and inner node count.
 
 When multiple hooks are registered for the same schedule, they execute in registration order, and each hook sees context changes made by previous hooks.
 

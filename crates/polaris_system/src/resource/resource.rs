@@ -141,6 +141,56 @@ pub trait GlobalResource: Resource {}
 /// ```
 pub trait LocalResource: Resource {}
 
+/// Strategy for producing a child-scope value of a [`LocalResource`] when crossing a scope boundary.
+///
+/// Implement this on a resource when its semantics differ from `Clone` — for example,
+/// when a sub-agent should receive a fresh-empty store, when parent and child should
+/// share an `Arc<AtomicU64>`-style counter, or when a tracing context should mint a
+/// child span linked to the parent.
+///
+/// The fork is one-way: mutations in the child do not propagate back to the parent.
+/// Implementations should be pure (no side effects on `self`) and total (no panics,
+/// no I/O).
+///
+/// # Examples
+///
+/// Fresh-empty fork — child starts with no inherited state:
+///
+/// ```
+/// use polaris_system::resource::{ForkStrategy, LocalResource};
+///
+/// #[derive(Default)]
+/// struct FragmentStore { fragments: Vec<String> }
+/// impl LocalResource for FragmentStore {}
+///
+/// impl ForkStrategy for FragmentStore {
+///     fn fork(&self) -> Self {
+///         FragmentStore::default()
+///     }
+/// }
+/// ```
+///
+/// Shared-atomic fork — parent and child compete on the same pool:
+///
+/// ```
+/// use polaris_system::resource::{ForkStrategy, LocalResource};
+/// use std::sync::Arc;
+/// use std::sync::atomic::AtomicU64;
+///
+/// struct TokenBudget { remaining: Arc<AtomicU64> }
+/// impl LocalResource for TokenBudget {}
+///
+/// impl ForkStrategy for TokenBudget {
+///     fn fork(&self) -> Self {
+///         Self { remaining: Arc::clone(&self.remaining) }
+///     }
+/// }
+/// ```
+pub trait ForkStrategy: LocalResource + Sized {
+    /// Produces a child-scope value derived from `self`.
+    fn fork(&self) -> Self;
+}
+
 /// Unique identifier for a resource type.
 ///
 /// Used internally to key resources in the storage map.
@@ -173,6 +223,61 @@ pub enum ResourceError {
     BorrowConflict(&'static str),
 }
 
+/// Type-erased factory that produces a fresh, boxed resource value.
+///
+/// Captured when a resource is instantiated from a registered factory
+/// (`Server::register_local`) and used by `forward_fresh::<T>()` at scope entry
+/// to produce a clean instance for the child context.
+///
+/// `ResourceFactory` is `Clone` (cheap — internally an `Arc`) and
+/// `Send + Sync`, so it can be stored on every resource entry and shared
+/// across the executor without rebuilding the closure.
+///
+/// # Example
+///
+/// ```
+/// use polaris_system::resource::ResourceFactory;
+///
+/// struct Counter { value: u32 }
+///
+/// let factory = ResourceFactory::new(|| Box::new(Counter { value: 0 }));
+/// let boxed = factory.produce();
+/// let counter = boxed.downcast::<Counter>().unwrap();
+/// assert_eq!(counter.value, 0);
+/// ```
+#[derive(Clone)]
+pub struct ResourceFactory {
+    inner: std::sync::Arc<dyn Fn() -> Box<dyn Any + Send + Sync> + Send + Sync>,
+}
+
+impl ResourceFactory {
+    /// Wraps a closure that produces a fresh boxed resource value.
+    ///
+    /// The closure is stored behind an `Arc`, so the returned factory is
+    /// cheap to clone.
+    #[must_use]
+    pub fn new<F>(factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn Any + Send + Sync> + Send + Sync + 'static,
+    {
+        Self {
+            inner: std::sync::Arc::new(factory),
+        }
+    }
+
+    /// Invokes the factory and returns a freshly produced boxed value.
+    #[must_use]
+    pub fn produce(&self) -> Box<dyn Any + Send + Sync> {
+        (self.inner)()
+    }
+}
+
+impl std::fmt::Debug for ResourceFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceFactory").finish_non_exhaustive()
+    }
+}
+
 /// Internal storage for a single resource with thread-safe access.
 struct ResourceEntry {
     /// Type-erased resource data protected by `RwLock`.
@@ -180,6 +285,10 @@ struct ResourceEntry {
     /// Optional clone function for type-erased cloning.
     /// Registered via [`Resources::register_clone_fn`] for types that implement `Clone`.
     clone_fn: Option<fn(&dyn Any) -> Box<dyn Any + Send + Sync>>,
+    /// Optional factory for producing a fresh value of this resource.
+    /// Populated when the entry was instantiated from a registered factory
+    /// (`Server::register_local`).
+    factory_fn: Option<ResourceFactory>,
 }
 
 impl ResourceEntry {
@@ -188,6 +297,7 @@ impl ResourceEntry {
         Self {
             data: RwLock::new(Box::new(resource)),
             clone_fn: None,
+            factory_fn: None,
         }
     }
 
@@ -196,6 +306,19 @@ impl ResourceEntry {
         Self {
             data: RwLock::new(data),
             clone_fn: None,
+            factory_fn: None,
+        }
+    }
+
+    /// Creates a new resource entry from a boxed value with an associated factory.
+    fn new_boxed_with_factory(
+        data: Box<dyn Any + Send + Sync>,
+        factory_fn: ResourceFactory,
+    ) -> Self {
+        Self {
+            data: RwLock::new(data),
+            clone_fn: None,
+            factory_fn: Some(factory_fn),
         }
     }
 
@@ -296,7 +419,7 @@ impl Resources {
     /// This is used internally by factories that create resources dynamically.
     /// The `type_id` must match the type of the boxed resource.
     ///
-    /// # Safety
+    /// # Correctness
     ///
     /// The caller must ensure that `type_id` corresponds to the type stored
     /// in `resource`. Mismatches will cause panics when the resource is
@@ -305,6 +428,77 @@ impl Resources {
         let id = ResourceId(type_id);
         let entry = ResourceEntry::new_boxed(resource);
         self.storage.insert(id, entry);
+    }
+
+    /// Inserts a type-erased resource together with the factory that produced it.
+    ///
+    /// The factory is retained on the resource entry so that `forward_fresh::<T>()`
+    /// at a scope boundary can re-invoke it to produce a clean child-scope instance
+    /// without separate Server→executor plumbing.
+    ///
+    /// If a resource of this type already exists, it is replaced. Any
+    /// previously registered clone function on the entry is dropped — register
+    /// a new one with [`Resources::register_clone_fn`] after re-inserting if
+    /// needed.
+    ///
+    /// # Correctness
+    ///
+    /// The caller must ensure that `type_id` corresponds to the type stored
+    /// in `resource` and that `factory_fn` produces a value of the same type.
+    /// Mismatches will cause panics when the resource is accessed via
+    /// `get::<T>()` or when the retained factory is invoked at a scope
+    /// boundary.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::resource::{Resources, ResourceFactory};
+    /// use std::any::TypeId;
+    ///
+    /// struct Counter { value: u32 }
+    ///
+    /// let mut resources = Resources::new();
+    /// let factory = ResourceFactory::new(|| Box::new(Counter { value: 0 }));
+    /// resources.insert_boxed_with_factory(TypeId::of::<Counter>(), factory.produce(), factory);
+    /// assert!(resources.factory_fn_by_type_id(TypeId::of::<Counter>()).is_some());
+    /// ```
+    pub fn insert_boxed_with_factory(
+        &mut self,
+        type_id: TypeId,
+        resource: Box<dyn Any + Send + Sync>,
+        factory_fn: ResourceFactory,
+    ) {
+        let id = ResourceId(type_id);
+        let entry = ResourceEntry::new_boxed_with_factory(resource, factory_fn);
+        self.storage.insert(id, entry);
+    }
+
+    /// Returns the factory function associated with a resource entry, if any.
+    ///
+    /// Used by `forward_fresh` at scope boundaries to instantiate a clean
+    /// child-scope value from the parent's registered factory. Returns `None`
+    /// when the resource is absent or when it was inserted without a factory
+    /// (via [`Resources::insert`] or [`Resources::insert_boxed`]).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::resource::{Resources, ResourceFactory};
+    /// use std::any::TypeId;
+    ///
+    /// struct Counter { value: u32 }
+    ///
+    /// let mut resources = Resources::new();
+    /// resources.insert(Counter { value: 0 });
+    /// // Plain insert leaves no factory on the entry.
+    /// assert!(resources.factory_fn_by_type_id(TypeId::of::<Counter>()).is_none());
+    /// ```
+    #[must_use]
+    pub fn factory_fn_by_type_id(&self, type_id: TypeId) -> Option<ResourceFactory> {
+        let id = ResourceId(type_id);
+        self.storage
+            .get(&id)
+            .and_then(|entry| entry.factory_fn.clone())
     }
 
     /// Returns `true` if a resource of type `T` exists.
@@ -903,6 +1097,78 @@ mod tests {
         assert!(
             result.is_none(),
             "should return None when resource is write-locked"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ResourceFactory / insert_boxed_with_factory tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_boxed_with_factory_round_trip() {
+        let mut resources = Resources::new();
+        let factory = ResourceFactory::new(|| Box::new(Cloneable { value: 3 }));
+        resources.insert_boxed_with_factory(TypeId::of::<Cloneable>(), factory.produce(), factory);
+
+        // Original value is reachable via get().
+        {
+            let guard = resources.get::<Cloneable>().unwrap();
+            assert_eq!(guard.value, 3);
+        }
+
+        // Factory survives onto the entry.
+        let resolved = resources
+            .factory_fn_by_type_id(TypeId::of::<Cloneable>())
+            .expect("factory should be retained");
+        let fresh = resolved.produce();
+        let downcast = fresh.downcast::<Cloneable>().unwrap();
+        assert_eq!(downcast.value, 3);
+    }
+
+    #[test]
+    fn factory_fn_by_type_id_returns_none_for_plain_insert() {
+        let mut resources = Resources::new();
+        resources.insert(Cloneable { value: 1 });
+        assert!(
+            resources
+                .factory_fn_by_type_id(TypeId::of::<Cloneable>())
+                .is_none(),
+            "plain insert should leave no factory on the entry",
+        );
+    }
+
+    #[test]
+    fn factory_fn_by_type_id_returns_none_for_missing_resource() {
+        let resources = Resources::new();
+        assert!(
+            resources
+                .factory_fn_by_type_id(TypeId::of::<Cloneable>())
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn insert_boxed_with_factory_clears_prior_clone_fn() {
+        // Regression: re-inserting via insert_boxed_with_factory creates a
+        // fresh entry whose `clone_fn` is None. Callers that rely on clone-by-
+        // type-id must re-register their clone function after reinserting.
+        let mut resources = Resources::new();
+        resources.insert(Cloneable { value: 1 });
+        resources.register_clone_fn::<Cloneable>();
+        assert!(
+            resources
+                .clone_by_type_id(TypeId::of::<Cloneable>())
+                .is_some()
+        );
+
+        let factory = ResourceFactory::new(|| Box::new(Cloneable { value: 2 }));
+        resources.insert_boxed_with_factory(TypeId::of::<Cloneable>(), factory.produce(), factory);
+
+        assert!(
+            resources
+                .clone_by_type_id(TypeId::of::<Cloneable>())
+                .is_none(),
+            "insert_boxed_with_factory should not preserve the prior clone_fn",
         );
     }
 }

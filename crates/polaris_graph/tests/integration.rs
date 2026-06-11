@@ -25,7 +25,6 @@ use polaris_system::system::{BoxFuture, System, SystemError};
 use std::sync::{Arc, Mutex};
 use test_utils::{
     ConsumerSystem, FlagSystem, ProducerSystem, ReadConfigCapture, SuccessSystem, TestConfig,
-    WriteConfigCapture,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -809,99 +808,6 @@ async fn scope_shared_reads_parent_resources() {
 }
 
 #[tokio::test]
-async fn scope_inherit_executes_inner_graph() {
-    let mut inner = Graph::new();
-    let flag = Arc::new(Mutex::new(false));
-    inner.add_boxed_system(Box::new(FlagSystem {
-        flag: Arc::clone(&flag),
-    }));
-
-    let mut graph = Graph::new();
-    graph.add_scope("inherit_scope", inner, ContextPolicy::inherit());
-
-    let mut ctx = SystemContext::new();
-    let executor = GraphExecutor::new();
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    assert!(result.is_ok());
-    assert!(*flag.lock().unwrap(), "inner system should have executed");
-}
-
-#[tokio::test]
-async fn scope_inherit_merges_outputs_back() {
-    let mut inner = Graph::new();
-    inner.add_boxed_system(Box::new(ProducerSystem { value: 77 }));
-
-    let received = Arc::new(Mutex::new(None));
-    let mut graph = Graph::new();
-    graph
-        .add_scope("inherit_scope", inner, ContextPolicy::inherit())
-        .add_boxed_system(Box::new(ConsumerSystem {
-            received: Arc::clone(&received),
-        }));
-
-    let mut ctx = SystemContext::new();
-    let executor = GraphExecutor::new();
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    assert!(result.is_ok());
-    assert_eq!(
-        *received.lock().unwrap(),
-        Some(77),
-        "outputs from inherit scope should be merged back to parent"
-    );
-}
-
-#[tokio::test]
-async fn scope_inherit_reads_parent_resources_via_chain() {
-    let captured = Arc::new(Mutex::new(None));
-    let mut inner = Graph::new();
-    inner.add_boxed_system(Box::new(ReadConfigCapture {
-        captured: Arc::clone(&captured),
-    }));
-
-    let mut graph = Graph::new();
-    graph.add_scope("inherit_scope", inner, ContextPolicy::inherit());
-
-    let mut ctx = SystemContext::new().with(TestConfig { value: 55 });
-    let executor = GraphExecutor::new();
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    assert!(result.is_ok());
-    assert_eq!(
-        *captured.lock().unwrap(),
-        Some(55),
-        "inherit scope should read parent resources via chain"
-    );
-}
-
-#[tokio::test]
-async fn scope_inherit_forward_clones_resource() {
-    let captured = Arc::new(Mutex::new(None));
-    let mut inner = Graph::new();
-    inner.add_boxed_system(Box::new(ReadConfigCapture {
-        captured: Arc::clone(&captured),
-    }));
-
-    let policy = ContextPolicy::inherit().forward::<TestConfig>();
-
-    let mut graph = Graph::new();
-    graph.add_scope("inherit_fwd", inner, policy);
-
-    let mut ctx = SystemContext::new().with(TestConfig { value: 33 });
-
-    let executor = GraphExecutor::new();
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    assert!(result.is_ok());
-    assert_eq!(
-        *captured.lock().unwrap(),
-        Some(33),
-        "forwarded resource should be readable in child"
-    );
-}
-
-#[tokio::test]
 async fn scope_isolated_executes_inner_graph() {
     let mut inner = Graph::new();
     let flag = Arc::new(Mutex::new(false));
@@ -910,7 +816,7 @@ async fn scope_isolated_executes_inner_graph() {
     }));
 
     let mut graph = Graph::new();
-    graph.add_scope("isolated_scope", inner, ContextPolicy::isolated());
+    graph.add_scope("isolated_scope", inner, ContextPolicy::new());
 
     let mut ctx = SystemContext::new();
     let executor = GraphExecutor::new();
@@ -928,7 +834,7 @@ async fn scope_isolated_merges_outputs_back() {
     let received = Arc::new(Mutex::new(None));
     let mut graph = Graph::new();
     graph
-        .add_scope("isolated_scope", inner, ContextPolicy::isolated())
+        .add_scope("isolated_scope", inner, ContextPolicy::new())
         .add_boxed_system(Box::new(ConsumerSystem {
             received: Arc::clone(&received),
         }));
@@ -946,28 +852,31 @@ async fn scope_isolated_merges_outputs_back() {
 }
 
 #[tokio::test]
-async fn scope_isolated_forward_clones_resource() {
-    let captured = Arc::new(Mutex::new(None));
+async fn scope_share_rest_merges_outputs_back() {
+    // `share_rest()` (Inherit-mode) still builds a filtered child via
+    // `child_filtered`, so a producer inside it must have its output merged
+    // back to the parent on scope completion — the same path the isolated case
+    // exercises, asserted here directly for the non-isolated filtered child.
     let mut inner = Graph::new();
-    inner.add_boxed_system(Box::new(ReadConfigCapture {
-        captured: Arc::clone(&captured),
-    }));
+    inner.add_boxed_system(Box::new(ProducerSystem { value: 202 }));
 
-    let policy = ContextPolicy::isolated().forward::<TestConfig>();
-
+    let received = Arc::new(Mutex::new(None));
     let mut graph = Graph::new();
-    graph.add_scope("isolated_fwd_mut", inner, policy);
+    graph
+        .add_scope("share_rest_scope", inner, ContextPolicy::new().share_rest())
+        .add_boxed_system(Box::new(ConsumerSystem {
+            received: Arc::clone(&received),
+        }));
 
-    let mut ctx = SystemContext::new().with(TestConfig { value: 77 });
-
+    let mut ctx = SystemContext::new();
     let executor = GraphExecutor::new();
     let result = executor.execute(&graph, &mut ctx, None, None).await;
 
     assert!(result.is_ok());
     assert_eq!(
-        *captured.lock().unwrap(),
-        Some(77),
-        "forward should make resource accessible in isolated scope"
+        *received.lock().unwrap(),
+        Some(202),
+        "outputs from a share_rest (Inherit-mode) scope should be merged back"
     );
 }
 
@@ -1093,41 +1002,6 @@ async fn scope_inside_parallel_branch() {
     );
 }
 
-#[tokio::test]
-async fn scope_inherit_write_isolation() {
-    // In Inherit mode, writes inside the scope go to the child's local scope.
-    // The parent's resource should remain unchanged after the scope completes.
-    let captured_before = Arc::new(Mutex::new(None));
-    let mut inner = Graph::new();
-    inner.add_boxed_system(Box::new(WriteConfigCapture {
-        new_value: 999,
-        captured: Arc::clone(&captured_before),
-    }));
-
-    let policy = ContextPolicy::inherit().forward::<TestConfig>();
-
-    let mut graph = Graph::new();
-    graph.add_scope("inherit_write", inner, policy);
-
-    let mut ctx = SystemContext::new().with(TestConfig { value: 42 });
-    let executor = GraphExecutor::new();
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    assert!(result.is_ok());
-    // The scope system saw the original value via the forwarded clone
-    assert_eq!(
-        *captured_before.lock().unwrap(),
-        Some(42),
-        "scope system should see original forwarded value"
-    );
-    // The parent's resource should be unchanged — writes went to the child
-    let parent_config = ctx.get_resource::<TestConfig>().unwrap();
-    assert_eq!(
-        parent_config.value, 42,
-        "parent resource should be unchanged after inherit scope writes"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Scope Middleware
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1211,7 +1085,7 @@ async fn scope_isolated_inherits_global_resources() {
     }));
 
     let mut graph = Graph::new();
-    graph.add_scope("iso_globals", inner, ContextPolicy::isolated());
+    graph.add_scope("iso_globals", inner, ContextPolicy::new());
 
     // Create a context with global resources
     let mut globals = Resources::new();
@@ -1439,39 +1313,6 @@ async fn scope_graph_timeout_fires_shared() {
 }
 
 #[tokio::test]
-async fn scope_graph_timeout_fires_inherit() {
-    async fn fast_step() -> i32 {
-        1
-    }
-
-    let mut inner_graph = Graph::new();
-    inner_graph.with_max_duration(std::time::Duration::from_millis(50));
-    inner_graph.add_boxed_system(Box::new(SlowSystem {
-        duration: std::time::Duration::from_millis(200),
-    }));
-
-    let mut graph = Graph::new();
-    graph
-        .add_system(fast_step)
-        .add_scope("timed_scope", inner_graph, ContextPolicy::inherit());
-    assert!(graph.validate().is_ok());
-
-    let mut ctx = SystemContext::new();
-    let executor = GraphExecutor::new();
-
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    assert!(
-        result.is_err(),
-        "scope graph timeout should fire in inherit mode"
-    );
-    assert!(matches!(
-        result.unwrap_err(),
-        ExecutionError::GraphTimeout { .. }
-    ));
-}
-
-#[tokio::test]
 async fn scope_graph_timeout_fires_isolated() {
     async fn fast_step() -> i32 {
         1
@@ -1486,7 +1327,7 @@ async fn scope_graph_timeout_fires_isolated() {
     let mut graph = Graph::new();
     graph
         .add_system(fast_step)
-        .add_scope("timed_scope", inner_graph, ContextPolicy::isolated());
+        .add_scope("timed_scope", inner_graph, ContextPolicy::new());
     assert!(graph.validate().is_ok());
 
     let mut ctx = SystemContext::new();

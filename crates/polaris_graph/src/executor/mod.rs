@@ -36,7 +36,7 @@ use crate::hooks::HooksAPI;
 use crate::hooks::events::{GraphEvent, RunId, RunLabels};
 use crate::hooks::schedule::{OnGraphComplete, OnGraphFailure, OnGraphStart, OnSystemStart};
 use crate::middleware::{self, MiddlewareAPI};
-use crate::node::{ContextMode, Node, NodeId};
+use crate::node::{ContextPolicy, CrossingAction, Node, NodeId};
 use hashbrown::HashSet;
 use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
@@ -358,14 +358,28 @@ impl GraphExecutor {
     /// Recursively validates resource availability for all systems in a graph,
     /// including systems inside scope nodes.
     ///
-    /// For scope nodes, the validation builds a synthetic child context that
-    /// matches the runtime context the scoped graph will receive:
-    /// - **Shared**: same context as parent (no boundary)
-    /// - **Inherit**: child context with parent chain + forwarded resources
-    /// - **Isolated**: fresh context with only globals + forwarded resources
+    /// For scope nodes, validation walks the [`ContextPolicy`] and constructs
+    /// the same view the inner graph will see at execution time:
+    ///
+    /// - When [`ContextPolicy::is_shared`] is true, the inner graph is
+    ///   validated against the parent context unchanged (no boundary).
+    /// - Otherwise, a synthetic child context is built via
+    ///   [`SystemContext::child_filtered`] with the policy's
+    ///   [`ParentFilter`]. The filter reflects `share`/`share_rest`/`exclude`
+    ///   visibility through the parent chain; `populate_validation_locals`
+    ///   then inserts placeholder entries for each `forward`/`fork`/
+    ///   `forward_fresh` crossing so that systems requiring those locals
+    ///   resolve cleanly in the child.
+    ///
+    /// `forward_fresh::<T>()` additionally requires a registered factory; if
+    /// neither the parent context nor globals can produce one, a
+    /// [`ResourceValidationError::ScopeMissingFactory`] is recorded.
     ///
     /// The `depth` parameter mirrors the execution depth limit to prevent
     /// unbounded recursion during validation of deeply nested scope graphs.
+    ///
+    /// [`ParentFilter`]: polaris_system::param::ParentFilter
+    /// [`SystemContext::child_filtered`]: polaris_system::param::SystemContext::child_filtered
     fn validate_graph_resources(
         &self,
         graph: &Graph,
@@ -392,55 +406,32 @@ impl GraphExecutor {
                     );
                 }
                 Node::Scope(scope) => {
-                    match scope.context_policy.mode {
-                        ContextMode::Shared => {
-                            // No boundary — same context
-                            self.validate_graph_resources(
-                                &scope.graph,
-                                ctx,
-                                hook_provided,
-                                errors,
-                                depth + 1,
-                            );
-                        }
-                        ContextMode::Inherit => {
-                            // Child context: reads walk parent chain, writes local only.
-                            // Forwarded resources are cloned into the child.
-                            let mut child = ctx.child();
-                            for fwd in &scope.context_policy.forward_resources {
-                                // Placeholder value: validation only checks TypeId
-                                // presence via `contains_resource_by_type_id`, never
-                                // downcasts the value. The actual clone happens at
-                                // execution time in `forward_resources()`.
-                                child.insert_boxed(fwd.type_id, Box::new(()));
-                            }
-                            self.validate_graph_resources(
-                                &scope.graph,
-                                &child,
-                                hook_provided,
-                                errors,
-                                depth + 1,
-                            );
-                        }
-                        ContextMode::Isolated => {
-                            // Fresh context: no parent chain.
-                            // Only forwarded resources + globals are available.
-                            let mut child = match ctx.globals_arc() {
-                                Some(globals) => SystemContext::with_globals(globals),
-                                None => SystemContext::new(),
-                            };
-                            for fwd in &scope.context_policy.forward_resources {
-                                // Placeholder value: see Inherit comment above.
-                                child.insert_boxed(fwd.type_id, Box::new(()));
-                            }
-                            self.validate_graph_resources(
-                                &scope.graph,
-                                &child,
-                                hook_provided,
-                                errors,
-                                depth + 1,
-                            );
-                        }
+                    let policy = &scope.context_policy;
+                    if policy.is_shared() {
+                        // No boundary — same context.
+                        self.validate_graph_resources(
+                            &scope.graph,
+                            ctx,
+                            hook_provided,
+                            errors,
+                            depth + 1,
+                        );
+                    } else {
+                        // Child context with a parent-chain filter. `forward` and
+                        // `forward_fresh` insert into the child's locals; `share`
+                        // and `share_rest` govern parent-chain visibility. Pure
+                        // isolation (no `share` verbs) is `AllowOnly(empty)` — the
+                        // child still sees globals through the parent.
+                        Self::validate_scope_crossings(scope, policy, ctx, errors);
+                        let mut child = ctx.child_filtered(policy.parent_filter().clone());
+                        Self::populate_validation_locals(policy, &mut child);
+                        self.validate_graph_resources(
+                            &scope.graph,
+                            &child,
+                            hook_provided,
+                            errors,
+                            depth + 1,
+                        );
                     }
                 }
                 _ => {}
@@ -448,6 +439,74 @@ impl GraphExecutor {
         }
 
         self.validate_output_reachability(graph, hook_provided, errors);
+    }
+
+    /// Verifies that every per-resource crossing on a scope policy can be
+    /// satisfied from the parent context before execution:
+    ///
+    /// - `forward_fresh::<T>()` requires a registered factory reachable from
+    ///   the parent context (parent chain or globals); a missing one is
+    ///   recorded as [`ResourceValidationError::ScopeMissingFactory`].
+    /// - `forward::<T>()` / `fork::<T>()` require the source resource to be
+    ///   reachable from the parent context; a missing one is recorded as
+    ///   [`ResourceValidationError::ScopeMissingResource`].
+    ///
+    /// Both failures are surfaced before execution. The runtime path retains
+    /// its own [`ExecutionError`] variants as a safety net for callers that
+    /// skip validation.
+    fn validate_scope_crossings(
+        scope: &crate::node::ScopeNode,
+        policy: &ContextPolicy,
+        ctx: &SystemContext<'_>,
+        errors: &mut Vec<ResourceValidationError>,
+    ) {
+        for crossing in policy.crossings() {
+            match &crossing.action {
+                CrossingAction::ForwardFresh => {
+                    if ctx.factory_fn_by_type_id(crossing.type_id).is_none() {
+                        errors.push(ResourceValidationError::ScopeMissingFactory {
+                            scope: scope.id.clone(),
+                            scope_name: scope.name,
+                            resource: crossing.type_name,
+                        });
+                    }
+                }
+                CrossingAction::Forward(_) | CrossingAction::Fork(_) => {
+                    if !ctx.contains_resource_by_type_id(crossing.type_id) {
+                        errors.push(ResourceValidationError::ScopeMissingResource {
+                            scope: scope.id.clone(),
+                            scope_name: scope.name,
+                            resource: crossing.type_name,
+                            action: match crossing.action {
+                                CrossingAction::Fork(_) => "fork",
+                                _ => "forward",
+                            },
+                        });
+                    }
+                }
+                CrossingAction::Share => {}
+            }
+        }
+    }
+
+    /// Populates a child context with placeholder entries for every resource
+    /// the policy will produce in the child's local scope at execution time.
+    ///
+    /// Validation only checks `TypeId` presence via `contains_resource_by_type_id`;
+    /// the actual values are produced at execution time. `Share` does not
+    /// insert a local — it is reflected in the parent filter. Excludes are
+    /// tracked separately on the policy and don't appear here.
+    fn populate_validation_locals(policy: &ContextPolicy, child: &mut SystemContext<'_>) {
+        for crossing in policy.crossings() {
+            match crossing.action {
+                CrossingAction::Forward(_)
+                | CrossingAction::Fork(_)
+                | CrossingAction::ForwardFresh => {
+                    child.insert_boxed(crossing.type_id, Box::new(()));
+                }
+                CrossingAction::Share => {}
+            }
+        }
     }
 
     /// Validates that `Out<T>` parameters declared by systems have a matching

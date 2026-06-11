@@ -194,8 +194,7 @@ impl Outputs {
     /// Removes and returns the most recently inserted output as a type-erased box.
     ///
     /// Returns `None` if no output has been inserted or if the last output was
-    /// already taken. This is used by the executor to extract the final output
-    /// from a completed graph execution.
+    /// already taken.
     pub fn take_last(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
         let id = self.last_type_id.take()?;
         let entry = self.storage.remove(&id)?;
@@ -219,16 +218,6 @@ impl Outputs {
     /// Consumes `other`, moving all entries into `self`.
     /// If both containers have an output of the same type, the entry
     /// from `other` overwrites the one in `self`.
-    ///
-    /// The `last_type_id` is updated to the source's value when present,
-    /// so the most recent output from the merged container becomes the
-    /// overall most recent. For parallel branches this means the branch
-    /// merged last determines `take_last()`; the merge order is fixed by
-    /// the executor's branch iteration order, which is deterministic for
-    /// a given graph topology.
-    ///
-    /// This is used by the executor to propagate outputs from child
-    /// contexts (parallel branches) back to the parent context.
     pub fn merge_from(&mut self, other: Outputs) {
         if let Some(id) = other.last_type_id {
             self.last_type_id = Some(id);

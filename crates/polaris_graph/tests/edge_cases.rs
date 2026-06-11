@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 use test_utils::{
     ConsumerSystem, DecisionOutput, DecisionSystem, ErrorKindLog, EventuallySucceedsSystem,
     FailingSystem, FlagSystem, HandlerLog, HandlerSystem, InitialStateSystem, KindCheckingHandler,
-    LoopIterationSystem, LoopState, ParamFailingSystem, ProducerOutput, ProducerSystem,
-    ReadConfigCapture, SlowSystem, SuccessSystem, SwitchKeySystem, SwitchOutput, TestConfig,
-    branch, create_test_server, get_hooks,
+    LoopIterationSystem, LoopState, ParamFailingSystem, ProducerOutput, ProducerSystem, SlowSystem,
+    SuccessSystem, SwitchKeySystem, SwitchOutput, TestConfig, branch, create_test_server,
+    get_hooks,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -975,29 +975,6 @@ async fn retry_with_timeout_retries_on_timeout() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn scope_isolated_cannot_read_parent_resources() {
-    // In isolated mode, parent resources are NOT accessible
-    let captured = Arc::new(Mutex::new(None));
-    let mut inner = Graph::new();
-    inner.add_boxed_system(Box::new(ReadConfigCapture {
-        captured: Arc::clone(&captured),
-    }));
-
-    let mut graph = Graph::new();
-    graph.add_scope("isolated_scope", inner, ContextPolicy::isolated());
-
-    let mut ctx = SystemContext::new().with(TestConfig { value: 88 });
-    let executor = GraphExecutor::new();
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    // ReadConfig should fail because TestConfig is not accessible
-    assert!(
-        matches!(result, Err(ExecutionError::SystemError(_))),
-        "isolated scope should produce SystemError for missing resource, got: {result:?}"
-    );
-}
-
-#[tokio::test]
 async fn scope_error_propagates_to_parent() {
     // A failing system inside a scope should propagate the error to the parent graph.
     let mut inner = Graph::new();
@@ -1017,30 +994,12 @@ async fn scope_error_propagates_to_parent() {
 }
 
 #[tokio::test]
-async fn scope_error_propagates_inherit_mode() {
-    let mut inner = Graph::new();
-    inner.add_boxed_system(Box::new(FailingSystem));
-
-    let mut graph = Graph::new();
-    graph.add_scope("failing_inherit", inner, ContextPolicy::inherit());
-
-    let mut ctx = SystemContext::new();
-    let executor = GraphExecutor::new();
-    let result = executor.execute(&graph, &mut ctx, None, None).await;
-
-    assert!(
-        matches!(result, Err(ExecutionError::SystemError(_))),
-        "error inside inherit scope should propagate, got: {result:?}"
-    );
-}
-
-#[tokio::test]
 async fn scope_error_propagates_isolated_mode() {
     let mut inner = Graph::new();
     inner.add_boxed_system(Box::new(FailingSystem));
 
     let mut graph = Graph::new();
-    graph.add_scope("failing_isolated", inner, ContextPolicy::isolated());
+    graph.add_scope("failing_isolated", inner, ContextPolicy::new());
 
     let mut ctx = SystemContext::new();
     let executor = GraphExecutor::new();
@@ -1053,17 +1012,16 @@ async fn scope_error_propagates_isolated_mode() {
 }
 
 #[tokio::test]
-async fn scope_forward_missing_resource_still_runs() {
-    // Forward a resource that doesn't exist in parent — scope should still run
-    // (forward is best-effort with a tracing::warn).
+async fn scope_forward_missing_resource_hard_errors() {
+    // `forward::<T>()` for a resource that isn't in the parent is a hard
+    // error — symmetric with `forward_fresh`'s missing-factory behavior.
     let flag = Arc::new(Mutex::new(false));
     let mut inner = Graph::new();
     inner.add_boxed_system(Box::new(FlagSystem {
         flag: Arc::clone(&flag),
     }));
 
-    // Forward TestConfig but don't put it in the context
-    let policy = ContextPolicy::inherit().forward::<TestConfig>();
+    let policy = ContextPolicy::new().share_rest().forward::<TestConfig>();
     let mut graph = Graph::new();
     graph.add_scope("fwd_missing", inner, policy);
 
@@ -1071,9 +1029,68 @@ async fn scope_forward_missing_resource_still_runs() {
     let executor = GraphExecutor::new();
     let result = executor.execute(&graph, &mut ctx, None, None).await;
 
-    assert!(result.is_ok(), "scope should still execute");
+    match result {
+        Err(ExecutionError::ScopeMissingResource {
+            scope,
+            resource,
+            action,
+        }) => {
+            assert_eq!(scope, "fwd_missing");
+            assert!(resource.contains("TestConfig"));
+            assert_eq!(action, "forward");
+        }
+        other => panic!("expected ScopeMissingResource, got {other:?}"),
+    }
     assert!(
-        *flag.lock().unwrap(),
-        "inner system should run even if forwarded resource was missing"
+        !*flag.lock().unwrap(),
+        "inner system should not run when scope entry fails"
+    );
+}
+
+#[tokio::test]
+async fn scope_fork_missing_resource_hard_errors() {
+    // `fork::<T>()` for a resource that isn't in the parent is a hard error —
+    // the runtime safety net for the `fork` verb, mirroring `forward`. Covers
+    // the `action: "fork"` branch of `ScopeMissingResource`.
+    #[derive(Debug, Default)]
+    struct Forkable {
+        value: i32,
+    }
+    impl polaris_system::resource::LocalResource for Forkable {}
+    impl polaris_system::resource::ForkStrategy for Forkable {
+        fn fork(&self) -> Self {
+            Self { value: self.value }
+        }
+    }
+
+    let flag = Arc::new(Mutex::new(false));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(FlagSystem {
+        flag: Arc::clone(&flag),
+    }));
+
+    let policy = ContextPolicy::new().share_rest().fork::<Forkable>();
+    let mut graph = Graph::new();
+    graph.add_scope("fork_missing", inner, policy);
+
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    match result {
+        Err(ExecutionError::ScopeMissingResource {
+            scope,
+            resource,
+            action,
+        }) => {
+            assert_eq!(scope, "fork_missing");
+            assert!(resource.contains("Forkable"));
+            assert_eq!(action, "fork");
+        }
+        other => panic!("expected ScopeMissingResource, got {other:?}"),
+    }
+    assert!(
+        !*flag.lock().unwrap(),
+        "inner system should not run when scope entry fails"
     );
 }

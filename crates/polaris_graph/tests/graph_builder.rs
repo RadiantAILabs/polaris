@@ -9,6 +9,7 @@
 //! - Loops (predicate-based and iteration-based)
 //! - Complex graph compositions
 
+use hashbrown::HashSet;
 use polaris_graph::graph::Graph;
 use polaris_graph::node::Node;
 
@@ -372,7 +373,7 @@ fn ids_are_sequential_across_subgraphs() {
     let node_ids: Vec<_> = graph.nodes().iter().map(Node::id).collect();
 
     // Verify all IDs are unique (no collisions)
-    let unique_ids: std::collections::HashSet<_> = node_ids.iter().collect();
+    let unique_ids: HashSet<_> = node_ids.iter().collect();
     assert_eq!(
         node_ids.len(),
         unique_ids.len(),
