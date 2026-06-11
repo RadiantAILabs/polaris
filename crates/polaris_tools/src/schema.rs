@@ -61,6 +61,15 @@ pub struct FunctionMetadata {
     pub parameters: Vec<ParameterInfo>,
     /// Full JSON Schema derived from `parameters`. Use [`Self::schema()`] to read.
     schema: serde_json::Value,
+    /// Whether the resulting tool should request provider strict-mode enforcement.
+    /// Defaults to `true`; set via [`Self::with_strict`].
+    #[serde(default = "default_strict")]
+    strict: bool,
+}
+
+/// Default value for [`FunctionMetadata::strict`] — strict mode is opt-out.
+fn default_strict() -> bool {
+    true
 }
 
 impl FunctionMetadata {
@@ -89,6 +98,7 @@ impl FunctionMetadata {
                 "properties": {},
                 "required": []
             }),
+            strict: true,
         }
     }
 
@@ -96,6 +106,13 @@ impl FunctionMetadata {
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Sets whether the resulting tool requests provider strict-mode enforcement.
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
         self
     }
 
@@ -119,6 +136,7 @@ impl FunctionMetadata {
             name: self.name.clone(),
             description: self.description.clone().unwrap_or_default(),
             parameters: self.schema.clone(),
+            strict: self.strict,
         }
     }
 

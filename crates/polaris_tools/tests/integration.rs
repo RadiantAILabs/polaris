@@ -17,17 +17,17 @@ struct ManualTool;
 
 impl Tool for ManualTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "manual_tool".to_string(),
-            description: "A manually implemented tool.".to_string(),
-            parameters: serde_json::json!({
+        ToolDefinition::new(
+            "manual_tool",
+            "A manually implemented tool.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "input": { "type": "string" }
                 },
                 "required": ["input"]
             }),
-        }
+        )
     }
 
     fn execute<'ctx>(

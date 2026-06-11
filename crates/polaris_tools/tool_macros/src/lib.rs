@@ -14,6 +14,13 @@ use proc_macro::TokenStream;
 /// Generates a `Tool` impl struct with automatic JSON schema generation
 /// and parameter extraction.
 ///
+/// # Tool Attributes
+///
+/// - `#[tool(strict = false)]` — opt this tool out of provider strict-mode
+///   schema enforcement (defaults to `true`). Useful when the tool's schema
+///   relies on constructs strict mode forbids, or to free a strict-tool slot
+///   under provider caps.
+///
 /// # Parameter Attributes
 ///
 /// - `/// doc comment` — becomes the parameter's description in JSON schema
@@ -40,9 +47,13 @@ use proc_macro::TokenStream;
 /// }
 /// ```
 #[proc_macro_attribute]
-pub fn tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
-    tool_fn::generate_tool_fn(&input).into()
+    let options = match common::parse_tool_options(attr.into()) {
+        Ok(options) => options,
+        Err(err) => return err.into(),
+    };
+    tool_fn::generate_tool_fn(&input, options.strict).into()
 }
 
 /// Defines a toolset from an impl block containing `#[tool]` methods.

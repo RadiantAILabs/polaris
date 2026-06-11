@@ -173,8 +173,10 @@ pub(crate) fn freeze(server: &Server) {
     let registry = server
         .get_global::<ToolRegistry>()
         .expect("ToolsPlugin must globalize ToolRegistry before dashboard freeze");
+    // The admin snapshot lists every registered tool, including ones hidden from
+    // the model via exposure/permission overrides.
     let definitions = registry
-        .definitions()
+        .all_definitions()
         .into_iter()
         .map(|definition| to_wire_definition(&registry, definition))
         .collect();

@@ -26,13 +26,11 @@ use std::pin::Pin;
 ///
 /// impl Tool for EchoTool {
 ///     fn definition(&self) -> ToolDefinition {
-///         ToolDefinition {
-///             name: "echo".into(),
-///             description: "Echoes input back".into(),
-///             parameters: json!({"type": "object", "properties": {
-///                 "text": {"type": "string"}
-///             }}),
-///         }
+///         ToolDefinition::new(
+///             "echo",
+///             "Echoes input back",
+///             json!({"type": "object", "properties": {"text": {"type": "string"}}}),
+///         )
 ///     }
 ///
 ///     fn execute<'ctx>(
@@ -99,11 +97,11 @@ mod tests {
 
     impl Tool for DummyTool {
         fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: "dummy".into(),
-                description: "A dummy tool for testing".into(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
-            }
+            ToolDefinition::new(
+                "dummy",
+                "A dummy tool for testing",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
         }
 
         fn execute<'ctx>(

@@ -116,13 +116,19 @@ fn convert_request(
         tools
             .iter()
             .map(|tool| {
-                let normalized_parameters =
-                    normalize_schema_for_strict_mode(tool.parameters.clone());
+                // Honor each tool's strict preference. Normalize the schema only
+                // when strict — a non-strict tool keeps its full schema rather
+                // than having strict-incompatible constructs stripped.
+                let parameters = if tool.strict {
+                    normalize_schema_for_strict_mode(tool.parameters.clone())
+                } else {
+                    tool.parameters.clone()
+                };
                 Tool::Function(FunctionTool {
                     name: tool.name.clone(),
                     description: Some(tool.description.clone()),
-                    parameters: Some(normalized_parameters),
-                    strict: Some(true),
+                    parameters: Some(parameters),
+                    strict: Some(tool.strict),
                 })
             })
             .collect()

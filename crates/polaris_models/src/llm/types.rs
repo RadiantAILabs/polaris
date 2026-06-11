@@ -641,6 +641,39 @@ pub struct ToolDefinition {
     /// }
     /// ```
     pub parameters: Value,
+    /// Whether the model provider should enforce this tool's schema in *strict*
+    /// mode (constrained decoding that guarantees schema-valid arguments).
+    ///
+    /// This is the tool author's declared preference. The agent designer may
+    /// override it on the [`ToolRegistry`], and the provider applies its own cap
+    /// (e.g. Anthropic allows at most 20 strict tools per request, degrading the
+    /// overflow to non-strict in registration order). Defaults to `true`.
+    #[serde(default = "default_strict")]
+    pub strict: bool,
+}
+
+/// Default value for [`ToolDefinition::strict`] — strict mode is opt-out.
+fn default_strict() -> bool {
+    true
+}
+
+impl ToolDefinition {
+    /// Creates a tool definition with strict mode enabled (the default).
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            strict: true,
+        }
+    }
+
+    /// Sets whether the provider should enforce this tool's schema in strict mode.
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
 }
 
 /// Controls how the model should select tools.

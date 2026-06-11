@@ -736,6 +736,7 @@ mod tests {
                     },
                     "required": ["city"]
                 }),
+                strict: true,
             }]),
             tool_choice: Some(ToolChoice::Auto),
             output_schema: None,

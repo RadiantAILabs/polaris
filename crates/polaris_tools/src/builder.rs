@@ -62,6 +62,21 @@ pub trait LlmRequestBuilderExt<'a, S> {
 
     /// Adds all tool definitions from a registry to the builder.
     fn with_registry(self, registry: &ToolRegistry) -> LlmRequestBuilder<'a, S>;
+
+    /// Adds the registry's exposed tool definitions whose name satisfies `select`.
+    ///
+    /// The request-time selection lever: an agent can narrow the advertised
+    /// toolset per turn (e.g. to the tools relevant to the current goal) without
+    /// mutating the registry. Delegates to
+    /// [`ToolRegistry::definitions_for`](crate::ToolRegistry::definitions_for),
+    /// so exposure and `strict` overrides still apply.
+    fn with_registry_filtered<F>(
+        self,
+        registry: &ToolRegistry,
+        select: F,
+    ) -> LlmRequestBuilder<'a, S>
+    where
+        F: Fn(&str) -> bool;
 }
 
 impl<'a, S> LlmRequestBuilderExt<'a, S> for LlmRequestBuilder<'a, S> {
@@ -76,6 +91,17 @@ impl<'a, S> LlmRequestBuilderExt<'a, S> for LlmRequestBuilder<'a, S> {
 
     fn with_registry(self, registry: &ToolRegistry) -> LlmRequestBuilder<'a, S> {
         self.with_definitions(registry.definitions())
+    }
+
+    fn with_registry_filtered<F>(
+        self,
+        registry: &ToolRegistry,
+        select: F,
+    ) -> LlmRequestBuilder<'a, S>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.with_definitions(registry.definitions_for(select))
     }
 }
 
@@ -142,11 +168,11 @@ mod tests {
 
     impl Tool for FakeTool {
         fn definition(&self) -> polaris_models::llm::ToolDefinition {
-            polaris_models::llm::ToolDefinition {
-                name: self.name.to_string(),
-                description: format!("Fake {}", self.name),
-                parameters: json!({"type": "object", "properties": {}}),
-            }
+            polaris_models::llm::ToolDefinition::new(
+                self.name,
+                format!("Fake {}", self.name),
+                json!({"type": "object", "properties": {}}),
+            )
         }
 
         fn execute<'ctx>(

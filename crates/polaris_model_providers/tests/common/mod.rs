@@ -31,10 +31,10 @@ pub struct Person {
 }
 
 fn weather_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "get_weather".to_string(),
-        description: "Get the current weather in a location".to_string(),
-        parameters: json!({
+    ToolDefinition::new(
+        "get_weather",
+        "Get the current weather in a location",
+        json!({
             "type": "object",
             "properties": {
                 "location": {
@@ -45,7 +45,7 @@ fn weather_tool() -> ToolDefinition {
             "required": ["location"],
             "additionalProperties": false
         }),
-    }
+    )
 }
 
 fn extract_tool_calls(response: &LlmResponse) -> Vec<&ToolCall> {
