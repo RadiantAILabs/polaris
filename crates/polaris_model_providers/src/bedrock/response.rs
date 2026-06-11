@@ -111,6 +111,12 @@ fn convert_reasoning(
 }
 
 /// Converts Bedrock token usage to Polaris usage.
+///
+/// `cache_read_tokens` / `cache_creation_tokens` are left `None`: prompt caching
+/// is wired only for Anthropic so far. Bedrock *does* report cache tokens
+/// upstream (`cacheReadInputTokens` / `cacheWriteInputTokens`), so surface them
+/// here when caching is enabled for this provider — otherwise cached input is
+/// silently under-counted in cost estimates.
 fn convert_usage(usage: Option<bedrock::TokenUsage>) -> polaris_llm::Usage {
     usage.map_or_else(polaris_llm::Usage::default, |u| polaris_llm::Usage {
         input_tokens: Some(u.input_tokens as u64),

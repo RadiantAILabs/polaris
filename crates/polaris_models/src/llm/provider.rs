@@ -291,4 +291,20 @@ mod tests {
         let pricing = ModelPricing::new(15.0, 75.0);
         assert!(pricing.cost(0, 0).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn with_cache_rates_overrides_the_default_ratios() {
+        // `new` derives cache tiers from the input rate (0.1× / 1.25×);
+        // `with_cache_rates` replaces them outright.
+        let pricing = ModelPricing::new(3.0, 15.0).with_cache_rates(0.5, 6.0);
+        // 1M cache-read tokens at the overridden $0.50/M rate.
+        let read = pricing.cost_with_cache(0, 0, 1_000_000, 0);
+        assert!((read - 0.5).abs() < 1e-9, "cache read = $0.50, got {read}");
+        // 1M cache-write tokens at the overridden $6.00/M rate.
+        let write = pricing.cost_with_cache(0, 0, 0, 1_000_000);
+        assert!(
+            (write - 6.0).abs() < 1e-9,
+            "cache write = $6.00, got {write}"
+        );
+    }
 }

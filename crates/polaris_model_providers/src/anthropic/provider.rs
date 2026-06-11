@@ -150,7 +150,12 @@ impl<S> AnthropicStreamAdapter<S> {
         Usage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            total_tokens: Some(input + output + cache_read + cache_creation),
+            total_tokens: Some(
+                input
+                    .saturating_add(output)
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_creation),
+            ),
             cache_read_tokens: self.cache_read_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
         }
@@ -341,6 +346,12 @@ fn apply_cache_control(
     tools: Option<&mut Vec<ToolDef>>,
     messages: &mut [MessageParam],
 ) -> Option<SystemPrompt> {
+    // Nothing requested: emit the plain system string (if any) and skip all
+    // marker work.
+    if cache.is_disabled() {
+        return system.map(|text| SystemPrompt::Text(text.to_string()));
+    }
+
     let mut budget = MAX_CACHE_BREAKPOINTS;
 
     // Prefix: one marker covers tools + system. Prefer the system block; fall
@@ -369,6 +380,12 @@ fn apply_cache_control(
         if budget == 0 {
             break;
         }
+        debug_assert!(
+            idx < messages.len(),
+            "cache breakpoint index {idx} out of range for {} messages; \
+             a context strategy produced a stale breakpoint",
+            messages.len()
+        );
         if let Some(block) = messages.get_mut(idx).and_then(|msg| msg.content.last_mut()) {
             block.set_cache_control(CacheControlMarker::ephemeral());
             budget -= 1;
@@ -522,10 +539,11 @@ fn convert_response(response: super::types::MessageResponse) -> LlmResponse {
             input_tokens: Some(usage.input_tokens),
             output_tokens: Some(usage.output_tokens),
             total_tokens: Some(
-                usage.input_tokens
-                    + usage.output_tokens
-                    + usage.cache_read_input_tokens
-                    + usage.cache_creation_input_tokens,
+                usage
+                    .input_tokens
+                    .saturating_add(usage.output_tokens)
+                    .saturating_add(usage.cache_read_input_tokens)
+                    .saturating_add(usage.cache_creation_input_tokens),
             ),
             cache_read_tokens: Some(usage.cache_read_input_tokens),
             cache_creation_tokens: Some(usage.cache_creation_input_tokens),
@@ -1022,7 +1040,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_prefix_without_system_or_tools_is_a_noop() {
+        // Prefix requested but nothing to anchor it on (no system, no tools, or
+        // an empty tool list): no marker is emitted and no message is touched.
+        for tools in [None, Some(vec![])] {
+            let request = LlmRequest {
+                system: None,
+                messages: vec![Message::user("hi")],
+                tools,
+                cache: CacheControl {
+                    prefix: true,
+                    breakpoints: vec![],
+                },
+                ..Default::default()
+            };
+            let json = request_json(&request);
+            assert!(json.get("system").is_none() || json["system"].is_null());
+            assert!(
+                json["messages"][0]["content"][0]
+                    .get("cache_control")
+                    .is_none()
+            );
+        }
+    }
+
     // ── Prompt caching: cache-usage parsing ──
+
+    #[test]
+    fn nonstream_usage_parses_cache_tokens() {
+        // Mirror of `stream_usage_parses_cache_tokens` for the non-stream
+        // `convert_response` path: cache tokens are surfaced and the total folds
+        // input + output + cache_read + cache_creation.
+        let response = super::super::types::MessageResponse {
+            id: "msg_1".to_string(),
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![],
+            model: "claude-sonnet-4-6".to_string(),
+            stop_reason: anthropic_types::StopReason::EndTurn,
+            stop_sequence: None,
+            usage: UsageResponse {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: 20,
+                cache_read_input_tokens: 500,
+            },
+        };
+        let converted = convert_response(response);
+        assert_eq!(converted.usage.input_tokens, Some(100));
+        assert_eq!(converted.usage.output_tokens, Some(10));
+        assert_eq!(converted.usage.cache_read_tokens, Some(500));
+        assert_eq!(converted.usage.cache_creation_tokens, Some(20));
+        assert_eq!(converted.usage.total_tokens, Some(100 + 10 + 500 + 20));
+    }
 
     #[test]
     fn stream_usage_parses_cache_tokens() {

@@ -379,6 +379,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_breakpoint_before_any_message_is_a_noop() {
+        struct CacheAssertingProvider;
+
+        impl crate::llm::provider::LlmProvider for CacheAssertingProvider {
+            fn name(&self) -> &'static str {
+                "cache_mock"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                // `.cache_breakpoint()` called before any message was added
+                // records nothing (no index to anchor on).
+                assert!(request.cache.breakpoints.is_empty());
+                Ok(LlmResponse {
+                    content: vec![AssistantBlock::Text("ok".into())],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                })
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(CacheAssertingProvider);
+        let llm = registry.llm("cache_mock/test").unwrap();
+        llm.builder()
+            .cache_breakpoint()
+            .user("first")
+            .generate()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn send_passes_tools_and_system() {
         struct MockProvider;
 

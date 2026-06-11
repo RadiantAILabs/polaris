@@ -45,8 +45,9 @@ pub struct LlmRequest {
 /// recent point — the incremental-caching pattern).
 ///
 /// Construct via [`LlmRequestBuilder`](super::builder::LlmRequestBuilder)'s
-/// `cache_prefix()` / `cache_breakpoint()` verbs rather than computing indices by
-/// hand. [`Default`] is "no caching".
+/// [`cache_prefix()`](super::builder::LlmRequestBuilder::cache_prefix) /
+/// [`cache_breakpoint()`](super::builder::LlmRequestBuilder::cache_breakpoint)
+/// verbs rather than computing indices by hand. [`Default`] is "no caching".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheControl {
     /// Cache the stable prefix: the system prompt and tool definitions.
