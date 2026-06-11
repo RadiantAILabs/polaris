@@ -718,7 +718,7 @@ impl Graph {
     ///
     /// // Embed it as a scope with inherited context
     /// let mut graph = Graph::new();
-    /// graph.add_scope("research", research, ContextPolicy::inherit());
+    /// graph.add_scope("research", research, ContextPolicy::new().share_rest());
     /// ```
     pub fn add_scope(
         &mut self,

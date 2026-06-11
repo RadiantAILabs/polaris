@@ -14,7 +14,7 @@ use crate::hooks::schedule::{
 };
 use crate::middleware::{self, MiddlewareAPI};
 use crate::node::{
-    ContextMode, DecisionNode, LoopNode, Node, NodeId, ParallelNode, ScopeNode, SwitchNode,
+    CrossingAction, DecisionNode, LoopNode, Node, NodeId, ParallelNode, ScopeNode, SwitchNode,
     SystemNode,
 };
 use futures::future::BoxFuture;
@@ -600,7 +600,6 @@ impl GraphExecutor {
         &'a self,
         scope: &'a ScopeNode,
         scope_id: &'a NodeId,
-        context_mode: ContextMode,
         depth: usize,
         hooks: Option<&'a HooksAPI>,
         middleware: &'a MiddlewareAPI,
@@ -608,6 +607,7 @@ impl GraphExecutor {
         run_ctx: &'a RunContext,
     ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
         Box::pin(async move {
+            let mode = scope.context_policy.mode();
             Self::invoke_hook::<OnScopeStart>(
                 hooks,
                 ctx,
@@ -616,7 +616,7 @@ impl GraphExecutor {
                     labels: run_ctx.labels.clone(),
                     node_id: scope_id.clone(),
                     node_name: scope.name,
-                    context_mode,
+                    mode,
                     inner_node_count: scope.graph.node_count(),
                 },
             );
@@ -626,9 +626,10 @@ impl GraphExecutor {
             let entry = scope.graph.entry().ok_or(ExecutionError::EmptyGraph)?;
 
             let execute_scope = async {
-                match scope.context_policy.mode {
-                    ContextMode::Shared => {
-                        self.execute_from(
+                let policy = &scope.context_policy;
+                if policy.is_shared() {
+                    return self
+                        .execute_from(
                             &scope.graph,
                             ctx,
                             entry,
@@ -637,55 +638,33 @@ impl GraphExecutor {
                             middleware,
                             run_ctx,
                         )
-                        .await
-                    }
-                    ContextMode::Inherit => {
-                        let mut child = ctx.child();
-                        Self::forward_resources(scope, ctx, &mut child);
-                        let inner_count = self
-                            .execute_from(
-                                &scope.graph,
-                                &mut child,
-                                entry,
-                                depth + 1,
-                                hooks,
-                                middleware,
-                                run_ctx,
-                            )
-                            .await?;
-                        let child_outputs = child.take_outputs();
-                        drop(child);
-                        ctx.outputs_mut().merge_from(child_outputs);
-                        Ok(inner_count)
-                    }
-                    ContextMode::Isolated => {
-                        // Inherit globals (infrastructure resources) if present.
-                        // globals_arc() is None only when the root context was
-                        // created via SystemContext::new() (tests) — in that case
-                        // there are no globals to inherit.
-                        let mut child = if let Some(globals) = ctx.globals_arc() {
-                            SystemContext::with_globals(globals)
-                        } else {
-                            SystemContext::new()
-                        };
-                        Self::forward_resources(scope, ctx, &mut child);
-                        let inner_count = self
-                            .execute_from(
-                                &scope.graph,
-                                &mut child,
-                                entry,
-                                depth + 1,
-                                hooks,
-                                middleware,
-                                run_ctx,
-                            )
-                            .await?;
-                        let child_outputs = child.take_outputs();
-                        drop(child);
-                        ctx.outputs_mut().merge_from(child_outputs);
-                        Ok(inner_count)
-                    }
+                        .await;
                 }
+
+                // Every non-shared scope keeps a parent reference; the
+                // parent_filter expresses what's reachable through it. Pure
+                // isolation (no `share` / `share_rest`) is just an empty
+                // AllowOnly filter — globals still flow through, parent
+                // locals are blocked. Retaining the parent ref is what lets
+                // ParamError::ResourceOutOfScope distinguish a missing
+                // resource from one the policy is hiding.
+                let mut child = ctx.child_filtered(policy.parent_filter().clone());
+                Self::populate_child_locals(scope, ctx, &mut child)?;
+                let inner_count = self
+                    .execute_from(
+                        &scope.graph,
+                        &mut child,
+                        entry,
+                        depth + 1,
+                        hooks,
+                        middleware,
+                        run_ctx,
+                    )
+                    .await?;
+                let child_outputs = child.take_outputs();
+                drop(child);
+                ctx.outputs_mut().merge_from(child_outputs);
+                Ok(inner_count)
             };
 
             let count = if let Some(max) = scope.graph.max_duration {
@@ -708,7 +687,7 @@ impl GraphExecutor {
                     labels: run_ctx.labels.clone(),
                     node_id: scope_id.clone(),
                     node_name: scope.name,
-                    context_mode,
+                    mode,
                     nodes_executed: count,
                     duration: start.elapsed(),
                 },
@@ -718,23 +697,60 @@ impl GraphExecutor {
         })
     }
 
-    /// Clones forwarded resources from a parent context into a child context.
-    fn forward_resources(
+    /// Populates a child context with the resource values produced by each
+    /// per-resource crossing on the policy.
+    ///
+    /// `Share` produces no child-local entry — it is reflected in the child's
+    /// parent filter. Excludes are tracked separately on the policy and don't
+    /// appear here.
+    ///
+    /// `Forward`/`Fork` return [`ExecutionError::ScopeMissingResource`] when
+    /// the parent has no local resource of the requested type, mirroring the
+    /// `ForwardFresh` behavior for missing factories. Validation
+    /// ([`GraphExecutor::validate_resources`]) catches the static cases —
+    /// this is the runtime safety net.
+    ///
+    /// [`GraphExecutor::validate_resources`]: super::GraphExecutor::validate_resources
+    fn populate_child_locals(
         scope: &ScopeNode,
         parent: &SystemContext<'_>,
         child: &mut SystemContext<'_>,
-    ) {
-        for fwd in &scope.context_policy.forward_resources {
-            if let Some(cloned) = parent.clone_local_resource_with(fwd.type_id, fwd.clone_fn) {
-                child.insert_boxed(fwd.type_id, cloned);
-            } else {
-                tracing::warn!(
-                    resource = fwd.type_name,
-                    scope = scope.name,
-                    "forwarded resource not found in parent context"
-                );
+    ) -> Result<(), ExecutionError> {
+        for crossing in scope.context_policy.crossings() {
+            match &crossing.action {
+                CrossingAction::Share => {}
+                CrossingAction::Forward(clone_fn) => {
+                    let value = parent
+                        .clone_local_resource_with(crossing.type_id, *clone_fn)
+                        .ok_or(ExecutionError::ScopeMissingResource {
+                            scope: scope.name,
+                            resource: crossing.type_name,
+                            action: "forward",
+                        })?;
+                    child.insert_boxed(crossing.type_id, value);
+                }
+                CrossingAction::Fork(clone_fn) => {
+                    let value = parent
+                        .clone_local_resource_with(crossing.type_id, *clone_fn)
+                        .ok_or(ExecutionError::ScopeMissingResource {
+                            scope: scope.name,
+                            resource: crossing.type_name,
+                            action: "fork",
+                        })?;
+                    child.insert_boxed(crossing.type_id, value);
+                }
+                CrossingAction::ForwardFresh => {
+                    let factory = parent.factory_fn_by_type_id(crossing.type_id).ok_or(
+                        ExecutionError::ScopeMissingFactory {
+                            scope: scope.name,
+                            resource: crossing.type_name,
+                        },
+                    )?;
+                    child.insert_boxed_with_factory(crossing.type_id, factory.produce(), factory);
+                }
             }
         }
+        Ok(())
     }
 
     /// Core graph execution engine starting from a given node.
@@ -905,11 +921,10 @@ impl GraphExecutor {
                     }
                     Node::Scope(scope) => {
                         let scope_id = current.clone();
-                        let context_mode = scope.context_policy.mode;
                         let scope_info = middleware::info::ScopeInfo {
                             node_id: scope_id.clone(),
                             node_name: scope.name,
-                            context_mode,
+                            mode: scope.context_policy.mode(),
                             inner_node_count: scope.graph.node_count(),
                         };
                         let node_count = middleware
@@ -917,14 +932,7 @@ impl GraphExecutor {
                             .scope
                             .execute(scope_info, ctx, |ctx| {
                                 self.run_scope_body(
-                                    scope,
-                                    &scope_id,
-                                    context_mode,
-                                    depth,
-                                    hooks,
-                                    middleware,
-                                    ctx,
-                                    run_ctx,
+                                    scope, &scope_id, depth, hooks, middleware, ctx, run_ctx,
                                 )
                             })
                             .await?;

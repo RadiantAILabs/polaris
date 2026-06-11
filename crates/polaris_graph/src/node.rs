@@ -6,7 +6,7 @@
 use crate::graph::Graph;
 use crate::predicate::BoxedPredicate;
 use core::any::Any;
-use core::hash::{Hash, Hasher};
+use hashbrown::{HashMap, HashSet};
 use polaris_system::plugin::{IntoScheduleIds, ScheduleId};
 use polaris_system::resource::LocalResource;
 use polaris_system::system::{BoxedSystem, ErasedSystem, IntoSystem};
@@ -704,130 +704,132 @@ impl fmt::Debug for LoopNode {
 // Scope Node
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Base isolation level for context sharing between a parent and scoped graph.
+/// Type-erased clone function used by the `forward` crossing.
 ///
-/// Determines how the parent's [`SystemContext`](polaris_system::param::SystemContext)
-/// is made available to systems within the scoped graph.
+/// Returns `None` on downcast failure (should never happen in practice —
+/// `TypeId` is verified before invocation).
+pub(crate) type CloneFn = fn(&dyn Any) -> Option<Box<dyn Any + Send + Sync>>;
+
+/// Per-resource crossing strategy used when entering a scope boundary.
 ///
-/// # Examples
+/// Each variant corresponds to a positive builder verb on [`ContextPolicy`]
+/// (`share`, `forward`, `fork`, `forward_fresh`). The negative `exclude` verb
+/// is tracked separately on [`ContextPolicy::excludes`].
+#[derive(Clone)]
+pub(crate) enum CrossingAction {
+    /// Reachable via the parent chain — no copy. Translates to an entry in
+    /// the child's [`ParentFilter`](polaris_system::param::ParentFilter).
+    Share,
+    /// Cloned from the parent's local scope at scope entry.
+    Forward(CloneFn),
+    /// Forked from the parent's local scope via [`ForkStrategy::fork`].
+    ///
+    /// [`ForkStrategy::fork`]: polaris_system::resource::ForkStrategy::fork
+    Fork(CloneFn),
+    /// Re-instantiated at scope entry from the resource's registered factory.
+    ForwardFresh,
+}
+
+impl PartialEq for CrossingAction {
+    /// Variants compare by tag only — `Forward` and `Fork` deliberately
+    /// ignore their inner [`CloneFn`] pointers because Rust does not
+    /// guarantee fn-pointer addresses are unique across codegen units.
+    /// Two crossings with the same verb on the same `T` are stored once
+    /// per [`TypeId`], so equality only needs to distinguish verb shape.
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Share, Self::Share)
+                | (Self::Forward(_), Self::Forward(_))
+                | (Self::Fork(_), Self::Fork(_))
+                | (Self::ForwardFresh, Self::ForwardFresh)
+        )
+    }
+}
+
+impl Eq for CrossingAction {}
+
+impl fmt::Debug for CrossingAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Share => f.write_str("Share"),
+            Self::Forward(_) => f.write_str("Forward"),
+            Self::Fork(_) => f.write_str("Fork"),
+            Self::ForwardFresh => f.write_str("ForwardFresh"),
+        }
+    }
+}
+
+/// Per-resource decision recorded on a [`ContextPolicy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResourceCrossing {
+    pub(crate) type_id: TypeId,
+    pub(crate) type_name: &'static str,
+    pub(crate) action: CrossingAction,
+}
+
+/// High-level summary of a [`ContextPolicy`]'s scope-boundary mode.
 ///
-/// ```
-/// use polaris_graph::ContextMode;
+/// `ContextMode` collapses the verb composition on a [`ContextPolicy`] into
+/// a coarse classification suitable for hooks and middleware that don't need
+/// the per-resource detail. Each policy maps to exactly one mode:
 ///
-/// let mode = ContextMode::Inherit;
-/// assert_eq!(format!("{mode}"), "Inherit");
-/// ```
+/// | Mode | Trigger |
+/// |---|---|
+/// | [`Shared`](Self::Shared) | [`ContextPolicy::shared`] |
+/// | [`Inherit`](Self::Inherit) | [`share_rest`](ContextPolicy::share_rest) on a [`ContextPolicy::new`] policy |
+/// | [`Isolated`](Self::Isolated) | a [`ContextPolicy::new`] policy without `share_rest` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ContextMode {
-    /// Pass the same context through. No boundary.
-    ///
-    /// The scope is purely organizational — a labeled block. All resources
-    /// and outputs are shared with the parent.
+    /// No boundary — the scope reuses the parent context
+    /// ([`ContextPolicy::shared`]).
     Shared,
-
-    /// Create a child context via `ctx.child()`.
-    ///
-    /// Reads walk the parent chain (parent locals + globals). Writes go to
-    /// the child's own local scope. Outputs accumulate in the child and are
-    /// merged back into the parent when the scope completes.
+    /// Selective sharing — `share_rest()` lets the child see the parent
+    /// chain by default, with optional per-type `exclude::<T>()` overrides.
     Inherit,
-
-    /// Create a fresh context with no parent chain.
-    ///
-    /// Nothing is accessible unless explicitly forwarded. Global resources
-    /// are inherited by default (they are infrastructure). Outputs are
-    /// merged back into the parent on completion.
+    /// Pure isolation or per-resource crossings only — the child sees
+    /// globals plus explicitly forwarded/forked/fresh locals, and any
+    /// types listed via `share::<T>()`.
     Isolated,
 }
 
 impl fmt::Display for ContextMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Shared => f.write_str("Shared"),
-            Self::Inherit => f.write_str("Inherit"),
-            Self::Isolated => f.write_str("Isolated"),
+            ContextMode::Shared => f.write_str("shared"),
+            ContextMode::Inherit => f.write_str("inherit"),
+            ContextMode::Isolated => f.write_str("isolated"),
         }
     }
 }
 
-/// Identifies a resource to forward across a scope boundary.
+/// Per-resource policy controlling which resources cross a scope boundary,
+/// and how each one crosses.
 ///
-/// Constructed exclusively through [`ContextPolicy::forward`]. The `TypeId`
-/// is used for type-erased resource cloning; `type_name` is retained for
-/// error messages and debugging.
+/// Construct with [`ContextPolicy::new`] (empty: nothing crosses unless added)
+/// or [`ContextPolicy::shared`] (no boundary at all, equivalent to running the
+/// inner graph inline). Compose by chaining per-resource verbs:
 ///
-/// The `clone_fn` is captured at policy-build time from the generic `T: Clone`
-/// bound on the builder methods, eliminating the need for a separate
-/// `register_clone_fn` call at runtime.
+/// | Verb | Mechanism | Requires of `T` | Use when |
+/// |---|---|---|---|
+/// | [`share`](Self::share) | Child reads via parent chain | nothing | Read-only access; large or expensive-to-clone |
+/// | [`forward`](Self::forward) | `Clone::clone` into child's local | `T: Clone` | Small mutable resource; child needs its own copy |
+/// | [`fork`](Self::fork) | [`ForkStrategy::fork`] into child's local | `T: ForkStrategy` | Stateful resource with non-`Clone` semantics |
+/// | [`forward_fresh`](Self::forward_fresh) | Re-invoke `T`'s registered factory | factory registered via `Server::register_local` | Resource that should start clean (counters, scratchpads) |
+/// | [`exclude`](Self::exclude) | Suppress any earlier verb / [`share_rest`](Self::share_rest) | nothing | Opt one resource out of the catch-all |
+/// | [`share_rest`](Self::share_rest) | Apply `share` to every resource not otherwise mentioned | nothing | Common "mostly inherit, with a few overrides" case |
 ///
-/// # Examples
+/// Verbs are applied in declaration order; later verbs override earlier ones
+/// for the same `T`. [`share_rest`](Self::share_rest) only applies to types
+/// not otherwise named.
 ///
-/// ```
-/// use polaris_graph::ContextPolicy;
-/// use polaris_system::resource::LocalResource;
+/// # Panics
 ///
-/// #[derive(Clone)]
-/// struct MyConfig { retries: usize }
-/// impl LocalResource for MyConfig {}
-///
-/// let policy = ContextPolicy::isolated().forward::<MyConfig>();
-/// let forwards = policy.forward_resources();
-/// assert_eq!(forwards.len(), 1);
-/// assert!(forwards[0].type_name().contains("MyConfig"));
-/// ```
-#[derive(Clone)]
-pub struct ResourceForward {
-    pub(crate) type_id: TypeId,
-    pub(crate) type_name: &'static str,
-    /// Type-erased clone function captured from the `T: Clone` bound at build time.
-    /// Returns `None` on downcast failure (should never happen in practice).
-    pub(crate) clone_fn: fn(&dyn Any) -> Option<Box<dyn Any + Send + Sync>>,
-}
-
-impl fmt::Debug for ResourceForward {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResourceForward")
-            .field("type_id", &self.type_id)
-            .field("type_name", &self.type_name)
-            .finish()
-    }
-}
-
-impl PartialEq for ResourceForward {
-    fn eq(&self, other: &Self) -> bool {
-        self.type_id == other.type_id
-    }
-}
-
-impl Eq for ResourceForward {}
-
-impl Hash for ResourceForward {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.type_id.hash(state);
-    }
-}
-
-impl ResourceForward {
-    /// Returns the [`TypeId`] of the forwarded resource.
-    #[must_use]
-    pub fn type_id(&self) -> TypeId {
-        self.type_id
-    }
-
-    /// Returns the type name for display and debugging.
-    #[must_use]
-    pub fn type_name(&self) -> &'static str {
-        self.type_name
-    }
-}
-
-/// Controls how a parent [`SystemContext`](polaris_system::param::SystemContext)
-/// is shared with a scoped graph.
-///
-/// Use the builder methods [`shared()`](Self::shared), [`inherit()`](Self::inherit),
-/// or [`isolated()`](Self::isolated) to create a policy, then chain
-/// [`forward()`](Self::forward) to forward specific resources.
+/// Calling any verb on a policy constructed via [`shared()`](Self::shared)
+/// panics. `shared()` denotes "no boundary at all" — there is no child context
+/// to apply per-resource decisions to, so attempting to compose verbs onto it
+/// is a programmer error.
 ///
 /// # Examples
 ///
@@ -835,98 +837,287 @@ impl ResourceForward {
 /// use polaris_graph::ContextPolicy;
 /// use polaris_system::resource::LocalResource;
 ///
-/// #[derive(Clone)]
+/// #[derive(Clone, Default)]
 /// struct Config;
 /// impl LocalResource for Config {}
 ///
-/// // Shared: no boundary, everything accessible
-/// let shared = ContextPolicy::shared();
+/// // No boundary at all — same context.
+/// let _ = ContextPolicy::shared();
 ///
-/// // Inherit: child reads parent, writes own scope
-/// let inherit = ContextPolicy::inherit();
+/// // Strict isolation — only Config crosses, by clone.
+/// let _ = ContextPolicy::new().forward::<Config>();
 ///
-/// // Isolated with forwarded resources
-/// let isolated = ContextPolicy::isolated().forward::<Config>();
-/// assert_eq!(isolated.forward_resources().len(), 1);
+/// // Mostly inherit, override one resource.
+/// let _ = ContextPolicy::new()
+///     .forward::<Config>()
+///     .share_rest();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// [`ForkStrategy::fork`]: polaris_system::resource::ForkStrategy::fork
+///
+/// Note: `ContextPolicy` derives `PartialEq`/`Eq` (sufficient for tests and
+/// equality checks). It does **not** derive `Hash` because the underlying
+/// `HashMap`/`HashSet` storage and the cached
+/// [`ParentFilter`](polaris_system::param::ParentFilter) do not
+/// implement `Hash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPolicy {
-    /// Base isolation level.
+    /// High-level scope-boundary mode (kept in sync with `share_rest` and the
+    /// constructor used).
     pub(crate) mode: ContextMode,
-    /// Resources to clone from parent into the child's local scope.
-    ///
-    /// Only meaningful for `Inherit` and `Isolated` modes.
-    /// Ignored in `Shared` mode (everything is already accessible).
-    pub(crate) forward_resources: Vec<ResourceForward>,
+    /// Positive per-resource crossings (`share`, `forward`, `fork`, `forward_fresh`).
+    /// Disjoint from [`Self::excludes`].
+    pub(crate) crossings: HashMap<TypeId, ResourceCrossing>,
+    /// Resources opted out of any catch-all (e.g. `share_rest`).
+    /// Disjoint from [`Self::crossings`].
+    pub(crate) excludes: HashSet<TypeId>,
+    /// When `true`, resources not in `crossings`/`excludes` are reachable via
+    /// the parent chain.
+    pub(crate) share_rest: bool,
+    /// Cached [`ParentFilter`](polaris_system::param::ParentFilter) — rebuilt
+    /// eagerly whenever a verb mutates the policy. Avoids per-call allocation
+    /// in the executor and validation hot paths.
+    pub(crate) cached_parent_filter: polaris_system::param::ParentFilter,
 }
 
 impl ContextPolicy {
-    /// Shared mode — same context, no boundary.
+    /// Empty per-resource policy: no resources cross unless explicitly added.
+    ///
+    /// The child context is created fresh and only sees globals plus whatever
+    /// is added via [`share`](Self::share), [`forward`](Self::forward),
+    /// [`fork`](Self::fork), [`forward_fresh`](Self::forward_fresh), or
+    /// [`share_rest`](Self::share_rest). This is the right default for
+    /// sandbox-style scopes.
+    #[must_use]
+    #[expect(
+        clippy::new_without_default,
+        reason = "ContextPolicy intentionally omits Default — `new()` and `shared()` make the boundary choice explicit"
+    )]
+    pub fn new() -> Self {
+        Self {
+            mode: ContextMode::Isolated,
+            crossings: HashMap::new(),
+            excludes: HashSet::new(),
+            share_rest: false,
+            // Pure-isolation default: parent chain hides every local; globals
+            // still flow. `ParentFilter::default()` is `AllowAllExcept(empty)`
+            // — the wrong starting point — so we set `AllowOnly(empty)`
+            // explicitly here.
+            cached_parent_filter: polaris_system::param::ParentFilter::allow_only([]),
+        }
+    }
+
+    /// No-boundary policy — the scope reuses the parent context.
+    ///
+    /// Reads, writes, and outputs all flow through the parent. Per-resource
+    /// verbs are rejected (see [`ContextPolicy`] panics).
     #[must_use]
     pub fn shared() -> Self {
         Self {
             mode: ContextMode::Shared,
-            forward_resources: Vec::new(),
+            crossings: HashMap::new(),
+            excludes: HashSet::new(),
+            share_rest: false,
+            // Unused for `shared` policies (no child context is built), but
+            // keep a sensible value: an empty `AllowOnly` mirrors `new()`.
+            cached_parent_filter: polaris_system::param::ParentFilter::allow_only([]),
         }
     }
 
-    /// Inherit mode — child context, reads parent, writes own.
-    #[must_use]
-    pub fn inherit() -> Self {
-        Self {
-            mode: ContextMode::Inherit,
-            forward_resources: Vec::new(),
-        }
-    }
-
-    /// Isolated mode — fresh context, only forwarded resources.
+    /// Make `T` reachable in the child via the parent chain — zero copy.
     ///
-    /// The child context inherits the parent's global resources (if any).
-    /// If the parent has no globals, the child starts with an empty context.
-    #[must_use]
-    pub fn isolated() -> Self {
-        Self {
-            mode: ContextMode::Isolated,
-            forward_resources: Vec::new(),
-        }
-    }
-
-    /// Forward a local resource into the child scope.
+    /// The child does not own a copy; reads of `T` walk up to the parent.
+    /// Use this for read-only access to large or expensive-to-clone resources
+    /// (e.g. tool registries, system prompts).
     ///
-    /// The resource is cloned from the parent's local scope into the child.
-    /// Only applicable to `Inherit` and `Isolated` modes — in `Shared` mode
-    /// everything is already accessible and forwarded resources are ignored.
-    /// The clone is one-way — mutations in the child do not propagate back
-    /// to the parent.
+    /// # Panics
     ///
-    /// Note: the clone happens on every scope invocation. If the scope is
-    /// inside a loop, each iteration clones the resource.
+    /// Panics if called on [`ContextPolicy::shared`] — see type-level docs.
     #[must_use]
-    pub fn forward<T: LocalResource + Clone>(mut self) -> Self {
-        if self.mode == ContextMode::Shared {
-            tracing::debug!(
-                resource = core::any::type_name::<T>(),
-                "forward() has no effect on ContextPolicy::shared() — resources are already accessible",
-            );
-        }
-        self.forward_resources.push(ResourceForward {
-            type_id: TypeId::of::<T>(),
-            type_name: core::any::type_name::<T>(),
-            clone_fn: |any| Some(Box::new(any.downcast_ref::<T>()?.clone())),
-        });
+    pub fn share<T: LocalResource>(mut self) -> Self {
+        self.assert_not_shared::<T>("share");
+        self.set_crossing::<T>(CrossingAction::Share);
+        self.refresh_parent_filter();
         self
     }
 
-    /// Returns the context mode.
+    /// Clone `T` from the parent's local scope into the child at scope entry.
+    ///
+    /// The clone is one-way — mutations in the child do not propagate back.
+    /// If the scope sits inside a loop, each iteration clones the resource.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on [`ContextPolicy::shared`] — see type-level docs.
+    #[must_use]
+    pub fn forward<T: LocalResource + Clone>(mut self) -> Self {
+        self.assert_not_shared::<T>("forward");
+        self.set_crossing::<T>(CrossingAction::Forward(|any| {
+            Some(Box::new(any.downcast_ref::<T>()?.clone()))
+        }));
+        self.refresh_parent_filter();
+        self
+    }
+
+    /// Fork `T` from the parent into the child via [`ForkStrategy::fork`].
+    ///
+    /// Use this when domain semantics differ from `Clone` — e.g. fresh-empty
+    /// stores, `Arc`-shared atomics, or child trace spans.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on [`ContextPolicy::shared`] — see type-level docs.
+    ///
+    /// [`ForkStrategy::fork`]: polaris_system::resource::ForkStrategy::fork
+    #[must_use]
+    pub fn fork<T>(mut self) -> Self
+    where
+        T: polaris_system::resource::ForkStrategy,
+    {
+        self.assert_not_shared::<T>("fork");
+        self.set_crossing::<T>(CrossingAction::Fork(|any| {
+            Some(Box::new(any.downcast_ref::<T>()?.fork()))
+        }));
+        self.refresh_parent_filter();
+        self
+    }
+
+    /// Instantiate a fresh `T` in the child via the resource's registered factory.
+    ///
+    /// `T` must have been registered with the server via `register_local(...)`
+    /// — the factory is captured on the resource entry and re-invoked at scope
+    /// entry. If no factory is registered for `T` anywhere in the parent
+    /// hierarchy, scope execution fails with a clear error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on [`ContextPolicy::shared`] — see type-level docs.
+    #[must_use]
+    pub fn forward_fresh<T: LocalResource>(mut self) -> Self {
+        self.assert_not_shared::<T>("forward_fresh");
+        self.set_crossing::<T>(CrossingAction::ForwardFresh);
+        self.refresh_parent_filter();
+        self
+    }
+
+    /// Suppress any earlier verb and any catch-all [`share_rest`](Self::share_rest)
+    /// for this resource.
+    ///
+    /// Combine with [`share_rest`](Self::share_rest) to opt one resource out of
+    /// the catch-all.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on [`ContextPolicy::shared`] — see type-level docs.
+    #[must_use]
+    pub fn exclude<T: LocalResource>(mut self) -> Self {
+        self.assert_not_shared::<T>("exclude");
+        self.crossings.remove(&TypeId::of::<T>());
+        self.excludes.insert(TypeId::of::<T>());
+        self.refresh_parent_filter();
+        self
+    }
+
+    /// Apply [`share`](Self::share) to every resource not otherwise named.
+    ///
+    /// Conventionally the last call in a chain. Combines naturally with
+    /// [`exclude`](Self::exclude) for a "mostly inherit, with a few overrides"
+    /// pattern.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on [`ContextPolicy::shared`] — see type-level docs.
+    #[must_use]
+    pub fn share_rest(mut self) -> Self {
+        assert!(
+            !matches!(self.mode, ContextMode::Shared),
+            "share_rest() is not valid on ContextPolicy::shared() — \
+             use ContextPolicy::new() to compose per-resource verbs",
+        );
+        self.share_rest = true;
+        self.mode = ContextMode::Inherit;
+        self.refresh_parent_filter();
+        self
+    }
+
+    fn assert_not_shared<T: ?Sized>(&self, verb: &'static str) {
+        assert!(
+            !matches!(self.mode, ContextMode::Shared),
+            "{verb}::<{}>() is not valid on ContextPolicy::shared() — \
+             use ContextPolicy::new() to compose per-resource verbs",
+            core::any::type_name::<T>(),
+        );
+    }
+
+    /// Records a positive crossing for `T`, removing any prior `exclude`.
+    fn set_crossing<T: 'static>(&mut self, action: CrossingAction) {
+        let type_id = TypeId::of::<T>();
+        self.excludes.remove(&type_id);
+        self.crossings.insert(
+            type_id,
+            ResourceCrossing {
+                type_id,
+                type_name: core::any::type_name::<T>(),
+                action,
+            },
+        );
+    }
+
+    /// Rebuilds the cached [`ParentFilter`] from the current verb composition.
+    ///
+    /// Called from the tail of every mutating verb method. Cheap (one
+    /// allocation per mutation) and avoids repeated rebuilding at execution
+    /// time.
+    fn refresh_parent_filter(&mut self) {
+        use polaris_system::param::ParentFilter;
+        self.cached_parent_filter = if self.share_rest {
+            ParentFilter::allow_all_except(self.excludes.iter().copied())
+        } else {
+            ParentFilter::allow_only(
+                self.crossings
+                    .values()
+                    .filter(|c| matches!(c.action, CrossingAction::Share))
+                    .map(|c| c.type_id),
+            )
+        };
+    }
+
+    /// Returns the high-level [`ContextMode`] for this policy.
+    ///
+    /// `Shared` for [`ContextPolicy::shared`], `Inherit` when
+    /// [`share_rest`](Self::share_rest) is set, otherwise `Isolated`.
     #[must_use]
     pub fn mode(&self) -> ContextMode {
         self.mode
     }
 
-    /// Returns the list of forwarded resources.
+    /// Returns whether this policy is the no-boundary form
+    /// ([`ContextPolicy::shared`]).
     #[must_use]
-    pub fn forward_resources(&self) -> &[ResourceForward] {
-        &self.forward_resources
+    pub fn is_shared(&self) -> bool {
+        matches!(self.mode, ContextMode::Shared)
+    }
+
+    /// Returns the per-resource crossing decisions on this policy.
+    pub(crate) fn crossings(&self) -> impl Iterator<Item = &ResourceCrossing> {
+        self.crossings.values()
+    }
+
+    /// Looks up the crossing action for a specific type.
+    #[cfg(test)]
+    pub(crate) fn crossing_for(&self, type_id: TypeId) -> Option<&ResourceCrossing> {
+        self.crossings.get(&type_id)
+    }
+
+    /// Returns the cached [`ParentFilter`](polaris_system::param::ParentFilter)
+    /// for this policy.
+    ///
+    /// The filter governs which resource types are reachable through the
+    /// parent chain in the child context. For pure-isolation policies (no
+    /// `share` / `share_rest`) the filter allows only the explicitly shared
+    /// types — globals still flow through.
+    pub(crate) fn parent_filter(&self) -> &polaris_system::param::ParentFilter {
+        &self.cached_parent_filter
     }
 }
 
@@ -958,9 +1149,9 @@ impl ContextPolicy {
 /// let mut research = Graph::new();
 /// research.add_system(gather_info).add_system(summarize);
 ///
-/// // Embed it as a scope with inherited context
+/// // Embed it as a scope that chain-reads parent resources.
 /// let mut graph = Graph::new();
-/// graph.add_scope("research", research, ContextPolicy::inherit());
+/// graph.add_scope("research", research, ContextPolicy::new().share_rest());
 /// ```
 #[derive(Debug)]
 pub struct ScopeNode {
@@ -1172,36 +1363,170 @@ mod tests {
     // ContextPolicy tests
     // ─────────────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn context_policy_shared() {
-        let policy = ContextPolicy::shared();
-        assert!(matches!(policy.mode, ContextMode::Shared));
-        assert!(policy.forward_resources.is_empty());
-    }
+    use polaris_system::param::ParentFilter;
+    use polaris_system::resource::{ForkStrategy, LocalResource};
 
-    #[test]
-    fn context_policy_inherit() {
-        let policy = ContextPolicy::inherit();
-        assert!(matches!(policy.mode, ContextMode::Inherit));
-    }
-
-    #[test]
-    fn context_policy_isolated() {
-        let policy = ContextPolicy::isolated();
-        assert!(matches!(policy.mode, ContextMode::Isolated));
-    }
-
-    use polaris_system::resource::LocalResource;
-
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct TestRes;
     impl LocalResource for TestRes {}
 
+    #[derive(Default)]
+    struct ForkRes;
+    impl LocalResource for ForkRes {}
+    impl ForkStrategy for ForkRes {
+        fn fork(&self) -> Self {
+            ForkRes
+        }
+    }
+
     #[test]
-    fn context_policy_forward() {
-        let policy = ContextPolicy::inherit().forward::<TestRes>();
-        assert_eq!(policy.forward_resources.len(), 1);
-        assert_eq!(policy.forward_resources[0].type_id, TypeId::of::<TestRes>());
+    fn context_policy_shared_no_boundary() {
+        let policy = ContextPolicy::shared();
+        assert!(policy.is_shared());
+        assert_eq!(policy.mode(), ContextMode::Shared);
+        assert!(policy.crossings().next().is_none());
+    }
+
+    #[test]
+    fn context_policy_new_is_isolated_by_default() {
+        let policy = ContextPolicy::new();
+        assert!(!policy.is_shared());
+        assert_eq!(policy.mode(), ContextMode::Isolated);
+        assert_eq!(*policy.parent_filter(), ParentFilter::allow_only([]));
+    }
+
+    #[test]
+    fn share_rest_yields_child_with_allow_all() {
+        let policy = ContextPolicy::new().share_rest();
+        assert_eq!(policy.mode(), ContextMode::Inherit);
+        assert_eq!(*policy.parent_filter(), ParentFilter::allow_all_except([]));
+    }
+
+    #[test]
+    fn share_specific_type_yields_child_with_allow_only() {
+        let policy = ContextPolicy::new().share::<TestRes>();
+        assert_eq!(
+            *policy.parent_filter(),
+            ParentFilter::allow_only([TypeId::of::<TestRes>()])
+        );
+    }
+
+    #[test]
+    fn share_then_share_rest_keeps_share_and_yields_allow_all() {
+        // Under `share_rest`, an explicit `share::<T>()` is redundant — but
+        // the policy must not lose the share or produce the wrong parent
+        // filter. We assert both: the parent filter is `AllowAllExcept([])`
+        // (i.e. unrestricted), and the share crossing is still recorded.
+        let policy = ContextPolicy::new().share::<TestRes>().share_rest();
+        assert_eq!(policy.mode(), ContextMode::Inherit);
+        assert_eq!(*policy.parent_filter(), ParentFilter::allow_all_except([]));
+        let crossing = policy
+            .crossing_for(TypeId::of::<TestRes>())
+            .expect("share crossing should be retained");
+        assert!(matches!(crossing.action, CrossingAction::Share));
+    }
+
+    #[test]
+    fn forward_records_clone_strategy() {
+        let policy = ContextPolicy::new().forward::<TestRes>();
+        let crossing = policy.crossing_for(TypeId::of::<TestRes>()).unwrap();
+        assert!(matches!(crossing.action, CrossingAction::Forward(_)));
+    }
+
+    #[test]
+    fn fork_records_fork_strategy() {
+        let policy = ContextPolicy::new().fork::<ForkRes>();
+        let crossing = policy.crossing_for(TypeId::of::<ForkRes>()).unwrap();
+        assert!(matches!(crossing.action, CrossingAction::Fork(_)));
+    }
+
+    #[test]
+    fn forward_fresh_records_factory_strategy() {
+        let policy = ContextPolicy::new().forward_fresh::<TestRes>();
+        let crossing = policy.crossing_for(TypeId::of::<TestRes>()).unwrap();
+        assert!(matches!(crossing.action, CrossingAction::ForwardFresh));
+    }
+
+    #[test]
+    fn exclude_in_share_rest_filters_parent() {
+        let policy = ContextPolicy::new().share_rest().exclude::<TestRes>();
+        let filter = policy.parent_filter();
+        assert!(!filter.allows(TypeId::of::<TestRes>()));
+        // share_rest still allows other types through.
+        struct Other;
+        assert!(filter.allows(TypeId::of::<Other>()));
+    }
+
+    #[test]
+    fn exclude_clears_prior_positive_verb() {
+        // .share().exclude() must remove the share — last verb wins, and
+        // exclude must not leave a stale entry in `crossings`.
+        let policy = ContextPolicy::new().share::<TestRes>().exclude::<TestRes>();
+        assert!(policy.crossing_for(TypeId::of::<TestRes>()).is_none());
+        // `exclude` alone (without share_rest) doesn't change parent_filter
+        // — allow_only stays empty — but we do want excludes tracked for
+        // share_rest interactions.
+        let policy_with_rest = ContextPolicy::new()
+            .share::<TestRes>()
+            .exclude::<TestRes>()
+            .share_rest();
+        let filter = policy_with_rest.parent_filter();
+        assert!(!filter.allows(TypeId::of::<TestRes>()));
+    }
+
+    #[test]
+    fn positive_verb_clears_prior_exclude() {
+        // .exclude().share() must clear the exclude — last verb wins.
+        let policy = ContextPolicy::new().exclude::<TestRes>().share::<TestRes>();
+        let crossing = policy.crossing_for(TypeId::of::<TestRes>()).unwrap();
+        assert!(matches!(crossing.action, CrossingAction::Share));
+        assert_eq!(
+            *policy.parent_filter(),
+            ParentFilter::allow_only([TypeId::of::<TestRes>()])
+        );
+    }
+
+    #[test]
+    fn later_verb_overrides_earlier_for_same_type() {
+        let policy = ContextPolicy::new().forward::<TestRes>().share::<TestRes>();
+        let crossing = policy.crossing_for(TypeId::of::<TestRes>()).unwrap();
+        assert!(matches!(crossing.action, CrossingAction::Share));
+    }
+
+    #[test]
+    #[should_panic(expected = "is not valid on ContextPolicy::shared()")]
+    fn shared_plus_share_panics() {
+        let _ = ContextPolicy::shared().share::<TestRes>();
+    }
+
+    #[test]
+    #[should_panic(expected = "is not valid on ContextPolicy::shared()")]
+    fn shared_plus_forward_panics() {
+        let _ = ContextPolicy::shared().forward::<TestRes>();
+    }
+
+    #[test]
+    #[should_panic(expected = "is not valid on ContextPolicy::shared()")]
+    fn shared_plus_forward_fresh_panics() {
+        let _ = ContextPolicy::shared().forward_fresh::<TestRes>();
+    }
+
+    #[test]
+    #[should_panic(expected = "is not valid on ContextPolicy::shared()")]
+    fn shared_plus_fork_panics() {
+        let _ = ContextPolicy::shared().fork::<ForkRes>();
+    }
+
+    #[test]
+    #[should_panic(expected = "is not valid on ContextPolicy::shared()")]
+    fn shared_plus_exclude_panics() {
+        let _ = ContextPolicy::shared().exclude::<TestRes>();
+    }
+
+    #[test]
+    #[should_panic(expected = "is not valid on ContextPolicy::shared()")]
+    fn shared_plus_share_rest_panics() {
+        let _ = ContextPolicy::shared().share_rest();
     }
 
     #[test]

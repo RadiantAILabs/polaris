@@ -1,8 +1,8 @@
-# AGENT.md
+# AGENTS.md
 
 This file provides guidance to general-purpose coding agents when working with code in this repository.
 
-`AGENT.md` is the agent-neutral counterpart to `CLAUDE.md`. If both files are present, prefer this file for shared repository guidance and use agent-specific files only for host-specific behavior.
+`AGENTS.md` is the single source of truth for coding-agent guidance in this repository. `CLAUDE.md` is a symlink to this file, so both names resolve to the same content. Edit `AGENTS.md`; never edit `CLAUDE.md` directly.
 
 ## Project Overview
 
@@ -26,6 +26,7 @@ cargo make test
 cargo test --verbose          # Run tests only
 cargo fmt -- --check          # Check formatting
 cargo clippy --all-targets --all-features -- -D warnings
+cargo make test-rustdoc       # Build docs with rustdoc warnings denied
 
 # Fix formatting
 cargo fmt
@@ -116,6 +117,18 @@ Before reading the entire file, read the first 100 lines when navigating to thes
 | Middleware API | `crates/polaris_graph/src/middleware/mod.rs` | `MiddlewareAPI`, target types, handler trait |
 | SystemContext | `crates/polaris_system/src/param/mod.rs` | Context struct, `Res<T>`, `ResMut<T>`, hierarchy |
 | Execution errors | `crates/polaris_graph/src/executor/error.rs` | `ExecutionError`, `CaughtError`, `ErrOut` |
+
+## Discovery and Integration
+
+For *"how do I X?"* answers — what plugins/APIs/resources to combine for a given goal — see [`docs/reference/guide.md`](docs/reference/guide.md).
+
+For per-thing documentation standards (every plugin, API, and resource has required rustdoc sections), see:
+
+- [`docs/reference/plugins.md#documentation-standard`](docs/reference/plugins.md#documentation-standard)
+- [`docs/reference/api.md#documentation-standard`](docs/reference/api.md#documentation-standard)
+- [`docs/reference/resources.md#documentation-standard`](docs/reference/resources.md#documentation-standard)
+
+The catalogs (every shipped plugin, API, and resource) live at [`src/docs/plugins.md`](src/docs/plugins.md), [`src/docs/apis.md`](src/docs/apis.md), and [`src/docs/resources.md`](src/docs/resources.md). Each has a CI drift guard under `tests/`. The `/review-docs` skill checks PRs against the standards.
 
 ## Common Integration Patterns
 
@@ -212,7 +225,7 @@ When modifying any file in `docs/**/*.md`, always check other documentation file
 2. `docs/taxonomy.md` - Layered architecture and concept classification
 3. `docs/reference/*.md` - Pattern implementations and detailed specifications
 
-If a change affects repository navigation or coding-agent guidance, update `AGENT.md` and any agent-specific mirrors such as `CLAUDE.md` together.
+If a change affects repository navigation or coding-agent guidance, update `AGENTS.md` and any agent-specific mirrors such as `CLAUDE.md` together.
 
 ## Implementation Guidelines
 
@@ -245,6 +258,13 @@ Conventional commit style: `<type>: <short summary>`. Types: `feat`, `fix`, `ref
 - Description: explain why, link Shortcut story
 - One logical change per PR
 - Tests required for features and fixes
+
+### Available Skills
+
+- `/create-ticket` — create a well-scoped Shortcut story
+- `/evaluate-ticket` — evaluate tickets against quality checklist
+- `/roadmap` — decompose an initiative into sequenced tickets
+- `/review-pr` — review a PR against contribution standards
 
 ## Ignored Files
 

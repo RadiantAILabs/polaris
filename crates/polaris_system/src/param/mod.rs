@@ -63,6 +63,7 @@ use crate::resource::{
     LocalResource, Output, OutputRef, Outputs, Resource, ResourceRef, ResourceRefMut, Resources,
 };
 pub use access::{Access, AccessMode, SystemAccess};
+use hashbrown::HashSet;
 use std::any::{Any, TypeId, type_name};
 use std::sync::Arc;
 use variadics_please::all_tuples;
@@ -107,6 +108,15 @@ pub enum ParamError {
     #[error("resource not found: {0}")]
     ResourceNotFound(&'static str),
 
+    /// The resource exists in the parent context but is not reachable in the
+    /// current scope because the scope's `ContextPolicy` does not list it.
+    #[error(
+        "resource '{0}' exists in the parent context but is not reachable in this scope — \
+         add a crossing verb (`.share::<{0}>()`, `.forward::<{0}>()`, `.forward_fresh::<{0}>()`, \
+         or `.share_rest()`) to the scope's ContextPolicy"
+    )]
+    ResourceOutOfScope(&'static str),
+
     /// A borrow conflict occurred (e.g., trying to mutably borrow
     /// a resource that is already borrowed).
     #[error("borrow conflict: {0}")]
@@ -119,8 +129,7 @@ pub enum ParamError {
     /// Error context not found in outputs.
     ///
     /// A `ErrOut<T>` parameter requested error context, but no preceding
-    /// system has failed with a matching error type. This typically means the
-    /// system is not reachable through an error edge in the graph.
+    /// system has failed with a matching error type.
     #[error("error context not found: {0}")]
     ErrorNotFound(&'static str),
 }
@@ -194,6 +203,105 @@ pub struct SystemContext<'parent> {
     resources: Resources,
     /// Ephemeral system outputs for current execution (owned).
     outputs: Outputs,
+    /// Restricts which resource types are reachable through the parent chain.
+    ///
+    /// Applies only to walks into [`Self::parent`]; the local scope and
+    /// globals are always reachable. The default is the unrestricted filter
+    /// (`AllowAllExcept` over an empty set).
+    parent_filter: ParentFilter,
+}
+
+/// Restricts which resource types are reachable through a context's parent chain.
+///
+/// Applied during read operations (`get_resource`, `contains_resource`, factory
+/// lookup) to gate access into the parent. The local scope and globals are
+/// always reachable regardless of the filter.
+///
+/// The filter is opaque — construct one via [`ParentFilter::allow_all_except`]
+/// or [`ParentFilter::allow_only`] and query it via [`ParentFilter::allows`].
+/// The default is the unrestricted filter (allows every type through the
+/// parent chain), matching the behavior of [`SystemContext::child`].
+///
+/// # Examples
+///
+/// ```
+/// use polaris_system::param::ParentFilter;
+/// use std::any::TypeId;
+///
+/// struct A;
+/// struct B;
+///
+/// // Allow everything from the parent except `A`.
+/// let f = ParentFilter::allow_all_except([TypeId::of::<A>()]);
+/// assert!(!f.allows(TypeId::of::<A>()));
+/// assert!(f.allows(TypeId::of::<B>()));
+///
+/// // Allow only `A` from the parent.
+/// let f = ParentFilter::allow_only([TypeId::of::<A>()]);
+/// assert!(f.allows(TypeId::of::<A>()));
+/// assert!(!f.allows(TypeId::of::<B>()));
+///
+/// // The default is unrestricted.
+/// assert!(ParentFilter::default().allows(TypeId::of::<A>()));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentFilter {
+    mode: ParentFilterMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParentFilterMode {
+    AllowAllExcept(HashSet<TypeId>),
+    AllowOnly(HashSet<TypeId>),
+}
+
+impl Default for ParentFilter {
+    fn default() -> Self {
+        Self {
+            mode: ParentFilterMode::AllowAllExcept(HashSet::new()),
+        }
+    }
+}
+
+impl ParentFilter {
+    /// Builds a filter that allows the parent chain to expose every resource
+    /// except the listed types.
+    ///
+    /// Passing an empty iterator yields the unrestricted filter (equivalent to
+    /// [`ParentFilter::default`]).
+    #[must_use]
+    pub fn allow_all_except<I>(types: I) -> Self
+    where
+        I: IntoIterator<Item = TypeId>,
+    {
+        Self {
+            mode: ParentFilterMode::AllowAllExcept(types.into_iter().collect()),
+        }
+    }
+
+    /// Builds a filter that allows the parent chain to expose only the listed
+    /// types.
+    ///
+    /// Passing an empty iterator yields a filter that hides every parent
+    /// resource (globals remain reachable).
+    #[must_use]
+    pub fn allow_only<I>(types: I) -> Self
+    where
+        I: IntoIterator<Item = TypeId>,
+    {
+        Self {
+            mode: ParentFilterMode::AllowOnly(types.into_iter().collect()),
+        }
+    }
+
+    /// Returns whether `type_id` is reachable through the parent chain.
+    #[must_use]
+    pub fn allows(&self, type_id: TypeId) -> bool {
+        match &self.mode {
+            ParentFilterMode::AllowAllExcept(set) => !set.contains(&type_id),
+            ParentFilterMode::AllowOnly(set) => set.contains(&type_id),
+        }
+    }
 }
 
 impl Default for SystemContext<'_> {
@@ -214,6 +322,7 @@ impl<'parent> SystemContext<'parent> {
             globals: None,
             resources: Resources::new(),
             outputs: Outputs::new(),
+            parent_filter: ParentFilter::default(),
         }
     }
 
@@ -229,6 +338,7 @@ impl<'parent> SystemContext<'parent> {
             globals: Some(globals),
             resources: Resources::new(),
             outputs: Outputs::new(),
+            parent_filter: ParentFilter::default(),
         }
     }
 
@@ -266,6 +376,46 @@ impl<'parent> SystemContext<'parent> {
             globals: self.globals.clone(),
             resources: Resources::new(),
             outputs: Outputs::new(),
+            parent_filter: ParentFilter::default(),
+        }
+    }
+
+    /// Creates a child context with this context as its parent and a restricted
+    /// view of the parent chain.
+    ///
+    /// The filter applies to walks into the parent only — the child's local
+    /// scope and the global resources remain reachable regardless of the
+    /// filter.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::param::{ParentFilter, SystemContext};
+    /// # use polaris_system::resource::LocalResource;
+    /// # use std::any::TypeId;
+    /// # struct Secret;
+    /// # impl LocalResource for Secret {}
+    /// # struct Public;
+    /// # impl LocalResource for Public {}
+    /// let mut parent = SystemContext::new();
+    /// parent.insert(Public);
+    /// parent.insert(Secret);
+    ///
+    /// // Hide `Secret` from the child while keeping `Public` reachable.
+    /// let filter = ParentFilter::allow_all_except([TypeId::of::<Secret>()]);
+    /// let child = parent.child_filtered(filter);
+    ///
+    /// assert!(child.contains_resource::<Public>());
+    /// assert!(!child.contains_resource::<Secret>());
+    /// ```
+    #[must_use]
+    pub fn child_filtered(&'parent self, parent_filter: ParentFilter) -> SystemContext<'parent> {
+        SystemContext {
+            parent: Some(self),
+            globals: self.globals.clone(),
+            resources: Resources::new(),
+            outputs: Outputs::new(),
+            parent_filter,
         }
     }
 
@@ -298,18 +448,100 @@ impl<'parent> SystemContext<'parent> {
         self.resources.insert_boxed(type_id, resource);
     }
 
+    /// Inserts a type-erased resource together with the factory that produced it.
+    ///
+    /// Used by `Server::create_context` and `ContextFactory::create_context` to
+    /// instantiate local resources from registered factories while retaining the
+    /// factory on the resource entry. The retained factory enables
+    /// `forward_fresh::<T>()` at a scope boundary to produce a clean
+    /// child-scope value without needing access to the `Server`.
+    ///
+    /// See [`Resources::insert_boxed_with_factory`] for the type-correctness
+    /// contract — mismatched `type_id` / `resource` / `factory_fn` will surface
+    /// as runtime downcast panics on access.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::param::SystemContext;
+    /// # use polaris_system::resource::{LocalResource, ResourceFactory};
+    /// # use std::any::TypeId;
+    /// #[derive(Default)]
+    /// struct Counter { value: u32 }
+    /// impl LocalResource for Counter {}
+    ///
+    /// let mut ctx = SystemContext::new();
+    /// let factory = ResourceFactory::new(|| Box::new(Counter::default()));
+    /// ctx.insert_boxed_with_factory(TypeId::of::<Counter>(), factory.produce(), factory);
+    /// assert!(ctx.factory_fn_by_type_id(TypeId::of::<Counter>()).is_some());
+    /// ```
+    pub fn insert_boxed_with_factory(
+        &mut self,
+        type_id: TypeId,
+        resource: Box<dyn Any + Send + Sync>,
+        factory_fn: crate::resource::ResourceFactory,
+    ) {
+        self.resources
+            .insert_boxed_with_factory(type_id, resource, factory_fn);
+    }
+
+    /// Looks up the factory function for a resource type, walking this scope
+    /// then the parent chain (gated by [`ParentFilter`]) then globals.
+    ///
+    /// Returns `None` if the resource is not present anywhere in the hierarchy
+    /// or if the entry was inserted without a factory (i.e. via
+    /// [`Self::insert_boxed`] rather than [`Self::insert_boxed_with_factory`]).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::param::SystemContext;
+    /// # use polaris_system::resource::{LocalResource, ResourceFactory};
+    /// # use std::any::TypeId;
+    /// # #[derive(Default)] struct Counter;
+    /// # impl LocalResource for Counter {}
+    /// let mut ctx = SystemContext::new();
+    /// assert!(ctx.factory_fn_by_type_id(TypeId::of::<Counter>()).is_none());
+    ///
+    /// let factory = ResourceFactory::new(|| Box::new(Counter));
+    /// ctx.insert_boxed_with_factory(TypeId::of::<Counter>(), factory.produce(), factory);
+    /// assert!(ctx.factory_fn_by_type_id(TypeId::of::<Counter>()).is_some());
+    /// ```
+    #[must_use]
+    pub fn factory_fn_by_type_id(
+        &self,
+        type_id: TypeId,
+    ) -> Option<crate::resource::ResourceFactory> {
+        if let Some(f) = self.resources.factory_fn_by_type_id(type_id) {
+            return Some(f);
+        }
+        if let Some(parent) = self.parent
+            && self.parent_filter.allows(type_id)
+            && let Some(f) = parent.factory_fn_by_type_id(type_id)
+        {
+            return Some(f);
+        }
+        self.globals
+            .as_ref()
+            .and_then(|g| g.factory_fn_by_type_id(type_id))
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Resource methods (hierarchical lookup)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Returns `true` if a resource of type `R` exists in this scope, any parent, or globals.
+    /// Returns `true` if a resource of type `R` exists in this scope, any parent
+    /// (subject to [`ParentFilter`]), or globals.
     #[must_use]
     pub fn contains_resource<R: Resource>(&self) -> bool {
         if self.resources.contains::<R>() {
             return true;
         }
-        if let Some(parent) = self.parent {
-            return parent.contains_resource::<R>();
+        if let Some(parent) = self.parent
+            && self.parent_filter.allows(TypeId::of::<R>())
+            && parent.contains_resource::<R>()
+        {
+            return true;
         }
         if let Some(globals) = &self.globals {
             return globals.contains::<R>();
@@ -342,12 +574,26 @@ impl<'parent> SystemContext<'parent> {
             }
         }
 
-        // Walk up to parent
-        if let Some(parent) = self.parent {
-            return parent.get_resource::<R>();
+        // Walk up to parent, gated by parent_filter. The filter is the
+        // runtime expression of `ContextPolicy` verbs (`share`, `share_rest`,
+        // `exclude`); it lets isolated child scopes block parent visibility
+        // while still seeing globals.
+        if let Some(parent) = self.parent
+            && self.parent_filter.allows(TypeId::of::<R>())
+        {
+            match parent.get_resource::<R>() {
+                Ok(r) => return Ok(r),
+                Err(ParamError::BorrowConflict(name)) => {
+                    return Err(ParamError::BorrowConflict(name));
+                }
+                Err(ParamError::ResourceNotFound(_)) => {
+                    // Not in parent; fall through to globals.
+                }
+                Err(other) => return Err(other),
+            }
         }
 
-        // Check global resources (server-level)
+        // Check global resources (server-level) - always reachable
         if let Some(globals) = &self.globals {
             match globals.get::<R>() {
                 Ok(r) => return Ok(r),
@@ -358,6 +604,17 @@ impl<'parent> SystemContext<'parent> {
                     // Not in globals either
                 }
             }
+        }
+
+        // The resource was nowhere reachable. If a parent has it but this
+        // scope's `parent_filter` is hiding it, surface that as a distinct
+        // error so the caller fixes the scope's `ContextPolicy` rather than
+        // chasing missing resource registration upstream.
+        if let Some(parent) = self.parent
+            && !self.parent_filter.allows(TypeId::of::<R>())
+            && parent.contains_resource_by_type_id(TypeId::of::<R>())
+        {
+            return Err(ParamError::ResourceOutOfScope(type_name::<R>()));
         }
 
         Err(ParamError::ResourceNotFound(type_name::<R>()))
@@ -445,7 +702,7 @@ impl<'parent> SystemContext<'parent> {
     /// Unlike [`clone_local_resource`](Self::clone_local_resource), this does not
     /// require [`register_clone_fn`](Self::register_clone_fn) to have been called.
     /// The clone function is supplied by the caller — typically captured at
-    /// compile time in a `ResourceForward` (defined in the graph crate).
+    /// compile time in a `ResourceCrossing` (defined in the graph crate).
     ///
     /// Returns `None` if the resource does not exist in the local scope or is
     /// currently write-locked.
@@ -490,8 +747,8 @@ impl<'parent> SystemContext<'parent> {
         self.resources.register_clone_fn::<T>()
     }
 
-    /// Returns `true` if a resource with the given `TypeId` exists in this scope,
-    /// any parent, or globals.
+    /// Returns `true` if a resource with the given `TypeId` is reachable in
+    /// this scope, the parent chain (subject to [`ParentFilter`]), or globals.
     ///
     /// This is useful for validation when the concrete type is not known
     /// at compile time (e.g., validating system access declarations).
@@ -500,8 +757,11 @@ impl<'parent> SystemContext<'parent> {
         if self.resources.contains_by_type_id(type_id) {
             return true;
         }
-        if let Some(parent) = self.parent {
-            return parent.contains_resource_by_type_id(type_id);
+        if let Some(parent) = self.parent
+            && self.parent_filter.allows(type_id)
+            && parent.contains_resource_by_type_id(type_id)
+        {
+            return true;
         }
         if let Some(globals) = &self.globals {
             return globals.contains_by_type_id(type_id);
@@ -1600,5 +1860,166 @@ mod tests {
 
         let arc = child.globals_arc().expect("child should inherit globals");
         assert!(Arc::ptr_eq(&arc, &globals));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ParentFilter / child_filtered tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    struct Allowed;
+    impl LocalResource for Allowed {}
+
+    struct Blocked;
+    impl LocalResource for Blocked {}
+
+    #[test]
+    fn parent_filter_allow_all_except_truth_table() {
+        let filter = ParentFilter::allow_all_except([TypeId::of::<Blocked>()]);
+        assert!(!filter.allows(TypeId::of::<Blocked>()));
+        assert!(filter.allows(TypeId::of::<Allowed>()));
+    }
+
+    #[test]
+    fn parent_filter_allow_only_truth_table() {
+        let filter = ParentFilter::allow_only([TypeId::of::<Allowed>()]);
+        assert!(filter.allows(TypeId::of::<Allowed>()));
+        assert!(!filter.allows(TypeId::of::<Blocked>()));
+    }
+
+    #[test]
+    fn parent_filter_default_is_unrestricted() {
+        let filter = ParentFilter::default();
+        assert!(filter.allows(TypeId::of::<Allowed>()));
+        assert!(filter.allows(TypeId::of::<Blocked>()));
+        assert_eq!(filter, ParentFilter::allow_all_except([]));
+    }
+
+    #[test]
+    fn parent_filter_allow_only_empty_blocks_everything() {
+        let filter = ParentFilter::allow_only([]);
+        assert!(!filter.allows(TypeId::of::<Allowed>()));
+        assert!(!filter.allows(TypeId::of::<Blocked>()));
+    }
+
+    #[test]
+    fn child_filtered_blocks_parent_resource() {
+        let mut parent = SystemContext::new();
+        parent.insert(Allowed);
+        parent.insert(Blocked);
+
+        let child = parent.child_filtered(ParentFilter::allow_only([TypeId::of::<Allowed>()]));
+        assert!(child.contains_resource::<Allowed>());
+        assert!(!child.contains_resource::<Blocked>());
+    }
+
+    #[test]
+    fn child_filtered_still_sees_globals() {
+        let mut globals = Resources::new();
+        globals.insert(Counter { value: 7 });
+        let parent = SystemContext::with_globals(Arc::new(globals));
+
+        // Block everything from the parent chain — globals should still flow.
+        let child = parent.child_filtered(ParentFilter::allow_only([]));
+        let counter = child.get_resource::<Counter>().unwrap();
+        assert_eq!(counter.value, 7);
+    }
+
+    #[test]
+    fn child_filtered_propagates_parent_borrow_conflict() {
+        // A `share`d resource the parent currently holds write-locked must
+        // surface BorrowConflict through the filter — not be masked as
+        // ResourceOutOfScope or ResourceNotFound.
+        let mut parent = SystemContext::new();
+        parent.insert(Counter { value: 1 });
+
+        let child = parent.child_filtered(ParentFilter::allow_only([TypeId::of::<Counter>()]));
+
+        // Parent holds a write lock on the shared Counter...
+        let _write = parent.get_resource_mut::<Counter>().unwrap();
+
+        // ...so a chain-read from the filtered child sees the live borrow.
+        match child.get_resource::<Counter>() {
+            Ok(_) => panic!("expected BorrowConflict, got Ok"),
+            Err(ParamError::BorrowConflict(name)) => {
+                assert!(name.contains("Counter"), "type name in error: {name}");
+            }
+            Err(other) => panic!("expected BorrowConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_resource_blocked_by_filter_returns_out_of_scope() {
+        let mut parent = SystemContext::new();
+        parent.insert(Blocked);
+
+        let child = parent.child_filtered(ParentFilter::allow_only([]));
+        match child.get_resource::<Blocked>() {
+            Ok(_) => panic!("expected ResourceOutOfScope, got Ok"),
+            Err(ParamError::ResourceOutOfScope(name)) => {
+                assert!(name.contains("Blocked"), "type name in error: {name}");
+            }
+            Err(other) => panic!("expected ResourceOutOfScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_resource_missing_in_parent_returns_not_found_not_out_of_scope() {
+        let parent = SystemContext::new();
+        // Filter excludes `Blocked`, but the parent doesn't have it either.
+        let child = parent.child_filtered(ParentFilter::allow_only([]));
+
+        match child.get_resource::<Blocked>() {
+            Ok(_) => panic!("expected ResourceNotFound, got Ok"),
+            Err(ParamError::ResourceNotFound(name)) => {
+                assert!(name.contains("Blocked"), "type name in error: {name}");
+            }
+            Err(other) => panic!("expected ResourceNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn factory_fn_lookup_round_trip() {
+        use crate::resource::ResourceFactory;
+        let mut ctx = SystemContext::new();
+        let factory = ResourceFactory::new(|| Box::new(Counter { value: 5 }));
+        ctx.insert_boxed_with_factory(TypeId::of::<Counter>(), factory.produce(), factory);
+
+        let resolved = ctx
+            .factory_fn_by_type_id(TypeId::of::<Counter>())
+            .expect("factory should be retrievable");
+        let boxed = resolved.produce();
+        let counter = boxed.downcast::<Counter>().unwrap();
+        assert_eq!(counter.value, 5);
+    }
+
+    #[test]
+    fn factory_fn_lookup_returns_none_for_plain_insert() {
+        let mut ctx = SystemContext::new();
+        ctx.insert(Counter { value: 1 });
+        assert!(ctx.factory_fn_by_type_id(TypeId::of::<Counter>()).is_none());
+    }
+
+    #[test]
+    fn factory_fn_lookup_walks_parent_subject_to_filter() {
+        use crate::resource::ResourceFactory;
+        let mut parent = SystemContext::new();
+        let factory = ResourceFactory::new(|| Box::new(Counter { value: 9 }));
+        parent.insert_boxed_with_factory(TypeId::of::<Counter>(), factory.produce(), factory);
+
+        // Unrestricted child — sees the parent's factory.
+        let child = parent.child();
+        assert!(
+            child
+                .factory_fn_by_type_id(TypeId::of::<Counter>())
+                .is_some()
+        );
+
+        // Filtered child — parent's factory hidden.
+        let blocked = parent.child_filtered(ParentFilter::allow_only([]));
+        assert!(
+            blocked
+                .factory_fn_by_type_id(TypeId::of::<Counter>())
+                .is_none()
+        );
     }
 }

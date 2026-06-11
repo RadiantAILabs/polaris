@@ -98,6 +98,25 @@ pub enum ExecutionError {
         /// The configured maximum duration.
         max: Duration,
     },
+    /// A scope's `ContextPolicy` declared `forward_fresh::<T>()` for a resource
+    /// that has no registered factory anywhere in the parent hierarchy.
+    ScopeMissingFactory {
+        /// The scope node's name.
+        scope: &'static str,
+        /// The resource type that was missing a factory.
+        resource: &'static str,
+    },
+    /// A scope's `ContextPolicy` declared a per-resource crossing
+    /// (`forward::<T>()` or `fork::<T>()`) for a resource that does not exist
+    /// in the parent's local scope at execution time.
+    ScopeMissingResource {
+        /// The scope node's name.
+        scope: &'static str,
+        /// The resource type that was missing.
+        resource: &'static str,
+        /// Which verb declared the crossing — `"forward"` or `"fork"`.
+        action: &'static str,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -149,6 +168,22 @@ impl fmt::Display for ExecutionError {
                 write!(
                     f,
                     "graph execution timed out after {elapsed:?} (max: {max:?})"
+                )
+            }
+            ExecutionError::ScopeMissingFactory { scope, resource } => {
+                write!(
+                    f,
+                    "scope '{scope}' declared forward_fresh::<{resource}>() but no factory is registered (call Server::register_local::<{resource}>(...) before entering this scope)"
+                )
+            }
+            ExecutionError::ScopeMissingResource {
+                scope,
+                resource,
+                action,
+            } => {
+                write!(
+                    f,
+                    "scope '{scope}' declared {action}::<{resource}>() but the parent context has no local resource of that type"
                 )
             }
         }
@@ -217,6 +252,44 @@ pub enum ResourceValidationError {
         /// The type ID of the missing output.
         type_id: TypeId,
     },
+    /// A scope's `ContextPolicy` declared `forward_fresh::<T>()` for a resource
+    /// that has no registered factory in the parent context or globals.
+    ///
+    /// Detected during [`GraphExecutor::validate_resources`] by walking the
+    /// parent chain via [`SystemContext::factory_fn_by_type_id`].
+    ///
+    /// [`GraphExecutor::validate_resources`]: super::GraphExecutor::validate_resources
+    /// [`SystemContext::factory_fn_by_type_id`]: polaris_system::param::SystemContext::factory_fn_by_type_id
+    ScopeMissingFactory {
+        /// The scope node ID.
+        scope: NodeId,
+        /// The scope node's name.
+        scope_name: &'static str,
+        /// The resource type that was missing a factory.
+        resource: &'static str,
+    },
+    /// A scope's `ContextPolicy` declared a per-resource crossing
+    /// (`forward::<T>()` or `fork::<T>()`) for a resource that is not
+    /// reachable from the parent context at validation time.
+    ///
+    /// Detected during [`GraphExecutor::validate_resources`] via
+    /// [`SystemContext::contains_resource_by_type_id`]. Mirrors the runtime
+    /// [`ExecutionError::ScopeMissingResource`] safety net for callers that
+    /// skip validation.
+    ///
+    /// [`GraphExecutor::validate_resources`]: super::GraphExecutor::validate_resources
+    /// [`SystemContext::contains_resource_by_type_id`]: polaris_system::param::SystemContext::contains_resource_by_type_id
+    /// [`ExecutionError::ScopeMissingResource`]: super::ExecutionError::ScopeMissingResource
+    ScopeMissingResource {
+        /// The scope node ID.
+        scope: NodeId,
+        /// The scope node's name.
+        scope_name: &'static str,
+        /// The resource type that was missing.
+        resource: &'static str,
+        /// Which verb declared the crossing — `"forward"` or `"fork"`.
+        action: &'static str,
+    },
 }
 
 impl fmt::Display for ResourceValidationError {
@@ -247,6 +320,27 @@ impl fmt::Display for ResourceValidationError {
                 write!(
                     f,
                     "system '{system_name}' ({node}) requires missing output: {output_type}"
+                )
+            }
+            ResourceValidationError::ScopeMissingFactory {
+                scope,
+                scope_name,
+                resource,
+            } => {
+                write!(
+                    f,
+                    "scope '{scope_name}' ({scope}) declared forward_fresh::<{resource}>() but no factory is registered for {resource} in the parent context or globals"
+                )
+            }
+            ResourceValidationError::ScopeMissingResource {
+                scope,
+                scope_name,
+                resource,
+                action,
+            } => {
+                write!(
+                    f,
+                    "scope '{scope_name}' ({scope}) declared {action}::<{resource}>() but {resource} is not reachable from the parent context"
                 )
             }
         }

@@ -617,36 +617,6 @@ impl System for ReadConfigSystem {
     }
 }
 
-/// System that writes a new value to `TestConfig` via `ResMut<T>`.
-pub struct WriteConfigCapture {
-    pub new_value: i32,
-    pub captured: Arc<Mutex<Option<i32>>>,
-}
-
-impl System for WriteConfigCapture {
-    type Output = ();
-
-    fn run<'a>(
-        &'a self,
-        ctx: &'a SystemContext<'_>,
-    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
-        let captured = Arc::clone(&self.captured);
-        let new_value = self.new_value;
-        Box::pin(async move {
-            let mut config = ctx
-                .get_resource_mut::<TestConfig>()
-                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
-            *captured.lock().unwrap() = Some(config.value);
-            config.value = new_value;
-            Ok(())
-        })
-    }
-
-    fn name(&self) -> &'static str {
-        "write_config_capture"
-    }
-}
-
 /// System that declares `ResMut<TestConfig>` (write access, for validation tests).
 pub struct WriteConfigSystem;
 

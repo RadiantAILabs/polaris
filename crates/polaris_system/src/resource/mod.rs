@@ -57,6 +57,6 @@ mod resource;
 
 pub use output::{Output, OutputError, OutputId, OutputRef, Outputs};
 pub use resource::{
-    GlobalResource, LocalResource, Resource, ResourceError, ResourceId, ResourceRef,
-    ResourceRefMut, Resources,
+    ForkStrategy, GlobalResource, LocalResource, Resource, ResourceError, ResourceFactory,
+    ResourceId, ResourceRef, ResourceRefMut, Resources,
 };

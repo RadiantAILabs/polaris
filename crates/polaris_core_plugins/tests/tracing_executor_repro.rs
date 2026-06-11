@@ -12,7 +12,7 @@
 //!
 //! Regression context: a downstream consumer reported that neither span
 //! reached the buffer in their dashboard build. This test pins the
-//! polaris side of that contract.
+//! polar-rs side of that contract.
 
 #![cfg(feature = "dashboard")]
 
