@@ -25,6 +25,50 @@ pub struct LlmRequest {
     /// When provided, the model will generate output conforming to this schema.
     /// This is set automatically by `Llm::generate_structured()`.
     pub output_schema: Option<Value>,
+    /// Prompt-cache breakpoint markers for this request.
+    ///
+    /// Provider-agnostic: a provider that supports prompt caching (e.g.
+    /// Anthropic) translates these into its native cache-control markers; a
+    /// provider that does not simply ignores them. Defaults to disabled.
+    #[serde(default)]
+    pub cache: CacheControl,
+}
+
+/// Declarative prompt-cache breakpoint markers for an [`LlmRequest`].
+///
+/// The model types stay provider-agnostic: this descriptor names *where* a
+/// consumer wants cache breakpoints, and the provider maps them onto its native
+/// mechanism (for Anthropic, `cache_control: {type: "ephemeral"}` on the last
+/// block of the marked region). The two things consumers reason about are the
+/// **stable prefix** (system + tools, re-sent verbatim every call) and one or
+/// more **conversation breakpoints** (a stable mid-history point and a rolling
+/// recent point — the incremental-caching pattern).
+///
+/// Construct via [`LlmRequestBuilder`](super::builder::LlmRequestBuilder)'s
+/// `cache_prefix()` / `cache_breakpoint()` verbs rather than computing indices by
+/// hand. [`Default`] is "no caching".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheControl {
+    /// Cache the stable prefix: the system prompt and tool definitions.
+    ///
+    /// This is the common case and the dominant win — the fixed prefix is
+    /// otherwise re-billed at full price on every call.
+    pub prefix: bool,
+    /// Indices into [`LlmRequest::messages`] after which to place a cache
+    /// breakpoint (the prefix up to and including that message is cached).
+    ///
+    /// Providers honor a bounded number of breakpoints (Anthropic: 4 total,
+    /// counting prefix markers); extras are applied low-to-high and the rest
+    /// ignored.
+    pub breakpoints: Vec<usize>,
+}
+
+impl CacheControl {
+    /// Returns `true` when no caching is requested (the [`Default`]).
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        !self.prefix && self.breakpoints.is_empty()
+    }
 }
 
 impl LlmRequest {
@@ -153,14 +197,28 @@ impl LlmResponse {
 }
 
 /// Token usage information.
+///
+/// `input_tokens` counts only tokens billed at the full input rate. When prompt
+/// caching is in effect, cached prefix tokens are reported separately in
+/// [`cache_read_tokens`](Self::cache_read_tokens) (billed at a steep discount)
+/// and [`cache_creation_tokens`](Self::cache_creation_tokens) (billed at a small
+/// premium the first time a prefix is written). Providers without caching leave
+/// the cache fields `None`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
-    /// Number of tokens in the input.
+    /// Number of full-price (uncached) input tokens.
     pub input_tokens: Option<u64>,
     /// Number of tokens in the output.
     pub output_tokens: Option<u64>,
-    /// Total tokens (input + output).
+    /// Total tokens (input + output, including any cached input).
     pub total_tokens: Option<u64>,
+    /// Input tokens served from the prompt cache, billed at the cache-read rate.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    /// Input tokens written to the prompt cache this call, billed at the
+    /// cache-write rate.
+    #[serde(default)]
+    pub cache_creation_tokens: Option<u64>,
 }
 
 // ─────────────────────

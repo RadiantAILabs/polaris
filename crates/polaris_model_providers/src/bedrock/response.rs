@@ -116,5 +116,6 @@ fn convert_usage(usage: Option<bedrock::TokenUsage>) -> polaris_llm::Usage {
         input_tokens: Some(u.input_tokens as u64),
         output_tokens: Some(u.output_tokens as u64),
         total_tokens: Some(u.total_tokens as u64),
+        ..Default::default()
     })
 }

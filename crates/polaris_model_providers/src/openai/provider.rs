@@ -512,6 +512,7 @@ fn convert_usage(usage: ResponseUsage) -> Usage {
         input_tokens: Some(u64::from(usage.input_tokens)),
         output_tokens: Some(u64::from(usage.output_tokens)),
         total_tokens: Some(u64::from(usage.total_tokens)),
+        ..Default::default()
     }
 }
 

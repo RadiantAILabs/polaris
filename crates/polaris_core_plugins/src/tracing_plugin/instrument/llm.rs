@@ -199,9 +199,11 @@ fn record_cost(span: &tracing::Span, pricing: Option<ModelPricing>, usage: &Usag
     if usage.input_tokens.is_none() && usage.output_tokens.is_none() {
         return;
     }
-    let cost = rate.cost(
+    let cost = rate.cost_with_cache(
         usage.input_tokens.unwrap_or(0),
         usage.output_tokens.unwrap_or(0),
+        usage.cache_read_tokens.unwrap_or(0),
+        usage.cache_creation_tokens.unwrap_or(0),
     );
     span.record("gen_ai.usage.cost_usd", cost);
 }
@@ -347,6 +349,7 @@ mod tests {
                         input_tokens: Some(10),
                         output_tokens: Some(20),
                         total_tokens: Some(30),
+                        ..Default::default()
                     },
                 },
             )])),
@@ -430,6 +433,7 @@ mod tests {
                     input_tokens: Some(self.input_tokens),
                     output_tokens: Some(self.output_tokens),
                     total_tokens: Some(self.input_tokens + self.output_tokens),
+                    ..Default::default()
                 },
                 stop_reason: StopReason::EndTurn,
             };

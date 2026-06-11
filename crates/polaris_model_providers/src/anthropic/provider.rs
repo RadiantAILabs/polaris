@@ -2,9 +2,10 @@
 
 use super::client::AnthropicClient;
 use super::types::{
-    self as anthropic_types, ContentBlock, ContentBlockParam, CreateMessageRequest, ImageMediaType,
-    ImageSource, MessageParam, OutputFormat, RawStreamEvent, Role, StreamContentBlock, StreamDelta,
-    ToolChoiceParam, ToolDef, ToolResultBlock, ToolResultContent,
+    self as anthropic_types, CacheControlMarker, ContentBlock, ContentBlockParam,
+    CreateMessageRequest, ImageMediaType, ImageSource, MessageParam, OutputFormat, RawStreamEvent,
+    Role, StreamContentBlock, StreamDelta, SystemBlock, SystemPrompt, ToolChoiceParam, ToolDef,
+    ToolResultBlock, ToolResultContent,
 };
 use crate::schema::normalize_schema_for_strict_mode;
 use core::pin::Pin;
@@ -71,11 +72,12 @@ impl LlmProvider for AnthropicProvider {
 
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
         // Anthropic public list prices, USD per million base input / output
-        // tokens. Cache-tier rates are intentionally omitted — `Usage`
-        // carries no cache-token breakdown. `starts_with` tolerates dated
-        // ids (e.g. `claude-opus-4-7-20260115`). List prices drift and new
-        // model ids must be added here; verify against anthropic.com/pricing
-        // before relying on the figure for billing.
+        // tokens. Cache-tier rates are derived from the base input rate by
+        // `ModelPricing::new` (0.1× read, 1.25× write — the 5-minute ephemeral
+        // ratios). `starts_with` tolerates dated ids (e.g.
+        // `claude-opus-4-7-20260115`). List prices drift and new model ids must
+        // be added here; verify against anthropic.com/pricing before relying on
+        // the figure for billing.
         let (input_per_million_usd, output_per_million_usd) = if model
             .starts_with("claude-opus-4-5")
             || model.starts_with("claude-opus-4-6")
@@ -115,6 +117,10 @@ struct AnthropicStreamAdapter<S> {
     input_tokens: Option<u64>,
     /// Output tokens from the latest `message_delta` event.
     output_tokens: Option<u64>,
+    /// Cache-read tokens from the `message_start` event.
+    cache_read_tokens: Option<u64>,
+    /// Cache-creation (write) tokens from the `message_start` event.
+    cache_creation_tokens: Option<u64>,
     /// Stop reason from the `message_delta` event, held until `message_stop`.
     stop_reason: Option<StopReason>,
     /// Block indices whose `ContentBlockStart` was filtered (e.g. redacted
@@ -129,6 +135,8 @@ impl<S> AnthropicStreamAdapter<S> {
             inner,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             stop_reason: None,
             filtered_indices: Vec::new(),
         }
@@ -137,10 +145,14 @@ impl<S> AnthropicStreamAdapter<S> {
     fn build_usage(&self) -> Usage {
         let input = self.input_tokens.unwrap_or(0);
         let output = self.output_tokens.unwrap_or(0);
+        let cache_read = self.cache_read_tokens.unwrap_or(0);
+        let cache_creation = self.cache_creation_tokens.unwrap_or(0);
         Usage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            total_tokens: Some(input + output),
+            total_tokens: Some(input + output + cache_read + cache_creation),
+            cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
         }
     }
 
@@ -151,6 +163,8 @@ impl<S> AnthropicStreamAdapter<S> {
         match raw {
             RawStreamEvent::MessageStart { message } => {
                 self.input_tokens = Some(message.usage.input_tokens);
+                self.cache_read_tokens = Some(message.usage.cache_read_input_tokens);
+                self.cache_creation_tokens = Some(message.usage.cache_creation_input_tokens);
                 None
             }
             RawStreamEvent::ContentBlockStart {
@@ -262,13 +276,13 @@ fn convert_request(
     model: &str,
     request: &LlmRequest,
 ) -> Result<CreateMessageRequest, GenerationError> {
-    let messages = request
+    let mut messages = request
         .messages
         .iter()
         .map(convert_message)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let tools = request.tools.as_ref().map(|tools| {
+    let mut tools: Option<Vec<ToolDef>> = request.tools.as_ref().map(|tools| {
         tools
             .iter()
             .map(|tool| ToolDef {
@@ -276,6 +290,7 @@ fn convert_request(
                 description: Some(tool.description.clone()),
                 input_schema: normalize_schema_for_strict_mode(tool.parameters.clone()),
                 strict: Some(true),
+                cache_control: None,
             })
             .collect()
     });
@@ -287,11 +302,18 @@ fn convert_request(
         .as_ref()
         .map(|schema| OutputFormat::new(schema.clone()));
 
+    let system = apply_cache_control(
+        &request.cache,
+        request.system.as_deref(),
+        tools.as_mut(),
+        &mut messages,
+    );
+
     Ok(CreateMessageRequest {
         model: model.to_string(),
         max_tokens: DEFAULT_MAX_TOKENS,
         messages,
-        system: request.system.clone(),
+        system,
         tools,
         tool_choice,
         temperature: None,
@@ -299,6 +321,61 @@ fn convert_request(
         output_format,
         stream: None,
     })
+}
+
+/// Anthropic honors at most four `cache_control` breakpoints per request.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// Translate the provider-agnostic [`CacheControl`](polaris_models::llm::CacheControl)
+/// into Anthropic `cache_control` markers, returning the `system` field to send.
+///
+/// The stable prefix (tools → system, in Anthropic's cache order) is covered by a
+/// single marker on the system block when a system prompt is present, or on the
+/// last tool otherwise — caching everything before it. Each requested message
+/// breakpoint marks the last block of that message. Markers are budgeted to
+/// [`MAX_CACHE_BREAKPOINTS`]; extras are dropped low-to-high (prefix first, then
+/// message breakpoints in order).
+fn apply_cache_control(
+    cache: &polaris_models::llm::CacheControl,
+    system: Option<&str>,
+    tools: Option<&mut Vec<ToolDef>>,
+    messages: &mut [MessageParam],
+) -> Option<SystemPrompt> {
+    let mut budget = MAX_CACHE_BREAKPOINTS;
+
+    // Prefix: one marker covers tools + system. Prefer the system block; fall
+    // back to the last tool when there is no system prompt.
+    let system = match (cache.prefix, system) {
+        (true, Some(text)) if budget > 0 => {
+            budget -= 1;
+            Some(SystemPrompt::Blocks(vec![SystemBlock::text(
+                text.to_string(),
+                Some(CacheControlMarker::ephemeral()),
+            )]))
+        }
+        (true, None) if budget > 0 => {
+            if let Some(last) = tools.and_then(|tools| tools.last_mut()) {
+                last.cache_control = Some(CacheControlMarker::ephemeral());
+                budget -= 1;
+            }
+            None
+        }
+        (_, Some(text)) => Some(SystemPrompt::Text(text.to_string())),
+        (_, None) => None,
+    };
+
+    // Message breakpoints: mark the last block of each referenced message.
+    for &idx in &cache.breakpoints {
+        if budget == 0 {
+            break;
+        }
+        if let Some(block) = messages.get_mut(idx).and_then(|msg| msg.content.last_mut()) {
+            block.set_cache_control(CacheControlMarker::ephemeral());
+            budget -= 1;
+        }
+    }
+
+    system
 }
 
 fn convert_message(message: &Message) -> Result<MessageParam, GenerationError> {
@@ -351,10 +428,14 @@ fn convert_user_block(block: &UserBlock) -> Result<ContentBlockParam, Generation
     match block {
         UserBlock::Text(block) => Ok(ContentBlockParam::Text {
             text: block.text.clone(),
+            cache_control: None,
         }),
         UserBlock::Image(image) => {
             let source = convert_image_to_source(image)?;
-            Ok(ContentBlockParam::Image { source })
+            Ok(ContentBlockParam::Image {
+                source,
+                cache_control: None,
+            })
         }
         UserBlock::Audio(_) => Err(GenerationError::UnsupportedContent(
             "Audio content is not supported by Anthropic".to_string(),
@@ -380,6 +461,7 @@ fn convert_user_block(block: &UserBlock) -> Result<ContentBlockParam, Generation
                 tool_use_id: result.id.clone(),
                 content,
                 is_error,
+                cache_control: None,
             })
         }
     }
@@ -389,17 +471,20 @@ fn convert_assistant_block(block: &AssistantBlock) -> Result<ContentBlockParam, 
     match block {
         AssistantBlock::Text(block) => Ok(ContentBlockParam::Text {
             text: block.text.clone(),
+            cache_control: None,
         }),
         AssistantBlock::ToolCall(call) => Ok(ContentBlockParam::ToolUse {
             id: call.id.clone(),
             name: call.function.name.clone(),
             input: call.function.arguments.clone(),
+            cache_control: None,
         }),
         AssistantBlock::Reasoning(reasoning) => {
             let signature = reasoning.signature.clone().unwrap_or_default();
             Ok(ContentBlockParam::Thinking {
                 thinking: reasoning.reasoning.join("\n"),
                 signature,
+                cache_control: None,
             })
         }
     }
@@ -430,12 +515,20 @@ fn convert_response(response: super::types::MessageResponse) -> LlmResponse {
         .filter_map(convert_content_block)
         .collect();
 
+    let usage = &response.usage;
     LlmResponse {
         content,
         usage: Usage {
-            input_tokens: Some(response.usage.input_tokens),
-            output_tokens: Some(response.usage.output_tokens),
-            total_tokens: Some(response.usage.input_tokens + response.usage.output_tokens),
+            input_tokens: Some(usage.input_tokens),
+            output_tokens: Some(usage.output_tokens),
+            total_tokens: Some(
+                usage.input_tokens
+                    + usage.output_tokens
+                    + usage.cache_read_input_tokens
+                    + usage.cache_creation_input_tokens,
+            ),
+            cache_read_tokens: Some(usage.cache_read_input_tokens),
+            cache_creation_tokens: Some(usage.cache_creation_input_tokens),
         },
         stop_reason,
     }
@@ -804,5 +897,177 @@ mod tests {
                 delta: ContentBlockDelta::Signature(s)
             } if s == "EqQBCgIYAhIM..."
         ));
+    }
+
+    // ── Prompt caching: request-side cache_control emission ──
+
+    use polaris_models::llm::{CacheControl, LlmRequest, ToolDefinition};
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    /// The JSON the wire request serializes to.
+    fn request_json(request: &LlmRequest) -> serde_json::Value {
+        serde_json::to_value(convert_request("claude-sonnet-4-6", request).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn cache_prefix_marks_the_system_block() {
+        let request = LlmRequest {
+            system: Some("You are helpful".to_string()),
+            messages: vec![Message::user("hi")],
+            tools: Some(vec![tool_def("search")]),
+            cache: CacheControl {
+                prefix: true,
+                breakpoints: vec![],
+            },
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        // System is emitted as a block array carrying the ephemeral marker.
+        let system = &json["system"];
+        assert!(
+            system.is_array(),
+            "system should be a block array: {system}"
+        );
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        // One marker covers tools+system, so the last tool is NOT separately marked.
+        assert!(json["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_prefix_without_system_marks_last_tool() {
+        let request = LlmRequest {
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: Some(vec![tool_def("a"), tool_def("b")]),
+            cache: CacheControl {
+                prefix: true,
+                breakpoints: vec![],
+            },
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        assert!(json.get("system").is_none() || json["system"].is_null());
+        assert!(json["tools"][0].get("cache_control").is_none());
+        assert_eq!(json["tools"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_breakpoints_mark_message_blocks() {
+        let request = LlmRequest {
+            system: Some("sys".to_string()),
+            messages: vec![
+                Message::user("first"),
+                Message::assistant("second"),
+                Message::user("third"),
+            ],
+            cache: CacheControl {
+                prefix: false,
+                breakpoints: vec![0, 2],
+            },
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        let msgs = &json["messages"];
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(msgs[1]["content"][0].get("cache_control").is_none());
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        // No prefix requested → plain system string.
+        assert!(json["system"].is_string());
+    }
+
+    #[test]
+    fn cache_markers_are_budget_capped_at_four() {
+        // Prefix (1) + five message breakpoints; only three messages can also be
+        // marked before the four-marker budget is exhausted.
+        let request = LlmRequest {
+            system: Some("sys".to_string()),
+            messages: (0..5).map(|i| Message::user(format!("m{i}"))).collect(),
+            cache: CacheControl {
+                prefix: true,
+                breakpoints: vec![0, 1, 2, 3, 4],
+            },
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        let marked = (0..5)
+            .filter(|&i| {
+                json["messages"][i]["content"][0]
+                    .get("cache_control")
+                    .is_some()
+            })
+            .count();
+        assert_eq!(marked, 3, "prefix + 3 message markers = 4 total");
+    }
+
+    #[test]
+    fn no_cache_control_emits_plain_string_system() {
+        let request = LlmRequest {
+            system: Some("sys".to_string()),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        assert!(json["system"].is_string());
+        assert!(
+            json["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    // ── Prompt caching: cache-usage parsing ──
+
+    #[test]
+    fn stream_usage_parses_cache_tokens() {
+        let mut adapter = AnthropicStreamAdapter::new(());
+        adapter.convert_event(RawStreamEvent::MessageStart {
+            message: MessageStartPayload {
+                usage: UsageResponse {
+                    input_tokens: 100,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 20,
+                    cache_read_input_tokens: 500,
+                },
+            },
+        });
+        let stop = adapter
+            .convert_event(RawStreamEvent::MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: anthropic_types::StopReason::EndTurn,
+                },
+                usage: Some(MessageDeltaUsage { output_tokens: 10 }),
+            })
+            .unwrap()
+            .unwrap();
+        match stop {
+            StreamEvent::MessageDelta { usage } => {
+                assert_eq!(usage.input_tokens, Some(100));
+                assert_eq!(usage.cache_read_tokens, Some(500));
+                assert_eq!(usage.cache_creation_tokens, Some(20));
+                // total = input + output + cache_read + cache_creation.
+                assert_eq!(usage.total_tokens, Some(100 + 10 + 500 + 20));
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_input_is_billed_at_the_discount_tier() {
+        // Sonnet: $3/M input, derived 0.1× read ($0.30/M) and 1.25× write ($3.75/M).
+        let rate = AnthropicProvider::new("k")
+            .pricing("claude-sonnet-4-6")
+            .unwrap();
+        // 1M cache-read tokens cost a tenth of 1M full-price input tokens.
+        let full = rate.cost(1_000_000, 0);
+        let cached = rate.cost_with_cache(0, 0, 1_000_000, 0);
+        assert!((full - 3.0).abs() < 1e-9, "full input = $3");
+        assert!((cached - 0.30).abs() < 1e-9, "cache read = $0.30");
     }
 }
