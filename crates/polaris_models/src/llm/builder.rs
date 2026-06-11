@@ -25,7 +25,9 @@
 
 use super::error::{ExtractionError, GenerationError};
 use super::model::Llm;
-use super::types::{LlmRequest, LlmResponse, LlmStream, Message, ToolChoice, ToolDefinition};
+use super::types::{
+    CacheControl, LlmRequest, LlmResponse, LlmStream, Message, ToolChoice, ToolDefinition,
+};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -52,6 +54,7 @@ pub struct LlmRequestBuilder<'a, S = Empty> {
     system: Option<String>,
     messages: Vec<Message>,
     tool_choice: Option<ToolChoice>,
+    cache: CacheControl,
     _state: PhantomData<S>,
 }
 
@@ -115,6 +118,43 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
         self.tool_choice = Some(ToolChoice::None);
         self
     }
+
+    /// Caches the stable prefix — the system prompt and tool definitions — for
+    /// prompt caching. This is the common case and the dominant cost win: the
+    /// fixed prefix is otherwise re-billed at full price on every call.
+    ///
+    /// A no-op on providers that don't support prompt caching.
+    #[must_use]
+    pub fn cache_prefix(mut self) -> Self {
+        self.cache.prefix = true;
+        self
+    }
+
+    /// Places a cache breakpoint after the most recently added message — i.e.
+    /// "everything up to here is stable, cache it". Call it as you assemble the
+    /// window (after the stable history, again before the rolling tail) so the
+    /// breakpoint positions are captured without computing indices by hand.
+    ///
+    /// A no-op when no messages have been added yet, or on providers without
+    /// prompt caching.
+    #[must_use]
+    pub fn cache_breakpoint(mut self) -> Self {
+        if let Some(last) = self.messages.len().checked_sub(1) {
+            self.cache.breakpoints.push(last);
+        }
+        self
+    }
+
+    /// Sets explicit cache-breakpoint message indices, replacing any previously
+    /// recorded breakpoints. Use this on the bulk path where a context strategy
+    /// computes breakpoint positions over a window it assembled (the
+    /// [`cache_breakpoint`](Self::cache_breakpoint) verb is the incremental
+    /// alternative).
+    #[must_use]
+    pub fn cache_breakpoints(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
+        self.cache.breakpoints = indices.into_iter().collect();
+        self
+    }
 }
 
 // ─────────────────────
@@ -130,6 +170,7 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
             system: self.system,
             messages: self.messages,
             tool_choice: self.tool_choice,
+            cache: self.cache,
             _state: PhantomData,
         }
     }
@@ -180,6 +221,7 @@ impl<'a> LlmRequestBuilder<'a, Ready> {
             tools,
             tool_choice: self.tool_choice,
             output_schema: None,
+            cache: self.cache,
         };
 
         (self.llm, request)
@@ -237,6 +279,7 @@ impl<'a> LlmRequestBuilder<'a, Empty> {
             system: None,
             messages: Vec::new(),
             tool_choice: None,
+            cache: CacheControl::default(),
             _state: PhantomData,
         }
     }
@@ -291,6 +334,84 @@ mod tests {
             .with_definitions(vec![make_tool_def("b"), make_tool_def("c")]);
 
         assert_eq!(builder.tool_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn cache_verbs_populate_request_cache_control() {
+        struct CacheAssertingProvider;
+
+        impl crate::llm::provider::LlmProvider for CacheAssertingProvider {
+            fn name(&self) -> &'static str {
+                "cache_mock"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                assert!(request.cache.prefix, "cache_prefix() sets prefix");
+                // `.cache_breakpoint()` after the first message marks index 0;
+                // `.cache_breakpoints([2])` then replaces with the explicit set.
+                assert_eq!(request.cache.breakpoints, vec![2]);
+                Ok(LlmResponse {
+                    content: vec![AssistantBlock::Text("ok".into())],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                })
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(CacheAssertingProvider);
+        let llm = registry.llm("cache_mock/test").unwrap();
+        llm.builder()
+            .system("sys")
+            .user("first")
+            .cache_prefix()
+            .cache_breakpoint()
+            .assistant("second")
+            .user("third")
+            .cache_breakpoints([2])
+            .generate()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_breakpoint_before_any_message_is_a_noop() {
+        struct CacheAssertingProvider;
+
+        impl crate::llm::provider::LlmProvider for CacheAssertingProvider {
+            fn name(&self) -> &'static str {
+                "cache_mock"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                // `.cache_breakpoint()` called before any message was added
+                // records nothing (no index to anchor on).
+                assert!(request.cache.breakpoints.is_empty());
+                Ok(LlmResponse {
+                    content: vec![AssistantBlock::Text("ok".into())],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                })
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(CacheAssertingProvider);
+        let llm = registry.llm("cache_mock/test").unwrap();
+        llm.builder()
+            .cache_breakpoint()
+            .user("first")
+            .generate()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -468,6 +589,7 @@ mod tests {
                             input_tokens: Some(10),
                             output_tokens: Some(5),
                             total_tokens: Some(15),
+                            ..Default::default()
                         },
                     }),
                 ];
@@ -487,6 +609,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             output_schema: None,
+            cache: CacheControl::default(),
         };
         let stream = llm.stream(request).await.unwrap();
         let response = stream.collect_response().await.unwrap();

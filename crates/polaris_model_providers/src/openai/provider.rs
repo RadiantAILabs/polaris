@@ -507,11 +507,19 @@ fn convert_output_message_content(
     }
 }
 
+/// Converts `OpenAI` token usage to Polaris usage.
+///
+/// `cache_read_tokens` / `cache_creation_tokens` are left `None`: prompt caching
+/// is wired only for Anthropic so far. `OpenAI` *does* report cached input
+/// (`input_tokens_details.cached_tokens`), so surface it here when caching is
+/// enabled for this provider — otherwise cached input is silently under-counted
+/// in cost estimates.
 fn convert_usage(usage: ResponseUsage) -> Usage {
     Usage {
         input_tokens: Some(u64::from(usage.input_tokens)),
         output_tokens: Some(u64::from(usage.output_tokens)),
         total_tokens: Some(u64::from(usage.total_tokens)),
+        ..Default::default()
     }
 }
 

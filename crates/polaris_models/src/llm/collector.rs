@@ -211,6 +211,7 @@ mod tests {
             input_tokens: Some(input),
             output_tokens: Some(output),
             total_tokens: Some(input + output),
+            ..Default::default()
         }
     }
 
