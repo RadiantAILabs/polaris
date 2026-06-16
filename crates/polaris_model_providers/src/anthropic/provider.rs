@@ -1141,4 +1141,87 @@ mod tests {
         assert!((full - 3.0).abs() < 1e-9, "full input = $3");
         assert!((cached - 0.30).abs() < 1e-9, "cache read = $0.30");
     }
+
+    #[test]
+    fn cache_breakpoint_marks_tool_use_and_tool_result_blocks() {
+        // A breakpoint can land on a message whose last block is a tool_use
+        // (assistant) or tool_result (user), not just plain text — the marker
+        // must attach to those `ContentBlockParam` arms too, not only `Text`.
+        let request = LlmRequest {
+            messages: vec![
+                Message::assistant_tool_call(ToolCall::new(
+                    "call_1",
+                    "search",
+                    serde_json::json!({ "q": "x" }),
+                )),
+                Message::tool_result("call_1", PolarisToolResult::Text("done".to_string())),
+            ],
+            cache: CacheControl {
+                prefix: false,
+                breakpoints: vec![0, 1],
+            },
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        let msgs = &json["messages"];
+        assert_eq!(msgs[0]["content"][0]["type"], "tool_use");
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "tool_use block must carry the cache marker: {}",
+            msgs[0]
+        );
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            msgs[1]["content"][0]["cache_control"]["type"], "ephemeral",
+            "tool_result block must carry the cache marker: {}",
+            msgs[1]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn out_of_range_breakpoint_trips_debug_assert() {
+        // A stale breakpoint index (past the message list) is a context-strategy
+        // bug, caught loudly in debug builds. In release the `debug_assert!` is
+        // compiled out and `messages.get_mut(idx)` skips it silently, leaving
+        // other markers intact — so this guard never panics in production.
+        let request = LlmRequest {
+            messages: vec![Message::user("only one")],
+            cache: CacheControl {
+                prefix: false,
+                breakpoints: vec![5],
+            },
+            ..Default::default()
+        };
+        let _ = request_json(&request);
+    }
+
+    #[test]
+    fn total_tokens_saturates_instead_of_overflowing() {
+        // A response whose token tiers sum past u64::MAX must saturate, not
+        // panic on debug-overflow — guards the `saturating_add` folding in
+        // `convert_response`.
+        let response = super::super::types::MessageResponse {
+            id: "msg_overflow".to_string(),
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![],
+            model: "claude-sonnet-4-6".to_string(),
+            stop_reason: anthropic_types::StopReason::EndTurn,
+            stop_sequence: None,
+            usage: UsageResponse {
+                input_tokens: u64::MAX,
+                output_tokens: u64::MAX,
+                cache_creation_input_tokens: u64::MAX,
+                cache_read_input_tokens: u64::MAX,
+            },
+        };
+        let converted = convert_response(response);
+        assert_eq!(
+            converted.usage.total_tokens,
+            Some(u64::MAX),
+            "summed token tiers must saturate at u64::MAX, not wrap or panic"
+        );
+    }
 }
