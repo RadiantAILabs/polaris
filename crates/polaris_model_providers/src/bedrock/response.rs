@@ -125,3 +125,39 @@ fn convert_usage(usage: Option<bedrock::TokenUsage>) -> polaris_llm::Usage {
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convert_usage_leaves_cache_fields_none() {
+        // Prompt caching is wired only for Anthropic; the Bedrock converter must
+        // leave the cache tiers `None` so the usage rollup neither prices nor
+        // counts them — even though Bedrock *does* report cache tokens upstream.
+        // Set the upstream cache fields here to prove they are deliberately
+        // dropped, locking the contract against accidental future wiring.
+        let usage = bedrock::TokenUsage::builder()
+            .input_tokens(10)
+            .output_tokens(5)
+            .total_tokens(15)
+            .cache_read_input_tokens(7)
+            .cache_write_input_tokens(3)
+            .build()
+            .expect("token usage with all required fields builds");
+
+        let converted = convert_usage(Some(usage));
+
+        assert_eq!(converted.input_tokens, Some(10));
+        assert_eq!(converted.output_tokens, Some(5));
+        assert_eq!(converted.total_tokens, Some(15));
+        assert_eq!(converted.cache_read_tokens, None);
+        assert_eq!(converted.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn convert_usage_defaults_when_absent() {
+        // A response with no usage block yields a default (all-`None`) Usage.
+        assert_eq!(convert_usage(None), polaris_llm::Usage::default());
+    }
+}

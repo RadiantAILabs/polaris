@@ -47,8 +47,16 @@ pub struct LlmRequest {
 /// Construct via [`LlmRequestBuilder`](super::builder::LlmRequestBuilder)'s
 /// [`cache_prefix()`](super::builder::LlmRequestBuilder::cache_prefix) /
 /// [`cache_breakpoint()`](super::builder::LlmRequestBuilder::cache_breakpoint)
-/// verbs rather than computing indices by hand. [`Default`] is "no caching".
+/// verbs rather than computing indices by hand, or build one standalone with
+/// [`CacheControl::prefix`] /
+/// [`with_breakpoints`](CacheControl::with_breakpoints). [`Default`] is "no
+/// caching".
+///
+/// `#[non_exhaustive]` - breakpoint kinds may be added in the future to
+/// construct it through the verbs/constructors above rather than a
+/// struct literal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CacheControl {
     /// Cache the stable prefix: the system prompt and tool definitions.
     ///
@@ -65,10 +73,39 @@ pub struct CacheControl {
 }
 
 impl CacheControl {
-    /// Returns `true` when no caching is requested (the [`Default`]).
+    /// A [`CacheControl`] that caches the stable prefix (system prompt + tool
+    /// definitions) and nothing else — the common case and the dominant cost
+    /// win. Equivalent to the builder's
+    /// [`cache_prefix()`](super::builder::LlmRequestBuilder::cache_prefix) verb.
+    #[must_use]
+    pub fn prefix() -> Self {
+        Self {
+            prefix: true,
+            breakpoints: Vec::new(),
+        }
+    }
+
+    /// Sets the message breakpoint indices (into [`LlmRequest::messages`]),
+    /// replacing any already present, and returns the updated value. Chains
+    /// onto [`prefix`](Self::prefix) or [`Default`].
+    #[must_use]
+    pub fn with_breakpoints(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
+        self.breakpoints = indices.into_iter().collect();
+        self
+    }
+
+    /// Returns `true` when at least one cache breakpoint (prefix or message) is
+    /// requested.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.prefix || !self.breakpoints.is_empty()
+    }
+
+    /// Returns `true` when no caching is requested (the [`Default`]) — the
+    /// negation of [`is_enabled`](Self::is_enabled).
     #[must_use]
     pub fn is_disabled(&self) -> bool {
-        !self.prefix && self.breakpoints.is_empty()
+        !self.is_enabled()
     }
 }
 
@@ -213,11 +250,16 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
     /// Total tokens (input + output, including any cached input).
     pub total_tokens: Option<u64>,
-    /// Input tokens served from the prompt cache, billed at the cache-read rate.
+    /// Input tokens served from the prompt cache, priced by
+    /// [`ModelPricing::cache_read_per_million_usd`](super::ModelPricing::cache_read_per_million_usd).
     #[serde(default)]
     pub cache_read_tokens: Option<u64>,
-    /// Input tokens written to the prompt cache this call, billed at the
-    /// cache-write rate.
+    /// Input tokens written to the prompt cache this call.
+    ///
+    /// Named "creation" to mirror the provider wire field (Anthropic's
+    /// `cache_creation_input_tokens`); these are the same tokens priced by
+    /// [`ModelPricing::cache_write_per_million_usd`](super::ModelPricing::cache_write_per_million_usd)
+    /// ("write" being the billing-tier term for them).
     #[serde(default)]
     pub cache_creation_tokens: Option<u64>,
 }
@@ -860,3 +902,44 @@ pub enum StreamEvent {
 /// [`Llm`](super::model::Llm), and [`LlmRequestBuilder`](super::builder::LlmRequestBuilder).
 pub type LlmStream =
     Pin<Box<dyn Stream<Item = Result<StreamEvent, super::error::GenerationError>> + Send>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_control_default_is_disabled() {
+        let cache = CacheControl::default();
+        assert!(cache.is_disabled());
+        assert!(!cache.is_enabled());
+    }
+
+    #[test]
+    fn cache_control_prefix_constructor_enables_only_the_prefix() {
+        let cache = CacheControl::prefix();
+        assert!(cache.prefix);
+        assert!(cache.breakpoints.is_empty());
+        assert!(cache.is_enabled());
+        assert!(!cache.is_disabled());
+    }
+
+    #[test]
+    fn cache_control_with_breakpoints_sets_indices_and_enables() {
+        // Breakpoints alone (no prefix) still count as enabled, and the
+        // constructor *replaces* rather than appends.
+        let cache = CacheControl::default()
+            .with_breakpoints([3, 1])
+            .with_breakpoints([0, 2]);
+        assert!(!cache.prefix);
+        assert_eq!(cache.breakpoints, vec![0, 2]);
+        assert!(cache.is_enabled());
+    }
+
+    #[test]
+    fn cache_control_prefix_and_breakpoints_compose() {
+        let cache = CacheControl::prefix().with_breakpoints([4]);
+        assert!(cache.prefix);
+        assert_eq!(cache.breakpoints, vec![4]);
+        assert!(cache.is_enabled());
+    }
+}

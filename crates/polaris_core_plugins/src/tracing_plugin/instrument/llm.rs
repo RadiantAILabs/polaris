@@ -296,12 +296,26 @@ mod tests {
     /// (avoids requiring `Clone` on `GenerationError`).
     struct StubStreamProvider {
         events: Mutex<Option<VecDeque<Result<StreamEvent, GenerationError>>>>,
+        pricing: Option<ModelPricing>,
     }
 
     impl StubStreamProvider {
         fn new(events: Vec<Result<StreamEvent, GenerationError>>) -> Self {
             Self {
                 events: Mutex::new(Some(events.into())),
+                pricing: None,
+            }
+        }
+
+        /// Like [`new`](Self::new) but advertises a fixed pricing rate, so the
+        /// stream path exercises `record_cost` on `MessageStop`.
+        fn with_pricing(
+            events: Vec<Result<StreamEvent, GenerationError>>,
+            pricing: ModelPricing,
+        ) -> Self {
+            Self {
+                events: Mutex::new(Some(events.into())),
+                pricing: Some(pricing),
             }
         }
     }
@@ -334,7 +348,7 @@ mod tests {
         }
 
         fn pricing(&self, _model: &str) -> Option<ModelPricing> {
-            None
+            self.pricing
         }
     }
 
@@ -586,6 +600,77 @@ mod tests {
         assert!(
             (cost - 3.30).abs() < 1e-9,
             "expected $3.30 incl. cache-read tier, got {cost}",
+        );
+    }
+
+    /// The streaming path must record cache tokens and bill them at the cache
+    /// tiers too. `record_usage_tokens`/`record_cost` fire from both the
+    /// `generate()` path and `TracingStream::poll_next` on `MessageStop`, but
+    /// only the former was covered. A regression in the stream branch (e.g.
+    /// dropping `record_cost` on `MessageStop`) would otherwise pass CI.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_records_cache_tokens_and_cache_tier_cost() {
+        let records = Arc::new(Mutex::new(Vec::<SpanRecord>::new()));
+        let sink = Arc::new(CapturingSink {
+            records: Arc::clone(&records),
+        });
+        let layer = RecordingLayer::with_sink(sink);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let provider = TracingLlmProvider::new(
+            Arc::new(StubStreamProvider::with_pricing(
+                vec![Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage {
+                        input_tokens: Some(1_000_000),
+                        output_tokens: Some(0),
+                        total_tokens: Some(2_000_000),
+                        cache_read_tokens: Some(1_000_000),
+                        cache_creation_tokens: None,
+                    },
+                })],
+                ModelPricing::new(3.0, 15.0),
+            )),
+            false,
+        );
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut stream = provider
+            .stream("test-model", empty_request())
+            .await
+            .expect("stream must start");
+        let items = drain_stream(&mut stream);
+        assert_eq!(items.len(), 1);
+        // Drop the stream so the cloned chat span closes and the layer emits
+        // its close record with the fields the stream branch recorded.
+        drop(stream);
+        drop(_guard);
+
+        let captured = records.lock();
+        let chat = captured
+            .iter()
+            .find(|r| r.name == "chat")
+            .expect("chat span must be recorded");
+
+        // The stream branch records the cache-read count for the aggregator.
+        assert_eq!(
+            chat.fields
+                .get("gen_ai.usage.cache_read_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(1_000_000),
+            "cache_read_tokens must be recorded on the streamed span"
+        );
+
+        let cost = chat
+            .fields
+            .get("gen_ai.usage.cost_usd")
+            .expect("cost present on the streamed span")
+            .as_f64()
+            .expect("cost must serialize as a number");
+        // 1M input @ $3/M + 1M cache-read @ $0.30/M (0.1x of $3) = $3.30.
+        assert!(
+            (cost - 3.30).abs() < 1e-9,
+            "expected $3.30 incl. cache-read tier on the stream path, got {cost}",
         );
     }
 }

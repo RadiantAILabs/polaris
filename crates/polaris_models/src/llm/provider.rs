@@ -18,9 +18,12 @@ pub struct ModelPricing {
     pub input_per_million_usd: f64,
     /// USD charged per million output tokens.
     pub output_per_million_usd: f64,
-    /// USD charged per million tokens served from the prompt cache.
+    /// USD charged per million tokens served from the prompt cache (prices
+    /// [`Usage::cache_read_tokens`](super::Usage::cache_read_tokens)).
     pub cache_read_per_million_usd: f64,
-    /// USD charged per million tokens written to the prompt cache.
+    /// USD charged per million tokens written to the prompt cache. "Write" is
+    /// the billing-tier term; it prices the tokens the response reports as
+    /// [`Usage::cache_creation_tokens`](super::Usage::cache_creation_tokens).
     pub cache_write_per_million_usd: f64,
 }
 
@@ -76,6 +79,10 @@ impl ModelPricing {
 
     /// Estimated USD cost for a single call, billing cached input at the
     /// cache-read / cache-write tiers and the rest at the full input rate.
+    ///
+    /// A best-effort estimate computed in `f64`: token counts above 2^53 lose
+    /// precision and pathological counts/rates can saturate to `f64::INFINITY`.
+    /// Should not be used as a billing source of truth.
     #[must_use]
     pub fn cost_with_cache(
         &self,

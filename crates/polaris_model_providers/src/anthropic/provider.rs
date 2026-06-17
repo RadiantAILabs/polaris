@@ -380,16 +380,28 @@ fn apply_cache_control(
         if budget == 0 {
             break;
         }
-        debug_assert!(
-            idx < messages.len(),
-            "cache breakpoint index {idx} out of range for {} messages; \
-             a context strategy produced a stale breakpoint",
-            messages.len()
-        );
-        if let Some(block) = messages.get_mut(idx).and_then(|msg| msg.content.last_mut()) {
-            block.set_cache_control(CacheControlMarker::ephemeral());
-            budget -= 1;
-        }
+        let Some(block) = messages.get_mut(idx).and_then(|msg| msg.content.last_mut()) else {
+            // A stale breakpoint (index past the message list, or an empty
+            // message with no block to mark) silently produces no marker in
+            // release, degrading the cache hit rate with no signal. Trip the
+            // assertion in debug to fail fast in tests, and warn in release so
+            // the misconfiguration is observable rather than invisible.
+            debug_assert!(
+                idx < messages.len(),
+                "cache breakpoint index {idx} out of range for {} messages; \
+                 a context strategy produced a stale breakpoint",
+                messages.len()
+            );
+            tracing::warn!(
+                breakpoint = idx,
+                message_count = messages.len(),
+                "dropping cache breakpoint with no markable block; \
+                 a context strategy produced a stale breakpoint"
+            );
+            continue;
+        };
+        block.set_cache_control(CacheControlMarker::ephemeral());
+        budget -= 1;
     }
 
     system
@@ -940,10 +952,7 @@ mod tests {
             system: Some("You are helpful".to_string()),
             messages: vec![Message::user("hi")],
             tools: Some(vec![tool_def("search")]),
-            cache: CacheControl {
-                prefix: true,
-                breakpoints: vec![],
-            },
+            cache: CacheControl::prefix(),
             ..Default::default()
         };
         let json = request_json(&request);
@@ -964,10 +973,7 @@ mod tests {
             system: None,
             messages: vec![Message::user("hi")],
             tools: Some(vec![tool_def("a"), tool_def("b")]),
-            cache: CacheControl {
-                prefix: true,
-                breakpoints: vec![],
-            },
+            cache: CacheControl::prefix(),
             ..Default::default()
         };
         let json = request_json(&request);
@@ -985,10 +991,7 @@ mod tests {
                 Message::assistant("second"),
                 Message::user("third"),
             ],
-            cache: CacheControl {
-                prefix: false,
-                breakpoints: vec![0, 2],
-            },
+            cache: CacheControl::default().with_breakpoints([0, 2]),
             ..Default::default()
         };
         let json = request_json(&request);
@@ -1007,21 +1010,25 @@ mod tests {
         let request = LlmRequest {
             system: Some("sys".to_string()),
             messages: (0..5).map(|i| Message::user(format!("m{i}"))).collect(),
-            cache: CacheControl {
-                prefix: true,
-                breakpoints: vec![0, 1, 2, 3, 4],
-            },
+            cache: CacheControl::prefix().with_breakpoints([0, 1, 2, 3, 4]),
             ..Default::default()
         };
         let json = request_json(&request);
-        let marked = (0..5)
+        let marked: Vec<usize> = (0..5)
             .filter(|&i| {
                 json["messages"][i]["content"][0]
                     .get("cache_control")
                     .is_some()
             })
-            .count();
-        assert_eq!(marked, 3, "prefix + 3 message markers = 4 total");
+            .collect();
+        // Prefix takes one marker; the remaining three go to the *lowest*
+        // breakpoint indices in order (0, 1, 2), and 3 & 4 are dropped — locking
+        // the documented low-to-high drop order, not just the count.
+        assert_eq!(
+            marked,
+            vec![0, 1, 2],
+            "prefix + 3 lowest message markers = 4 total; 3 & 4 dropped"
+        );
     }
 
     #[test]
@@ -1049,10 +1056,7 @@ mod tests {
                 system: None,
                 messages: vec![Message::user("hi")],
                 tools,
-                cache: CacheControl {
-                    prefix: true,
-                    breakpoints: vec![],
-                },
+                cache: CacheControl::prefix(),
                 ..Default::default()
             };
             let json = request_json(&request);
@@ -1156,10 +1160,7 @@ mod tests {
                 )),
                 Message::tool_result("call_1", PolarisToolResult::Text("done".to_string())),
             ],
-            cache: CacheControl {
-                prefix: false,
-                breakpoints: vec![0, 1],
-            },
+            cache: CacheControl::default().with_breakpoints([0, 1]),
             ..Default::default()
         };
         let json = request_json(&request);
@@ -1184,14 +1185,12 @@ mod tests {
     fn out_of_range_breakpoint_trips_debug_assert() {
         // A stale breakpoint index (past the message list) is a context-strategy
         // bug, caught loudly in debug builds. In release the `debug_assert!` is
-        // compiled out and `messages.get_mut(idx)` skips it silently, leaving
-        // other markers intact — so this guard never panics in production.
+        // compiled out and `messages.get_mut(idx)` skips it (logging a
+        // `tracing::warn!`), leaving other markers intact — so this guard never
+        // panics in production.
         let request = LlmRequest {
             messages: vec![Message::user("only one")],
-            cache: CacheControl {
-                prefix: false,
-                breakpoints: vec![5],
-            },
+            cache: CacheControl::default().with_breakpoints([5]),
             ..Default::default()
         };
         let _ = request_json(&request);
