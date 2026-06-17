@@ -404,16 +404,28 @@ fn apply_cache_control(
         if budget == 0 {
             break;
         }
-        debug_assert!(
-            idx < messages.len(),
-            "cache breakpoint index {idx} out of range for {} messages; \
-             a context strategy produced a stale breakpoint",
-            messages.len()
-        );
-        if let Some(block) = messages.get_mut(idx).and_then(|msg| msg.content.last_mut()) {
-            block.set_cache_control(CacheControlMarker::ephemeral());
-            budget -= 1;
-        }
+        let Some(block) = messages.get_mut(idx).and_then(|msg| msg.content.last_mut()) else {
+            // A stale breakpoint (index past the message list, or an empty
+            // message with no block to mark) silently produces no marker in
+            // release, degrading the cache hit rate with no signal. Trip the
+            // assertion in debug to fail fast in tests, and warn in release so
+            // the misconfiguration is observable rather than invisible.
+            debug_assert!(
+                idx < messages.len(),
+                "cache breakpoint index {idx} out of range for {} messages; \
+                 a context strategy produced a stale breakpoint",
+                messages.len()
+            );
+            tracing::warn!(
+                breakpoint = idx,
+                message_count = messages.len(),
+                "dropping cache breakpoint with no markable block; \
+                 a context strategy produced a stale breakpoint"
+            );
+            continue;
+        };
+        block.set_cache_control(CacheControlMarker::ephemeral());
+        budget -= 1;
     }
 
     system
@@ -964,10 +976,7 @@ mod tests {
             system: Some("You are helpful".to_string()),
             messages: vec![Message::user("hi")],
             tools: Some(vec![tool_def("search")]),
-            cache: CacheControl {
-                prefix: true,
-                breakpoints: vec![],
-            },
+            cache: CacheControl::prefix(),
             ..Default::default()
         };
         let json = request_json(&request);
@@ -988,10 +997,7 @@ mod tests {
             system: None,
             messages: vec![Message::user("hi")],
             tools: Some(vec![tool_def("a"), tool_def("b")]),
-            cache: CacheControl {
-                prefix: true,
-                breakpoints: vec![],
-            },
+            cache: CacheControl::prefix(),
             ..Default::default()
         };
         let json = request_json(&request);
@@ -1084,10 +1090,7 @@ mod tests {
                 Message::assistant("second"),
                 Message::user("third"),
             ],
-            cache: CacheControl {
-                prefix: false,
-                breakpoints: vec![0, 2],
-            },
+            cache: CacheControl::default().with_breakpoints([0, 2]),
             ..Default::default()
         };
         let json = request_json(&request);
@@ -1106,21 +1109,25 @@ mod tests {
         let request = LlmRequest {
             system: Some("sys".to_string()),
             messages: (0..5).map(|i| Message::user(format!("m{i}"))).collect(),
-            cache: CacheControl {
-                prefix: true,
-                breakpoints: vec![0, 1, 2, 3, 4],
-            },
+            cache: CacheControl::prefix().with_breakpoints([0, 1, 2, 3, 4]),
             ..Default::default()
         };
         let json = request_json(&request);
-        let marked = (0..5)
+        let marked: Vec<usize> = (0..5)
             .filter(|&i| {
                 json["messages"][i]["content"][0]
                     .get("cache_control")
                     .is_some()
             })
-            .count();
-        assert_eq!(marked, 3, "prefix + 3 message markers = 4 total");
+            .collect();
+        // Prefix takes one marker; the remaining three go to the *lowest*
+        // breakpoint indices in order (0, 1, 2), and 3 & 4 are dropped — locking
+        // the documented low-to-high drop order, not just the count.
+        assert_eq!(
+            marked,
+            vec![0, 1, 2],
+            "prefix + 3 lowest message markers = 4 total; 3 & 4 dropped"
+        );
     }
 
     #[test]
@@ -1148,10 +1155,7 @@ mod tests {
                 system: None,
                 messages: vec![Message::user("hi")],
                 tools,
-                cache: CacheControl {
-                    prefix: true,
-                    breakpoints: vec![],
-                },
+                cache: CacheControl::prefix(),
                 ..Default::default()
             };
             let json = request_json(&request);
@@ -1239,5 +1243,83 @@ mod tests {
         let cached = rate.cost_with_cache(0, 0, 1_000_000, 0);
         assert!((full - 3.0).abs() < 1e-9, "full input = $3");
         assert!((cached - 0.30).abs() < 1e-9, "cache read = $0.30");
+    }
+
+    #[test]
+    fn cache_breakpoint_marks_tool_use_and_tool_result_blocks() {
+        // A breakpoint can land on a message whose last block is a tool_use
+        // (assistant) or tool_result (user), not just plain text — the marker
+        // must attach to those `ContentBlockParam` arms too, not only `Text`.
+        let request = LlmRequest {
+            messages: vec![
+                Message::assistant_tool_call(ToolCall::new(
+                    "call_1",
+                    "search",
+                    serde_json::json!({ "q": "x" }),
+                )),
+                Message::tool_result("call_1", PolarisToolResult::Text("done".to_string())),
+            ],
+            cache: CacheControl::default().with_breakpoints([0, 1]),
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        let msgs = &json["messages"];
+        assert_eq!(msgs[0]["content"][0]["type"], "tool_use");
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "tool_use block must carry the cache marker: {}",
+            msgs[0]
+        );
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            msgs[1]["content"][0]["cache_control"]["type"], "ephemeral",
+            "tool_result block must carry the cache marker: {}",
+            msgs[1]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn out_of_range_breakpoint_trips_debug_assert() {
+        // A stale breakpoint index (past the message list) is a context-strategy
+        // bug, caught loudly in debug builds. In release the `debug_assert!` is
+        // compiled out and `messages.get_mut(idx)` skips it (logging a
+        // `tracing::warn!`), leaving other markers intact — so this guard never
+        // panics in production.
+        let request = LlmRequest {
+            messages: vec![Message::user("only one")],
+            cache: CacheControl::default().with_breakpoints([5]),
+            ..Default::default()
+        };
+        let _ = request_json(&request);
+    }
+
+    #[test]
+    fn total_tokens_saturates_instead_of_overflowing() {
+        // A response whose token tiers sum past u64::MAX must saturate, not
+        // panic on debug-overflow — guards the `saturating_add` folding in
+        // `convert_response`.
+        let response = super::super::types::MessageResponse {
+            id: "msg_overflow".to_string(),
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![],
+            model: "claude-sonnet-4-6".to_string(),
+            stop_reason: anthropic_types::StopReason::EndTurn,
+            stop_sequence: None,
+            usage: UsageResponse {
+                input_tokens: u64::MAX,
+                output_tokens: u64::MAX,
+                cache_creation_input_tokens: u64::MAX,
+                cache_read_input_tokens: u64::MAX,
+            },
+        };
+        let converted = convert_response(response);
+        assert_eq!(
+            converted.usage.total_tokens,
+            Some(u64::MAX),
+            "summed token tiers must saturate at u64::MAX, not wrap or panic"
+        );
     }
 }

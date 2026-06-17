@@ -189,6 +189,38 @@ let response = llm.builder()
     .await?;
 ```
 
+## Prompt Caching
+
+Prompt caching is a provider-agnostic request feature: the builder marks which parts of a request are stable enough to cache, and each provider decides how to honor them. A provider that supports caching translates the markers into its native cache directives; one that does not simply ignores them, so the same `LlmRequest` runs unchanged on every provider.
+
+### Consumer side
+
+The builder exposes cache breakpoints:
+
+- `.cache_prefix()` — caches the stable prefix (system prompt + tool definitions). This is the dominant cost win, since that prefix is otherwise re-billed in full on every call.
+- `.cache_breakpoint()` — marks "everything up to here is stable" as you assemble a context window, for incremental history caching.
+- `.cache_breakpoints(indices)` — the bulk form, taking the message indices to mark in one call (handy when a context strategy computes them).
+
+```rust
+let response = llm.builder()
+    .system("You are helpful")
+    .cache_prefix()         // marks the system + tools prefix
+    .user("Hello!")
+    .generate()
+    .await?;
+```
+
+These verbs populate `CacheControl` on the `LlmRequest`; the default (no verbs called) is an empty `CacheControl` that requests no caching.
+
+### Provider side
+
+When you implement `generate()` / `stream()`, read `request.cache` (a `CacheControl`) and translate it into your vendor's cache directives:
+
+- **Honoring it.** The Anthropic provider maps the prefix marker onto the system block — or the last tool when there is no system prompt — and each message breakpoint onto the last block of the referenced message, emitting `cache_control: { "type": "ephemeral" }`. Anthropic honors at most four breakpoints per request, so the provider budgets markers and drops extras low-to-high (prefix first, then message breakpoints in order); a stale (out-of-range) breakpoint index is skipped and surfaced with a `tracing::warn!` rather than silently lost.
+- **Ignoring it.** A provider with no cache support leaves `request.cache` untouched and sends the request as-is. Caching is therefore purely opt-in per provider, and adding a new provider never needs to think about it.
+
+Report cache usage back on `LlmResponse::usage` so cost accounting stays accurate: set `Usage::cache_read_tokens` (input served from cache, billed at a steep discount) and `Usage::cache_creation_tokens` (input written to the cache the first time, billed at a small premium). The tracing decorator prices these against the cache tiers on `ModelPricing` — `cache_read_per_million_usd` / `cache_write_per_million_usd`, derived from the input rate by default and overridable via `ModelPricing::with_cache_rates` — and records the result in `gen_ai.usage.cost_usd`. A provider that does not report cache tokens leaves both fields `None`, and the rollup neither counts nor prices them.
+
 ## Testing
 
 - **Unit-test** `LlmRequest → vendor` translation pure functions in isolation.

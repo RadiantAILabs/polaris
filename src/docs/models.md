@@ -59,14 +59,15 @@ The builder exposes provider-agnostic cache breakpoints. `.cache_prefix()` cache
 the stable prefix (system prompt + tool definitions), the dominant cost win since
 that prefix is otherwise re-billed in full on every call. `.cache_breakpoint()`
 marks "everything up to here is stable" as you assemble a window, for incremental
-history caching.
+history caching; `.cache_breakpoints(indices)` is the bulk form, taking the
+message indices to mark in one call (handy when a context strategy computes them).
 
 ```no_run
 # use polaris_ai::models::llm::Llm;
 # async fn f(llm: Llm) -> Result<(), Box<dyn std::error::Error>> {
 let response = llm.builder()
     .system("You are helpful")
-    .cache_prefix()
+    .cache_prefix() // position-independent: marks the system + tools prefix
     .user("Hello!")
     .generate()
     .await?;
@@ -77,7 +78,7 @@ A provider that supports caching (Anthropic) translates these into its native
 `cache_control` markers; one that does not simply ignores them. Cached input is
 reported separately on [`Usage`](crate::models::llm::Usage)
 (`cache_read_tokens` / `cache_creation_tokens`) and billed at the cache tiers in
-[`ModelPricing`](crate::models::ModelPricing).
+[`ModelPricing`](crate::models::llm::ModelPricing).
 
 # Adding a Custom Provider
 

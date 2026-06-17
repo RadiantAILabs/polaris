@@ -954,6 +954,18 @@ mod tests {
     }
 
     #[test]
+    fn convert_usage_leaves_cache_fields_none() {
+        // Prompt caching is wired only for Anthropic; the OpenAI converter must
+        // leave the cache tiers `None` so the usage rollup neither prices nor
+        // counts them. Locks that contract against accidental future wiring.
+        let usage = convert_usage(stub_usage());
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.cache_creation_tokens, None);
+    }
+
+    #[test]
     fn converts_text_stream() {
         let mut adapter = OpenAiStreamAdapter::new(());
 
