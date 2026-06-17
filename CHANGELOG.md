@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-06-17
+
+### Added
+
+- **Provider-agnostic prompt caching** (`polaris_models`) — `LlmRequest` carries a `CacheControl` that declares cache breakpoints (system prompt, tool definitions, long context) in a provider-neutral way, with builder cache verbs for ergonomic construction. Lets agents mark stable prefixes as cacheable to cut cost and latency on repeated turns; previously there was no way to express cache breakpoints through the `LlmRequest` builder.
+
+- **Anthropic cache emission and parsing** (`polaris_model_providers`) — the Anthropic provider translates `CacheControl` into `cache_control` markers on the outgoing request and parses `cache_creation_input_tokens` / `cache_read_input_tokens` back out of the usage response.
+
+- **Cache-tier usage and cost plumbing** (`polaris_models`, `polaris_model_providers`) — cache-tier token counts flow through `Usage` and into cost computation across providers (Anthropic, Bedrock, OpenAI), priced into the usage rollup with overflow-hardened arithmetic.
+
+- **Cache token tiers in tracing** (`polaris_core_plugins`) — LLM instrumentation surfaces cache-creation and cache-read token tiers alongside the existing input/output counts.
+
+### Changed
+
+- **Tolerate empty streamed tool-call arguments** (`polaris_model_providers`) — streamed tool calls that arrive with empty arguments are parsed without error.
+
+### Documentation
+
+- **Prompt caching docs** — `src/docs/models.md` and the models reference guide document the caching surface (`CacheControl`, builder verbs, usage/cost accounting).
+
 ## [0.4.2] - 2026-06-02
 
 ### Added
