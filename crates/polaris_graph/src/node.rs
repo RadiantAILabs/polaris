@@ -779,6 +779,19 @@ pub(crate) struct ResourceCrossing {
 /// | [`Shared`](Self::Shared) | [`ContextPolicy::shared`] |
 /// | [`Inherit`](Self::Inherit) | [`share_rest`](ContextPolicy::share_rest) on a [`ContextPolicy::new`] policy |
 /// | [`Isolated`](Self::Isolated) | a [`ContextPolicy::new`] policy without `share_rest` |
+///
+/// The [`Display`](fmt::Display) rendering is the capitalized variant name —
+/// `Shared` / `Inherit` / `Isolated` — and is interpolated into
+/// [`GraphEvent`](crate::hooks::events::GraphEvent) scope logs, so it is part of the
+/// observable surface that downstream log consumers may match against.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::ContextMode;
+///
+/// assert_eq!(ContextMode::Inherit.to_string(), "Inherit");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ContextMode {
@@ -797,9 +810,9 @@ pub enum ContextMode {
 impl fmt::Display for ContextMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ContextMode::Shared => f.write_str("shared"),
-            ContextMode::Inherit => f.write_str("inherit"),
-            ContextMode::Isolated => f.write_str("isolated"),
+            ContextMode::Shared => f.write_str("Shared"),
+            ContextMode::Inherit => f.write_str("Inherit"),
+            ContextMode::Isolated => f.write_str("Isolated"),
         }
     }
 }
@@ -855,9 +868,15 @@ impl fmt::Display for ContextMode {
 ///
 /// [`ForkStrategy::fork`]: polaris_system::resource::ForkStrategy::fork
 ///
+/// See the *Execution Context — Scope* and *Graph — Scope* reference docs for
+/// how the executor applies these verbs at scope entry at runtime.
+///
 /// Note: `ContextPolicy` derives `PartialEq`/`Eq` (sufficient for tests and
-/// equality checks). It does **not** derive `Hash` because the underlying
-/// `HashMap`/`HashSet` storage and the cached
+/// equality checks). Equality is **verb-shape** equality, not behavioral
+/// equality: the per-resource crossing compares by verb kind only and ignores
+/// the inner clone/fork closure, so two policies that `forward::<T>()` with
+/// distinct closures compare equal. It does **not** derive `Hash` because the
+/// underlying `HashMap`/`HashSet` storage and the cached
 /// [`ParentFilter`](polaris_system::param::ParentFilter) do not
 /// implement `Hash`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1484,6 +1503,22 @@ mod tests {
             *policy.parent_filter(),
             ParentFilter::allow_only([TypeId::of::<TestRes>()])
         );
+    }
+
+    #[test]
+    fn forward_clears_prior_exclude() {
+        // .exclude().forward() must clear the exclude — last verb wins for the
+        // clone verbs too, mirroring `positive_verb_clears_prior_exclude` for
+        // `share`.
+        let policy = ContextPolicy::new()
+            .exclude::<TestRes>()
+            .forward::<TestRes>();
+        let crossing = policy.crossing_for(TypeId::of::<TestRes>()).unwrap();
+        assert!(matches!(crossing.action, CrossingAction::Forward(_)));
+        assert!(!policy.excludes.contains(&TypeId::of::<TestRes>()));
+        // `forward` copies into the child rather than chain-reading, so it does
+        // not widen the parent filter — allow_only stays empty.
+        assert_eq!(*policy.parent_filter(), ParentFilter::allow_only([]));
     }
 
     #[test]

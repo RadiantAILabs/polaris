@@ -16,7 +16,7 @@ proc-macro = true
 workspace = true
 
 [dependencies]
-polaris_macro_utils = { path = "../../polaris_macro_utils", version = "0.4.3" }
+polaris_macro_utils = { path = "../../polaris_macro_utils", version = "0.4.4" }
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"

@@ -152,6 +152,10 @@ pub trait LocalResource: Resource {}
 /// Implementations should be pure (no side effects on `self`) and total (no panics,
 /// no I/O).
 ///
+/// This trait backs the `fork::<T>()` scope-boundary verb on `polaris_graph`'s
+/// `ContextPolicy`; see that type for the full per-resource boundary model and
+/// the *Execution Context — Scope* reference doc for the runtime semantics.
+///
 /// # Examples
 ///
 /// Fresh-empty fork — child starts with no inherited state:

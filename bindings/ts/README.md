@@ -28,7 +28,7 @@ While unpublished, depend on the package via a workspace path or a Git submodule
 // dashboard repo's package.json
 {
   "dependencies": {
-    "@polaris/types": "file:../polar-rs/bindings/ts"
+    "@polaris/types": "file:../polaris/bindings/ts"
   }
 }
 ```

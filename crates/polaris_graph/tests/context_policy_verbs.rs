@@ -154,6 +154,31 @@ impl System for ReadFragmentCount {
     }
 }
 
+/// Appends the current `FragmentStore` length to a shared vec on each call, so
+/// a loop body can record the count seen on every iteration.
+struct RecordFragmentCount {
+    out: Arc<Mutex<Vec<usize>>>,
+}
+impl System for RecordFragmentCount {
+    type Output = ();
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let out = Arc::clone(&self.out);
+        Box::pin(async move {
+            let s = ctx
+                .get_resource::<FragmentStore>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            out.lock().unwrap().push(s.entries.len());
+            Ok(())
+        })
+    }
+    fn name(&self) -> &'static str {
+        "record_fragment_count"
+    }
+}
+
 struct DeductBudget {
     amount: u64,
 }
@@ -411,6 +436,53 @@ async fn fork_arc_shared_lets_child_mutate_parent_atomic() {
         .unwrap();
 
     assert_eq!(parent_remaining.load(Ordering::SeqCst), 750);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// verbs inside a loop — the crossing re-runs on every iteration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn fork_reforks_on_each_loop_iteration() {
+    // A `fork` scope nested in a loop must re-fork on every iteration (the
+    // per-iteration semantics documented on `ContextPolicy::fork`): each pass
+    // starts from a fresh-empty FragmentStore, so the recorded count is always
+    // 1 and never accumulates, and the parent store is never mutated.
+    let per_iteration = Arc::new(Mutex::new(Vec::new()));
+
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(PushFragment { text: "child" }));
+    inner.add_boxed_system(Box::new(RecordFragmentCount {
+        out: Arc::clone(&per_iteration),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_loop_n("fork_loop", 3, move |body| {
+        body.add_scope(
+            "fragment_fork",
+            inner,
+            ContextPolicy::new().fork::<FragmentStore>(),
+        );
+    });
+
+    let mut ctx = SystemContext::new().with(FragmentStore {
+        entries: vec!["seed".into()],
+    });
+    assert!(graph.validate().is_ok());
+    let executor = GraphExecutor::new();
+    executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
+
+    // Three iterations, each forked fresh-empty then pushed exactly one
+    // fragment — counts do not carry over between iterations.
+    assert_eq!(*per_iteration.lock().unwrap(), vec![1, 1, 1]);
+    // Parent FragmentStore is untouched across every iteration.
+    assert_eq!(
+        ctx.get_resource::<FragmentStore>().unwrap().entries.len(),
+        1
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
