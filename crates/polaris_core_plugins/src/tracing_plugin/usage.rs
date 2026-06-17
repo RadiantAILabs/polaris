@@ -2,7 +2,8 @@
 //!
 //! Token counts arrive on `chat` spans as OpenTelemetry `GenAI` attributes
 //! recorded by [`TracingLlmProvider`](super::instrument::llm::TracingLlmProvider):
-//! `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
+//! `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, the cache tiers
+//! `gen_ai.usage.cache_read_tokens` / `gen_ai.usage.cache_creation_tokens`,
 //! `gen_ai.request.model`, and `gen_ai.provider.name`. The aggregator walks
 //! the dashboard's in-memory [`SpanBuffer`](super::SpanBuffer) and projects
 //! totals and per-model / per-provider / per-`agent_type` breakdowns.
@@ -23,6 +24,10 @@ use ts_rs::TS;
 const INPUT_TOKENS_KEY: &str = "gen_ai.usage.input_tokens";
 /// Field key carrying output-token count on `chat` spans.
 const OUTPUT_TOKENS_KEY: &str = "gen_ai.usage.output_tokens";
+/// Field key carrying cache-read input-token count on `chat` spans.
+const CACHE_READ_TOKENS_KEY: &str = "gen_ai.usage.cache_read_tokens";
+/// Field key carrying cache-creation input-token count on `chat` spans.
+const CACHE_CREATION_TOKENS_KEY: &str = "gen_ai.usage.cache_creation_tokens";
 /// Field key carrying the model identifier on `chat` spans.
 const MODEL_KEY: &str = "gen_ai.request.model";
 /// Field key carrying the provider name on `chat` spans.
@@ -39,13 +44,23 @@ const UNKNOWN_KEY: &str = "unknown";
 #[cfg_attr(feature = "typegen", derive(TS), ts(export))]
 #[non_exhaustive]
 pub struct TokenUsageTotals {
-    /// Sum of input tokens reported by the aggregated spans.
+    /// Sum of full-price (uncached) input tokens reported by the aggregated
+    /// spans.
     #[cfg_attr(feature = "typegen", ts(type = "number"))]
     pub input_tokens: u64,
     /// Sum of output tokens reported by the aggregated spans.
     #[cfg_attr(feature = "typegen", ts(type = "number"))]
     pub output_tokens: u64,
-    /// `input_tokens + output_tokens`. Pre-computed for convenience.
+    /// Sum of input tokens served from the prompt cache (billed at the
+    /// cache-read rate). Zero for providers/calls without prompt caching.
+    #[cfg_attr(feature = "typegen", ts(type = "number"))]
+    pub cache_read_tokens: u64,
+    /// Sum of input tokens written to the prompt cache (billed at the
+    /// cache-write rate). Zero for providers/calls without prompt caching.
+    #[cfg_attr(feature = "typegen", ts(type = "number"))]
+    pub cache_creation_tokens: u64,
+    /// `input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens`.
+    /// Pre-computed for convenience; matches each call's `Usage::total_tokens`.
     #[cfg_attr(feature = "typegen", ts(type = "number"))]
     pub total_tokens: u64,
     /// Computed cost in USD when a [`UsagePricing`] table covered at least
@@ -115,7 +130,17 @@ where
             .get(OUTPUT_TOKENS_KEY)
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        if input == 0 && output == 0 {
+        let cache_read = record
+            .fields
+            .get(CACHE_READ_TOKENS_KEY)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation = record
+            .fields
+            .get(CACHE_CREATION_TOKENS_KEY)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if input == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
             continue;
         }
 
@@ -136,21 +161,27 @@ where
 
         let cost_usd = pricing
             .and_then(|pricing| pricing.get(provider, model))
-            .map(|rate| rate.cost(input, output));
+            .map(|rate| rate.cost_with_cache(input, output, cache_read, cache_creation));
 
-        totals.add(input, output, cost_usd);
+        let counts = TokenCounts {
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        };
+        totals.add(counts, cost_usd);
         by_model
             .entry(model.to_owned())
             .or_default()
-            .add(input, output, cost_usd);
+            .add(counts, cost_usd);
         by_provider
             .entry(provider.to_owned())
             .or_default()
-            .add(input, output, cost_usd);
+            .add(counts, cost_usd);
         by_agent_type
             .entry(agent_type.to_owned())
             .or_default()
-            .add(input, output, cost_usd);
+            .add(counts, cost_usd);
 
         source_span_count += 1;
     }
@@ -181,27 +212,50 @@ fn finish_breakdown(map: BTreeMap<String, TokenAcc>) -> Vec<TokenUsageBreakdown>
     rows
 }
 
+/// Token counts read from a single `chat` span, grouped so they travel through
+/// the accumulators as one value.
+#[derive(Clone, Copy)]
+struct TokenCounts {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+}
+
 #[derive(Default)]
 struct TokenAcc {
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
     cost_usd: Option<f64>,
 }
 
 impl TokenAcc {
-    fn add(&mut self, input: u64, output: u64, cost: Option<f64>) {
-        self.input_tokens = self.input_tokens.saturating_add(input);
-        self.output_tokens = self.output_tokens.saturating_add(output);
+    fn add(&mut self, counts: TokenCounts, cost: Option<f64>) {
+        self.input_tokens = self.input_tokens.saturating_add(counts.input);
+        self.output_tokens = self.output_tokens.saturating_add(counts.output);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(counts.cache_read);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(counts.cache_creation);
         if let Some(amount) = cost {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + amount);
         }
     }
 
     fn into_totals(self) -> TokenUsageTotals {
+        let total_tokens = self
+            .input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_tokens);
         TokenUsageTotals {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            total_tokens: self.input_tokens.saturating_add(self.output_tokens),
+            cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            total_tokens,
             cost_usd: self.cost_usd,
         }
     }
@@ -338,6 +392,59 @@ mod tests {
         assert!((cost - 52.5).abs() < 1e-9, "expected $52.50, got {cost}");
         // Pricing also enriches breakdown rows.
         assert!(response.by_model[0].usage.cost_usd.is_some());
+    }
+
+    #[test]
+    fn cache_tokens_count_toward_totals_and_are_priced_at_cache_tiers() {
+        let pricing = UsagePricing::new();
+        // new() seeds Anthropic ephemeral ratios: cache-read 0.1x, write 1.25x.
+        pricing.set(
+            "anthropic",
+            "claude-opus-4-7",
+            ModelPricing::new(15.0, 75.0),
+        );
+        let rec = chat_record(
+            "r",
+            "anthropic",
+            "claude-opus-4-7",
+            Some("react"),
+            1_000_000,
+            500_000,
+        )
+        .with_field(CACHE_READ_TOKENS_KEY, json!(2_000_000_u64))
+        .with_field(CACHE_CREATION_TOKENS_KEY, json!(100_000_u64));
+
+        let response = aggregate(std::iter::once(&rec), Some(&pricing));
+        let totals = &response.totals;
+
+        assert_eq!(totals.input_tokens, 1_000_000);
+        assert_eq!(totals.output_tokens, 500_000);
+        assert_eq!(totals.cache_read_tokens, 2_000_000);
+        assert_eq!(totals.cache_creation_tokens, 100_000);
+        // total_tokens now folds in the cache tiers (matches Usage::total_tokens).
+        assert_eq!(totals.total_tokens, 3_600_000);
+
+        // input 1M*$15/M = $15 ; output 500k*$75/M = $37.5 ;
+        // cache-read 2M*$1.5/M = $3 ; cache-write 100k*$18.75/M = $1.875.
+        let cost = totals.cost_usd.expect("cost present");
+        assert!(
+            (cost - 57.375).abs() < 1e-9,
+            "expected $57.375 incl. cache tiers, got {cost}"
+        );
+        // The breakdown rows carry the cache tiers too.
+        assert_eq!(response.by_model[0].usage.cache_read_tokens, 2_000_000);
+    }
+
+    #[test]
+    fn cache_only_record_is_not_skipped() {
+        // A span with zero fresh input/output but non-zero cache tokens must
+        // still be aggregated — the skip guard keys off all token tiers.
+        let rec = chat_record("r", "anthropic", "claude-opus-4-7", None, 0, 0)
+            .with_field(CACHE_READ_TOKENS_KEY, json!(1_000_u64));
+        let response = aggregate(std::iter::once(&rec), None);
+        assert_eq!(response.source_span_count, 1);
+        assert_eq!(response.totals.cache_read_tokens, 1_000);
+        assert_eq!(response.totals.total_tokens, 1_000);
     }
 
     #[test]

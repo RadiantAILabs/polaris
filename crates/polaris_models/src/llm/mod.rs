@@ -23,9 +23,9 @@ pub use provider::DynLlmProvider;
 pub use provider::LlmProvider;
 pub use provider::ModelPricing;
 pub use types::{
-    AssistantBlock, AudioBlock, AudioMediaType, ContentBlockDelta, ContentBlockStartData,
-    DocumentBlock, DocumentMediaType, DocumentSource, ImageBlock, ImageMediaType, LlmRequest,
-    LlmResponse, LlmStream, Message, ReasoningBlock, StopReason, StreamEvent, TextBlock, ToolCall,
-    ToolChoice, ToolDefinition, ToolFunction, ToolResult, ToolResultContent, ToolResultStatus,
-    Usage, UserBlock,
+    AssistantBlock, AudioBlock, AudioMediaType, CacheControl, ContentBlockDelta,
+    ContentBlockStartData, DocumentBlock, DocumentMediaType, DocumentSource, ImageBlock,
+    ImageMediaType, LlmRequest, LlmResponse, LlmStream, Message, ReasoningBlock, StopReason,
+    StreamEvent, TextBlock, ToolCall, ToolChoice, ToolDefinition, ToolFunction, ToolResult,
+    ToolResultContent, ToolResultStatus, Usage, UserBlock,
 };

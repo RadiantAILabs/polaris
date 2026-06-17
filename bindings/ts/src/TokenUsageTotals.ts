@@ -5,7 +5,8 @@
  */
 export type TokenUsageTotals = { 
 /**
- * Sum of input tokens reported by the aggregated spans.
+ * Sum of full-price (uncached) input tokens reported by the aggregated
+ * spans.
  */
 input_tokens: number, 
 /**
@@ -13,7 +14,18 @@ input_tokens: number,
  */
 output_tokens: number, 
 /**
- * `input_tokens + output_tokens`. Pre-computed for convenience.
+ * Sum of input tokens served from the prompt cache (billed at the
+ * cache-read rate). Zero for providers/calls without prompt caching.
+ */
+cache_read_tokens: number, 
+/**
+ * Sum of input tokens written to the prompt cache (billed at the
+ * cache-write rate). Zero for providers/calls without prompt caching.
+ */
+cache_creation_tokens: number, 
+/**
+ * `input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens`.
+ * Pre-computed for convenience; matches each call's `Usage::total_tokens`.
  */
 total_tokens: number, 
 /**

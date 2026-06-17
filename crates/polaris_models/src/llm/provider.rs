@@ -14,32 +14,88 @@ use std::pin::Pin;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct ModelPricing {
-    /// USD charged per million input tokens.
+    /// USD charged per million full-price (uncached) input tokens.
     pub input_per_million_usd: f64,
     /// USD charged per million output tokens.
     pub output_per_million_usd: f64,
+    /// USD charged per million tokens served from the prompt cache (prices
+    /// [`Usage::cache_read_tokens`](super::Usage::cache_read_tokens)).
+    pub cache_read_per_million_usd: f64,
+    /// USD charged per million tokens written to the prompt cache. "Write" is
+    /// the billing-tier term; it prices the tokens the response reports as
+    /// [`Usage::cache_creation_tokens`](super::Usage::cache_creation_tokens).
+    pub cache_write_per_million_usd: f64,
 }
+
+/// Cache-read rate as a fraction of the base input rate (Anthropic 5-minute
+/// ephemeral: a cache hit costs 0.1× a fresh input token).
+const DEFAULT_CACHE_READ_MULTIPLIER: f64 = 0.1;
+/// Cache-write rate as a fraction of the base input rate (Anthropic 5-minute
+/// ephemeral: writing the cache costs 1.25× a fresh input token).
+const DEFAULT_CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 
 impl ModelPricing {
     /// Creates a pricing record from per-million-token USD rates.
     ///
-    /// `ModelPricing` is `#[non_exhaustive]` so future rate tiers (cache,
-    /// batch, …) can be added without breaking callers — construct it
-    /// through this constructor rather than a struct literal.
+    /// Cache-tier rates default to the Anthropic 5-minute-ephemeral ratios
+    /// (0.1× read, 1.25× write of the input rate); override them with
+    /// [`with_cache_rates`](Self::with_cache_rates) for providers that price
+    /// caching differently.
+    ///
+    /// `ModelPricing` is `#[non_exhaustive]` so future rate tiers (batch, …)
+    /// can be added without breaking callers — construct it through this
+    /// constructor rather than a struct literal.
     #[must_use]
     pub const fn new(input_per_million_usd: f64, output_per_million_usd: f64) -> Self {
         Self {
             input_per_million_usd,
             output_per_million_usd,
+            cache_read_per_million_usd: input_per_million_usd * DEFAULT_CACHE_READ_MULTIPLIER,
+            cache_write_per_million_usd: input_per_million_usd * DEFAULT_CACHE_WRITE_MULTIPLIER,
         }
     }
 
-    /// Estimated USD cost for a single call given its token counts.
+    /// Overrides the cache-tier rates (USD per million cache-read / cache-write
+    /// tokens) for providers whose caching is priced off the default ratios.
+    #[must_use]
+    pub const fn with_cache_rates(
+        mut self,
+        cache_read_per_million_usd: f64,
+        cache_write_per_million_usd: f64,
+    ) -> Self {
+        self.cache_read_per_million_usd = cache_read_per_million_usd;
+        self.cache_write_per_million_usd = cache_write_per_million_usd;
+        self
+    }
+
+    /// Estimated USD cost for a single call given its full-price token counts.
+    ///
+    /// Ignores cache tiers — use [`cost_with_cache`](Self::cost_with_cache) when
+    /// cache-read / cache-write token counts are available.
     #[must_use]
     pub fn cost(&self, input_tokens: u64, output_tokens: u64) -> f64 {
+        self.cost_with_cache(input_tokens, output_tokens, 0, 0)
+    }
+
+    /// Estimated USD cost for a single call, billing cached input at the
+    /// cache-read / cache-write tiers and the rest at the full input rate.
+    ///
+    /// A best-effort estimate computed in `f64`: token counts above 2^53 lose
+    /// precision and pathological counts/rates can saturate to `f64::INFINITY`.
+    /// Should not be used as a billing source of truth.
+    #[must_use]
+    pub fn cost_with_cache(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> f64 {
         let input = input_tokens as f64 * self.input_per_million_usd;
         let output = output_tokens as f64 * self.output_per_million_usd;
-        (input + output) / 1_000_000.0
+        let cache_read = cache_read_tokens as f64 * self.cache_read_per_million_usd;
+        let cache_write = cache_creation_tokens as f64 * self.cache_write_per_million_usd;
+        (input + output + cache_read + cache_write) / 1_000_000.0
     }
 }
 
@@ -241,5 +297,21 @@ mod tests {
     fn cost_is_zero_for_zero_tokens() {
         let pricing = ModelPricing::new(15.0, 75.0);
         assert!(pricing.cost(0, 0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn with_cache_rates_overrides_the_default_ratios() {
+        // `new` derives cache tiers from the input rate (0.1× / 1.25×);
+        // `with_cache_rates` replaces them outright.
+        let pricing = ModelPricing::new(3.0, 15.0).with_cache_rates(0.5, 6.0);
+        // 1M cache-read tokens at the overridden $0.50/M rate.
+        let read = pricing.cost_with_cache(0, 0, 1_000_000, 0);
+        assert!((read - 0.5).abs() < 1e-9, "cache read = $0.50, got {read}");
+        // 1M cache-write tokens at the overridden $6.00/M rate.
+        let write = pricing.cost_with_cache(0, 0, 0, 1_000_000);
+        assert!(
+            (write - 6.0).abs() < 1e-9,
+            "cache write = $6.00, got {write}"
+        );
     }
 }

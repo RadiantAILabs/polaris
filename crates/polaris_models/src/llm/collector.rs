@@ -160,11 +160,21 @@ impl BlockAccumulator {
                 name,
                 arguments,
             } => {
-                let arguments: Value = serde_json::from_str(&arguments).map_err(|err| {
-                    GenerationError::InvalidResponse(format!(
-                        "failed to parse tool call arguments: {err}"
-                    ))
-                })?;
+                // A tool invoked with no arguments streams no (or empty) argument
+                // deltas, leaving `arguments` empty. An empty string is not valid
+                // JSON, so parse it as the canonical "no input" value — an empty
+                // object — rather than failing the whole response. This mirrors
+                // the non-streaming provider path, which also tolerates absent
+                // arguments.
+                let arguments: Value = if arguments.trim().is_empty() {
+                    Value::Object(serde_json::Map::new())
+                } else {
+                    serde_json::from_str(&arguments).map_err(|err| {
+                        GenerationError::InvalidResponse(format!(
+                            "failed to parse tool call arguments: {err}"
+                        ))
+                    })?
+                };
                 Ok(AssistantBlock::ToolCall(ToolCall {
                     id,
                     call_id,
@@ -211,6 +221,7 @@ mod tests {
             input_tokens: Some(input),
             output_tokens: Some(output),
             total_tokens: Some(input + output),
+            ..Default::default()
         }
     }
 
@@ -550,6 +561,11 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_block_no_deltas() {
+        // A no-argument tool (e.g. a parameterless query) streams a ToolCall
+        // block with no argument deltas, so the accumulated arguments string is
+        // empty. That must collect to `{}`, not fail to parse as JSON — and the
+        // response (including usage) must still assemble, since the parse happens
+        // at ContentBlockStop, before MessageStop carries usage.
         let stream = EventStream(vec![
             Ok(StreamEvent::ContentBlockStart {
                 index: 0,
@@ -563,14 +579,22 @@ mod tests {
             Ok(message_stop(StopReason::ToolUse, usage(5, 0))),
         ]);
 
-        let err = stream
+        let response = stream
             .collect_response()
             .await
-            .expect_err("should error on empty arguments");
-
-        assert!(
-            matches!(&err, GenerationError::InvalidResponse(msg) if msg.contains("tool call arguments")),
-            "empty arguments should fail JSON parsing"
+            .expect("a no-argument tool call should collect, not error");
+        let calls = response.tool_calls();
+        assert_eq!(calls.len(), 1, "should have one tool call");
+        assert_eq!(calls[0].function.name, "noop");
+        assert_eq!(
+            calls[0].function.arguments,
+            json!({}),
+            "absent arguments should become an empty object"
+        );
+        assert_eq!(
+            response.usage,
+            usage(5, 0),
+            "usage should still propagate when arguments are empty"
         );
     }
 

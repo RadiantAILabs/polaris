@@ -43,5 +43,7 @@ temp/
 
 # Claude code
 .claude/settings.local.json
+.claude/skills
 .claude/agents
+CLAUDE.md
 .claude/agent-memory-local

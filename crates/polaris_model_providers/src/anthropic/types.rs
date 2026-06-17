@@ -11,6 +11,64 @@ use serde_json::Value;
 // Request Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Prompt-cache control marker. Serializes to `{"type":"ephemeral"}`, the
+/// 5-minute cache tier; attaches to the last block of a cached prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheControlMarker {
+    /// Cache tier — always `"ephemeral"`. Skipped on deserialize (request-only
+    /// field) so the `&'static str` need not round-trip.
+    #[serde(rename = "type", skip_deserializing, default = "ephemeral_cache_type")]
+    cache_type: &'static str,
+}
+
+fn ephemeral_cache_type() -> &'static str {
+    "ephemeral"
+}
+
+impl CacheControlMarker {
+    /// The 5-minute ephemeral cache marker.
+    pub(crate) const fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral",
+        }
+    }
+}
+
+/// The `system` field: either a plain string or an array of text blocks (the
+/// block form is required to attach a [`CacheControlMarker`] to the prefix).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum SystemPrompt {
+    /// A plain system string (no cache marker).
+    Text(String),
+    /// System text blocks, the last of which may carry a cache marker.
+    Blocks(Vec<SystemBlock>),
+}
+
+/// One block of an array-form system prompt.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemBlock {
+    /// Block type — always `"text"`.
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    /// The system text.
+    text: String,
+    /// Optional cache marker (set on the last block to cache the prefix).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControlMarker>,
+}
+
+impl SystemBlock {
+    /// A `text` system block with an optional cache marker.
+    pub(crate) fn text(text: String, cache_control: Option<CacheControlMarker>) -> Self {
+        Self {
+            block_type: "text",
+            text,
+            cache_control,
+        }
+    }
+}
+
 /// Request body for the Messages API.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateMessageRequest {
@@ -22,7 +80,7 @@ pub struct CreateMessageRequest {
     pub messages: Vec<MessageParam>,
     /// System prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<SystemPrompt>,
     /// Tool definitions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
@@ -66,11 +124,17 @@ pub enum ContentBlockParam {
     Text {
         /// The text content.
         text: String,
+        /// Optional prompt-cache marker.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlMarker>,
     },
     /// Image content.
     Image {
         /// Image source.
         source: ImageSource,
+        /// Optional prompt-cache marker.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlMarker>,
     },
     /// Tool use block (for assistant messages).
     ToolUse {
@@ -80,6 +144,9 @@ pub enum ContentBlockParam {
         name: String,
         /// Tool input.
         input: Value,
+        /// Optional prompt-cache marker.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlMarker>,
     },
     /// Tool result block (for user messages).
     ToolResult {
@@ -91,6 +158,9 @@ pub enum ContentBlockParam {
         /// Whether this is an error result.
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        /// Optional prompt-cache marker.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlMarker>,
     },
     /// Thinking block (for assistant messages with extended thinking).
     Thinking {
@@ -98,7 +168,24 @@ pub enum ContentBlockParam {
         thinking: String,
         /// Signature for verification.
         signature: String,
+        /// Optional prompt-cache marker.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlMarker>,
     },
+}
+
+impl ContentBlockParam {
+    /// Attaches a cache marker to this block (used to mark a breakpoint on the
+    /// last block of a cached message).
+    pub(crate) fn set_cache_control(&mut self, marker: CacheControlMarker) {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::Image { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::ToolResult { cache_control, .. }
+            | Self::Thinking { cache_control, .. } => *cache_control = Some(marker),
+        }
+    }
 }
 
 /// Content block allowed in tool results.
@@ -161,6 +248,9 @@ pub struct ToolDef {
     /// Enable strict mode (beta).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// Optional prompt-cache marker (set on the last tool to cache the tool prefix).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlMarker>,
 }
 
 /// Tool choice configuration.
@@ -299,13 +389,11 @@ pub struct UsageResponse {
     pub input_tokens: u64,
     /// Output tokens generated.
     pub output_tokens: u64,
-    /// Cache creation tokens.
+    /// Cache creation (write) tokens.
     #[serde(default)]
-    #[expect(dead_code, reason = "field used for deserialization completeness")]
     pub cache_creation_input_tokens: u64,
-    /// Cache read tokens.
+    /// Cache read (hit) tokens.
     #[serde(default)]
-    #[expect(dead_code, reason = "field used for deserialization completeness")]
     pub cache_read_input_tokens: u64,
 }
 
