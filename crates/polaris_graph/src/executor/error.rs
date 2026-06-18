@@ -117,6 +117,22 @@ pub enum ExecutionError {
         /// Which verb declared the crossing — `"forward"` or `"fork"`.
         action: &'static str,
     },
+    /// A scope's `ContextPolicy` declared a per-resource crossing
+    /// (`forward::<T>()` or `fork::<T>()`) for a resource that exists in the
+    /// parent's local scope but could not be copied at scope entry because it
+    /// is currently held mutably (write-locked).
+    ///
+    /// Distinct from [`ScopeMissingResource`](Self::ScopeMissingResource),
+    /// which means the resource is genuinely absent. This variant means the
+    /// resource is present but momentarily unavailable.
+    ScopeResourceBusy {
+        /// The scope node's name.
+        scope: &'static str,
+        /// The resource type that was held mutably.
+        resource: &'static str,
+        /// Which verb declared the crossing — `"forward"` or `"fork"`.
+        action: &'static str,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -184,6 +200,16 @@ impl fmt::Display for ExecutionError {
                 write!(
                     f,
                     "scope '{scope}' declared {action}::<{resource}>() but the parent context has no local resource of that type"
+                )
+            }
+            ExecutionError::ScopeResourceBusy {
+                scope,
+                resource,
+                action,
+            } => {
+                write!(
+                    f,
+                    "scope '{scope}' declared {action}::<{resource}>() but {resource} is currently held mutably in the parent context and cannot be copied at scope entry"
                 )
             }
         }

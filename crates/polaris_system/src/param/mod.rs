@@ -65,7 +65,7 @@ use crate::resource::{
 pub use access::{Access, AccessMode, SystemAccess};
 use hashbrown::HashSet;
 use std::any::{Any, TypeId, type_name};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use variadics_please::all_tuples;
 
 /// A parameter that can be injected into a system function.
@@ -102,7 +102,12 @@ pub trait SystemParam: Sized {
 }
 
 /// Errors that can occur when fetching system parameters.
+///
+/// Marked `#[non_exhaustive]`: new variants (such as
+/// [`ResourceOutOfScope`](Self::ResourceOutOfScope)) may be added in future
+/// releases, so downstream matches must include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParamError {
     /// The requested resource was not found.
     #[error("resource not found: {0}")]
@@ -208,7 +213,22 @@ pub struct SystemContext<'parent> {
     /// Applies only to walks into [`Self::parent`]; the local scope and
     /// globals are always reachable. The default is the unrestricted filter
     /// (`AllowAllExcept` over an empty set).
-    parent_filter: ParentFilter,
+    ///
+    /// Held behind an [`Arc`] so a scope entered in a loop pays only a
+    /// reference-count bump per iteration rather than cloning the underlying
+    /// `HashSet`. The unrestricted default is a shared singleton (see
+    /// [`unrestricted_parent_filter`]).
+    parent_filter: Arc<ParentFilter>,
+}
+
+/// Returns the process-wide shared unrestricted [`ParentFilter`].
+///
+/// Root contexts and unfiltered children (`new`, `with_globals`, `child`) all
+/// share this single `Arc` instead of allocating a fresh filter each time —
+/// the unrestricted filter is immutable, so one instance is reused everywhere.
+fn unrestricted_parent_filter() -> Arc<ParentFilter> {
+    static UNRESTRICTED: OnceLock<Arc<ParentFilter>> = OnceLock::new();
+    Arc::clone(UNRESTRICTED.get_or_init(|| Arc::new(ParentFilter::default())))
 }
 
 /// Restricts which resource types are reachable through a context's parent chain.
@@ -322,7 +342,7 @@ impl<'parent> SystemContext<'parent> {
             globals: None,
             resources: Resources::new(),
             outputs: Outputs::new(),
-            parent_filter: ParentFilter::default(),
+            parent_filter: unrestricted_parent_filter(),
         }
     }
 
@@ -338,7 +358,7 @@ impl<'parent> SystemContext<'parent> {
             globals: Some(globals),
             resources: Resources::new(),
             outputs: Outputs::new(),
-            parent_filter: ParentFilter::default(),
+            parent_filter: unrestricted_parent_filter(),
         }
     }
 
@@ -376,7 +396,7 @@ impl<'parent> SystemContext<'parent> {
             globals: self.globals.clone(),
             resources: Resources::new(),
             outputs: Outputs::new(),
-            parent_filter: ParentFilter::default(),
+            parent_filter: unrestricted_parent_filter(),
         }
     }
 
@@ -386,6 +406,11 @@ impl<'parent> SystemContext<'parent> {
     /// The filter applies to walks into the parent only — the child's local
     /// scope and the global resources remain reachable regardless of the
     /// filter.
+    ///
+    /// Accepts anything convertible into `Arc<ParentFilter>`: pass an owned
+    /// [`ParentFilter`] for a one-off child, or a pre-built `Arc<ParentFilter>`
+    /// (e.g. a policy's cached filter) to share it across repeated scope
+    /// entries without re-cloning the underlying set.
     ///
     /// # Example
     ///
@@ -409,13 +434,16 @@ impl<'parent> SystemContext<'parent> {
     /// assert!(!child.contains_resource::<Secret>());
     /// ```
     #[must_use]
-    pub fn child_filtered(&'parent self, parent_filter: ParentFilter) -> SystemContext<'parent> {
+    pub fn child_filtered(
+        &'parent self,
+        parent_filter: impl Into<Arc<ParentFilter>>,
+    ) -> SystemContext<'parent> {
         SystemContext {
             parent: Some(self),
             globals: self.globals.clone(),
             resources: Resources::new(),
             outputs: Outputs::new(),
-            parent_filter,
+            parent_filter: parent_filter.into(),
         }
     }
 
@@ -1831,6 +1859,45 @@ mod tests {
         // clone_local_resource_with only checks local scope, not parent
         let result = child.clone_local_resource_with(TypeId::of::<Cloneable>(), cloneable_clone_fn);
         assert!(result.is_none(), "should not find resource in parent chain");
+    }
+
+    #[test]
+    fn clone_local_resource_with_distinguishes_busy_from_missing() {
+        // The scope-entry path (the executor's `populate_child_locals`) tells
+        // a genuinely-absent forward/fork source apart from one that is present
+        // but write-locked, by pairing these two primitives: a write-locked
+        // resource still reports as present, so the executor can emit
+        // `ScopeResourceBusy` instead of the misleading `ScopeMissingResource`.
+        let ctx = SystemContext::new().with(Cloneable { value: 1 });
+
+        // Hold a write guard to model a resource borrowed mutably at scope entry.
+        let guard = ctx.get_resource_mut::<Cloneable>().unwrap();
+        assert!(
+            ctx.contains_local_resource_by_type_id(TypeId::of::<Cloneable>()),
+            "a write-locked resource must still report as present",
+        );
+        assert!(
+            ctx.clone_local_resource_with(TypeId::of::<Cloneable>(), cloneable_clone_fn)
+                .is_none(),
+            "a write-locked resource cannot be cloned",
+        );
+        drop(guard);
+
+        // Once the guard is released, the clone succeeds again.
+        assert!(
+            ctx.clone_local_resource_with(TypeId::of::<Cloneable>(), cloneable_clone_fn)
+                .is_some(),
+            "clone should succeed after the write lock is released",
+        );
+
+        // A genuinely missing resource reports absent — the other branch.
+        let empty = SystemContext::new();
+        assert!(!empty.contains_local_resource_by_type_id(TypeId::of::<Cloneable>()));
+        assert!(
+            empty
+                .clone_local_resource_with(TypeId::of::<Cloneable>(), cloneable_clone_fn)
+                .is_none(),
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

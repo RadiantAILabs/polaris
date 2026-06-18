@@ -423,8 +423,8 @@ impl GraphExecutor {
                         // isolation (no `share` verbs) is `AllowOnly(empty)` — the
                         // child still sees globals through the parent.
                         Self::validate_scope_crossings(scope, policy, ctx, errors);
-                        let mut child = ctx.child_filtered(policy.parent_filter().clone());
-                        Self::populate_validation_locals(policy, &mut child);
+                        let mut child = ctx.child_filtered(policy.parent_filter_arc());
+                        Self::populate_validation_locals(policy, ctx, &mut child);
                         self.validate_graph_resources(
                             &scope.graph,
                             &child,
@@ -492,17 +492,41 @@ impl GraphExecutor {
     /// Populates a child context with placeholder entries for every resource
     /// the policy will produce in the child's local scope at execution time.
     ///
-    /// Validation only checks `TypeId` presence via `contains_resource_by_type_id`;
-    /// the actual values are produced at execution time. `Share` does not
-    /// insert a local — it is reflected in the parent filter. Excludes are
-    /// tracked separately on the policy and don't appear here.
-    fn populate_validation_locals(policy: &ContextPolicy, child: &mut SystemContext<'_>) {
+    /// Validation only checks `TypeId` presence via `contains_resource_by_type_id`
+    /// (for `forward`/`fork`) or factory presence via `factory_fn_by_type_id`
+    /// (for `forward_fresh`); the actual values are produced at execution time.
+    /// `Share` does not insert a local — it is reflected in the parent filter.
+    /// Excludes are tracked separately on the policy and don't appear here.
+    ///
+    /// For `forward_fresh`, the factory itself is carried onto the placeholder
+    /// (looked up from `parent`) — never produced — so a *nested* scope's
+    /// `forward_fresh::<T>()` can resolve `T`'s factory through this child
+    /// during validation, mirroring how the runtime seeds it via
+    /// [`SystemContext::insert_boxed_with_factory`]. Without this, a nested
+    /// `forward_fresh` would spuriously fail validation even though it
+    /// succeeds at runtime, because an isolated scope's parent filter blocks
+    /// the walk back to the root factory. The placeholder value is never read.
+    ///
+    /// [`SystemContext::insert_boxed_with_factory`]: polaris_system::param::SystemContext::insert_boxed_with_factory
+    fn populate_validation_locals(
+        policy: &ContextPolicy,
+        parent: &SystemContext<'_>,
+        child: &mut SystemContext<'_>,
+    ) {
         for crossing in policy.crossings() {
             match crossing.action {
-                CrossingAction::Forward(_)
-                | CrossingAction::Fork(_)
-                | CrossingAction::ForwardFresh => {
+                CrossingAction::Forward(_) | CrossingAction::Fork(_) => {
                     child.insert_boxed(crossing.type_id, Box::new(()));
+                }
+                CrossingAction::ForwardFresh => {
+                    if let Some(factory) = parent.factory_fn_by_type_id(crossing.type_id) {
+                        child.insert_boxed_with_factory(crossing.type_id, Box::new(()), factory);
+                    } else {
+                        // Factory missing — `validate_scope_crossings` already
+                        // recorded `ScopeMissingFactory`; a plain placeholder
+                        // keeps the `TypeId` present for any other checks.
+                        child.insert_boxed(crossing.type_id, Box::new(()));
+                    }
                 }
                 CrossingAction::Share => {}
             }

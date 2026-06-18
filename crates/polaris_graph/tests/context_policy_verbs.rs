@@ -109,6 +109,29 @@ impl System for MutateCloneable {
     }
 }
 
+struct MutateCounter {
+    new_value: u32,
+}
+impl System for MutateCounter {
+    type Output = ();
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let new_value = self.new_value;
+        Box::pin(async move {
+            let mut c = ctx
+                .get_resource_mut::<Counter>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            c.value = new_value;
+            Ok(())
+        })
+    }
+    fn name(&self) -> &'static str {
+        "mutate_counter"
+    }
+}
+
 struct PushFragment {
     text: &'static str,
 }
@@ -523,6 +546,55 @@ async fn forward_fresh_creates_clean_instance_from_factory() {
     assert_eq!(*count.lock().unwrap(), Some(0));
     // Parent's counter is unchanged.
     assert_eq!(ctx.get_resource::<Counter>().unwrap().value, 99);
+}
+
+#[tokio::test]
+async fn forward_fresh_writes_do_not_escape_to_parent() {
+    // Property: the fresh instance `forward_fresh` builds is a child-local
+    // resource — a `ResMut<T>` write in the child takes on that local copy and
+    // never touches the parent's value. (Write-isolation companion to
+    // `forward_fresh_creates_clean_instance_from_factory`, mirroring the
+    // `forward`/`fork` write-isolation tests.)
+    let observed = Arc::new(Mutex::new(None));
+    let mut inner = Graph::new();
+    // Mutate the fresh counter, then read it back within the same child scope.
+    inner.add_boxed_system(Box::new(MutateCounter { new_value: 42 }));
+    inner.add_boxed_system(Box::new(ReadCounter {
+        out: Arc::clone(&observed),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope(
+        "fresh_writable",
+        inner,
+        ContextPolicy::new().forward_fresh::<Counter>(),
+    );
+
+    let mut server = Server::new();
+    server.register_local(Counter::default);
+    server.finish().await.unwrap();
+    let mut ctx = server.create_context();
+    ctx.get_resource_mut::<Counter>().unwrap().value = 99;
+
+    assert!(graph.validate().is_ok());
+    let executor = GraphExecutor::new();
+    executor
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .unwrap();
+
+    // The child's write landed on its own fresh instance (0 → 42)...
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(42),
+        "write must take on the child's fresh local instance"
+    );
+    // ...and the parent's counter is untouched by the child's mutation.
+    assert_eq!(
+        ctx.get_resource::<Counter>().unwrap().value,
+        99,
+        "child mutation of a forward_fresh instance must not escape to parent"
+    );
 }
 
 #[tokio::test]

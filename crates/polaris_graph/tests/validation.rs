@@ -824,6 +824,48 @@ async fn scope_forward_fresh_passes_when_factory_registered() {
     );
 }
 
+#[tokio::test]
+async fn scope_nested_forward_fresh_resolves_root_factory() {
+    // Two-level scope where both the outer and inner scope forward_fresh the
+    // same type, and the factory is registered only at the root. The inner
+    // scope is validated against the *outer scope's* child context, so eager
+    // validation must carry the factory down through each scope's validation
+    // locals — an isolated scope's parent filter blocks the walk back to the
+    // root, and the factory lives in the root's local resources (not globals).
+    // This is the validation-time mirror of the runtime
+    // `forward_fresh_walks_ancestor_chain_for_factory` test.
+    let mut innermost = Graph::new();
+    innermost.add_boxed_system(Box::new(WriteConfigSystem));
+
+    let mut middle = Graph::new();
+    middle.add_scope(
+        "inner_scope",
+        innermost,
+        ContextPolicy::new().forward_fresh::<TestConfig>(),
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope(
+        "outer_scope",
+        middle,
+        ContextPolicy::new().forward_fresh::<TestConfig>(),
+    );
+
+    let mut server = polaris_system::server::Server::new();
+    server.register_local(|| TestConfig { value: 0 });
+    server.finish().await.unwrap();
+    let ctx = server.create_context();
+
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "nested forward_fresh must resolve the root factory during validation, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
 #[test]
 fn scope_forward_fresh_without_factory_reports_error() {
     // Eager validation surfaces ScopeMissingFactory before execution.

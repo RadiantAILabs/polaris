@@ -648,7 +648,7 @@ impl GraphExecutor {
                 // locals are blocked. Retaining the parent ref is what lets
                 // ParamError::ResourceOutOfScope distinguish a missing
                 // resource from one the policy is hiding.
-                let mut child = ctx.child_filtered(policy.parent_filter().clone());
+                let mut child = ctx.child_filtered(policy.parent_filter_arc());
                 Self::populate_child_locals(scope, ctx, &mut child)?;
                 let inner_count = self
                     .execute_from(
@@ -705,8 +705,10 @@ impl GraphExecutor {
     /// appear here.
     ///
     /// `Forward`/`Fork` return [`ExecutionError::ScopeMissingResource`] when
-    /// the parent has no local resource of the requested type, mirroring the
-    /// `ForwardFresh` behavior for missing factories. Validation
+    /// the parent has no local resource of the requested type, or
+    /// [`ExecutionError::ScopeResourceBusy`] when the resource is present but
+    /// currently held mutably (write-locked) and so cannot be copied. This
+    /// mirrors the `ForwardFresh` behavior for missing factories. Validation
     /// ([`GraphExecutor::validate_resources`]) catches the static cases —
     /// this is the runtime safety net.
     ///
@@ -719,24 +721,32 @@ impl GraphExecutor {
         for crossing in scope.context_policy.crossings() {
             match &crossing.action {
                 CrossingAction::Share => {}
-                CrossingAction::Forward(clone_fn) => {
-                    let value = parent
-                        .clone_local_resource_with(crossing.type_id, *clone_fn)
-                        .ok_or(ExecutionError::ScopeMissingResource {
-                            scope: scope.name,
-                            resource: crossing.type_name,
-                            action: "forward",
-                        })?;
-                    child.insert_boxed(crossing.type_id, value);
-                }
-                CrossingAction::Fork(clone_fn) => {
-                    let value = parent
-                        .clone_local_resource_with(crossing.type_id, *clone_fn)
-                        .ok_or(ExecutionError::ScopeMissingResource {
-                            scope: scope.name,
-                            resource: crossing.type_name,
-                            action: "fork",
-                        })?;
+                CrossingAction::Forward(clone_fn) | CrossingAction::Fork(clone_fn) => {
+                    let action = if matches!(crossing.action, CrossingAction::Fork(_)) {
+                        "fork"
+                    } else {
+                        "forward"
+                    };
+                    let value = match parent.clone_local_resource_with(crossing.type_id, *clone_fn) {
+                        Some(value) => value,
+                        // The clone failed. Distinguish a genuinely absent
+                        // resource from one that is present but write-locked
+                        // so the error names the real cause.
+                        None if parent.contains_local_resource_by_type_id(crossing.type_id) => {
+                            return Err(ExecutionError::ScopeResourceBusy {
+                                scope: scope.name,
+                                resource: crossing.type_name,
+                                action,
+                            });
+                        }
+                        None => {
+                            return Err(ExecutionError::ScopeMissingResource {
+                                scope: scope.name,
+                                resource: crossing.type_name,
+                                action,
+                            });
+                        }
+                    };
                     child.insert_boxed(crossing.type_id, value);
                 }
                 CrossingAction::ForwardFresh => {

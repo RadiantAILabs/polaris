@@ -868,8 +868,9 @@ impl fmt::Display for ContextMode {
 ///
 /// [`ForkStrategy::fork`]: polaris_system::resource::ForkStrategy::fork
 ///
-/// See the *Execution Context — Scope* and *Graph — Scope* reference docs for
-/// how the executor applies these verbs at scope entry at runtime.
+/// See [`ScopeNode`] — the node that carries this policy — for how the executor
+/// applies these verbs at scope entry, and the *Execution Context — Scope* /
+/// *Graph — Scope* reference docs for the narrative walkthrough.
 ///
 /// Note: `ContextPolicy` derives `PartialEq`/`Eq` (sufficient for tests and
 /// equality checks). Equality is **verb-shape** equality, not behavioral
@@ -896,7 +897,11 @@ pub struct ContextPolicy {
     /// Cached [`ParentFilter`](polaris_system::param::ParentFilter) — rebuilt
     /// eagerly whenever a verb mutates the policy. Avoids per-call allocation
     /// in the executor and validation hot paths.
-    pub(crate) cached_parent_filter: polaris_system::param::ParentFilter,
+    ///
+    /// Held behind an [`Arc`] so each scope entry (including every iteration of
+    /// a loop wrapping the scope) shares the cached filter with a
+    /// reference-count bump instead of cloning its `HashSet`.
+    pub(crate) cached_parent_filter: Arc<polaris_system::param::ParentFilter>,
 }
 
 impl ContextPolicy {
@@ -922,7 +927,7 @@ impl ContextPolicy {
             // still flow. `ParentFilter::default()` is `AllowAllExcept(empty)`
             // — the wrong starting point — so we set `AllowOnly(empty)`
             // explicitly here.
-            cached_parent_filter: polaris_system::param::ParentFilter::allow_only([]),
+            cached_parent_filter: Arc::new(polaris_system::param::ParentFilter::allow_only([])),
         }
     }
 
@@ -939,7 +944,7 @@ impl ContextPolicy {
             share_rest: false,
             // Unused for `shared` policies (no child context is built), but
             // keep a sensible value: an empty `AllowOnly` mirrors `new()`.
-            cached_parent_filter: polaris_system::param::ParentFilter::allow_only([]),
+            cached_parent_filter: Arc::new(polaris_system::param::ParentFilter::allow_only([])),
         }
     }
 
@@ -1089,7 +1094,7 @@ impl ContextPolicy {
     /// time.
     fn refresh_parent_filter(&mut self) {
         use polaris_system::param::ParentFilter;
-        self.cached_parent_filter = if self.share_rest {
+        self.cached_parent_filter = Arc::new(if self.share_rest {
             ParentFilter::allow_all_except(self.excludes.iter().copied())
         } else {
             ParentFilter::allow_only(
@@ -1098,7 +1103,7 @@ impl ContextPolicy {
                     .filter(|c| matches!(c.action, CrossingAction::Share))
                     .map(|c| c.type_id),
             )
-        };
+        });
     }
 
     /// Returns the high-level [`ContextMode`] for this policy.
@@ -1135,8 +1140,24 @@ impl ContextPolicy {
     /// parent chain in the child context. For pure-isolation policies (no
     /// `share` / `share_rest`) the filter allows only the explicitly shared
     /// types — globals still flow through.
+    ///
+    /// Production code clones the cached filter cheaply via
+    /// [`parent_filter_arc`](Self::parent_filter_arc); this borrowing accessor
+    /// exists for equality assertions in tests.
+    #[cfg(test)]
     pub(crate) fn parent_filter(&self) -> &polaris_system::param::ParentFilter {
         &self.cached_parent_filter
+    }
+
+    /// Returns a cheap (reference-counted) handle to the cached
+    /// [`ParentFilter`](polaris_system::param::ParentFilter).
+    ///
+    /// Used by the executor and validation paths to hand the filter to
+    /// [`SystemContext::child_filtered`](polaris_system::param::SystemContext::child_filtered)
+    /// at each scope entry without cloning the underlying set — a scope inside
+    /// a loop pays only a reference-count bump per iteration.
+    pub(crate) fn parent_filter_arc(&self) -> Arc<polaris_system::param::ParentFilter> {
+        Arc::clone(&self.cached_parent_filter)
     }
 }
 
@@ -1526,6 +1547,52 @@ mod tests {
         let policy = ContextPolicy::new().forward::<TestRes>().share::<TestRes>();
         let crossing = policy.crossing_for(TypeId::of::<TestRes>()).unwrap();
         assert!(matches!(crossing.action, CrossingAction::Share));
+    }
+
+    #[test]
+    fn context_mode_display_renders_each_variant() {
+        // The `Display` rendering is part of the observable surface — it is
+        // interpolated into `GraphEvent` scope logs that downstream consumers
+        // may match against — so pin all three variants, not just `Inherit`.
+        assert_eq!(ContextMode::Shared.to_string(), "Shared");
+        assert_eq!(ContextMode::Inherit.to_string(), "Inherit");
+        assert_eq!(ContextMode::Isolated.to_string(), "Isolated");
+    }
+
+    #[test]
+    fn equality_is_verb_shape_not_closure_identity() {
+        // The documented contract (see the `ContextPolicy` type docs):
+        // equality is *verb-shape* equality, not closure identity.
+        // `forward::<T>()` builds a fresh clone closure on each call, so the
+        // two policies below hold distinct `CloneFn` pointers — yet they must
+        // compare equal because the crossing compares by verb kind only.
+        assert_eq!(
+            ContextPolicy::new().forward::<TestRes>(),
+            ContextPolicy::new().forward::<TestRes>(),
+        );
+        assert_eq!(
+            ContextPolicy::new().fork::<ForkRes>(),
+            ContextPolicy::new().fork::<ForkRes>(),
+        );
+        assert_eq!(
+            ContextPolicy::new().share::<TestRes>(),
+            ContextPolicy::new().share::<TestRes>(),
+        );
+
+        // Different verbs on the same type are not equal...
+        assert_ne!(
+            ContextPolicy::new().forward::<TestRes>(),
+            ContextPolicy::new().share::<TestRes>(),
+        );
+
+        // ...and the same verb on different types is not equal.
+        #[derive(Clone, Default)]
+        struct OtherRes;
+        impl LocalResource for OtherRes {}
+        assert_ne!(
+            ContextPolicy::new().forward::<TestRes>(),
+            ContextPolicy::new().forward::<OtherRes>(),
+        );
     }
 
     #[test]

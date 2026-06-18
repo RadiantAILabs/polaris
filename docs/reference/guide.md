@@ -36,13 +36,14 @@ The most common things downstream consumers want to do, and what they reach for.
 | Manage agent sessions | `SessionsAPI` — register agent, create session, process turns | [`SessionsAPI`](crate::sessions::SessionsAPI) | [Sessions](./sessions.md) |
 | Inject per-turn resources | Setup closure on `process_turn_with(\|ctx\| { ctx.insert(...) })` | `Res<T>`, [`LocalResource`](crate::system::resource::LocalResource) | [Sessions — Turn Execution](./sessions.md#turn-execution) |
 | Bridge HTTP I/O to an agent | `HttpIOProvider::new()` → send input → inject `UserIO` → drain output | [`HttpIOProvider`](crate::sessions::http::HttpIOProvider), [`UserIO`](crate::plugins::UserIO) | [HTTP — HttpIOProvider](./http.md#httpioprovider-bridging-http-to-agent-io) |
-| Understand context flow per graph node | Parallel forks children; Loop shares context; Scope has three modes | — | [Context — Graph Flow](./context.md#context-flow-through-graph-execution) |
+| Understand context flow per graph node | Parallel forks children; Loop shares context; Scope composes per-resource crossing verbs (`share`/`forward`/`fork`/`forward_fresh`/`exclude`/`share_rest`) | [`ContextPolicy`](crate::graph::ContextPolicy) | [Context — Graph Flow](./context.md#context-flow-through-graph-execution) |
+| Isolate or selectively share resources in a sub-graph | `ContextPolicy::new()` + per-resource verbs (or `ContextPolicy::shared()` for no boundary at all) | [`ContextPolicy`](crate::graph::ContextPolicy), [`ForkStrategy`](crate::system::resource::ForkStrategy) | [Graph — Scope](./graph.md#scope) |
 | Add middleware to graph execution | `MiddlewareAPI::register_system()` in plugin `build()` | [`MiddlewareAPI`](crate::graph::MiddlewareAPI) | [Graph — Middleware](./graph.md#middleware) |
 | Handle system errors in a graph | Fallible system + error edge + `ErrOut<CaughtError>` handler | [`ErrOut`](crate::system::param::ErrOut), [`CaughtError`](crate::graph::CaughtError) | [Graph — Error Handling](./graph.md#error-handling) |
 | Schedule plugin updates | `tick_schedules()` + `update()` + `server.tick::<S>()` | — | [Scheduling](./scheduling.md) |
 | Persist resources across session restart | Implement `Storable` + register via [`PersistenceAPI`](crate::plugins::PersistenceAPI) | [`PersistenceAPI`](crate::plugins::PersistenceAPI) | [Sessions — Persistence](./sessions.md#persistence-saveresume) |
 | Add LLM tracing or token-cost rollups | [`TracingPlugin`](crate::plugins::TracingPlugin) is always on; add `dashboard` feature for HTTP endpoints | [`TracingPlugin`](crate::plugins::TracingPlugin), [`SpanStorePlugin`](crate::plugins::SpanStorePlugin) | [DevTools](./devtools.md) |
-| Add a new LLM provider | Implement [`LlmProvider`](crate::models::LlmProvider), register with [`ModelRegistry`](crate::models::ModelRegistry) from a plugin's `ready()` | [`LlmProvider`](crate::models::LlmProvider) | [Model Providers](./model-providers.md) |
+| Add a new LLM provider | Implement [`LlmProvider`](crate::models::llm::LlmProvider), register with [`ModelRegistry`](crate::models::ModelRegistry) from a plugin's `ready()` | [`LlmProvider`](crate::models::llm::LlmProvider) | [Model Providers](./model-providers.md) |
 | Cache an LLM prompt prefix to cut input cost | `llm.builder().cache_prefix()` for the stable system+tools prefix; `.cache_breakpoint()` as you assemble the window for incremental history caching | [`LlmRequestBuilder`](crate::models::llm::LlmRequestBuilder), [`CacheControl`](crate::models::llm::CacheControl) | [Model Providers — Prompt Caching](./model-providers.md#prompt-caching) |
 | Make a function callable by an LLM | `#[tool]` macro on the function, register with [`ToolRegistry`](crate::tools::ToolRegistry) from a plugin | [`ToolRegistry`](crate::tools::ToolRegistry) | [Tools](./tools.md) |
 | Run shell commands from a tool | [`ShellPlugin`](crate::shell::ShellPlugin) + [`ShellPermission`](crate::shell::ShellPermission) gate | [`ShellExecutor`](crate::shell::ShellExecutor) | — |
@@ -107,7 +108,7 @@ The most common framework-extension tasks and where to make the change.
 2. Have a plugin register it via `insert_global` (global) or `register_local` (local) in its `build()`
 3. Document the resource per [resources.md — Documentation Standard](./resources.md#documentation-standard)
 4. If the resource is consumer-facing, add a row to the [Resource Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/resources/) (the catalog drift guard at `tests/resource_catalog.rs` enforces this)
-5. If the resource must survive checkpoints, implement [`Storable`](crate::sessions::Storable) and register with [`PersistenceAPI`](crate::plugins::PersistenceAPI)
+5. If the resource must survive checkpoints, implement [`Storable`](crate::plugins::Storable) and register with [`PersistenceAPI`](crate::plugins::PersistenceAPI)
 
 ## When this guide doesn't have your answer
 
