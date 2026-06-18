@@ -194,7 +194,7 @@ pub trait Agent: Send + Sync + 'static {
 /// }
 ///
 /// let mut graph = Graph::new();
-/// graph.add_agent_scope(&SubAgent, ContextPolicy::inherit());
+/// graph.add_agent_scope(&SubAgent, ContextPolicy::new().share_rest());
 /// assert_eq!(graph.node_count(), 1);
 /// ```
 pub trait AgentGraphExt {
@@ -308,7 +308,7 @@ mod tests {
     fn add_agent_scope_creates_scope_node() {
         let agent = ThreeStepAgent;
         let mut graph = Graph::new();
-        graph.add_agent_scope(&agent, ContextPolicy::inherit());
+        graph.add_agent_scope(&agent, ContextPolicy::new().share_rest());
 
         assert_eq!(graph.node_count(), 1);
         assert!(graph.entry().is_some());
@@ -322,7 +322,7 @@ mod tests {
         let mut graph = Graph::new();
         graph
             .add_system(step_one)
-            .add_agent_scope(&agent, ContextPolicy::isolated());
+            .add_agent_scope(&agent, ContextPolicy::new());
 
         assert_eq!(graph.node_count(), 2);
         assert_eq!(graph.edge_count(), 1);

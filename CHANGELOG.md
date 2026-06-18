@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-06-18
+
+### Added
+
+- **Per-resource `ContextPolicy` verbs** (`polaris_graph::node`) — scope boundaries are now declared per *resource type* via composable verbs instead of one of three all-or-nothing modes: `share::<T>()` (zero-copy chain-read from the parent), `forward::<T>()` (`Clone`-based copy into the child), `fork::<T>()` (designer-defined fork via the new `ForkStrategy`), `forward_fresh::<T>()` (re-invoke the registered factory for a clean instance), `exclude::<T>()` (block a type otherwise caught by the catch-all), and `share_rest()` (chain-read every type not named by another verb). An author now writes "inherit the tool registry, fork the fragment store, isolate everything else" directly. `ContextPolicy::new()` is the pure-isolation starting point (only globals cross) and `ContextPolicy::shared()` keeps the no-boundary form. Verbs compose in declaration order, last-verb-wins per type; `exclude`/`share_rest` round-trip cleanly.
+
+- **`ParentFilter` + `SystemContext::child_filtered`** (`polaris_system::param`) — the Layer 1 mechanism backing the scope boundary. `ParentFilter` has two modes — `AllowAllExcept` (the `share_rest()` case) and `AllowOnly` (the explicit-share case) — and `child_filtered` builds a child context whose parent-chain reads are gated by the filter, while globals remain reachable regardless. `ContextPolicy` derives and caches a `ParentFilter` internally, held behind an `Arc` so the executor's scope-entry path shares a ready filter with a reference-count bump rather than recomputing or deep-cloning one per entry (notably per loop iteration). `child_filtered` accepts anything `Into<Arc<ParentFilter>>`, so callers may pass an owned `ParentFilter` or a pre-built `Arc`.
+
+- **`ForkStrategy` trait** (`polaris_system::resource`) — opt-in `fork(&self) -> Self` for `LocalResource` types, letting a resource define its own cross-boundary semantics (fresh-empty store, shared `Arc<AtomicU64>` budget, child trace span) instead of relying on `Clone`. Backs the `fork::<T>()` verb, including non-`Clone` types.
+
+- **`ResourceFactory` on resource entries** (`polaris_system`) — the registered factory is retained on a resource entry (via `Resources::insert_boxed_with_factory` / `factory_fn_by_type_id`) so `forward_fresh::<T>()` can re-invoke it at scope entry by walking the parent chain — no separate Server→executor plumbing.
+
+### Changed
+
+- **`ContextPolicy` internal representation** (`polaris_graph::node`) — now a per-`TypeId` crossings map, an excludes set, a `share_rest` flag, a derived `cached_parent_filter`, and a `ContextMode` classification. `ContextMode` (`Shared` / `Inherit` / `Isolated`) replaces the prior `is_shared: bool` on `ScopeInfo` and `GraphEvent::Scope{Start,Complete}`; it is a *derived, read-only* observability value surfaced to hooks and middleware, not a control input. The corresponding hook/middleware field is renamed `context_mode` → `mode` and is now typed `ContextMode` rather than `&'static str` — *breaking* for hook/middleware consumers reading it.
+
+- **`forward` / `fork` / `forward_fresh` validate eagerly** (`polaris_graph`) — `forward_fresh::<T>()` checks factory presence at validate time (`ResourceValidationError::ScopeMissingFactory`), with `ExecutionError::ScopeMissingFactory` kept as a runtime safety net. Eager validation carries each `forward_fresh` factory onto its validation placeholder, so a *nested* `forward_fresh` resolves the root-registered factory at validate time instead of spuriously erroring (the isolated outer scope's filter would otherwise block the walk back to the root). `forward` / `fork` now hard-error via `ExecutionError::ScopeMissingResource` when the parent lacks the resource, symmetric with `forward_fresh`, or the new `ExecutionError::ScopeResourceBusy` when the source is present in the parent but held mutably (write-locked) at scope entry — so the error names the real cause rather than reporting it as missing. A read blocked by the policy returns the new `ParamError::ResourceOutOfScope` (naming the verb that would expose it) instead of an indistinct "not found". `ParamError` is now `#[non_exhaustive]` so this and future variant additions no longer break downstream matches — *breaking* for any existing code that matches `ParamError` without a wildcard arm.
+
+- **Calling any verb on `ContextPolicy::shared()` now panics** (`polaris_graph::node`) — fail-fast at graph-build time rather than silently no-op'ing, since `shared()` has no child context to populate.
+
+### Removed
+
+- **`ContextPolicy::inherit()` / `isolated()` / `forward_resources()` and the `ResourceForward` type** (`polaris_graph`) — *breaking*; the framework is pre-1.0, so these are removed outright rather than soft-deprecated, and in-tree call sites are migrated in the same change. Migrate `inherit()` → `new().share_rest()`, `isolated()` → `new()` plus explicit per-resource verbs, and `forward_resources(...)` / `ResourceForward` → the per-resource `forward::<T>()` verb.
+
+- **`Default` impl on `ContextPolicy`** (`polaris_graph`) — *breaking*; callers now choose `new()` (pure isolation) or `shared()` (no boundary) explicitly.
+
 ## [0.4.3] - 2026-06-17
 
 ### Added

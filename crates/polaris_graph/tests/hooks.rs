@@ -16,7 +16,7 @@ use polaris_graph::hooks::schedule::{
     OnLoopIteration, OnLoopStart, OnParallelComplete, OnParallelStart, OnScopeComplete,
     OnScopeStart, OnSwitchComplete, OnSwitchStart, OnSystemComplete, OnSystemError, OnSystemStart,
 };
-use polaris_graph::node::{ContextPolicy, NodeId};
+use polaris_graph::node::{ContextMode, ContextPolicy, NodeId};
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::Schedule;
 use polaris_system::system;
@@ -549,14 +549,13 @@ async fn marker_fires_on_system_error() {
 // SCOPE HOOKS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-async fn scope_fires_hooks() {
+async fn run_scope_hooks_case(policy: ContextPolicy, expected: ContextMode) {
     let hooks = HooksAPI::new();
 
-    // Capture the full ScopeStart/ScopeComplete events so we can assert both
-    // that the hooks fired AND that the events carry the same run_id /
-    // labels every other variant gets — closes the last gap in run-id
-    // coverage across all GraphEvent variants.
+    // Capture the full ScopeStart/ScopeComplete events so we can assert that
+    // the hooks fired, that the events carry the expected context mode, AND
+    // that they carry the same run_id / labels every other variant gets —
+    // closes the last gap in run-id coverage across all GraphEvent variants.
     let scope_started: Arc<Mutex<Option<GraphEvent>>> = Arc::new(Mutex::new(None));
     let started_clone = Arc::clone(&scope_started);
     hooks
@@ -584,7 +583,7 @@ async fn scope_fires_hooks() {
     inner.add_boxed_system(Box::new(SuccessSystem));
 
     let mut graph = Graph::new();
-    graph.add_scope("hooked_scope", inner, ContextPolicy::shared());
+    graph.add_scope("hooked_scope", inner, policy);
 
     let mut ctx = SystemContext::new();
     let executor = GraphExecutor::new();
@@ -627,6 +626,40 @@ async fn scope_fires_hooks() {
         Some("true"),
         "ScopeComplete must carry the labels passed to execute_with_labels"
     );
+
+    match start_event {
+        GraphEvent::ScopeStart { mode, .. } => {
+            assert_eq!(
+                mode, expected,
+                "OnScopeStart should carry the expected mode"
+            );
+        }
+        other => panic!("expected ScopeStart event, got {other:?}"),
+    }
+    match complete_event {
+        GraphEvent::ScopeComplete { mode, .. } => {
+            assert_eq!(
+                mode, expected,
+                "OnScopeComplete should carry the expected mode"
+            );
+        }
+        other => panic!("expected ScopeComplete event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn scope_fires_hooks_shared() {
+    run_scope_hooks_case(ContextPolicy::shared(), ContextMode::Shared).await;
+}
+
+#[tokio::test]
+async fn scope_fires_hooks_isolated() {
+    run_scope_hooks_case(ContextPolicy::new(), ContextMode::Isolated).await;
+}
+
+#[tokio::test]
+async fn scope_fires_hooks_inherit() {
+    run_scope_hooks_case(ContextPolicy::new().share_rest(), ContextMode::Inherit).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -374,3 +374,16 @@ pub mod apis {}
 
 #[doc = include_str!("docs/resources.md")]
 pub mod resources {}
+
+/// Contributor-facing reference docs included here purely so the rustdoc gate
+/// (`cargo doc -D warnings`) validates their `crate::…` intra-doc links against
+/// this crate's module tree. Hidden from the rendered API docs — these are
+/// authored under `docs/reference/` and are not part of the public surface.
+#[doc(hidden)]
+pub mod _reference_doc_link_check {
+    #[doc = include_str!("../docs/reference/guide.md")]
+    pub mod guide {}
+
+    #[doc = include_str!("../docs/reference/resources.md")]
+    pub mod resources {}
+}

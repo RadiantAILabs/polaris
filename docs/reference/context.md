@@ -180,20 +180,72 @@ The loop body executes in the **same context** across iterations. Outputs from i
 
 ### Scope
 
-Scope nodes have configurable context isolation via `ContextPolicy`, constructed upfront and passed to `add_scope`:
+Scope nodes have configurable context isolation via `ContextPolicy`, composed by chaining per-resource verbs onto `ContextPolicy::new()`. Two constructors anchor the surface:
 
-| Policy | Context | Reads | Writes | Output Merge |
-|--------|---------|-------|--------|--------------|
+| Constructor | Meaning |
+|---|---|
+| `ContextPolicy::shared()` | No boundary at all — the inner graph reuses the parent context. |
+| `ContextPolicy::new()` | Empty per-resource policy — nothing crosses unless added. |
+
+The policy is then composed from per-resource verbs:
+
+| Verb | Mechanism | Requires of `T` | Use when |
+|---|---|---|---|
+| `share::<T>()` | Child reads via parent chain (`Res<T>` walks up); zero copy | nothing (any `LocalResource`) | Read-only access; large or expensive-to-clone resources |
+| `forward::<T>()` | `Clone::clone` into child's local scope | `T: Clone` | Small mutable resource; child needs its own copy |
+| `fork::<T>()` | `ForkStrategy::fork(&self)` into child's local scope | `T: ForkStrategy` | Stateful resource with non-`Clone` semantics (snapshot, fresh-empty, `Arc`-shared) |
+| `forward_fresh::<T>()` | Re-invoke `T`'s registered factory | `T` registered via `Server::register_local(...)` | Resource that should start clean (counters, scratchpads, budgets) |
+| `exclude::<T>()` | Suppresses any earlier verb / `share_rest()` for `T` | nothing | Combine with `share_rest()` to opt one resource out of the catch-all |
+| `share_rest()` | Apply `share` to every resource not otherwise mentioned | nothing | "Mostly inherit, with a few overrides" pattern |
+
+Verbs are applied in declaration order; later verbs override earlier ones for the same `T`. `share_rest()` only applies to types not otherwise named.
+
+At runtime the executor branches on the policy:
+
+| Policy shape | Context | Reads | Writes | Output Merge |
+|---|---|---|---|---|
 | `ContextPolicy::shared()` | Same as parent | Parent's resources | Parent's resources | Shared (no merge needed) |
-| `ContextPolicy::inherit()` | `ctx.child()` | Walk parent chain + globals | Child's local scope | Merged back to parent |
-| `ContextPolicy::isolated()` | `SystemContext::with_globals(arc)` | Only globals + forwarded | Own local scope | Merged back to parent |
+| Any `share` verb / `share_rest()` | `ctx.child_filtered(parent_filter)` | Globals + parent chain (filtered by `share` / `share_rest` / `exclude`) + child locals | Child's local scope | Merged back to parent |
+| Pure isolation (only `forward` / `fork` / `forward_fresh`) | `ctx.child_filtered(AllowOnly(empty))` | Globals + forwarded/forked/fresh locals | Child's local scope | Merged back to parent |
 
-**Resource forwarding**: `ContextPolicy::inherit()` and `::isolated()` can forward specific resources from parent to child via `.forward::<T>()`. The resource must implement `Clone`; the clone function is captured at policy-build time.
+Every non-`shared()` policy builds the child via `child_filtered` and retains the (filtered) parent reference. For pure isolation the filter is an empty `AllowOnly`, so no parent local is readable — but keeping the reference lets a blocked read return `ParamError::ResourceOutOfScope` (naming the verb that would expose it) instead of an indistinct "not found". Globals still flow through the retained parent.
 
 ```rust
-let policy = ContextPolicy::isolated().forward::<Memory>();
+// Sub-agent: shared registry, fresh fragment store.
+let policy = ContextPolicy::new()
+    .share::<ToolRegistry>()
+    .forward_fresh::<FragmentStore>();
 graph.add_scope("sub_agent", inner_graph, policy);
+
+// "Mostly inherit, but override one resource."
+let policy = ContextPolicy::new()
+    .fork::<FragmentStore>()
+    .share_rest();
+graph.add_scope("scope", inner_graph, policy);
 ```
+
+### ParentFilter
+
+`ParentFilter` is the Layer 1 primitive that backs the scope boundary at runtime. It is an opaque type in `polaris_system::param` with two construction modes:
+
+- `ParentFilter::allow_all_except([TypeId, ...])` — used for the `share_rest()` case: parent-chain reads are allowed *except* for the listed type ids.
+- `ParentFilter::allow_only([TypeId, ...])` — used for explicit-share policies: parent-chain reads are allowed *only* for the listed type ids.
+
+`SystemContext::child_filtered(filter)` builds a child context whose parent-chain reads are gated by the filter. Globals remain reachable regardless of the filter — only locally-scoped resources walked through the parent chain are affected.
+
+```rust
+use std::any::TypeId;
+use polaris_system::param::{ParentFilter, SystemContext};
+
+let filter = ParentFilter::allow_all_except([TypeId::of::<Secret>()]);
+let child = parent.child_filtered(filter);
+// `Res<Secret>` walked from `child` will not see the parent's `Secret`,
+// but globals and unfiltered locals remain visible.
+```
+
+Application code rarely constructs `ParentFilter` directly. `ContextPolicy` builds the appropriate filter internally via `policy.parent_filter()`, and the executor invokes `child_filtered` when entering a scope. The filter is the mechanism that translates a `share` / `share_rest` / `exclude` declaration into runtime read-gating.
+
+Source: `polaris_system/src/param/mod.rs` — `ParentFilter`, `child_filtered`.
 
 ## Outputs
 
@@ -239,4 +291,6 @@ executor.validate_resources(&graph, &ctx, Some(&hooks))?;
 | `polaris_system/src/server.rs` | `Server::create_context()`, `ContextFactory`, deferred binding |
 | `polaris_graph/src/executor/mod.rs` | `validate_resources()`, scope validation |
 | `polaris_graph/src/executor/run.rs` | Per-node context management (parallel children, scope modes, output merging) |
-| `polaris_graph/src/node.rs` | `ContextMode`, `ContextPolicy`, `ResourceForward` |
+| `polaris_graph/src/node.rs` | `ContextPolicy`, `ContextMode` (high-level summary), `ResourceCrossing` |
+| `polaris_system/src/resource/resource.rs` | `ForkStrategy` trait |
+| `polaris_system/src/param/mod.rs` | `ParentFilter`, `SystemContext::child_filtered` |

@@ -100,8 +100,10 @@ pub struct ScopeInfo {
     pub node_id: NodeId,
     /// The scope node's name.
     pub node_name: &'static str,
-    /// The context mode for the scope.
-    pub context_mode: ContextMode,
+    /// High-level context-boundary classification — `Shared`, `Inherit`, or
+    /// `Isolated`. See [`ContextMode`] and
+    /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
+    pub mode: ContextMode,
     /// Number of nodes in the embedded graph.
     pub inner_node_count: usize,
 }

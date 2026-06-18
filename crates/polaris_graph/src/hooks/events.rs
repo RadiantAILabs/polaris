@@ -430,8 +430,10 @@ pub enum GraphEvent {
         node_id: NodeId,
         /// The scope node's name.
         node_name: &'static str,
-        /// The context mode for the scope (e.g., "Shared", "Inherit", "Isolated").
-        context_mode: ContextMode,
+        /// High-level context-boundary classification — `Shared`, `Inherit`,
+        /// or `Isolated`. See
+        /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
+        mode: ContextMode,
         /// Number of nodes in the embedded graph.
         inner_node_count: usize,
     },
@@ -446,8 +448,10 @@ pub enum GraphEvent {
         node_id: NodeId,
         /// The scope node's name.
         node_name: &'static str,
-        /// The context mode for the scope.
-        context_mode: ContextMode,
+        /// High-level context-boundary classification — `Shared`, `Inherit`,
+        /// or `Isolated`. See
+        /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
+        mode: ContextMode,
         /// Total nodes executed inside the scope.
         nodes_executed: usize,
         /// Total duration for scope execution.
@@ -721,26 +725,26 @@ impl std::fmt::Display for GraphEvent {
             GraphEvent::ScopeStart {
                 node_id,
                 node_name,
-                context_mode,
+                mode,
                 inner_node_count,
                 ..
             } => {
                 write!(
                     f,
-                    "[{run}] ScopeStart({node_name} @ {node_id:?}, mode: {context_mode}, inner_nodes: {inner_node_count})"
+                    "[{run}] ScopeStart({node_name} @ {node_id:?}, mode: {mode}, inner_nodes: {inner_node_count})"
                 )
             }
             GraphEvent::ScopeComplete {
                 node_id,
                 node_name,
-                context_mode,
+                mode,
                 nodes_executed,
                 duration,
                 ..
             } => {
                 write!(
                     f,
-                    "[{run}] ScopeComplete({node_name} @ {node_id:?}, mode: {context_mode}, executed: {nodes_executed}, duration: {duration:?})"
+                    "[{run}] ScopeComplete({node_name} @ {node_id:?}, mode: {mode}, executed: {nodes_executed}, duration: {duration:?})"
                 )
             }
         }
