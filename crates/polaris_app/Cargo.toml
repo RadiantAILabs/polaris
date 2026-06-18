@@ -23,8 +23,8 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.4.4" }
-polaris_graph = { path = "../polaris_graph", version = "0.4.4" }
+polaris_system = { path = "../polaris_system", version = "0.4" }
+polaris_graph = { path = "../polaris_graph", version = "0.4" }
 axum = { version = "0.8", features = ["tokio", "ws"] }
 hashbrown = "0.16.1"
 serde_json = "1"
@@ -38,7 +38,7 @@ opentelemetry = { version = "0.31", optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
 
 [dev-dependencies]
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4.4" }
+polaris_core_plugins = { path = "../polaris_core_plugins" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tokio-test = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
