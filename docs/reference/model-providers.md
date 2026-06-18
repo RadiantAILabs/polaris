@@ -223,7 +223,7 @@ Report cache usage back on `LlmResponse::usage` so cost accounting stays accurat
 
 ### Strict tool schemas
 
-Each `ToolDefinition` carries a `strict` flag (see [Tools](tools.md#strict-mode--exposure)) requesting that the provider enforce the tool's JSON schema via constrained decoding. As with caching, honoring it is per-provider:
+Each `ToolDefinition` carries a `strict` flag (see [Tools](tools.md#strict-mode-and-exposure)) requesting that the provider enforce the tool's JSON schema via constrained decoding. As with caching, honoring it is per-provider:
 
 - **OpenAI** passes each tool's `strict` flag through verbatim — there is no per-request strict-tool cap. The schema is normalized (`additionalProperties: false`, all keys required, unsupported constructs stripped) only when the tool is strict; a non-strict tool keeps its full schema.
 - **Anthropic** honors at most `MAX_STRICT_TOOLS` (20) strict tools per request. The provider budgets strictness in registration order — tools past the cap degrade to non-strict (and keep their full schema) so the request stays valid, surfacing each degradation with a `tracing::debug!`. A tool that opts out of strict does not consume a budget slot.

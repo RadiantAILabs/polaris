@@ -980,4 +980,28 @@ mod tests {
         assert_eq!(cache.breakpoints, vec![4]);
         assert!(cache.is_enabled());
     }
+
+    #[test]
+    fn tool_definition_strict_defaults_true_when_field_absent() {
+        // A payload that predates the `strict` field (or otherwise omits it) must
+        // deserialize as strict, matching the constructor default. A regression in
+        // `default_strict` would silently flip enforcement off for cached/persisted
+        // definitions, so pin it here.
+        let json = serde_json::json!({
+            "name": "legacy",
+            "description": "payload without a strict field",
+            "parameters": {"type": "object", "properties": {}}
+        });
+        let def: ToolDefinition = serde_json::from_value(json).unwrap();
+        assert!(def.strict, "missing `strict` must default to true, not false");
+    }
+
+    #[test]
+    fn tool_definition_strict_round_trips() {
+        let def = ToolDefinition::new("t", "d", serde_json::json!({})).with_strict(false);
+        let value = serde_json::to_value(&def).unwrap();
+        assert_eq!(value["strict"], serde_json::json!(false));
+        let back: ToolDefinition = serde_json::from_value(value).unwrap();
+        assert!(!back.strict, "explicit strict = false survives a round-trip");
+    }
 }

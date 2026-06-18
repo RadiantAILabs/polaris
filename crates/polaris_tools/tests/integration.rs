@@ -684,6 +684,7 @@ fn function_metadata_builder() {
     let def = meta.to_tool_definition();
     assert_eq!(def.name, "test");
     assert_eq!(def.description, "A test function.");
+    assert!(def.strict, "FunctionMetadata defaults to strict mode");
 
     let required = def.parameters["required"].as_array().unwrap();
     assert!(required.contains(&serde_json::json!("name")));

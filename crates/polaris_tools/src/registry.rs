@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 /// Registry of available tools.
 ///
-/// Stores tools by name and provides lookup, execution, and definition listing.
+/// Stores tools by name and provides lookup, execution, and definition listing,
+/// with per-tool permission, strict-mode, and exposure overrides applied at build
+/// time.
 ///
 /// # Examples
 ///
@@ -67,6 +69,8 @@ impl std::fmt::Debug for ToolRegistry {
         f.debug_struct("ToolRegistry")
             .field("tools", &self.names())
             .field("permission_overrides", &self.permission_overrides)
+            .field("strict_overrides", &self.strict_overrides)
+            .field("exposed_overrides", &self.exposed_overrides)
             .finish()
     }
 }
@@ -168,6 +172,22 @@ impl ToolRegistry {
     ///
     /// [`ToolDefinition::strict`]: polaris_models::llm::ToolDefinition::strict
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::{ToolError, ToolRegistry, tool};
+    ///
+    /// #[tool]
+    /// /// Look something up.
+    /// async fn search(query: String) -> Result<String, ToolError> { Ok(query) }
+    ///
+    /// let mut registry = ToolRegistry::new();
+    /// registry.register(search());
+    /// registry.set_strict("search", false)?;
+    /// assert!(!registry.definitions()[0].strict);
+    /// # Ok::<(), polaris_tools::ToolError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`ToolError::RegistryError`] if no tool with `name` is registered.
@@ -191,6 +211,23 @@ impl ToolRegistry {
     ///
     /// Applied during the build phase before the registry is frozen.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::{ToolError, ToolRegistry, tool};
+    ///
+    /// #[tool]
+    /// /// Internal debug helper, not advertised to the model.
+    /// async fn debug_dump() -> Result<String, ToolError> { Ok(String::new()) }
+    ///
+    /// let mut registry = ToolRegistry::new();
+    /// registry.register(debug_dump());
+    /// registry.set_exposed("debug_dump", false)?;
+    /// assert!(registry.definitions().is_empty()); // hidden from the model …
+    /// assert!(registry.has("debug_dump")); // … but still registered and invocable
+    /// # Ok::<(), polaris_tools::ToolError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`ToolError::RegistryError`] if no tool with `name` is registered.
@@ -210,6 +247,16 @@ impl ToolRegistry {
     /// or its effective [`permission`](Self::permission) is
     /// [`ToolPermission::Deny`] (a denied tool can never run, so it is never
     /// advertised). Returns `false` for an unregistered tool.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// // An unregistered tool is never exposed.
+    /// assert!(!registry.is_exposed("missing"));
+    /// ```
     #[must_use]
     pub fn is_exposed(&self, name: &str) -> bool {
         if !self.tools.contains_key(name) {
@@ -296,6 +343,29 @@ impl ToolRegistry {
     /// [`is_exposed`](Self::is_exposed) **and** `select(name)` returns `true`.
     /// Registration order — and therefore the provider's strict-cap priority — is
     /// preserved. [`set_strict`](Self::set_strict) overrides are applied.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::{ToolError, ToolRegistry, tool};
+    ///
+    /// #[tool]
+    /// /// Read a file.
+    /// async fn fs_read(path: String) -> Result<String, ToolError> { Ok(path) }
+    ///
+    /// #[tool]
+    /// /// Send a chat message.
+    /// async fn chat_send(text: String) -> Result<String, ToolError> { Ok(text) }
+    ///
+    /// let mut registry = ToolRegistry::new();
+    /// registry.register(fs_read());
+    /// registry.register(chat_send());
+    ///
+    /// // Advertise only the filesystem tools this turn, without mutating the registry.
+    /// let defs = registry.definitions_for(|name| name.starts_with("fs_"));
+    /// assert_eq!(defs.len(), 1);
+    /// assert_eq!(defs[0].name, "fs_read");
+    /// ```
     #[must_use]
     pub fn definitions_for<F>(&self, select: F) -> Vec<ToolDefinition>
     where
@@ -313,6 +383,15 @@ impl ToolRegistry {
     /// [`set_strict`](Self::set_strict) overrides are still applied. Intended for
     /// administrative views (e.g. the `GET /v1/tools` snapshot) that should list
     /// all tools regardless of whether they are advertised to the model.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// assert!(registry.all_definitions().is_empty());
+    /// ```
     #[must_use]
     pub fn all_definitions(&self) -> Vec<ToolDefinition> {
         self.tools
@@ -400,7 +479,7 @@ impl ToolRegistry {
 ///
 /// | Resource | Scope | Description |
 /// |----------|-------|-------------|
-/// | [`ToolRegistry`] | Global | Registry of tools keyed by name, with permission overrides |
+/// | [`ToolRegistry`] | Global | Registry of tools keyed by name, with per-tool permission, strict-mode, and exposure overrides |
 ///
 /// # APIs Provided
 ///
@@ -419,7 +498,7 @@ impl ToolRegistry {
 ///
 /// | Method | Path | Description |
 /// |--------|------|-------------|
-/// | `GET` | `/v1/tools` | Frozen snapshot of registered tool definitions and effective permissions. Takes no parameters — the handler reads only its axum `State`. |
+/// | `GET` | `/v1/tools` | Frozen snapshot of registered tool definitions, effective permissions, and per-tool exposure. Takes no parameters — the handler reads only its axum `State`. |
 ///
 /// # Lifecycle
 ///

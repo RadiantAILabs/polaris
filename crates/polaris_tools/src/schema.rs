@@ -176,3 +176,33 @@ impl FunctionMetadata {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_defaults_true_and_propagates_to_definition() {
+        let default = FunctionMetadata::new("a").to_tool_definition();
+        assert!(default.strict, "FunctionMetadata is strict by default");
+
+        let relaxed = FunctionMetadata::new("a")
+            .with_strict(false)
+            .to_tool_definition();
+        assert!(!relaxed.strict, "with_strict(false) reaches the ToolDefinition");
+    }
+
+    #[test]
+    fn strict_defaults_true_when_field_absent_on_deserialize() {
+        // Metadata serialized before `strict` existed must deserialize as strict,
+        // guarding the `#[serde(default = "default_strict")]` wiring against a
+        // regression that would silently disable enforcement.
+        let json = serde_json::json!({
+            "name": "legacy",
+            "parameters": [],
+            "schema": {"type": "object", "properties": {}, "required": []}
+        });
+        let meta: FunctionMetadata = serde_json::from_value(json).unwrap();
+        assert!(meta.to_tool_definition().strict);
+    }
+}

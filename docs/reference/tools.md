@@ -194,7 +194,7 @@ let effective: Option<ToolPermission> = registry.permission("delete_file");
 
 Returns the override if set, otherwise the tool's declared default, or `None` if the tool is unknown.
 
-## Strict Mode & Exposure
+## Strict Mode and Exposure
 
 Beyond permissions, two levers control how each tool is advertised to the model. Both are author-declared defaults that the agent designer can override at build time, exactly like permissions.
 

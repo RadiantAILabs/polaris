@@ -70,6 +70,20 @@ pub trait LlmRequestBuilderExt<'a, S> {
     /// mutating the registry. Delegates to
     /// [`ToolRegistry::definitions_for`](crate::ToolRegistry::definitions_for),
     /// so exposure and `strict` overrides still apply.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use polaris_tools::{LlmRequestBuilderExt, ToolRegistry};
+    /// use polaris_models::llm::Llm;
+    ///
+    /// # fn example(llm: Llm, registry: ToolRegistry) {
+    /// // Advertise only the filesystem tools relevant to this turn.
+    /// let _builder = llm
+    ///     .builder()
+    ///     .with_registry_filtered(&registry, |name| name.starts_with("fs_"));
+    /// # }
+    /// ```
     fn with_registry_filtered<F>(
         self,
         registry: &ToolRegistry,
@@ -252,8 +266,16 @@ mod tests {
         // The whole registry advertises all three …
         assert_eq!(llm.builder().with_registry(&registry).tool_count(), 3);
 
-        // … and the predicate narrows the advertised set, proving it reaches
-        // ToolRegistry::definitions_for.
+        // … the predicate narrows the set while preserving registration order
+        // (which drives the provider's strict-cap priority) …
+        let selected = registry.definitions_for(|n| n != "b");
+        assert_eq!(
+            selected.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["a", "c"],
+            "definitions_for keeps registration order and applies the predicate",
+        );
+
+        // … and with_registry_filtered forwards exactly that set to the builder.
         let filtered = llm
             .builder()
             .with_registry_filtered(&registry, |n| n != "b");
