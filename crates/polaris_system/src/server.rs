@@ -66,7 +66,8 @@ use crate::plugin::{
     Plugins, ResolvedReq, Schedule, ScheduleId, Version,
 };
 use crate::resource::{
-    GlobalResource, LocalResource, Resource, ResourceRef, ResourceRefMut, Resources,
+    GlobalResource, LocalResource, Resource, ResourceFactory, ResourceRef, ResourceRefMut,
+    Resources,
 };
 use hashbrown::{HashMap, HashSet};
 use std::any::TypeId;
@@ -75,12 +76,6 @@ use std::sync::{Arc, OnceLock};
 // ─────────────────────────────────────────────────────────────────────────────
 // Server
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Type-erased resource for dynamic storage.
-type BoxedResource = Box<dyn std::any::Any + Send + Sync>;
-
-/// Factory function that creates a local resource instance.
-type LocalFactory = Arc<dyn Fn() -> BoxedResource + Send + Sync>;
 
 /// Type-erased API for dynamic storage.
 type BoxedAPI = Box<dyn std::any::Any + Send + Sync>;
@@ -171,7 +166,7 @@ pub struct Server {
     /// Registered via [`register_local()`](Self::register_local).
     /// Each call to [`create_context()`](Self::create_context) invokes these factories
     /// to create fresh resource instances.
-    local_factories: HashMap<TypeId, LocalFactory>,
+    local_factories: HashMap<TypeId, ResourceFactory>,
 
     /// APIs for plugin orchestration (build-time capability registries).
     ///
@@ -485,8 +480,10 @@ impl Server {
         &mut self,
         factory: impl Fn() -> R + Send + Sync + 'static,
     ) {
-        self.local_factories
-            .insert(TypeId::of::<R>(), Arc::new(move || Box::new(factory())));
+        self.local_factories.insert(
+            TypeId::of::<R>(),
+            ResourceFactory::new(move || Box::new(factory())),
+        );
     }
 
     /// Returns true if a local resource factory for type `R` is registered.
@@ -531,10 +528,11 @@ impl Server {
         // Create context with access to server's global resources
         let mut ctx = SystemContext::with_globals(Arc::clone(&self.global));
 
-        // Instantiate local resources from factories
+        // Instantiate local resources from factories, retaining the factory on
+        // each entry so `forward_fresh::<T>()` can re-invoke it at scope boundaries.
         for (type_id, factory) in &self.local_factories {
-            let boxed = factory();
-            ctx.insert_boxed(*type_id, boxed);
+            let boxed = factory.produce();
+            ctx.insert_boxed_with_factory(*type_id, boxed, factory.clone());
         }
 
         ctx
@@ -582,7 +580,7 @@ impl Server {
             local_factories: self
                 .local_factories
                 .iter()
-                .map(|(k, v)| (*k, Arc::clone(v)))
+                .map(|(k, v)| (*k, v.clone()))
                 .collect(),
         }
     }
@@ -1425,7 +1423,7 @@ enum ContextFactoryGlobals {
 #[derive(Clone)]
 pub struct ContextFactory {
     globals: ContextFactoryGlobals,
-    local_factories: Vec<(TypeId, Arc<dyn Fn() -> BoxedResource + Send + Sync>)>,
+    local_factories: Vec<(TypeId, ResourceFactory)>,
 }
 
 impl std::fmt::Debug for ContextFactory {
@@ -1458,7 +1456,7 @@ impl ContextFactory {
         };
         let mut ctx = SystemContext::with_globals(globals);
         for (type_id, factory) in &self.local_factories {
-            ctx.insert_boxed(*type_id, factory());
+            ctx.insert_boxed_with_factory(*type_id, factory.produce(), factory.clone());
         }
         ctx
     }

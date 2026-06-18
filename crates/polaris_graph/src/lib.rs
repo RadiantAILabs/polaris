@@ -79,8 +79,8 @@ pub mod prelude {
     pub use crate::middleware::{MiddlewareAPI, MiddlewareError};
     pub use crate::node::{
         ContextMode, ContextPolicy, DecisionNode, IntoSystemNode, LoopNode, Node, NodeId,
-        NodeMarker, ParallelNode, ResourceForward, RetryPolicy, ScheduledNodeMarker, ScopeNode,
-        SwitchNode, SystemNode,
+        NodeMarker, ParallelNode, RetryPolicy, ScheduledNodeMarker, ScopeNode, SwitchNode,
+        SystemNode,
     };
     pub use crate::predicate::{
         BoxedDiscriminator, BoxedPredicate, Discriminator, ErasedDiscriminator, ErasedPredicate,
@@ -98,4 +98,4 @@ pub use graph::{
 };
 pub use hooks::{RunId, RunLabels};
 pub use middleware::{MiddlewareAPI, MiddlewareError};
-pub use node::{ContextMode, ContextPolicy, NodeId, ResourceForward, RetryPolicy, ScopeNode};
+pub use node::{ContextMode, ContextPolicy, NodeId, RetryPolicy, ScopeNode};

@@ -24,7 +24,7 @@ agent context) or **local** (one fresh instance per agent context). The scope
 is fixed at definition time by which trait the type implements; it cannot be
 changed at use sites.
 
-```rust
+```ignore
 use polaris_system::resource::{GlobalResource, LocalResource};
 
 /// Read-only registry — one instance shared by every system in every session.
@@ -57,7 +57,7 @@ about who shares the value.
 Globals are inserted by value; locals are registered with a factory closure
 that the framework calls each time a new context is created.
 
-```rust
+```ignore
 impl Plugin for MyPlugin {
     fn build(&self, server: &mut Server) {
         server.insert_global(ToolRegistry::default());
@@ -76,7 +76,7 @@ resource (which trait to impl) and when *deciding what data should live there*
 Local resources can also be inserted into a single agent context at runtime —
 typically inside a session setup closure on a specific turn:
 
-```rust
+```ignore
 sessions.process_turn_with(session_id, |ctx| {
     ctx.insert(RequestContext::from_headers(&headers));
 }).await?;
@@ -100,7 +100,7 @@ documented in [context.md](./context.md#resource-lookup-order).
 
 ## Documentation Standard
 
-Every `pub` type implementing [`GlobalResource`] or [`LocalResource`] that is
+Every `pub` type implementing [`GlobalResource`](crate::system::resource::GlobalResource) or [`LocalResource`](crate::system::resource::LocalResource) that is
 exported by this workspace **and is intended for downstream consumption** must
 include rustdoc covering the sections below. *Intended for downstream
 consumption* means: a downstream system would plausibly write
@@ -121,22 +121,24 @@ every PR.
 | **Scope + why** | One of `Global` or `Local`, with one sentence justifying the choice. Global resources should explain why they're safe to share across contexts; locals should explain why they need per-context isolation. |
 | **Provided by** | The plugin that calls `insert_global` / `register_local` for this type. Include the plugin's feature gate if any. If the resource is consumer-supplied (no plugin registers it by default), say so. |
 | **Access pattern** | Which parameter types are valid (`Res<T>` only, or `Res<T>` + `ResMut<T>`), and the mutation contract — *"every push is observed by the next system"*, *"reads see a consistent snapshot for the duration of one system call"*, etc. For globals, also note any interior mutability that bypasses `&T` (`Arc<Mutex<_>>` inside, etc.). |
-| **Alternatives** | Related or variant resources that consumers might also be looking for: trait alternatives ([`LlmProvider`](crate::models::LlmProvider) implementations), scope alternatives (a Global registry vs. a per-session Local override), or upstream substitutes (`MockClock` for `Clock` in tests). Empty `_none_` row is fine if there are no alternatives. |
+| **Alternatives** | Related or variant resources that consumers might also be looking for: trait alternatives ([`LlmProvider`](crate::models::llm::LlmProvider) implementations), scope alternatives (a Global registry vs. a per-session Local override), or upstream substitutes (`MockClock` for `Clock` in tests). Empty `_none_` row is fine if there are no alternatives. |
 | **Example system** | Rustdoc code block showing a real-shape `#[system]` that consumes the resource. Not a `let _ = ctx.get_resource::<T>()` snippet — an actual parameter-typed system, since that's the consumption pattern systems use. |
 
 ### Conditional Sections
 
 | Section | Include when | What it must contain |
 |---------|--------------|----------------------|
-| **Serialization** | The resource implements [`Storable`](crate::sessions::Storable) and is persisted across session checkpoints | Note that the resource is checkpointed, which plugin registers the serializer (typically [`SessionsPlugin`](crate::sessions::SessionsPlugin) via [`PersistenceAPI`](crate::plugins::PersistenceAPI)), and any non-obvious fields that aren't serialized. |
+| **Serialization** | The resource implements [`Storable`](crate::plugins::Storable) and is persisted across session checkpoints | Note that the resource is checkpointed, which plugin registers the serializer (typically [`SessionsPlugin`](crate::sessions::SessionsPlugin) via [`PersistenceAPI`](crate::plugins::PersistenceAPI)), and any non-obvious fields that aren't serialized. |
 | **Lifecycle hooks** | The resource's value changes meaning across hook boundaries (e.g., reset at `OnTurnStart`, finalized at `OnGraphComplete`) | Note which schedules transition the resource's state and what the values mean before vs. after. |
+| **Scope crossing** | The resource implements [`ForkStrategy`](crate::system::resource::ForkStrategy), or is meant to be `forward`/`forward_fresh`'d across a [scope boundary](crate::graph::ContextPolicy) | Note how the resource crosses into a child scope — a clone (`forward`), a fork (`fork`, and how `fork()` differs from `Clone`), or a fresh factory-built instance (`forward_fresh`) — so consumers know what state a sub-graph sees and whether writes propagate back. |
 
 ### Canonical Exemplars
 
 - [`ServerInfo`](crate::plugins::ServerInfo) — minimal Global: read-only metadata, no mutation, single provider.
 - [`Clock`](crate::plugins::Clock) — Global with substitutable implementation: `Clock` is the trait, `WallClock` is the default, `MockClock` is the test alternative. Demonstrates how to document a resource whose alternatives matter.
-- [`AgentMemory`](crate::sessions::AgentMemory) (or equivalent session-scoped scratchpad) — Local with `ResMut<T>` mutation contract.
+- `AgentMemory` (or equivalent session-scoped scratchpad) — Local with `ResMut<T>` mutation contract.
 - [`RequestContext`](crate::app::RequestContext) — per-turn Local, inserted at request boundary, demonstrates the runtime-insertion pattern.
+- [`ForkStrategy`](crate::system::resource::ForkStrategy) — capability trait a Local implements to control how it crosses a scope boundary via `fork::<T>()`, for when `Clone` semantics are wrong (fresh-empty stores, `Arc`-shared handles). The exemplar for documenting a resource's cross-scope behavior.
 
 ### Why this matters
 

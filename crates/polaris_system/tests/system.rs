@@ -470,6 +470,47 @@ fn create_context_instantiates_locals() {
 }
 
 #[test]
+fn create_context_retains_factory_on_entry() {
+    use std::any::TypeId;
+
+    // Regression: register_local + create_context must leave the factory on
+    // the resource entry so `forward_fresh::<T>()` at a scope boundary can
+    // produce a clean instance without separate Server→executor plumbing.
+    let mut server = Server::new();
+    server.register_local(LocalMemory::new);
+
+    let ctx = server.create_context();
+
+    let factory = ctx
+        .factory_fn_by_type_id(TypeId::of::<LocalMemory>())
+        .expect("Server::create_context should retain the factory on each entry");
+    let fresh = factory
+        .produce()
+        .downcast::<LocalMemory>()
+        .expect("factory should produce LocalMemory");
+    assert!(fresh.messages.is_empty());
+}
+
+#[test]
+fn context_factory_create_context_retains_factory_on_entry() {
+    use std::any::TypeId;
+
+    // Same contract for ContextFactory::create_context — used by HTTP handlers
+    // and other off-server callers.
+    let mut server = Server::new();
+    server.register_local(LocalMemory::new);
+    let factory = server.context_factory();
+
+    let ctx = factory.create_context();
+
+    assert!(
+        ctx.factory_fn_by_type_id(TypeId::of::<LocalMemory>())
+            .is_some(),
+        "ContextFactory::create_context should retain the factory on each entry",
+    );
+}
+
+#[test]
 fn global_resources_returns_container() {
     let mut server = Server::new();
     server.insert_global(GlobalConfig {
@@ -1334,7 +1375,7 @@ async fn context_factory_during_ready_does_not_block_insert_global() {
     use polaris_system::server::ContextFactory;
     use std::sync::{Arc, OnceLock};
 
-    /// Global resource registered by `PluginLate`.
+    /// Global resource registered by `LatePlugin`.
     #[derive(Debug, PartialEq)]
     struct LateGlobal {
         value: i32,

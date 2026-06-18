@@ -566,7 +566,7 @@ fn scope_isolated_forward_allows_write_access() {
     let mut inner = Graph::new();
     inner.add_boxed_system(Box::new(WriteConfigSystem));
 
-    let policy = ContextPolicy::isolated().forward::<TestConfig>();
+    let policy = ContextPolicy::new().forward::<TestConfig>();
 
     let mut graph = Graph::new();
     graph.add_scope("isolated_rw", inner, policy);
@@ -588,7 +588,7 @@ fn scope_isolated_forward_allows_read_access() {
     let mut inner = Graph::new();
     inner.add_boxed_system(Box::new(ReadConfigSystem));
 
-    let policy = ContextPolicy::isolated().forward::<TestConfig>();
+    let policy = ContextPolicy::new().forward::<TestConfig>();
 
     let mut graph = Graph::new();
     graph.add_scope("isolated_ro_read", inner, policy);
@@ -649,7 +649,7 @@ fn scope_isolated_without_forward_rejects_required_resource() {
     let mut inner = Graph::new();
     inner.add_boxed_system(Box::new(ReadConfigSystem));
 
-    let policy = ContextPolicy::isolated(); // no forward
+    let policy = ContextPolicy::new(); // no forward
     let mut graph = Graph::new();
     graph.add_scope("iso_no_fwd", inner, policy);
 
@@ -667,6 +667,343 @@ fn scope_isolated_without_forward_rejects_required_resource() {
             .iter()
             .any(|err| { matches!(err, ResourceValidationError::MissingResource { .. }) }),
         "should report MissingResource, got: {errors:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scope Resource Validation — Per-Verb Coverage
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Second `LocalResource` for cross-verb tests so we can vary which type
+/// the policy mentions vs. which type the inner system reads.
+#[derive(Debug, Default)]
+struct OtherConfig;
+impl LocalResource for OtherConfig {}
+
+/// System declaring `Res<OtherConfig>` (read-only) for validation coverage.
+struct ReadOtherSystem;
+impl System for ReadOtherSystem {
+    type Output = ();
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn name(&self) -> &'static str {
+        "read_other_system"
+    }
+    fn access(&self) -> SystemAccess {
+        SystemAccess::new().with_read::<OtherConfig>()
+    }
+}
+
+#[test]
+fn scope_share_allows_read_access() {
+    // `share::<T>()` makes the parent's T reachable through the parent
+    // chain — `Res<T>` (read access) must validate.
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigSystem));
+
+    let policy = ContextPolicy::new().share::<TestConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("share_ro", inner, policy);
+
+    let ctx = SystemContext::new().with(TestConfig { value: 1 });
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "share + Res<T> should pass validation, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn scope_share_rejects_write_access() {
+    // `share::<T>()` doesn't insert into the child's local scope, so
+    // `ResMut<T>` (write) must fail validation — write access requires
+    // a local resource.
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(WriteConfigSystem));
+
+    let policy = ContextPolicy::new().share::<TestConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("share_rw_misuse", inner, policy);
+
+    let ctx = SystemContext::new().with(TestConfig { value: 1 });
+    let executor = GraphExecutor::new();
+    let errors = executor
+        .validate_resources(&graph, &ctx, None)
+        .expect_err("share + ResMut should fail validation");
+
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingResource { access_mode, .. }
+                if *access_mode == AccessMode::Write
+        )),
+        "expected MissingResource for write access, got: {errors:?}"
+    );
+}
+
+#[test]
+fn scope_fork_allows_write_access() {
+    // `fork::<T>()` populates the child's local scope from
+    // `ForkStrategy::fork`, so `ResMut<T>` must validate.
+    #[derive(Debug, Default)]
+    struct ForkableConfig {
+        value: i32,
+    }
+    impl LocalResource for ForkableConfig {}
+    impl polaris_system::resource::ForkStrategy for ForkableConfig {
+        fn fork(&self) -> Self {
+            Self { value: self.value }
+        }
+    }
+
+    struct WriteForkable;
+    impl System for WriteForkable {
+        type Output = ();
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a SystemContext<'_>,
+        ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn name(&self) -> &'static str {
+            "write_forkable"
+        }
+        fn access(&self) -> SystemAccess {
+            SystemAccess::new().with_write::<ForkableConfig>()
+        }
+    }
+
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(WriteForkable));
+
+    let policy = ContextPolicy::new().fork::<ForkableConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("fork_rw", inner, policy);
+
+    let ctx = SystemContext::new().with(ForkableConfig::default());
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "fork + ResMut<T> should pass validation, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[tokio::test]
+async fn scope_forward_fresh_passes_when_factory_registered() {
+    // When the forward_fresh factory is registered, validation passes —
+    // the synthetic child has the resource available.
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(WriteConfigSystem));
+
+    let policy = ContextPolicy::new().forward_fresh::<TestConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("fwd_fresh_ok", inner, policy);
+
+    let mut server = polaris_system::server::Server::new();
+    server.register_local(|| TestConfig { value: 0 });
+    server.finish().await.unwrap();
+    let ctx = server.create_context();
+
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "forward_fresh with registered factory should validate, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[tokio::test]
+async fn scope_nested_forward_fresh_resolves_root_factory() {
+    // Two-level scope where both the outer and inner scope forward_fresh the
+    // same type, and the factory is registered only at the root. The inner
+    // scope is validated against the *outer scope's* child context, so eager
+    // validation must carry the factory down through each scope's validation
+    // locals — an isolated scope's parent filter blocks the walk back to the
+    // root, and the factory lives in the root's local resources (not globals).
+    // This is the validation-time mirror of the runtime
+    // `forward_fresh_walks_ancestor_chain_for_factory` test.
+    let mut innermost = Graph::new();
+    innermost.add_boxed_system(Box::new(WriteConfigSystem));
+
+    let mut middle = Graph::new();
+    middle.add_scope(
+        "inner_scope",
+        innermost,
+        ContextPolicy::new().forward_fresh::<TestConfig>(),
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope(
+        "outer_scope",
+        middle,
+        ContextPolicy::new().forward_fresh::<TestConfig>(),
+    );
+
+    let mut server = polaris_system::server::Server::new();
+    server.register_local(|| TestConfig { value: 0 });
+    server.finish().await.unwrap();
+    let ctx = server.create_context();
+
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "nested forward_fresh must resolve the root factory during validation, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn scope_forward_fresh_without_factory_reports_error() {
+    // Eager validation surfaces ScopeMissingFactory before execution.
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigSystem));
+
+    let policy = ContextPolicy::new().forward_fresh::<TestConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("fwd_fresh_no_factory", inner, policy);
+
+    // Plain context — no factory registered.
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let errors = executor
+        .validate_resources(&graph, &ctx, None)
+        .expect_err("forward_fresh with no factory should fail validation");
+
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::ScopeMissingFactory { scope_name, resource, .. }
+                if *scope_name == "fwd_fresh_no_factory" && resource.contains("TestConfig")
+        )),
+        "expected ScopeMissingFactory for TestConfig, got: {errors:?}"
+    );
+}
+
+#[test]
+fn scope_forward_without_source_reports_error() {
+    // Eager validation surfaces ScopeMissingResource for a `forward::<T>()`
+    // whose source is absent from the parent — symmetric with the
+    // forward_fresh missing-factory check, instead of deferring to runtime.
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadConfigSystem));
+
+    let policy = ContextPolicy::new().forward::<TestConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("fwd_no_source", inner, policy);
+
+    // Plain context — no TestConfig to forward.
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let errors = executor
+        .validate_resources(&graph, &ctx, None)
+        .expect_err("forward with no source should fail validation");
+
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::ScopeMissingResource { scope_name, resource, action, .. }
+                if *scope_name == "fwd_no_source"
+                    && resource.contains("TestConfig")
+                    && *action == "forward"
+        )),
+        "expected ScopeMissingResource for forward, got: {errors:?}"
+    );
+}
+
+#[test]
+fn scope_fork_without_source_reports_error() {
+    // Same eager check for the `fork::<T>()` verb — the `action` discriminant
+    // must report "fork".
+    #[derive(Debug, Default)]
+    struct ForkableConfig {
+        value: i32,
+    }
+    impl LocalResource for ForkableConfig {}
+    impl polaris_system::resource::ForkStrategy for ForkableConfig {
+        fn fork(&self) -> Self {
+            Self { value: self.value }
+        }
+    }
+
+    let inner = Graph::new();
+    let policy = ContextPolicy::new().fork::<ForkableConfig>();
+    let mut graph = Graph::new();
+    graph.add_scope("fork_no_source", inner, policy);
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let errors = executor
+        .validate_resources(&graph, &ctx, None)
+        .expect_err("fork with no source should fail validation");
+
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::ScopeMissingResource { scope_name, resource, action, .. }
+                if *scope_name == "fork_no_source"
+                    && resource.contains("ForkableConfig")
+                    && *action == "fork"
+        )),
+        "expected ScopeMissingResource for fork, got: {errors:?}"
+    );
+}
+
+#[test]
+fn scope_share_rest_with_exclude_validates_and_blocks_excluded_type() {
+    // `share_rest()` lets reads of unrelated types pass; `exclude::<T>()`
+    // overrides the catch-all and reverts to MissingResource for that type.
+    //
+    // Case A — system reads the *non-excluded* type: must pass.
+    let mut inner_pass = Graph::new();
+    inner_pass.add_boxed_system(Box::new(ReadOtherSystem));
+
+    let policy_pass = ContextPolicy::new().share_rest().exclude::<TestConfig>();
+    let mut graph_pass = Graph::new();
+    graph_pass.add_scope("rest_minus_one_pass", inner_pass, policy_pass);
+
+    let ctx = SystemContext::new()
+        .with(TestConfig { value: 1 })
+        .with(OtherConfig);
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph_pass, &ctx, None);
+    assert!(
+        result.is_ok(),
+        "share_rest leaves non-excluded types reachable, got: {:?}",
+        result.unwrap_err()
+    );
+
+    // Case B — system reads the *excluded* type: must fail.
+    let mut inner_fail = Graph::new();
+    inner_fail.add_boxed_system(Box::new(ReadConfigSystem));
+
+    let policy_fail = ContextPolicy::new().share_rest().exclude::<TestConfig>();
+    let mut graph_fail = Graph::new();
+    graph_fail.add_scope("rest_minus_one_fail", inner_fail, policy_fail);
+
+    let errors = executor
+        .validate_resources(&graph_fail, &ctx, None)
+        .expect_err("excluded type should fail validation");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingResource { resource_type, .. }
+                if resource_type.contains("TestConfig")
+        )),
+        "expected MissingResource for TestConfig, got: {errors:?}"
     );
 }
 

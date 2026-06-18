@@ -55,16 +55,16 @@ dashboard = [
 ]
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.4.0" }
-polaris_graph = { path = "../polaris_graph", version = "0.4.0" }
-polaris_agent = { path = "../polaris_agent", version = "0.4.0" }
-polaris_tools = { path = "../polaris_tools", version = "0.4.0" }
-polaris_model_providers = { path = "../polaris_model_providers", version = "0.4.0" }
-polaris_models = { path = "../polaris_models", version = "0.4.0" }
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4.0" }
-polaris_sessions = { path = "../polaris_sessions", version = "0.4.0", default-features = false }
-polaris_shell = { path = "../polaris_shell", version = "0.4.0" }
-polaris_app = { path = "../polaris_app", version = "0.4.0", default-features = false }
+polaris_system = { path = "../polaris_system", version = "0.4" }
+polaris_graph = { path = "../polaris_graph", version = "0.4" }
+polaris_agent = { path = "../polaris_agent", version = "0.4" }
+polaris_tools = { path = "../polaris_tools", version = "0.4" }
+polaris_model_providers = { path = "../polaris_model_providers", version = "0.4" }
+polaris_models = { path = "../polaris_models", version = "0.4" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4" }
+polaris_sessions = { path = "../polaris_sessions", version = "0.4", default-features = false }
+polaris_shell = { path = "../polaris_shell", version = "0.4" }
+polaris_app = { path = "../polaris_app", version = "0.4", default-features = false }
 
 [lints]
 workspace = true

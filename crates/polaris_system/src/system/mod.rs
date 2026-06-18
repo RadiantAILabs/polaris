@@ -3,8 +3,7 @@
 //! A [`System`] is an async function that receives dependencies via parameter
 //! injection from a [`SystemContext`] and produces
 //! a typed output. All dependencies are declared as parameters, making data
-//! flow explicit and systems composable across different execution contexts
-//! (graph nodes, hooks, standalone invocations).
+//! flow explicit and systems composable across different execution contexts.
 //!
 //! See [`System`] for the full trait definition and examples.
 //!
@@ -83,7 +82,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The `#[system]` macro detects this pattern and sets [`is_fallible`](System::is_fallible)
 /// to `true` automatically. On success, `T` is stored in the context for
 /// downstream `Out<T>` access. On error, the `SystemError` propagates to the
-/// executor, which routes to an error edge or halts the graph.
+/// executor.
 pub trait System: Send + Sync + 'static {
     /// The output type produced by this system.
     type Output: Output;
