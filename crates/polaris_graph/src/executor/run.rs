@@ -727,7 +727,8 @@ impl GraphExecutor {
                     } else {
                         "forward"
                     };
-                    let value = match parent.clone_local_resource_with(crossing.type_id, *clone_fn) {
+                    let value = match parent.clone_local_resource_with(crossing.type_id, *clone_fn)
+                    {
                         Some(value) => value,
                         // The clone failed. Distinguish a genuinely absent
                         // resource from one that is present but write-locked
