@@ -221,6 +221,15 @@ When you implement `generate()` / `stream()`, read `request.cache` (a `CacheCont
 
 Report cache usage back on `LlmResponse::usage` so cost accounting stays accurate: set `Usage::cache_read_tokens` (input served from cache, billed at a steep discount) and `Usage::cache_creation_tokens` (input written to the cache the first time, billed at a small premium). The tracing decorator prices these against the cache tiers on `ModelPricing` — `cache_read_per_million_usd` / `cache_write_per_million_usd`, derived from the input rate by default and overridable via `ModelPricing::with_cache_rates` — and records the result in `gen_ai.usage.cost_usd`. A provider that does not report cache tokens leaves both fields `None`, and the rollup neither counts nor prices them.
 
+### Strict tool schemas
+
+Each `ToolDefinition` carries a `strict` flag (see [Tools](tools.md#strict-mode--exposure)) requesting that the provider enforce the tool's JSON schema via constrained decoding. As with caching, honoring it is per-provider:
+
+- **OpenAI** passes each tool's `strict` flag through verbatim — there is no per-request strict-tool cap. The schema is normalized (`additionalProperties: false`, all keys required, unsupported constructs stripped) only when the tool is strict; a non-strict tool keeps its full schema.
+- **Anthropic** honors at most `MAX_STRICT_TOOLS` (20) strict tools per request. The provider budgets strictness in registration order — tools past the cap degrade to non-strict (and keep their full schema) so the request stays valid, surfacing each degradation with a `tracing::debug!`. A tool that opts out of strict does not consume a budget slot.
+
+Strict mode is best-effort schema enforcement, not a correctness requirement: a degraded tool is still sent, just without constrained decoding.
+
 ## Testing
 
 - **Unit-test** `LlmRequest → vendor` translation pure functions in isolation.

@@ -662,7 +662,12 @@ pub enum DocumentSource {
 // ─────────────────────
 
 /// Definition of a tool that can be called by the model.
+///
+/// Construct via [`ToolDefinition::new`] (and [`with_strict`](Self::with_strict));
+/// the struct is `#[non_exhaustive]` so fields may be added without a breaking
+/// change, and external callers cannot build it with a struct literal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolDefinition {
     /// Name of the tool (e.g., `get_weather`, `search_database`).
     pub name: String,

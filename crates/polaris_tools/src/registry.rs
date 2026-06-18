@@ -631,13 +631,41 @@ mod tests {
     #[test]
     fn set_strict_errors_for_unknown_tool() {
         let mut registry = ToolRegistry::new();
-        assert!(registry.set_strict("nope", false).is_err());
-        assert!(registry.set_exposed("nope", false).is_err());
+        let strict_err = registry.set_strict("nope", false).unwrap_err();
+        assert!(matches!(strict_err, ToolError::RegistryError(_)));
+        assert!(strict_err.to_string().contains("nope"));
+        let exposed_err = registry.set_exposed("nope", false).unwrap_err();
+        assert!(matches!(exposed_err, ToolError::RegistryError(_)));
+        assert!(exposed_err.to_string().contains("nope"));
     }
 
     #[test]
     fn is_exposed_is_false_for_unknown_tool() {
         let registry = ToolRegistry::new();
         assert!(!registry.is_exposed("nope"));
+    }
+
+    #[test]
+    fn all_definitions_applies_strict_override_and_ignores_exposure() {
+        let mut registry = registry_with(&["a", "b"]);
+        registry.set_strict("a", false).unwrap();
+        registry.set_exposed("a", false).unwrap();
+        let defs = registry.all_definitions();
+        // Exposure is ignored — the hidden tool still appears …
+        assert_eq!(names_of(&defs), ["a", "b"]);
+        // … but its documented strict override is still applied.
+        assert!(!defs.iter().find(|d| d.name == "a").unwrap().strict);
+        assert!(defs.iter().find(|d| d.name == "b").unwrap().strict);
+    }
+
+    #[test]
+    fn deny_permission_overrides_explicit_set_exposed_true() {
+        let mut registry = registry_with(&["a"]);
+        // Even an explicit expose-true cannot un-hide a denied tool: the `Deny`
+        // check in is_exposed precedes the exposure-override lookup.
+        registry.set_exposed("a", true).unwrap();
+        registry.set_permission("a", ToolPermission::Deny).unwrap();
+        assert!(!registry.is_exposed("a"));
+        assert!(names_of(&registry.definitions()).is_empty());
     }
 }

@@ -113,6 +113,9 @@ fn convert_request(
     let input_items = convert_messages(&request.messages)?;
 
     let tools: Option<Vec<Tool>> = request.tools.as_ref().map(|tools| {
+        // Unlike Anthropic (which caps strict tools per request — see
+        // `MAX_STRICT_TOOLS`), the OpenAI Responses API imposes no per-request
+        // strict-tool cap, so every tool's strict preference is honored verbatim.
         tools
             .iter()
             .map(|tool| {
@@ -963,6 +966,64 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.cache_read_tokens, None);
         assert_eq!(usage.cache_creation_tokens, None);
+    }
+
+    // ── Per-tool strict mode: request-side wiring ──
+
+    use polaris_models::llm::ToolDefinition;
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition::new(
+            name,
+            format!("{name} tool"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    /// The JSON the wire request serializes to. The `Tool` enum is internally
+    /// tagged on `type`, so a function tool flattens to
+    /// `{"type":"function","name":…,"parameters":…,"strict":…}`.
+    fn request_json(request: &LlmRequest) -> serde_json::Value {
+        serde_json::to_value(convert_request("gpt-5.5", request).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn strict_tool_is_marked_and_schema_normalized() {
+        // The default tool keeps strict on; OpenAI has no per-request strict-tool
+        // cap, so the preference is honored verbatim and the schema is normalized
+        // for constrained decoding (sealed with `additionalProperties: false`).
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: Some(vec![tool_def("search")]),
+            ..Default::default()
+        };
+        let tool = &request_json(&request)["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["strict"], true, "default tool is strict: {tool}");
+        assert_eq!(
+            tool["parameters"]["additionalProperties"], false,
+            "strict schema is normalized: {tool}"
+        );
+    }
+
+    #[test]
+    fn non_strict_tool_is_marked_and_schema_left_intact() {
+        // A tool that opts out is sent `strict: false` and keeps its full schema
+        // rather than having strict-incompatible constructs stripped.
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: Some(vec![tool_def("search").with_strict(false)]),
+            ..Default::default()
+        };
+        let tool = &request_json(&request)["tools"][0];
+        assert_eq!(
+            tool["strict"], false,
+            "opted-out tool is non-strict: {tool}"
+        );
+        assert!(
+            tool["parameters"].get("additionalProperties").is_none(),
+            "non-strict schema is left un-normalized: {tool}"
+        );
     }
 
     #[test]

@@ -241,6 +241,25 @@ mod tests {
         assert_eq!(builder.tool_count(), 4);
     }
 
+    #[test]
+    fn with_registry_filtered_narrows_to_selected_tools() {
+        let llm = mock_llm();
+        let mut registry = ToolRegistry::new();
+        registry.register(FakeTool { name: "a" });
+        registry.register(FakeTool { name: "b" });
+        registry.register(FakeTool { name: "c" });
+
+        // The whole registry advertises all three …
+        assert_eq!(llm.builder().with_registry(&registry).tool_count(), 3);
+
+        // … and the predicate narrows the advertised set, proving it reaches
+        // ToolRegistry::definitions_for.
+        let filtered = llm
+            .builder()
+            .with_registry_filtered(&registry, |n| n != "b");
+        assert_eq!(filtered.tool_count(), 2);
+    }
+
     // ── LlmReasonExt tests ──
 
     #[tokio::test]

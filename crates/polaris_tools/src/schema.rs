@@ -132,12 +132,12 @@ impl FunctionMetadata {
 
     /// Converts this metadata into a [`ToolDefinition`].
     pub fn to_tool_definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: self.name.clone(),
-            description: self.description.clone().unwrap_or_default(),
-            parameters: self.schema.clone(),
-            strict: self.strict,
-        }
+        ToolDefinition::new(
+            self.name.clone(),
+            self.description.clone().unwrap_or_default(),
+            self.schema.clone(),
+        )
+        .with_strict(self.strict)
     }
 
     fn rebuild_schema(&mut self) {

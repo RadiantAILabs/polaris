@@ -308,6 +308,15 @@ fn convert_request(
                 let strict = tool.strict && strict_budget > 0;
                 if strict {
                     strict_budget -= 1;
+                } else if tool.strict {
+                    // Wanted strict but the per-request budget is spent; degrade so
+                    // the request stays valid, and surface it so an operator can see
+                    // the tool is being sent without schema enforcement.
+                    tracing::debug!(
+                        tool = %tool.name,
+                        max_strict_tools = MAX_STRICT_TOOLS,
+                        "strict-tool budget exhausted; tool sent non-strict"
+                    );
                 }
                 ToolDef {
                     name: tool.name.clone(),

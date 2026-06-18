@@ -97,7 +97,7 @@ registry into a `GlobalResource` during `ready()`.
 | **Confirm** | Caller must obtain user confirmation |
 | **Deny** | Reject execution entirely |
 
-Override permissions at build time: `registry.set_permission("delete_file", ToolPermission::Deny)`.
+Override permissions at build time: `registry.set_permission("delete_file", ToolPermission::Deny)`. Two sibling build-time levers control how each tool is advertised: `set_strict(name, bool)` toggles provider strict-schema enforcement (default on; opt out per tool with `#[tool(strict = false)]`), and `set_exposed(name, bool)` hides a tool from the model while keeping it invocable. See the [Tools reference](https://www.notion.so/radiant-ai/Tools-342afe2e695d80228a2ccc2130f85703) for details.
 
 # Execution
 
@@ -118,7 +118,9 @@ async fn invoke_tool(registry: Res<ToolRegistry>) -> Result<serde_json::Value, S
 ```
 
 For LLM tool calling, pass `registry.definitions()` to the model provider
-and dispatch returned calls through `registry.execute()`.
+and dispatch returned calls through `registry.execute()`. Use `definitions_for(select)`
+to narrow the advertised set per turn, or `all_definitions()` for an admin view that
+ignores exposure.
 
 # Related
 
