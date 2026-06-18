@@ -54,6 +54,8 @@ impl TracingLlmProvider {
             gen_ai.request.model = %model,
             gen_ai.usage.input_tokens = tracing::field::Empty,
             gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_read_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_creation_tokens = tracing::field::Empty,
             gen_ai.usage.cost_usd = tracing::field::Empty,
             gen_ai.input.messages = tracing::field::Empty,
             gen_ai.output.messages = tracing::field::Empty,
@@ -117,12 +119,7 @@ impl DynLlmProvider for TracingLlmProvider {
                 match &result {
                     Ok(response) => {
                         let current = tracing::Span::current();
-                        if let Some(input) = response.usage.input_tokens {
-                            current.record("gen_ai.usage.input_tokens", input);
-                        }
-                        if let Some(output) = response.usage.output_tokens {
-                            current.record("gen_ai.usage.output_tokens", output);
-                        }
+                        record_usage_tokens(&current, &response.usage);
                         record_cost(&current, inner.pricing(model), &response.usage);
                         if capture_genai_content {
                             current.record(
@@ -188,6 +185,28 @@ impl DynLlmProvider for TracingLlmProvider {
     }
 }
 
+/// Records the `gen_ai.usage.*` token-count fields from `usage` onto `span`.
+///
+/// Records each field only when the provider reports it (non-caching providers
+/// leave the cache fields `None`). The usage aggregator re-prices from these
+/// same span fields, so recording the cache counts here is what lets the
+/// rollup bill cached input at the cache tiers — without them it silently
+/// under-counts cost for cached calls.
+fn record_usage_tokens(span: &tracing::Span, usage: &Usage) {
+    if let Some(input) = usage.input_tokens {
+        span.record("gen_ai.usage.input_tokens", input);
+    }
+    if let Some(output) = usage.output_tokens {
+        span.record("gen_ai.usage.output_tokens", output);
+    }
+    if let Some(cache_read) = usage.cache_read_tokens {
+        span.record("gen_ai.usage.cache_read_tokens", cache_read);
+    }
+    if let Some(cache_creation) = usage.cache_creation_tokens {
+        span.record("gen_ai.usage.cache_creation_tokens", cache_creation);
+    }
+}
+
 /// Records the estimated USD cost as `gen_ai.usage.cost_usd` on `span`.
 ///
 /// No-ops when the provider has no pricing for the model or both token
@@ -199,9 +218,11 @@ fn record_cost(span: &tracing::Span, pricing: Option<ModelPricing>, usage: &Usag
     if usage.input_tokens.is_none() && usage.output_tokens.is_none() {
         return;
     }
-    let cost = rate.cost(
+    let cost = rate.cost_with_cache(
         usage.input_tokens.unwrap_or(0),
         usage.output_tokens.unwrap_or(0),
+        usage.cache_read_tokens.unwrap_or(0),
+        usage.cache_creation_tokens.unwrap_or(0),
     );
     span.record("gen_ai.usage.cost_usd", cost);
 }
@@ -237,12 +258,7 @@ impl futures_core::Stream for TracingStream {
                     usage,
                 } = event
                 {
-                    if let Some(input) = usage.input_tokens {
-                        span.record("gen_ai.usage.input_tokens", input);
-                    }
-                    if let Some(output) = usage.output_tokens {
-                        span.record("gen_ai.usage.output_tokens", output);
-                    }
+                    record_usage_tokens(&span, usage);
                     record_cost(&span, self.pricing, usage);
                 }
             }
@@ -280,12 +296,26 @@ mod tests {
     /// (avoids requiring `Clone` on `GenerationError`).
     struct StubStreamProvider {
         events: Mutex<Option<VecDeque<Result<StreamEvent, GenerationError>>>>,
+        pricing: Option<ModelPricing>,
     }
 
     impl StubStreamProvider {
         fn new(events: Vec<Result<StreamEvent, GenerationError>>) -> Self {
             Self {
                 events: Mutex::new(Some(events.into())),
+                pricing: None,
+            }
+        }
+
+        /// Like [`new`](Self::new) but advertises a fixed pricing rate, so the
+        /// stream path exercises `record_cost` on `MessageStop`.
+        fn with_pricing(
+            events: Vec<Result<StreamEvent, GenerationError>>,
+            pricing: ModelPricing,
+        ) -> Self {
+            Self {
+                events: Mutex::new(Some(events.into())),
+                pricing: Some(pricing),
             }
         }
     }
@@ -318,7 +348,7 @@ mod tests {
         }
 
         fn pricing(&self, _model: &str) -> Option<ModelPricing> {
-            None
+            self.pricing
         }
     }
 
@@ -347,6 +377,7 @@ mod tests {
                         input_tokens: Some(10),
                         output_tokens: Some(20),
                         total_tokens: Some(30),
+                        ..Default::default()
                     },
                 },
             )])),
@@ -411,6 +442,8 @@ mod tests {
         rate: ModelPricing,
         input_tokens: u64,
         output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
     }
 
     impl DynLlmProvider for PricingProvider {
@@ -429,7 +462,16 @@ mod tests {
                 usage: Usage {
                     input_tokens: Some(self.input_tokens),
                     output_tokens: Some(self.output_tokens),
-                    total_tokens: Some(self.input_tokens + self.output_tokens),
+                    total_tokens: Some(
+                        self.input_tokens
+                            + self.output_tokens
+                            + self.cache_read_tokens
+                            + self.cache_creation_tokens,
+                    ),
+                    cache_read_tokens: (self.cache_read_tokens > 0)
+                        .then_some(self.cache_read_tokens),
+                    cache_creation_tokens: (self.cache_creation_tokens > 0)
+                        .then_some(self.cache_creation_tokens),
                 },
                 stop_reason: StopReason::EndTurn,
             };
@@ -468,6 +510,8 @@ mod tests {
                 rate: ModelPricing::new(3.0, 15.0),
                 input_tokens: 1_000_000,
                 output_tokens: 2_000_000,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             }),
             false,
         );
@@ -496,6 +540,137 @@ mod tests {
         assert!(
             (cost - 33.0).abs() < 1e-9,
             "expected cost ≈ 33.0 USD, got {cost}",
+        );
+    }
+
+    /// When the provider reports cache tokens, the chat span must (a) record
+    /// the cache-token fields the usage aggregator re-prices from, and (b)
+    /// bill them at the cache tiers in `gen_ai.usage.cost_usd`. Without the
+    /// recorded fields the rollup would silently under-count cached cost.
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_records_cache_tokens_and_cache_tier_cost() {
+        let records = Arc::new(Mutex::new(Vec::<SpanRecord>::new()));
+        let sink = Arc::new(CapturingSink {
+            records: Arc::clone(&records),
+        });
+        let layer = RecordingLayer::with_sink(sink);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let provider = TracingLlmProvider::new(
+            Arc::new(PricingProvider {
+                rate: ModelPricing::new(3.0, 15.0),
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                cache_read_tokens: 1_000_000,
+                cache_creation_tokens: 0,
+            }),
+            false,
+        );
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        provider
+            .generate("test-model", empty_request())
+            .await
+            .expect("generate must succeed");
+        drop(_guard);
+
+        let captured = records.lock();
+        let chat = captured
+            .iter()
+            .find(|r| r.name == "chat")
+            .expect("chat span must be recorded");
+
+        // The cache-read count is recorded so the aggregator can re-price it.
+        assert_eq!(
+            chat.fields
+                .get("gen_ai.usage.cache_read_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(1_000_000),
+            "cache_read_tokens must be recorded on the span"
+        );
+
+        let cost = chat
+            .fields
+            .get("gen_ai.usage.cost_usd")
+            .expect("cost present")
+            .as_f64()
+            .expect("cost must serialize as a number");
+        // 1M input @ $3/M + 1M cache-read @ $0.30/M (0.1x of $3) = $3.30,
+        // not the $3.00 a cache-blind `cost(input, output)` would report.
+        assert!(
+            (cost - 3.30).abs() < 1e-9,
+            "expected $3.30 incl. cache-read tier, got {cost}",
+        );
+    }
+
+    /// The streaming path must record cache tokens and bill them at the cache
+    /// tiers too. `record_usage_tokens`/`record_cost` fire from both the
+    /// `generate()` path and `TracingStream::poll_next` on `MessageStop`, but
+    /// only the former was covered. A regression in the stream branch (e.g.
+    /// dropping `record_cost` on `MessageStop`) would otherwise pass CI.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_records_cache_tokens_and_cache_tier_cost() {
+        let records = Arc::new(Mutex::new(Vec::<SpanRecord>::new()));
+        let sink = Arc::new(CapturingSink {
+            records: Arc::clone(&records),
+        });
+        let layer = RecordingLayer::with_sink(sink);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let provider = TracingLlmProvider::new(
+            Arc::new(StubStreamProvider::with_pricing(
+                vec![Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage {
+                        input_tokens: Some(1_000_000),
+                        output_tokens: Some(0),
+                        total_tokens: Some(2_000_000),
+                        cache_read_tokens: Some(1_000_000),
+                        cache_creation_tokens: None,
+                    },
+                })],
+                ModelPricing::new(3.0, 15.0),
+            )),
+            false,
+        );
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut stream = provider
+            .stream("test-model", empty_request())
+            .await
+            .expect("stream must start");
+        let items = drain_stream(&mut stream);
+        assert_eq!(items.len(), 1);
+        // Drop the stream so the cloned chat span closes and the layer emits
+        // its close record with the fields the stream branch recorded.
+        drop(stream);
+        drop(_guard);
+
+        let captured = records.lock();
+        let chat = captured
+            .iter()
+            .find(|r| r.name == "chat")
+            .expect("chat span must be recorded");
+
+        // The stream branch records the cache-read count for the aggregator.
+        assert_eq!(
+            chat.fields
+                .get("gen_ai.usage.cache_read_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(1_000_000),
+            "cache_read_tokens must be recorded on the streamed span"
+        );
+
+        let cost = chat
+            .fields
+            .get("gen_ai.usage.cost_usd")
+            .expect("cost present on the streamed span")
+            .as_f64()
+            .expect("cost must serialize as a number");
+        // 1M input @ $3/M + 1M cache-read @ $0.30/M (0.1x of $3) = $3.30.
+        assert!(
+            (cost - 3.30).abs() < 1e-9,
+            "expected $3.30 incl. cache-read tier on the stream path, got {cost}",
         );
     }
 }

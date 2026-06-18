@@ -507,11 +507,19 @@ fn convert_output_message_content(
     }
 }
 
+/// Converts `OpenAI` token usage to Polaris usage.
+///
+/// `cache_read_tokens` / `cache_creation_tokens` are left `None`: prompt caching
+/// is wired only for Anthropic so far. `OpenAI` *does* report cached input
+/// (`input_tokens_details.cached_tokens`), so surface it here when caching is
+/// enabled for this provider — otherwise cached input is silently under-counted
+/// in cost estimates.
 fn convert_usage(usage: ResponseUsage) -> Usage {
     Usage {
         input_tokens: Some(u64::from(usage.input_tokens)),
         output_tokens: Some(u64::from(usage.output_tokens)),
         total_tokens: Some(u64::from(usage.total_tokens)),
+        ..Default::default()
     }
 }
 
@@ -937,6 +945,18 @@ mod tests {
             "output_tokens_details": { "reasoning_tokens": 0 }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn convert_usage_leaves_cache_fields_none() {
+        // Prompt caching is wired only for Anthropic; the OpenAI converter must
+        // leave the cache tiers `None` so the usage rollup neither prices nor
+        // counts them. Locks that contract against accidental future wiring.
+        let usage = convert_usage(stub_usage());
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.cache_creation_tokens, None);
     }
 
     #[test]
