@@ -993,7 +993,10 @@ mod tests {
             "parameters": {"type": "object", "properties": {}}
         });
         let def: ToolDefinition = serde_json::from_value(json).unwrap();
-        assert!(def.strict, "missing `strict` must default to true, not false");
+        assert!(
+            def.strict,
+            "missing `strict` must default to true, not false"
+        );
     }
 
     #[test]
@@ -1002,6 +1005,9 @@ mod tests {
         let value = serde_json::to_value(&def).unwrap();
         assert_eq!(value["strict"], serde_json::json!(false));
         let back: ToolDefinition = serde_json::from_value(value).unwrap();
-        assert!(!back.strict, "explicit strict = false survives a round-trip");
+        assert!(
+            !back.strict,
+            "explicit strict = false survives a round-trip"
+        );
     }
 }

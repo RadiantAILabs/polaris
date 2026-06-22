@@ -189,7 +189,10 @@ mod tests {
         let relaxed = FunctionMetadata::new("a")
             .with_strict(false)
             .to_tool_definition();
-        assert!(!relaxed.strict, "with_strict(false) reaches the ToolDefinition");
+        assert!(
+            !relaxed.strict,
+            "with_strict(false) reaches the ToolDefinition"
+        );
     }
 
     #[test]
