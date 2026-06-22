@@ -692,7 +692,7 @@ pub struct ToolDefinition {
     /// mode (constrained decoding that guarantees schema-valid arguments).
     ///
     /// This is the tool author's declared preference. The agent designer may
-    /// override it on the [`ToolRegistry`], and the provider applies its own cap
+    /// override it on the tool registry, and the provider applies its own cap
     /// (e.g. Anthropic allows at most 20 strict tools per request, degrading the
     /// overflow to non-strict in registration order). Defaults to `true`.
     #[serde(default = "default_strict")]
