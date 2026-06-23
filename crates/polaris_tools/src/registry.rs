@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 /// Registry of available tools.
 ///
-/// Stores tools by name and provides lookup, execution, and definition listing.
+/// Stores tools by name and provides lookup, execution, and definition listing,
+/// with per-tool permission, strict-mode, and exposure overrides applied at build
+/// time.
 ///
 /// # Examples
 ///
@@ -37,11 +39,7 @@ use std::sync::Arc;
 /// struct GreetTool;
 /// impl Tool for GreetTool {
 ///     fn definition(&self) -> ToolDefinition {
-///         ToolDefinition {
-///             name: "greet".into(),
-///             description: "Say hello".into(),
-///             parameters: json!({"type": "object", "properties": {}}),
-///         }
+///         ToolDefinition::new("greet", "Say hello", json!({"type": "object", "properties": {}}))
 ///     }
 ///     fn execute<'ctx>(&'ctx self, _args: Value, _ctx: &'ctx ToolContext) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'ctx>> {
 ///         Box::pin(async { Ok(json!("hello")) })
@@ -57,6 +55,13 @@ use std::sync::Arc;
 pub struct ToolRegistry {
     tools: IndexMap<String, Arc<dyn Tool>>,
     permission_overrides: IndexMap<String, ToolPermission>,
+    /// Per-tool overrides of the author-declared `strict` flag, set by the agent
+    /// designer via [`set_strict`](Self::set_strict). Absent = use the tool's default.
+    strict_overrides: IndexMap<String, bool>,
+    /// Per-tool exposure overrides, set via [`set_exposed`](Self::set_exposed).
+    /// Absent = exposed. A tool whose effective permission is
+    /// [`ToolPermission::Deny`] is treated as unexposed regardless of this map.
+    exposed_overrides: IndexMap<String, bool>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -64,6 +69,8 @@ impl std::fmt::Debug for ToolRegistry {
         f.debug_struct("ToolRegistry")
             .field("tools", &self.names())
             .field("permission_overrides", &self.permission_overrides)
+            .field("strict_overrides", &self.strict_overrides)
+            .field("exposed_overrides", &self.exposed_overrides)
             .finish()
     }
 }
@@ -84,6 +91,8 @@ impl ToolRegistry {
         Self {
             tools: IndexMap::new(),
             permission_overrides: IndexMap::new(),
+            strict_overrides: IndexMap::new(),
+            exposed_overrides: IndexMap::new(),
         }
     }
 
@@ -153,6 +162,112 @@ impl ToolRegistry {
             .or_else(|| self.tools.get(name).map(|t| t.permission()))
     }
 
+    /// Overrides whether a tool requests provider strict-mode enforcement.
+    ///
+    /// Applied during the build phase before the registry is frozen. Overrides
+    /// the tool author's declared [`ToolDefinition::strict`] preference. The
+    /// override is honored by [`definitions`](Self::definitions) and
+    /// [`definitions_for`](Self::definitions_for); the model provider still
+    /// applies its own cap on the number of strict tools per request.
+    ///
+    /// [`ToolDefinition::strict`]: polaris_models::llm::ToolDefinition::strict
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::{ToolError, ToolRegistry, tool};
+    ///
+    /// #[tool]
+    /// /// Look something up.
+    /// async fn search(query: String) -> Result<String, ToolError> { Ok(query) }
+    ///
+    /// let mut registry = ToolRegistry::new();
+    /// registry.register(search());
+    /// registry.set_strict("search", false)?;
+    /// assert!(!registry.definitions()[0].strict);
+    /// # Ok::<(), polaris_tools::ToolError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::RegistryError`] if no tool with `name` is registered.
+    pub fn set_strict(&mut self, name: &str, strict: bool) -> Result<&mut Self, ToolError> {
+        if !self.tools.contains_key(name) {
+            return Err(ToolError::registry_error(format!(
+                "tool '{name}' not in registry"
+            )));
+        }
+        self.strict_overrides.insert(name.to_string(), strict);
+        Ok(self)
+    }
+
+    /// Overrides whether a tool is exposed to the model.
+    ///
+    /// An unexposed tool is omitted from [`definitions`](Self::definitions) and
+    /// [`definitions_for`](Self::definitions_for) — the model never sees it (and
+    /// it consumes neither context nor a strict-tool slot). The tool remains
+    /// registered and directly invocable via
+    /// [`execute_with`](Self::execute_with).
+    ///
+    /// Applied during the build phase before the registry is frozen.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::{ToolError, ToolRegistry, tool};
+    ///
+    /// #[tool]
+    /// /// Internal debug helper, not advertised to the model.
+    /// async fn debug_dump() -> Result<String, ToolError> { Ok(String::new()) }
+    ///
+    /// let mut registry = ToolRegistry::new();
+    /// registry.register(debug_dump());
+    /// registry.set_exposed("debug_dump", false)?;
+    /// assert!(registry.definitions().is_empty()); // hidden from the model …
+    /// assert!(registry.has("debug_dump")); // … but still registered and invocable
+    /// # Ok::<(), polaris_tools::ToolError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::RegistryError`] if no tool with `name` is registered.
+    pub fn set_exposed(&mut self, name: &str, exposed: bool) -> Result<&mut Self, ToolError> {
+        if !self.tools.contains_key(name) {
+            return Err(ToolError::registry_error(format!(
+                "tool '{name}' not in registry"
+            )));
+        }
+        self.exposed_overrides.insert(name.to_string(), exposed);
+        Ok(self)
+    }
+
+    /// Returns whether a tool is exposed to the model.
+    ///
+    /// A tool is exposed unless it was hidden via [`set_exposed`](Self::set_exposed)
+    /// or its effective [`permission`](Self::permission) is
+    /// [`ToolPermission::Deny`] (a denied tool can never run, so it is never
+    /// advertised). Returns `false` for an unregistered tool.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// // An unregistered tool is never exposed.
+    /// assert!(!registry.is_exposed("missing"));
+    /// ```
+    #[must_use]
+    pub fn is_exposed(&self, name: &str) -> bool {
+        if !self.tools.contains_key(name) {
+            return false;
+        }
+        if self.permission(name) == Some(ToolPermission::Deny) {
+            return false;
+        }
+        self.exposed_overrides.get(name).copied().unwrap_or(true)
+    }
+
     /// Executes a tool by name with JSON arguments and an empty context.
     ///
     /// This is a convenience wrapper around [`execute_with`](Self::execute_with)
@@ -207,10 +322,91 @@ impl ToolRegistry {
         })
     }
 
-    /// Returns tool definitions for all registered tools.
+    /// Returns tool definitions for the exposed tools, in registration order.
+    ///
+    /// Excludes tools hidden via [`set_exposed`](Self::set_exposed) or denied via
+    /// permission (see [`is_exposed`](Self::is_exposed)), and applies any
+    /// [`set_strict`](Self::set_strict) overrides. This is the set the agent
+    /// advertises to the model by default; use
+    /// [`definitions_for`](Self::definitions_for) to narrow it further per request,
+    /// or [`all_definitions`](Self::all_definitions) to ignore exposure entirely.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.definitions_for(|_| true)
+    }
+
+    /// Returns exposed tool definitions whose name satisfies `select`.
+    ///
+    /// The request-time companion to [`definitions`](Self::definitions): an agent
+    /// can narrow the advertised toolset per turn (e.g. to the tools relevant to
+    /// the current goal) without mutating the registry. A tool is included iff it
+    /// [`is_exposed`](Self::is_exposed) **and** `select(name)` returns `true`.
+    /// Registration order — and therefore the provider's strict-cap priority — is
+    /// preserved. [`set_strict`](Self::set_strict) overrides are applied.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::{ToolError, ToolRegistry, tool};
+    ///
+    /// #[tool]
+    /// /// Read a file.
+    /// async fn fs_read(path: String) -> Result<String, ToolError> { Ok(path) }
+    ///
+    /// #[tool]
+    /// /// Send a chat message.
+    /// async fn chat_send(text: String) -> Result<String, ToolError> { Ok(text) }
+    ///
+    /// let mut registry = ToolRegistry::new();
+    /// registry.register(fs_read());
+    /// registry.register(chat_send());
+    ///
+    /// // Advertise only the filesystem tools this turn, without mutating the registry.
+    /// let defs = registry.definitions_for(|name| name.starts_with("fs_"));
+    /// assert_eq!(defs.len(), 1);
+    /// assert_eq!(defs[0].name, "fs_read");
+    /// ```
+    #[must_use]
+    pub fn definitions_for<F>(&self, select: F) -> Vec<ToolDefinition>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.tools
+            .iter()
+            .filter(|(name, _)| self.is_exposed(name) && select(name))
+            .map(|(name, tool)| self.effective_definition(name, tool.as_ref()))
+            .collect()
+    }
+
+    /// Returns definitions for *every* registered tool, ignoring exposure.
+    ///
+    /// [`set_strict`](Self::set_strict) overrides are still applied. Intended for
+    /// administrative views (e.g. the `GET /v1/tools` snapshot) that should list
+    /// all tools regardless of whether they are advertised to the model.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_tools::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// assert!(registry.all_definitions().is_empty());
+    /// ```
+    #[must_use]
+    pub fn all_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| self.effective_definition(name, tool.as_ref()))
+            .collect()
+    }
+
+    /// Builds a tool's definition with the registry's `strict` override applied.
+    fn effective_definition(&self, name: &str, tool: &dyn Tool) -> ToolDefinition {
+        let mut def = tool.definition();
+        if let Some(&strict) = self.strict_overrides.get(name) {
+            def.strict = strict;
+        }
+        def
     }
 
     /// Returns a reference to a tool by name.
@@ -283,7 +479,7 @@ impl ToolRegistry {
 ///
 /// | Resource | Scope | Description |
 /// |----------|-------|-------------|
-/// | [`ToolRegistry`] | Global | Registry of tools keyed by name, with permission overrides |
+/// | [`ToolRegistry`] | Global | Registry of tools keyed by name, with per-tool permission, strict-mode, and exposure overrides |
 ///
 /// # APIs Provided
 ///
@@ -302,7 +498,7 @@ impl ToolRegistry {
 ///
 /// | Method | Path | Description |
 /// |--------|------|-------------|
-/// | `GET` | `/v1/tools` | Frozen snapshot of registered tool definitions and effective permissions. Takes no parameters — the handler reads only its axum `State`. |
+/// | `GET` | `/v1/tools` | Frozen snapshot of registered tool definitions, effective permissions, and per-tool exposure. Takes no parameters — the handler reads only its axum `State`. |
 ///
 /// # Lifecycle
 ///
@@ -383,11 +579,11 @@ mod tests {
 
     impl Tool for StubTool {
         fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: self.name.into(),
-                description: String::new(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
+            ToolDefinition::new(
+                self.name,
+                String::new(),
+                serde_json::json!({"type": "object"}),
+            )
         }
 
         fn permission(&self) -> ToolPermission {
@@ -446,5 +642,109 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nonexistent"));
+    }
+
+    fn registry_with(names: &[&'static str]) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in names {
+            registry.register(StubTool {
+                name,
+                permission: ToolPermission::Allow,
+            });
+        }
+        registry
+    }
+
+    fn names_of(defs: &[ToolDefinition]) -> Vec<&str> {
+        defs.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    #[test]
+    fn definitions_default_to_all_exposed_and_strict() {
+        let registry = registry_with(&["a", "b"]);
+        let defs = registry.definitions();
+        assert_eq!(names_of(&defs), ["a", "b"]);
+        // StubTool builds a raw ToolDefinition, which defaults to strict.
+        assert!(defs.iter().all(|d| d.strict));
+    }
+
+    #[test]
+    fn set_strict_override_is_applied_to_definitions() {
+        let mut registry = registry_with(&["a", "b"]);
+        registry.set_strict("a", false).unwrap();
+        let defs = registry.definitions();
+        assert!(!defs.iter().find(|d| d.name == "a").unwrap().strict);
+        assert!(defs.iter().find(|d| d.name == "b").unwrap().strict);
+    }
+
+    #[test]
+    fn set_exposed_false_hides_tool_from_definitions_but_keeps_it_registered() {
+        let mut registry = registry_with(&["a", "b"]);
+        registry.set_exposed("a", false).unwrap();
+        assert!(!registry.is_exposed("a"));
+        assert_eq!(names_of(&registry.definitions()), ["b"]);
+        // Still registered and invocable.
+        assert!(registry.has("a"));
+        assert_eq!(names_of(&registry.all_definitions()), ["a", "b"]);
+    }
+
+    #[test]
+    fn deny_permission_auto_unexposes() {
+        let mut registry = registry_with(&["a", "b"]);
+        registry.set_permission("a", ToolPermission::Deny).unwrap();
+        assert!(!registry.is_exposed("a"));
+        assert_eq!(names_of(&registry.definitions()), ["b"]);
+        // all_definitions ignores exposure, so the denied tool still appears there.
+        assert_eq!(names_of(&registry.all_definitions()), ["a", "b"]);
+    }
+
+    #[test]
+    fn definitions_for_intersects_predicate_with_exposure() {
+        let mut registry = registry_with(&["a", "b", "c"]);
+        registry.set_exposed("b", false).unwrap();
+        let defs = registry.definitions_for(|name| name != "c");
+        // "c" excluded by predicate, "b" excluded by exposure → only "a".
+        assert_eq!(names_of(&defs), ["a"]);
+    }
+
+    #[test]
+    fn set_strict_errors_for_unknown_tool() {
+        let mut registry = ToolRegistry::new();
+        let strict_err = registry.set_strict("nope", false).unwrap_err();
+        assert!(matches!(strict_err, ToolError::RegistryError(_)));
+        assert!(strict_err.to_string().contains("nope"));
+        let exposed_err = registry.set_exposed("nope", false).unwrap_err();
+        assert!(matches!(exposed_err, ToolError::RegistryError(_)));
+        assert!(exposed_err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn is_exposed_is_false_for_unknown_tool() {
+        let registry = ToolRegistry::new();
+        assert!(!registry.is_exposed("nope"));
+    }
+
+    #[test]
+    fn all_definitions_applies_strict_override_and_ignores_exposure() {
+        let mut registry = registry_with(&["a", "b"]);
+        registry.set_strict("a", false).unwrap();
+        registry.set_exposed("a", false).unwrap();
+        let defs = registry.all_definitions();
+        // Exposure is ignored — the hidden tool still appears …
+        assert_eq!(names_of(&defs), ["a", "b"]);
+        // … but its documented strict override is still applied.
+        assert!(!defs.iter().find(|d| d.name == "a").unwrap().strict);
+        assert!(defs.iter().find(|d| d.name == "b").unwrap().strict);
+    }
+
+    #[test]
+    fn deny_permission_overrides_explicit_set_exposed_true() {
+        let mut registry = registry_with(&["a"]);
+        // Even an explicit expose-true cannot un-hide a denied tool: the `Deny`
+        // check in is_exposed precedes the exposure-override lookup.
+        registry.set_exposed("a", true).unwrap();
+        registry.set_permission("a", ToolPermission::Deny).unwrap();
+        assert!(!registry.is_exposed("a"));
+        assert!(names_of(&registry.definitions()).is_empty());
     }
 }

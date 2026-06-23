@@ -737,11 +737,11 @@ mod tests {
 
         impl Tool for StubTool {
             fn definition(&self) -> polaris_models::llm::ToolDefinition {
-                polaris_models::llm::ToolDefinition {
-                    name: self.0.into(),
-                    description: String::new(),
-                    parameters: serde_json::json!({"type": "object"}),
-                }
+                polaris_models::llm::ToolDefinition::new(
+                    self.0,
+                    String::new(),
+                    serde_json::json!({"type": "object"}),
+                )
             }
 
             fn execute<'ctx>(

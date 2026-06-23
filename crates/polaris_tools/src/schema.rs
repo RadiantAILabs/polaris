@@ -61,6 +61,15 @@ pub struct FunctionMetadata {
     pub parameters: Vec<ParameterInfo>,
     /// Full JSON Schema derived from `parameters`. Use [`Self::schema()`] to read.
     schema: serde_json::Value,
+    /// Whether the resulting tool should request provider strict-mode enforcement.
+    /// Defaults to `true`; set via [`Self::with_strict`].
+    #[serde(default = "default_strict")]
+    strict: bool,
+}
+
+/// Default value for [`FunctionMetadata::strict`] — strict mode is opt-out.
+fn default_strict() -> bool {
+    true
 }
 
 impl FunctionMetadata {
@@ -89,6 +98,7 @@ impl FunctionMetadata {
                 "properties": {},
                 "required": []
             }),
+            strict: true,
         }
     }
 
@@ -96,6 +106,13 @@ impl FunctionMetadata {
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Sets whether the resulting tool requests provider strict-mode enforcement.
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
         self
     }
 
@@ -115,11 +132,12 @@ impl FunctionMetadata {
 
     /// Converts this metadata into a [`ToolDefinition`].
     pub fn to_tool_definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: self.name.clone(),
-            description: self.description.clone().unwrap_or_default(),
-            parameters: self.schema.clone(),
-        }
+        ToolDefinition::new(
+            self.name.clone(),
+            self.description.clone().unwrap_or_default(),
+            self.schema.clone(),
+        )
+        .with_strict(self.strict)
     }
 
     fn rebuild_schema(&mut self) {
@@ -156,5 +174,38 @@ impl FunctionMetadata {
             "properties": properties,
             "required": required
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_defaults_true_and_propagates_to_definition() {
+        let default = FunctionMetadata::new("a").to_tool_definition();
+        assert!(default.strict, "FunctionMetadata is strict by default");
+
+        let relaxed = FunctionMetadata::new("a")
+            .with_strict(false)
+            .to_tool_definition();
+        assert!(
+            !relaxed.strict,
+            "with_strict(false) reaches the ToolDefinition"
+        );
+    }
+
+    #[test]
+    fn strict_defaults_true_when_field_absent_on_deserialize() {
+        // Metadata serialized before `strict` existed must deserialize as strict,
+        // guarding the `#[serde(default = "default_strict")]` wiring against a
+        // regression that would silently disable enforcement.
+        let json = serde_json::json!({
+            "name": "legacy",
+            "parameters": [],
+            "schema": {"type": "object", "properties": {}, "required": []}
+        });
+        let meta: FunctionMetadata = serde_json::from_value(json).unwrap();
+        assert!(meta.to_tool_definition().strict);
     }
 }

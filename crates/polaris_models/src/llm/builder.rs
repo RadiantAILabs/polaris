@@ -318,11 +318,11 @@ mod tests {
     }
 
     fn make_tool_def(name: &str) -> ToolDefinition {
-        ToolDefinition {
-            name: name.to_string(),
-            description: format!("A {name} tool"),
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
-        }
+        ToolDefinition::new(
+            name,
+            format!("A {name} tool"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
     }
 
     #[test]

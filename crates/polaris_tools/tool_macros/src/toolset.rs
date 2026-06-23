@@ -6,8 +6,9 @@ use quote::{format_ident, quote};
 use syn::{FnArg, Generics, ImplItem, ImplItemFn, ItemImpl, Type};
 
 use crate::common::{
-    extract_doc_comments, generate_definition, generate_execute, parse_param, to_pascal_case,
-    validate_context_params, validate_tool_signature, validate_toolset_method,
+    extract_doc_comments, generate_definition, generate_execute, parse_param,
+    parse_tool_attr_options, to_pascal_case, validate_context_params, validate_tool_signature,
+    validate_toolset_method,
 };
 
 /// Generates a Toolset impl for an impl block with `#[tool]` methods.
@@ -153,7 +154,20 @@ fn generate_single_tool_struct(
         return err;
     }
 
-    let definition_code = generate_definition(&method_name_str, description_str, &params, &pt);
+    // Read `strict` from the method's `#[tool(...)]` marker attribute.
+    let strict = match method
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("tool"))
+        .map(parse_tool_attr_options)
+    {
+        Some(Ok(options)) => options.strict,
+        Some(Err(err)) => return err,
+        None => true,
+    };
+
+    let definition_code =
+        generate_definition(&method_name_str, description_str, &params, strict, &pt);
     let call_target = quote! { self.inner.#method_name };
     let execute_code = generate_execute(
         &method_name_str,

@@ -662,7 +662,12 @@ pub enum DocumentSource {
 // ─────────────────────
 
 /// Definition of a tool that can be called by the model.
+///
+/// Construct via [`ToolDefinition::new`] (and [`with_strict`](Self::with_strict));
+/// the struct is `#[non_exhaustive]` so fields may be added without a breaking
+/// change, and external callers cannot build it with a struct literal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolDefinition {
     /// Name of the tool (e.g., `get_weather`, `search_database`).
     pub name: String,
@@ -683,6 +688,39 @@ pub struct ToolDefinition {
     /// }
     /// ```
     pub parameters: Value,
+    /// Whether the model provider should enforce this tool's schema in *strict*
+    /// mode (constrained decoding that guarantees schema-valid arguments).
+    ///
+    /// This is the tool author's declared preference. The agent designer may
+    /// override it on the tool registry, and the provider applies its own cap
+    /// (e.g. Anthropic allows at most 20 strict tools per request, degrading the
+    /// overflow to non-strict in registration order). Defaults to `true`.
+    #[serde(default = "default_strict")]
+    pub strict: bool,
+}
+
+/// Default value for [`ToolDefinition::strict`] — strict mode is opt-out.
+fn default_strict() -> bool {
+    true
+}
+
+impl ToolDefinition {
+    /// Creates a tool definition with strict mode enabled (the default).
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            strict: true,
+        }
+    }
+
+    /// Sets whether the provider should enforce this tool's schema in strict mode.
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
 }
 
 /// Controls how the model should select tools.
@@ -941,5 +979,35 @@ mod tests {
         assert!(cache.prefix);
         assert_eq!(cache.breakpoints, vec![4]);
         assert!(cache.is_enabled());
+    }
+
+    #[test]
+    fn tool_definition_strict_defaults_true_when_field_absent() {
+        // A payload that predates the `strict` field (or otherwise omits it) must
+        // deserialize as strict, matching the constructor default. A regression in
+        // `default_strict` would silently flip enforcement off for cached/persisted
+        // definitions, so pin it here.
+        let json = serde_json::json!({
+            "name": "legacy",
+            "description": "payload without a strict field",
+            "parameters": {"type": "object", "properties": {}}
+        });
+        let def: ToolDefinition = serde_json::from_value(json).unwrap();
+        assert!(
+            def.strict,
+            "missing `strict` must default to true, not false"
+        );
+    }
+
+    #[test]
+    fn tool_definition_strict_round_trips() {
+        let def = ToolDefinition::new("t", "d", serde_json::json!({})).with_strict(false);
+        let value = serde_json::to_value(&def).unwrap();
+        assert_eq!(value["strict"], serde_json::json!(false));
+        let back: ToolDefinition = serde_json::from_value(value).unwrap();
+        assert!(
+            !back.strict,
+            "explicit strict = false survives a round-trip"
+        );
     }
 }

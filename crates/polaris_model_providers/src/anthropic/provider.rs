@@ -21,6 +21,13 @@ use polaris_models::llm::{
 /// Default maximum tokens for generation requests.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// Maximum number of tools Anthropic allows to be marked `strict` in a single
+/// request. Beyond this the API rejects the request, so we honor each tool's
+/// `strict` preference only up to this budget (in request/registration order)
+/// and degrade the overflow to non-strict. Strict mode is a best-effort
+/// schema-validation optimization, not a correctness requirement.
+const MAX_STRICT_TOOLS: usize = 20;
+
 /// Anthropic [`LlmProvider`] implementation.
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -288,14 +295,40 @@ fn convert_request(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut tools: Option<Vec<ToolDef>> = request.tools.as_ref().map(|tools| {
+        // Honor each tool's `strict` preference, but only up to Anthropic's
+        // per-request strict-tool budget; tools past the budget (in registration
+        // order) degrade to non-strict so the request stays valid. The schema is
+        // normalized only when the tool is actually strict — a non-strict tool
+        // keeps its full schema rather than having strict-incompatible
+        // constructs silently stripped.
+        let mut strict_budget = MAX_STRICT_TOOLS;
         tools
             .iter()
-            .map(|tool| ToolDef {
-                name: tool.name.clone(),
-                description: Some(tool.description.clone()),
-                input_schema: normalize_schema_for_strict_mode(tool.parameters.clone()),
-                strict: Some(true),
-                cache_control: None,
+            .map(|tool| {
+                let strict = tool.strict && strict_budget > 0;
+                if strict {
+                    strict_budget -= 1;
+                } else if tool.strict {
+                    // Wanted strict but the per-request budget is spent; degrade so
+                    // the request stays valid, and surface it so an operator can see
+                    // the tool is being sent without schema enforcement.
+                    tracing::debug!(
+                        tool = %tool.name,
+                        max_strict_tools = MAX_STRICT_TOOLS,
+                        "strict-tool budget exhausted; tool sent non-strict"
+                    );
+                }
+                ToolDef {
+                    name: tool.name.clone(),
+                    description: Some(tool.description.clone()),
+                    input_schema: if strict {
+                        normalize_schema_for_strict_mode(tool.parameters.clone())
+                    } else {
+                        tool.parameters.clone()
+                    },
+                    strict: strict.then_some(true),
+                    cache_control: None,
+                }
             })
             .collect()
     });
@@ -934,11 +967,11 @@ mod tests {
     use polaris_models::llm::{CacheControl, LlmRequest, ToolDefinition};
 
     fn tool_def(name: &str) -> ToolDefinition {
-        ToolDefinition {
-            name: name.to_string(),
-            description: format!("{name} tool"),
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
-        }
+        ToolDefinition::new(
+            name,
+            format!("{name} tool"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
     }
 
     /// The JSON the wire request serializes to.
@@ -980,6 +1013,81 @@ mod tests {
         assert!(json.get("system").is_none() || json["system"].is_null());
         assert!(json["tools"][0].get("cache_control").is_none());
         assert_eq!(json["tools"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn tools_within_cap_are_marked_strict() {
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: Some(
+                (0..MAX_STRICT_TOOLS)
+                    .map(|i| tool_def(&format!("t{i}")))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        for tool in json["tools"].as_array().unwrap() {
+            assert_eq!(
+                tool["strict"], true,
+                "tool should be strict at the cap: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_budget_degrades_overflow_in_order() {
+        // One past the cap: the first MAX_STRICT_TOOLS keep strict, the overflow
+        // degrades — so the request stays under Anthropic's strict-tool limit
+        // without dropping strictness from the whole batch.
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: Some(
+                (0..=MAX_STRICT_TOOLS)
+                    .map(|i| tool_def(&format!("t{i}")))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        let tools = json["tools"].as_array().unwrap();
+        let strict_count = tools.iter().filter(|t| t["strict"] == true).count();
+        assert_eq!(
+            strict_count, MAX_STRICT_TOOLS,
+            "exactly the budget stays strict"
+        );
+        assert!(
+            tools.last().unwrap().get("strict").is_none(),
+            "overflow tool should be non-strict: {}",
+            tools.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn per_tool_strict_opt_out_is_honored_and_frees_budget() {
+        // A tool that opts out of strict is sent non-strict and does not consume
+        // a strict-budget slot, so a later tool still fits under the cap.
+        let mut tools: Vec<_> = (0..MAX_STRICT_TOOLS)
+            .map(|i| tool_def(&format!("t{i}")))
+            .collect();
+        tools[0] = tools[0].clone().with_strict(false);
+        tools.push(tool_def("extra"));
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: Some(tools),
+            ..Default::default()
+        };
+        let json = request_json(&request);
+        let tools = json["tools"].as_array().unwrap();
+        assert!(
+            tools[0].get("strict").is_none(),
+            "opted-out tool stays non-strict: {}",
+            tools[0]
+        );
+        // Budget freed by t0's opt-out is taken by the extra tool at the tail.
+        assert_eq!(tools.last().unwrap()["strict"], true);
+        let strict_count = tools.iter().filter(|t| t["strict"] == true).count();
+        assert_eq!(strict_count, MAX_STRICT_TOOLS);
     }
 
     #[test]

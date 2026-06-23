@@ -2,11 +2,60 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::{
     Attribute, Expr, ExprLit, FnArg, GenericArgument, Lit, Meta, Pat, PatType, PathArguments,
     ReturnType, Signature, Type,
 };
+
+/// Options parsed from a `#[tool(...)]` attribute.
+pub(crate) struct ToolOptions {
+    /// Whether the tool requests provider strict-mode enforcement. Defaults to `true`.
+    pub strict: bool,
+}
+
+impl Default for ToolOptions {
+    fn default() -> Self {
+        Self { strict: true }
+    }
+}
+
+/// Parses the token stream inside `#[tool(...)]` into [`ToolOptions`].
+///
+/// Currently supports `strict = <bool>`. An empty stream yields the defaults.
+pub(crate) fn parse_tool_options(tokens: TokenStream) -> Result<ToolOptions, TokenStream> {
+    let mut options = ToolOptions::default();
+    if tokens.is_empty() {
+        return Ok(options);
+    }
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("strict") {
+            let lit: syn::LitBool = meta.value()?.parse()?;
+            options.strict = lit.value;
+            Ok(())
+        } else {
+            Err(meta.error("unsupported #[tool] option; expected `strict = <bool>`"))
+        }
+    });
+    parser
+        .parse2(tokens)
+        .map_err(|err| err.to_compile_error())?;
+    Ok(options)
+}
+
+/// Parses [`ToolOptions`] from a `#[tool]` / `#[tool(...)]` attribute on a method.
+pub(crate) fn parse_tool_attr_options(attr: &Attribute) -> Result<ToolOptions, TokenStream> {
+    match &attr.meta {
+        Meta::Path(_) => Ok(ToolOptions::default()),
+        Meta::List(list) => parse_tool_options(list.tokens.clone()),
+        Meta::NameValue(_) => Err(syn::Error::new_spanned(
+            attr,
+            "#[tool] takes options in `#[tool(strict = false)]` form, not `#[tool = ...]`",
+        )
+        .to_compile_error()),
+    }
+}
 
 /// Validates that a function signature is suitable for `#[tool]`.
 ///
@@ -239,6 +288,7 @@ pub(crate) fn generate_definition(
     fn_name: &str,
     description: &str,
     params: &[ParamInfo],
+    strict: bool,
     pt: &TokenStream,
 ) -> TokenStream {
     // Only include input params in the schema — context params are invisible to the LLM
@@ -296,6 +346,7 @@ pub(crate) fn generate_definition(
     quote! {
         let meta = #pt::FunctionMetadata::new(#fn_name)
             #desc_builder
+            .with_strict(#strict)
             #(
                 .add_parameter(#param_additions)
             )*;

@@ -17,17 +17,17 @@ struct ManualTool;
 
 impl Tool for ManualTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "manual_tool".to_string(),
-            description: "A manually implemented tool.".to_string(),
-            parameters: serde_json::json!({
+        ToolDefinition::new(
+            "manual_tool",
+            "A manually implemented tool.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "input": { "type": "string" }
                 },
                 "required": ["input"]
             }),
-        }
+        )
     }
 
     fn execute<'ctx>(
@@ -684,6 +684,7 @@ fn function_metadata_builder() {
     let def = meta.to_tool_definition();
     assert_eq!(def.name, "test");
     assert_eq!(def.description, "A test function.");
+    assert!(def.strict, "FunctionMetadata defaults to strict mode");
 
     let required = def.parameters["required"].as_array().unwrap();
     assert!(required.contains(&serde_json::json!("name")));

@@ -11,7 +11,7 @@ title: Tools
 
 | Primitive | Purpose |
 |-----------|---------|
-| `#[tool]` | Attribute macro turning an async function into a `Tool` impl |
+| `#[tool]` | Attribute macro turning an async function into a `Tool` impl (accepts `#[tool(strict = false)]` to opt out of strict schema mode) |
 | `#[toolset]` | Attribute macro generating `Toolset` for an `impl` block |
 | `#[context]` | Parameter attribute injecting a value from `ToolContext` (not in LLM schema) |
 | `Tool` | Trait for executable tools (definition + `execute`) |
@@ -109,11 +109,9 @@ struct DynamicQuery { schema: serde_json::Value }
 
 impl Tool for DynamicQuery {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "dynamic_query".into(),
-            description: "Run a dynamic query".into(),
-            parameters: self.schema.clone(),
-        }
+        // `ToolDefinition` is `#[non_exhaustive]`; construct it via `new`
+        // (strict mode defaults to `true`) and adjust with `with_strict`.
+        ToolDefinition::new("dynamic_query", "Run a dynamic query", self.schema.clone())
     }
 
     fn permission(&self) -> ToolPermission { ToolPermission::Confirm }
@@ -196,6 +194,44 @@ let effective: Option<ToolPermission> = registry.permission("delete_file");
 
 Returns the override if set, otherwise the tool's declared default, or `None` if the tool is unknown.
 
+## Strict Mode and Exposure
+
+Beyond permissions, two levers control how each tool is advertised to the model. Both are author-declared defaults that the agent designer can override at build time, exactly like permissions.
+
+### Strict schema mode
+
+Every `ToolDefinition` carries a `strict` flag (default `true`). When strict, the provider is asked to enforce the tool's JSON schema via constrained decoding so the model can only emit schema-valid arguments. This is the tool author's *preference*, not a correctness guarantee — providers apply their own caps (see below).
+
+The `#[tool]` macro declares `strict = true`. Opt a tool out when its schema uses constructs that strict mode would strip (e.g. open-ended objects, unsupported formats):
+
+```rust
+#[tool(strict = false)]
+/// Run an ad-hoc query whose schema is intentionally permissive.
+async fn query(filter: serde_json::Value) -> Result<String, ToolError> {
+    Ok(String::new())
+}
+```
+
+Override an author's default at build time:
+
+```rust
+registry.set_strict("query", true)?;   // force strict
+registry.set_strict("search", false)?; // relax strict
+```
+
+Provider behavior: the OpenAI Responses API honors each tool's `strict` flag verbatim. Anthropic caps strict tools at 20 per request — tools past the cap (in registration order) degrade to non-strict so the request stays valid; opting a tool out frees a slot for a later one.
+
+### Exposure
+
+`set_exposed(name, false)` hides a tool from the model's advertised set without unregistering it — it consumes neither context nor a strict-tool slot, but remains directly invocable via `execute_with`. A tool whose effective permission is `Deny` is auto-unexposed (a denied tool is never advertised), and `Deny` takes precedence over an explicit `set_exposed(name, true)`.
+
+```rust
+registry.set_exposed("internal_debug", false)?;
+let visible: bool = registry.is_exposed("internal_debug"); // false
+```
+
+> Exposure is an advertisement filter, not an access-control boundary — use `ToolPermission::Deny` to actually block invocation.
+
 ## Execution Flow
 
 Inside a system, obtain the registry via `Res<ToolRegistry>` and dispatch by name:
@@ -217,7 +253,7 @@ async fn invoke_tool(
 }
 ```
 
-For LLM tool calling, pass `registry.definitions()` to the model provider and dispatch the returned tool calls through `registry.execute(&name, &args)`.
+For LLM tool calling, pass `registry.definitions()` to the model provider and dispatch the returned tool calls through `registry.execute(&name, &args)`. `definitions()` returns the exposed tools with any `set_strict` overrides applied; to narrow the advertised set per turn (e.g. to the tools relevant to the current goal) without mutating the registry, use `registry.definitions_for(|name| ...)` — or the `LlmRequestBuilder::with_registry_filtered` extension. `all_definitions()` lists every registered tool regardless of exposure, for administrative views.
 
 ## Per-Invocation Context
 
@@ -309,7 +345,10 @@ When a `ToolContext` happens to carry secret material (auth tokens, session cook
 | `registry.has(name)` | `bool` |
 | `registry.get(name)` | `Option<&dyn Tool>` |
 | `registry.to_arc(name)` | `Option<Arc<dyn Tool>>` (for decorators) |
-| `registry.definitions()` | `Vec<ToolDefinition>` (for LLM tool lists) |
+| `registry.definitions()` | `Vec<ToolDefinition>` (exposed tools, for LLM tool lists) |
+| `registry.definitions_for(select)` | `Vec<ToolDefinition>` (exposed tools whose name satisfies `select`) |
+| `registry.all_definitions()` | `Vec<ToolDefinition>` (every tool, ignoring exposure; for admin views) |
+| `registry.is_exposed(name)` | `bool` (false if hidden or denied) |
 | `registry.names()` | `Vec<&str>` |
 
 ## Error Types

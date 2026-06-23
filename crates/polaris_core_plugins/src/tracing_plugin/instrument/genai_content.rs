@@ -294,16 +294,16 @@ mod tests {
 
     #[test]
     fn tool_definitions() {
-        let tools = vec![ToolDefinition {
-            name: "get_weather".to_string(),
-            description: "Get the weather for a city".to_string(),
-            parameters: json!({
+        let tools = vec![ToolDefinition::new(
+            "get_weather",
+            "Get the weather for a city",
+            json!({
                 "type": "object",
                 "properties": {
                     "city": {"type": "string"}
                 }
             }),
-        }];
+        )];
         let result = serialize_tool_definitions(&tools);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 

@@ -15,7 +15,7 @@ use syn::{FnArg, ItemFn};
 /// - A private `__tool_impl_<name>` async function with the original body
 /// - A `<Name>Tool` struct implementing `Tool`
 /// - A constructor `fn <name>() -> <Name>Tool`
-pub(crate) fn generate_tool_fn(input: &ItemFn) -> TokenStream {
+pub(crate) fn generate_tool_fn(input: &ItemFn, strict: bool) -> TokenStream {
     if let Some(err) = validate_tool_signature(&input.sig) {
         return err;
     }
@@ -52,7 +52,7 @@ pub(crate) fn generate_tool_fn(input: &ItemFn) -> TokenStream {
         return err;
     }
 
-    let definition_code = generate_definition(&fn_name_str, description_str, &params, &pt);
+    let definition_code = generate_definition(&fn_name_str, description_str, &params, strict, &pt);
     let call_target = quote! { #impl_fn_name };
     let execute_code =
         generate_execute(&fn_name_str, &call_target, &params, &input.sig.output, &pt);

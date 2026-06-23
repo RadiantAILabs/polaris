@@ -62,6 +62,35 @@ pub trait LlmRequestBuilderExt<'a, S> {
 
     /// Adds all tool definitions from a registry to the builder.
     fn with_registry(self, registry: &ToolRegistry) -> LlmRequestBuilder<'a, S>;
+
+    /// Adds the registry's exposed tool definitions whose name satisfies `select`.
+    ///
+    /// The request-time selection lever: an agent can narrow the advertised
+    /// toolset per turn (e.g. to the tools relevant to the current goal) without
+    /// mutating the registry. Delegates to
+    /// [`ToolRegistry::definitions_for`](crate::ToolRegistry::definitions_for),
+    /// so exposure and `strict` overrides still apply.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use polaris_tools::{LlmRequestBuilderExt, ToolRegistry};
+    /// use polaris_models::llm::Llm;
+    ///
+    /// # fn example(llm: Llm, registry: ToolRegistry) {
+    /// // Advertise only the filesystem tools relevant to this turn.
+    /// let _builder = llm
+    ///     .builder()
+    ///     .with_registry_filtered(&registry, |name| name.starts_with("fs_"));
+    /// # }
+    /// ```
+    fn with_registry_filtered<F>(
+        self,
+        registry: &ToolRegistry,
+        select: F,
+    ) -> LlmRequestBuilder<'a, S>
+    where
+        F: Fn(&str) -> bool;
 }
 
 impl<'a, S> LlmRequestBuilderExt<'a, S> for LlmRequestBuilder<'a, S> {
@@ -76,6 +105,17 @@ impl<'a, S> LlmRequestBuilderExt<'a, S> for LlmRequestBuilder<'a, S> {
 
     fn with_registry(self, registry: &ToolRegistry) -> LlmRequestBuilder<'a, S> {
         self.with_definitions(registry.definitions())
+    }
+
+    fn with_registry_filtered<F>(
+        self,
+        registry: &ToolRegistry,
+        select: F,
+    ) -> LlmRequestBuilder<'a, S>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.with_definitions(registry.definitions_for(select))
     }
 }
 
@@ -142,11 +182,11 @@ mod tests {
 
     impl Tool for FakeTool {
         fn definition(&self) -> polaris_models::llm::ToolDefinition {
-            polaris_models::llm::ToolDefinition {
-                name: self.name.to_string(),
-                description: format!("Fake {}", self.name),
-                parameters: json!({"type": "object", "properties": {}}),
-            }
+            polaris_models::llm::ToolDefinition::new(
+                self.name,
+                format!("Fake {}", self.name),
+                json!({"type": "object", "properties": {}}),
+            )
         }
 
         fn execute<'ctx>(
@@ -213,6 +253,33 @@ mod tests {
 
         // 2 from with_tool + 2 from FakeToolset
         assert_eq!(builder.tool_count(), 4);
+    }
+
+    #[test]
+    fn with_registry_filtered_narrows_to_selected_tools() {
+        let llm = mock_llm();
+        let mut registry = ToolRegistry::new();
+        registry.register(FakeTool { name: "a" });
+        registry.register(FakeTool { name: "b" });
+        registry.register(FakeTool { name: "c" });
+
+        // The whole registry advertises all three …
+        assert_eq!(llm.builder().with_registry(&registry).tool_count(), 3);
+
+        // … the predicate narrows the set while preserving registration order
+        // (which drives the provider's strict-cap priority) …
+        let selected = registry.definitions_for(|n| n != "b");
+        assert_eq!(
+            selected.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["a", "c"],
+            "definitions_for keeps registration order and applies the predicate",
+        );
+
+        // … and with_registry_filtered forwards exactly that set to the builder.
+        let filtered = llm
+            .builder()
+            .with_registry_filtered(&registry, |n| n != "b");
+        assert_eq!(filtered.tool_count(), 2);
     }
 
     // ── LlmReasonExt tests ──

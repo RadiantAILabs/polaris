@@ -124,6 +124,12 @@ pub struct ToolDefinitionWire {
     pub description: String,
     /// Effective permission level (`allow`, `confirm`, or `deny`).
     pub permission: String,
+    /// Whether the tool is advertised to the model. `false` for tools hidden via
+    /// [`ToolRegistry::set_exposed`](crate::ToolRegistry::set_exposed) or denied by
+    /// permission. The snapshot lists every registered tool, so this flag
+    /// distinguishes the model-visible set from internal/hidden tools rather than
+    /// presenting them identically.
+    pub exposed: bool,
     /// JSON Schema for the tool's arguments. Type-erased intentionally —
     /// JSON Schema is dynamic by nature.
     pub parameters: serde_json::Value,
@@ -140,10 +146,12 @@ fn to_wire_definition(registry: &ToolRegistry, definition: ToolDefinition) -> To
         .permission(&definition.name)
         .expect("tool definition must correspond to a registered tool")
         .to_string();
+    let exposed = registry.is_exposed(&definition.name);
     ToolDefinitionWire {
         name: definition.name,
         description: definition.description,
         permission,
+        exposed,
         parameters: definition.parameters,
     }
 }
@@ -173,8 +181,11 @@ pub(crate) fn freeze(server: &Server) {
     let registry = server
         .get_global::<ToolRegistry>()
         .expect("ToolsPlugin must globalize ToolRegistry before dashboard freeze");
+    // The admin snapshot lists every registered tool, including ones hidden from
+    // the model via exposure/permission overrides; each wire entry carries an
+    // `exposed` flag so hidden tools are marked rather than presented as visible.
     let definitions = registry
-        .definitions()
+        .all_definitions()
         .into_iter()
         .map(|definition| to_wire_definition(&registry, definition))
         .collect();
@@ -203,6 +214,7 @@ mod tests {
             name: name.into(),
             description: "desc".into(),
             permission: "allow".into(),
+            exposed: true,
             parameters: serde_json::json!({}),
         }
     }
@@ -251,5 +263,48 @@ mod tests {
             serde_json::from_slice(&snapshot.json_bytes()).expect("frozen bytes must round-trip");
         assert_eq!(response.items.len(), 1);
         assert_eq!(response.items[0].name, "ls");
+    }
+
+    #[test]
+    fn to_wire_definition_marks_hidden_tools_unexposed() {
+        use crate::{Tool, ToolContext, ToolError};
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct Noop(&'static str);
+        impl Tool for Noop {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new(self.0, "d", serde_json::json!({"type": "object"}))
+            }
+            fn execute<'ctx>(
+                &'ctx self,
+                _args: serde_json::Value,
+                _ctx: &'ctx ToolContext,
+            ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + 'ctx>>
+            {
+                Box::pin(async { Ok(serde_json::json!(null)) })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Noop("visible"));
+        registry.register(Noop("hidden"));
+        registry.set_exposed("hidden", false).unwrap();
+
+        // The admin snapshot lists both tools, but the hidden one is flagged so a
+        // dashboard viewer can tell it is not advertised to the model.
+        let wires: Vec<ToolDefinitionWire> = registry
+            .all_definitions()
+            .into_iter()
+            .map(|def| to_wire_definition(&registry, def))
+            .collect();
+
+        let visible = wires.iter().find(|w| w.name == "visible").unwrap();
+        let hidden = wires.iter().find(|w| w.name == "hidden").unwrap();
+        assert!(visible.exposed, "visible tool stays exposed");
+        assert!(
+            !hidden.exposed,
+            "hidden tool is listed but marked unexposed"
+        );
     }
 }
