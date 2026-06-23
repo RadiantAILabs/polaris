@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-06-23
+
+Per-tool **strict** preference and two registry-level levers — **exposure** and **selection** — that let agent authors control how tools are advertised to a model, plus provider-side handling of each provider's strict-tool limits. Strict mode opts a tool into constrained/structured decoding (a normalized JSON schema with `additionalProperties: false`); exposure filters which registered tools are advertised without removing the underlying capability. All three levers mirror the existing `permission_overrides` pattern on `ToolRegistry`, so they compose with it rather than special-casing it.
+
+### Added
+
+- **`strict` field on `ToolDefinition`** (`polaris_tools`) — defaults to `true` and opts a tool into constrained/structured decoding. `ToolDefinition` is now `#[non_exhaustive]`; construct it via `ToolDefinition::new(...)` / `.with_strict(...)` instead of a struct literal. `FunctionMetadata` gains a matching `strict` field + `with_strict`, and the `#[tool(strict = false)]` macro option opts a tool out at the author layer.
+
+- **Registry strict/exposure mutators and selection helpers** (`polaris_tools`) — `set_strict(name, bool)` / `set_exposed(name, bool)` are validated mutators that return `Err(RegistryError)` for unknown tools (same contract as `set_permission`). `is_exposed(name)` queries exposure (returns `false` for unknown tools; a `Deny` permission auto-unexposes and overrides an explicit `set_exposed(true)`). `definitions_for(predicate)` intersects a caller predicate with exposure, while `all_definitions()` returns every tool ignoring exposure but still applying strict overrides. `LlmRequestBuilderExt::with_registry_filtered(...)` narrows a request to a selected subset.
+
+### Changed
+
+- **Anthropic provider caps strict tools at `MAX_STRICT_TOOLS` (20)** (`polaris_model_providers`) — tools beyond the budget degrade to non-strict in registration order (best-effort, logged at `debug`) rather than erroring, and opting a tool out frees a slot for the next.
+
+- **OpenAI provider honors the per-tool strict flag verbatim** (`polaris_model_providers`) — it normalizes the schema only for strict tools and leaves non-strict schemas intact.
+
+- **Dashboard `/v1/tools` snapshot sources from `all_definitions()`** (`polaris_tools`) — the snapshot carries an `exposed` flag, so hidden tools stay inspectable to operators rather than disappearing.
+
+- **`strict` deserializes fail-closed** (`polaris_tools`) — via `#[serde(default = "default_strict")]` → `true`, so payloads predating the field deserialize as strict. `#[non_exhaustive]` on `ToolDefinition` is the only source-breaking change for downstream constructors — *breaking*; migrate struct literals to `ToolDefinition::new(...)`.
+
+### Documentation
+
+- **Strict mode and exposure docs** — `docs/reference/tools.md` gains a "Strict Mode and Exposure" section plus a method reference and the `#[non_exhaustive]` / `new` migration note; `docs/reference/model-providers.md` documents provider strict-cap behavior; `src/docs/tools.md` carries a catalog addendum.
+
 ## [0.4.4] - 2026-06-18
 
 ### Added
