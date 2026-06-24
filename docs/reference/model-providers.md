@@ -63,10 +63,14 @@ pub trait LlmProvider: Send + Sync + 'static {
     fn pricing(&self, _model: &str) -> Option<ModelPricing> {
         None
     }
+
+    fn endpoint(&self) -> Option<String> {
+        None
+    }
 }
 ```
 
-The `name()` must be stable and lowercase — it becomes the prefix in `"<name>/<model>"`. `stream()` has a default implementation that returns `UnsupportedOperation`; override it to support streaming. `pricing()` is optional — return `Some(ModelPricing::new(input_per_million_usd, output_per_million_usd))` to publish per-million-token rates for a given model; the tracing decorator multiplies token counts by the rate and records `gen_ai.usage.cost_usd` on chat spans. The defaulted `None` means cost stays `null` end-to-end. Provider-declared rates are the producer-side default; the `UsagePricing` API (registered by `TracingPlugin` under the `dashboard` feature) lets consumer plugins override at aggregation time without recompiling providers.
+The `name()` must be stable and lowercase — it becomes the prefix in `"<name>/<model>"`. `stream()` has a default implementation that returns `UnsupportedOperation`; override it to support streaming. `pricing()` is optional — return `Some(ModelPricing::new(input_per_million_usd, output_per_million_usd))` to publish per-million-token rates for a given model; the tracing decorator multiplies token counts by the rate and records `polaris.gen_ai.cost_usd` on chat spans, so cost surfaces in any console subscriber or OTel exporter. The defaulted `None` means cost stays unset end-to-end. `endpoint()` is optional — return the base URL the provider sends requests to (or the proxy address, if one is used); the tracing decorator records it as the `server.address` attribute on chat spans. The defaulted `None` leaves the attribute unset.
 
 ## Building a Provider
 
@@ -219,7 +223,7 @@ When you implement `generate()` / `stream()`, read `request.cache` (a `CacheCont
 - **Honoring it.** The Anthropic provider maps the prefix marker onto the system block — or the last tool when there is no system prompt — and each message breakpoint onto the last block of the referenced message, emitting `cache_control: { "type": "ephemeral" }`. Anthropic honors at most four breakpoints per request, so the provider budgets markers and drops extras low-to-high (prefix first, then message breakpoints in order); a stale (out-of-range) breakpoint index is skipped and surfaced with a `tracing::warn!` rather than silently lost.
 - **Ignoring it.** A provider with no cache support leaves `request.cache` untouched and sends the request as-is. Caching is therefore purely opt-in per provider, and adding a new provider never needs to think about it.
 
-Report cache usage back on `LlmResponse::usage` so cost accounting stays accurate: set `Usage::cache_read_tokens` (input served from cache, billed at a steep discount) and `Usage::cache_creation_tokens` (input written to the cache the first time, billed at a small premium). The tracing decorator prices these against the cache tiers on `ModelPricing` — `cache_read_per_million_usd` / `cache_write_per_million_usd`, derived from the input rate by default and overridable via `ModelPricing::with_cache_rates` — and records the result in `gen_ai.usage.cost_usd`. A provider that does not report cache tokens leaves both fields `None`, and the rollup neither counts nor prices them.
+Report cache usage back on `LlmResponse::usage` so cost accounting stays accurate: set `Usage::cache_read_tokens` (input served from cache, billed at a steep discount) and `Usage::cache_creation_tokens` (input written to the cache the first time, billed at a small premium). The tracing decorator prices these against the cache tiers on `ModelPricing` — `cache_read_per_million_usd` / `cache_write_per_million_usd`, derived from the input rate by default and overridable via `ModelPricing::with_cache_rates` — and records the result in `polaris.gen_ai.cost_usd`. A provider that does not report cache tokens leaves both fields `None`, and the rollup neither counts nor prices them.
 
 ### Strict tool schemas
 

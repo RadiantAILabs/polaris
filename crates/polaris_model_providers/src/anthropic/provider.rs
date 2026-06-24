@@ -108,6 +108,10 @@ impl LlmProvider for AnthropicProvider {
             output_per_million_usd,
         ))
     }
+
+    fn endpoint(&self) -> Option<String> {
+        Some(self.client.base_url().to_string())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +124,8 @@ impl LlmProvider for AnthropicProvider {
 /// tokens from `message_delta` to produce complete [`Usage`] values.
 struct AnthropicStreamAdapter<S> {
     inner: S,
-    /// Input tokens from the `message_start` event.
+    /// Input tokens from `message_start` (uncached; cache tokens are tracked
+    /// separately and summed into `total_tokens`).
     input_tokens: Option<u64>,
     /// Output tokens from the latest `message_delta` event.
     output_tokens: Option<u64>,
@@ -130,6 +135,10 @@ struct AnthropicStreamAdapter<S> {
     cache_creation_tokens: Option<u64>,
     /// Stop reason from the `message_delta` event, held until `message_stop`.
     stop_reason: Option<StopReason>,
+    /// Message ID from `message_start`, held until `message_stop`.
+    id: Option<String>,
+    /// Model from `message_start`, held until `message_stop`.
+    model: Option<String>,
     /// Block indices whose `ContentBlockStart` was filtered (e.g. redacted
     /// thinking). Subsequent deltas and stop events for these indices are
     /// also suppressed so the collector never sees an orphaned stop.
@@ -145,6 +154,8 @@ impl<S> AnthropicStreamAdapter<S> {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             stop_reason: None,
+            id: None,
+            model: None,
             filtered_indices: Vec::new(),
         }
     }
@@ -165,6 +176,7 @@ impl<S> AnthropicStreamAdapter<S> {
             ),
             cache_read_tokens: self.cache_read_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
+            reasoning_output_tokens: None,
         }
     }
 
@@ -174,9 +186,14 @@ impl<S> AnthropicStreamAdapter<S> {
     ) -> Option<Result<StreamEvent, GenerationError>> {
         match raw {
             RawStreamEvent::MessageStart { message } => {
+                // Anthropic reports `input_tokens` excluding cached tokens, so
+                // it maps straight to the uncached `input_tokens`; cache tokens
+                // are surfaced separately.
                 self.input_tokens = Some(message.usage.input_tokens);
                 self.cache_read_tokens = Some(message.usage.cache_read_input_tokens);
                 self.cache_creation_tokens = Some(message.usage.cache_creation_input_tokens);
+                self.id = Some(message.id);
+                self.model = Some(message.model);
                 None
             }
             RawStreamEvent::ContentBlockStart {
@@ -243,6 +260,8 @@ impl<S> AnthropicStreamAdapter<S> {
                 Some(Ok(StreamEvent::MessageStop {
                     stop_reason,
                     usage: self.build_usage(),
+                    id: self.id.take(),
+                    model: self.model.take(),
                 }))
             }
             RawStreamEvent::Ping => None,
@@ -571,6 +590,9 @@ fn convert_tool_choice(choice: &ToolChoice) -> ToolChoiceParam {
 fn convert_response(response: super::types::MessageResponse) -> LlmResponse {
     let stop_reason = convert_stop_reason(response.stop_reason);
 
+    let id = Some(response.id);
+    let model = Some(response.model);
+
     let content = response
         .content
         .into_iter()
@@ -592,8 +614,11 @@ fn convert_response(response: super::types::MessageResponse) -> LlmResponse {
             ),
             cache_read_tokens: Some(usage.cache_read_input_tokens),
             cache_creation_tokens: Some(usage.cache_creation_input_tokens),
+            reasoning_output_tokens: None,
         },
         stop_reason,
+        id,
+        model,
     }
 }
 
@@ -670,6 +695,19 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_returns_the_client_base_url() {
+        // `endpoint()` surfaces the client's base URL so tracing can record it
+        // as `server.address`. `AnthropicProvider::new` has no custom-base-url
+        // constructor, so the value is the documented production default.
+        let provider = AnthropicProvider::new("test-key");
+        assert_eq!(
+            provider.endpoint(),
+            Some("https://api.anthropic.com".to_string()),
+            "endpoint() should return the default Anthropic base URL"
+        );
+    }
+
+    #[test]
     fn converts_text_stream() {
         let mut adapter = AnthropicStreamAdapter::new(());
 
@@ -682,6 +720,8 @@ mod tests {
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
                     },
+                    id: "msg_1".into(),
+                    model: "claude-test".into(),
                 },
             },
             RawStreamEvent::ContentBlockStart {
@@ -744,13 +784,18 @@ mod tests {
             converted[4].as_ref().unwrap(),
             StreamEvent::MessageDelta { .. }
         ));
-        assert!(matches!(
-            converted[5].as_ref().unwrap(),
-            StreamEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                converted[5].as_ref().unwrap(),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                    id: Some(id),
+                    model: Some(model),
+                    ..
+                } if id.as_str() == "msg_1" && model.as_str() == "claude-test"
+            ),
+            "message_start id and model should surface on MessageStop"
+        );
     }
 
     #[test]
@@ -850,6 +895,8 @@ mod tests {
 
         adapter.convert_event(RawStreamEvent::MessageStart {
             message: MessageStartPayload {
+                id: "msg-1".to_string(),
+                model: "claude-fable-5".to_string(),
                 usage: UsageResponse {
                     input_tokens: 25,
                     output_tokens: 0,
@@ -878,7 +925,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &msg_stop,
-            StreamEvent::MessageStop { stop_reason: StopReason::EndTurn, usage }
+            StreamEvent::MessageStop { stop_reason: StopReason::EndTurn, usage, .. }
                 if usage.input_tokens == Some(25) && usage.output_tokens == Some(15) && usage.total_tokens == Some(40)
         ));
     }
@@ -1218,6 +1265,8 @@ mod tests {
                     cache_creation_input_tokens: 20,
                     cache_read_input_tokens: 500,
                 },
+                id: "msg_1".into(),
+                model: "claude-test".into(),
             },
         });
         let stop = adapter

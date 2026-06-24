@@ -28,6 +28,11 @@ impl AnthropicClient {
         }
     }
 
+    /// Returns the base URL the client targets.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Builds common headers for the Anthropic API.
     fn build_headers(&self, request: &CreateMessageRequest) -> Result<HeaderMap, GenerationError> {
         let mut headers = HeaderMap::new();

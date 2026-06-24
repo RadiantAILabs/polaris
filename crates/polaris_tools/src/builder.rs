@@ -230,6 +230,8 @@ mod tests {
                 content: vec![AssistantBlock::ToolCall(make_tool_call("1", "search"))],
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
+                id: None,
+                model: None,
             })
         }
     }

@@ -35,6 +35,8 @@ where
         let mut blocks: BTreeMap<u32, BlockAccumulator> = BTreeMap::new();
         let mut final_stop_reason = None;
         let mut final_usage = Usage::default();
+        let mut final_id = None;
+        let mut final_model = None;
 
         loop {
             let event = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
@@ -67,9 +69,16 @@ where
                     StreamEvent::MessageDelta { usage } => {
                         final_usage = usage;
                     }
-                    StreamEvent::MessageStop { stop_reason, usage } => {
+                    StreamEvent::MessageStop {
+                        stop_reason,
+                        usage,
+                        id,
+                        model,
+                    } => {
                         final_stop_reason = Some(stop_reason);
                         final_usage = usage;
+                        final_id = id;
+                        final_model = model;
                     }
                 },
                 Some(Err(err)) => return Err(err),
@@ -85,6 +94,8 @@ where
             content,
             usage: final_usage,
             stop_reason,
+            id: final_id,
+            model: final_model,
         })
     }
 }
@@ -226,7 +237,12 @@ mod tests {
     }
 
     fn message_stop(stop_reason: StopReason, usage: Usage) -> StreamEvent {
-        StreamEvent::MessageStop { stop_reason, usage }
+        StreamEvent::MessageStop {
+            stop_reason,
+            usage,
+            id: None,
+            model: None,
+        }
     }
 
     #[tokio::test]
@@ -402,6 +418,29 @@ mod tests {
             response.usage,
             usage(10, 8),
             "final usage should come from MessageStop, not MessageDelta"
+        );
+    }
+
+    #[tokio::test]
+    async fn id_and_model_from_message_stop() {
+        let stream = EventStream(vec![Ok(StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            usage: usage(5, 5),
+            id: Some("resp_123".into()),
+            model: Some("claude-opus-4".into()),
+        })]);
+
+        let response = stream.collect_response().await.expect("should succeed");
+
+        assert_eq!(
+            response.id.as_deref(),
+            Some("resp_123"),
+            "response id should come from MessageStop"
+        );
+        assert_eq!(
+            response.model.as_deref(),
+            Some("claude-opus-4"),
+            "response model should come from MessageStop"
         );
     }
 

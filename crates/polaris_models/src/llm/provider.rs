@@ -165,9 +165,15 @@ pub trait LlmProvider: Send + Sync + 'static {
     /// Returns per-million-token USD pricing for `model`, when known.
     ///
     /// Consumed to derive an estimated cost from reported token usage (e.g.
-    /// the `gen_ai.usage.cost_usd` tracing attribute). The default returns
+    /// the `polaris.gen_ai.cost_usd` tracing attribute). The default returns
     /// `None`; providers with a published rate card should override it.
     fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+        None
+    }
+
+    /// Returns the API endpoint this provider sends requests to, when known.
+    /// If a proxy is used, this should return the address of the proxy.
+    fn endpoint(&self) -> Option<String> {
         None
     }
 }
@@ -231,6 +237,10 @@ pub trait LlmProvider: Send + Sync + 'static {
 ///     fn pricing(&self, model: &str) -> Option<ModelPricing> {
 ///         self.inner.pricing(model)
 ///     }
+///
+///     fn endpoint(&self) -> Option<String> {
+///         self.inner.endpoint()
+///     }
 /// }
 /// ```
 pub trait DynLlmProvider: Send + Sync + 'static {
@@ -253,6 +263,10 @@ pub trait DynLlmProvider: Send + Sync + 'static {
 
     /// Returns per-million-token USD pricing for `model`, when known.
     fn pricing(&self, model: &str) -> Option<ModelPricing>;
+
+    /// Returns the API endpoint this provider sends requests to, when known.
+    /// If a proxy is used, this should return the address of the proxy.
+    fn endpoint(&self) -> Option<String>;
 }
 
 impl<T: LlmProvider> DynLlmProvider for T {
@@ -278,6 +292,10 @@ impl<T: LlmProvider> DynLlmProvider for T {
 
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
         LlmProvider::pricing(self, model)
+    }
+
+    fn endpoint(&self) -> Option<String> {
+        LlmProvider::endpoint(self)
     }
 }
 

@@ -115,14 +115,14 @@ Shell command execution behind the project permission model.
 
 The umbrella `dashboard` feature extends Layer-3 plugins with HTTP surfaces
 intended for an external dashboard frontend. It flips the per-crate
-`dashboard` features in `polaris_tools`, `polaris_models`, and
-`polaris_core_plugins`; the host plugins then mount their endpoints during
-`build()` and depend on [`AppPlugin`](crate::app::AppPlugin).
+`dashboard` features in `polaris_tools` and `polaris_models`; the host
+plugins then mount their endpoints during `build()` and depend on
+[`AppPlugin`](crate::app::AppPlugin).
 
 | Plugin | What the `dashboard` feature enables |
 |--------|--------------------------------------|
-| [`TracingPlugin`](crate::plugins::TracingPlugin) | Buffered span recording and a family of `/v1/tracing/*` endpoints exposing recent execution traces, run trees, and token-usage rollups. |
-| [`SpanStorePlugin`](crate::plugins::SpanStorePlugin) | Durable span/run history through a pluggable [`SpanStore`](crate::plugins::SpanStore). The plugin compiles unconditionally; when `dashboard` is also on, `ready()` hydrates the in-memory [`SpanBuffer`](crate::plugins::SpanBuffer) from the configured store so resumed sessions retain their run history across process restart. Pair with [`FileSpanStore`](crate::plugins::FileSpanStore) (feature `file-store`) for on-disk persistence. |
+| [`ToolsPlugin`](crate::tools::ToolsPlugin) | Mounts `GET /v1/tools` — a frozen [`ToolsSnapshot`](crate::tools::dashboard::ToolsSnapshot) of registered tools, schemas, and permissions. |
+| [`ModelsPlugin`](crate::models::ModelsPlugin) | Mounts `GET /v1/models/providers` — a frozen [`ModelsSnapshot`](crate::models::dashboard::ModelsSnapshot) of registered model providers. |
 
 # Observability
 

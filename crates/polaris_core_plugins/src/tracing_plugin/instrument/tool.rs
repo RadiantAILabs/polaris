@@ -43,6 +43,7 @@ impl Tool for TracingTool {
         let span = tracing::info_span!(
             "execute_tool",
             otel.name = %span_name,
+            otel.kind = "Internal",
             gen_ai.operation.name = "execute_tool",
             gen_ai.tool.name = %def.name,
             gen_ai.tool.description = %def.description,
@@ -77,9 +78,8 @@ impl Tool for TracingTool {
                         let current = tracing::Span::current();
                         let error_type = tool_err.error_type();
                         if capture_genai_content {
-                            let message = tool_err.to_string();
-                            current.record("gen_ai.tool.call.result", message.as_str());
-                            current.record("otel.status_description", message.as_str());
+                            current
+                                .record("otel.status_description", tool_err.to_string().as_str());
                         } else {
                             current.record("otel.status_description", error_type);
                         }

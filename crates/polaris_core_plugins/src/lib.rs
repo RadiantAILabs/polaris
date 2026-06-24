@@ -13,34 +13,17 @@
 //!
 //! # Feature Flags
 //!
-//! - `dashboard` - Extends [`TracingPlugin`] with the dashboard span
-//!   buffer, recording layer, and the `/v1/tracing/*` HTTP endpoints.
-//!   These endpoints mount onto the
-//!   [`HttpRouter`](polaris_app::HttpRouter) provided by
-//!   [`AppPlugin`](polaris_app::AppPlugin), so enabling this feature adds
-//!   `AppPlugin` as a hard dependency of [`TracingPlugin`],
-//!   [`ModelsPlugin`](polaris_models::ModelsPlugin), and
-//!   [`ToolsPlugin`](polaris_tools::ToolsPlugin). `AppPlugin` requires
-//!   explicit host/port configuration, so it is **not** auto-registered as
-//!   a default dependency — you must add it yourself (even when using
-//!   [`DefaultPlugins`]). Omitting it fails server init —
-//!   [`Server::finish`](polaris_system::server::Server::finish) (and
-//!   [`run`](polaris_system::server::Server::run) /
-//!   [`run_once`](polaris_system::server::Server::run_once)) returns
-//!   [`ServerBuildError::MissingDependencies`](polaris_system::server::ServerBuildError::MissingDependencies).
 //! - `otel` - Enables [`OpenTelemetryPlugin`] for OTLP trace export
 //! - `test-utils` - Enables [`MockClock`] and [`MockIOProvider`] for testing
 //!
 //! # Example
 //!
-//! ```
+//! ```no_run
 //! use polaris_system::server::Server;
 //! use polaris_system::plugin::PluginGroup;
 //! use polaris_core_plugins::DefaultPlugins;
 //!
 //! let mut server = Server::new();
-//! # #[cfg(feature = "dashboard")]
-//! # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 //! # server.add_plugins(polaris_models::ModelsPlugin);
 //! # server.add_plugins(polaris_tools::ToolsPlugin);
 //! server.add_plugins(DefaultPlugins::new().build());
@@ -53,15 +36,13 @@
 //!
 //! For fine-grained control, add plugins individually:
 //!
-//! ```
+//! ```no_run
 //! use polaris_system::server::Server;
 //! use polaris_core_plugins::{ServerInfoPlugin, TimePlugin, TracingPlugin, FmtConfig};
 //! use tracing::Level;
 //!
 //! let mut server = Server::new();
 //! server.add_plugins(ServerInfoPlugin);
-//! # #[cfg(feature = "dashboard")]
-//! # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 //! # server.add_plugins(polaris_models::ModelsPlugin);
 //! # server.add_plugins(polaris_tools::ToolsPlugin);
 //! server.add_plugins(TimePlugin::default());
@@ -94,27 +75,15 @@ mod io;
 mod otel_plugin;
 pub mod persistence;
 mod server_info;
+#[cfg(feature = "otel")]
+mod span_processor_registry;
 mod time;
 mod tracing_plugin;
 
 // Re-export plugins
 pub use server_info::ServerInfoPlugin;
 pub use time::{Clock, ClockProvider, Stopwatch, TimePlugin};
-pub use tracing_plugin::{
-    DynSpanStore, FmtConfig, InMemorySpanStore, RecordingLayer, SpanKind, SpanRecord,
-    SpanRecordSink, SpanStore, SpanStoreError, SpanStoreHandle, SpanStorePlugin, TracingConfig,
-    TracingFormat, TracingLayers, TracingPlugin,
-};
-#[cfg(feature = "file-store")]
-#[cfg_attr(docsrs_dep, doc(cfg(feature = "file-store")))]
-pub use tracing_plugin::{FileSpanStore, FileSpanStoreError};
-#[cfg(feature = "dashboard")]
-#[cfg_attr(docsrs_dep, doc(cfg(feature = "dashboard")))]
-pub use tracing_plugin::{
-    ModelPricing, RunSummary, SessionSummary, SpanBuffer, SpanEvent, SpanNode, SpanTree,
-    SpansResponse, TokenUsageBreakdown, TokenUsageResponse, TokenUsageTotals, TreeView,
-    UsagePricing,
-};
+pub use tracing_plugin::{FmtConfig, TracingConfig, TracingFormat, TracingLayers, TracingPlugin};
 
 // Re-export IO types
 pub use io::{
@@ -139,6 +108,8 @@ pub use server_info::ServerInfo;
 // Re-export OpenTelemetry plugin
 #[cfg(feature = "otel")]
 pub use otel_plugin::OpenTelemetryPlugin;
+#[cfg(feature = "otel")]
+pub use span_processor_registry::SpanProcessorRegistry;
 
 use polaris_system::plugin::{PluginGroup, PluginGroupBuilder};
 use tracing::Level;
@@ -152,14 +123,12 @@ use tracing::Level;
 ///
 /// # Example
 ///
-/// ```
+/// ```no_run
 /// use polaris_system::server::Server;
 /// use polaris_system::plugin::PluginGroup;
 /// use polaris_core_plugins::DefaultPlugins;
 ///
 /// let mut server = Server::new();
-/// # #[cfg(feature = "dashboard")]
-/// # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 /// # server.add_plugins(polaris_models::ModelsPlugin);
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// server.add_plugins(DefaultPlugins::new().build());
@@ -172,15 +141,13 @@ use tracing::Level;
 ///
 /// Configure logging directly:
 ///
-/// ```
+/// ```no_run
 /// use polaris_system::server::Server;
 /// use polaris_system::plugin::PluginGroup;
 /// use polaris_core_plugins::{DefaultPlugins, FmtConfig, TracingFormat};
 /// use tracing::Level;
 ///
 /// let mut server = Server::new();
-/// # #[cfg(feature = "dashboard")]
-/// # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 /// # server.add_plugins(polaris_models::ModelsPlugin);
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// server.add_plugins(
@@ -200,7 +167,7 @@ use tracing::Level;
 ///
 /// Add `OTel` export alongside console logging (requires the `otel` feature):
 ///
-/// ```
+/// ```no_run
 /// # #[cfg(feature = "otel")]
 /// # {
 /// use polaris_system::server::Server;
@@ -208,8 +175,6 @@ use tracing::Level;
 /// use polaris_core_plugins::{DefaultPlugins, OpenTelemetryPlugin};
 ///
 /// let mut server = Server::new();
-/// # #[cfg(feature = "dashboard")]
-/// # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 /// # server.add_plugins(polaris_models::ModelsPlugin);
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// # tokio_test::block_on(async {

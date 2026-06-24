@@ -100,6 +100,11 @@ impl LlmProvider for OpenAiProvider {
             output_per_million_usd,
         ))
     }
+
+    fn endpoint(&self) -> Option<String> {
+        use async_openai::config::Config;
+        Some(self.client.config().api_base().to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +405,9 @@ fn convert_tool_choice(choice: &ToolChoice) -> ToolChoiceParam {
 // ---------------------------------------------------------------------------
 
 fn convert_response(response: Response) -> Result<LlmResponse, GenerationError> {
+    let id = Some(response.id.clone());
+    let model = Some(response.model.clone());
+
     let content = response
         .output
         .into_iter()
@@ -433,6 +441,8 @@ fn convert_response(response: Response) -> Result<LlmResponse, GenerationError> 
         content,
         usage,
         stop_reason: finish_reason,
+        id,
+        model,
     })
 }
 
@@ -518,17 +528,23 @@ fn convert_output_message_content(
 
 /// Converts `OpenAI` token usage to Polaris usage.
 ///
-/// `cache_read_tokens` / `cache_creation_tokens` are left `None`: prompt caching
-/// is wired only for Anthropic so far. `OpenAI` *does* report cached input
-/// (`input_tokens_details.cached_tokens`), so surface it here when caching is
-/// enabled for this provider — otherwise cached input is silently under-counted
-/// in cost estimates.
+/// `OpenAI` reports `input_tokens` *including* cached input
+/// (`input_tokens_details.cached_tokens`) and reasoning output
+/// (`output_tokens_details.reasoning_tokens`). To keep `input_tokens` the
+/// uncached, full-price count (so cache-read tokens aren't double-counted in
+/// cost), the cached subset is subtracted out and surfaced as
+/// `cache_read_tokens`. `cache_creation_tokens` is left `None`: `OpenAI` does
+/// not report cache-write tokens.
 fn convert_usage(usage: ResponseUsage) -> Usage {
+    let cached = u64::from(usage.input_tokens_details.cached_tokens);
+    let input = u64::from(usage.input_tokens);
     Usage {
-        input_tokens: Some(u64::from(usage.input_tokens)),
+        input_tokens: Some(input.saturating_sub(cached)),
         output_tokens: Some(u64::from(usage.output_tokens)),
         total_tokens: Some(u64::from(usage.total_tokens)),
-        ..Default::default()
+        cache_read_tokens: Some(cached),
+        cache_creation_tokens: None,
+        reasoning_output_tokens: Some(u64::from(usage.output_tokens_details.reasoning_tokens)),
     }
 }
 
@@ -735,6 +751,8 @@ impl<S> OpenAiStreamAdapter<S> {
             // ── Terminal events ──────────────────────────────────────────
             ResponseStreamEvent::ResponseCompleted(event) => {
                 let stop_reason = infer_stop_reason(&event.response);
+                let id = Some(event.response.id.clone());
+                let model = Some(event.response.model.clone());
                 let usage = event.response.usage.map(convert_usage).unwrap_or_default();
 
                 // OpenAI reports usage only once, at completion — there is no
@@ -744,11 +762,17 @@ impl<S> OpenAiStreamAdapter<S> {
                 self.pending.push_back(Ok(StreamEvent::MessageDelta {
                     usage: usage.clone(),
                 }));
-                self.pending
-                    .push_back(Ok(StreamEvent::MessageStop { stop_reason, usage }));
+                self.pending.push_back(Ok(StreamEvent::MessageStop {
+                    stop_reason,
+                    usage,
+                    id,
+                    model,
+                }));
                 true
             }
             ResponseStreamEvent::ResponseIncomplete(event) => {
+                let id = Some(event.response.id.clone());
+                let model = Some(event.response.model.clone());
                 let usage = event.response.usage.map(convert_usage).unwrap_or_default();
                 let stop_reason = event
                     .response
@@ -764,8 +788,12 @@ impl<S> OpenAiStreamAdapter<S> {
                 self.pending.push_back(Ok(StreamEvent::MessageDelta {
                     usage: usage.clone(),
                 }));
-                self.pending
-                    .push_back(Ok(StreamEvent::MessageStop { stop_reason, usage }));
+                self.pending.push_back(Ok(StreamEvent::MessageStop {
+                    stop_reason,
+                    usage,
+                    id,
+                    model,
+                }));
                 true
             }
             ResponseStreamEvent::ResponseFailed(event) => {
@@ -925,6 +953,26 @@ mod tests {
         assert_eq!(provider.pricing("gpt-3.5-turbo"), None);
     }
 
+    #[test]
+    fn endpoint_returns_the_configured_api_base() {
+        // `endpoint()` surfaces the client's `api_base` so tracing can record it
+        // as `server.address`. Build the provider with an explicit, non-default
+        // base so the assertion is concrete and independent of the
+        // `OPENAI_BASE_URL` env var that `OpenAIConfig::new()` would otherwise
+        // read.
+        let config = OpenAIConfig::new()
+            .with_api_key("test-key")
+            .with_api_base("https://proxy.example.com/v1");
+        let provider = OpenAiProvider {
+            client: async_openai::Client::with_config(config),
+        };
+        assert_eq!(
+            provider.endpoint(),
+            Some("https://proxy.example.com/v1".to_string()),
+            "endpoint() should return the configured api_base"
+        );
+    }
+
     /// Builds a minimal [`Response`] for use in terminal events.
     fn stub_response(status: Status, usage: Option<ResponseUsage>) -> Response {
         // Response has many fields; we deserialize from minimal JSON.
@@ -957,15 +1005,27 @@ mod tests {
     }
 
     #[test]
-    fn convert_usage_leaves_cache_fields_none() {
-        // Prompt caching is wired only for Anthropic; the OpenAI converter must
-        // leave the cache tiers `None` so the usage rollup neither prices nor
-        // counts them. Locks that contract against accidental future wiring.
-        let usage = convert_usage(stub_usage());
-        assert_eq!(usage.input_tokens, Some(10));
-        assert_eq!(usage.output_tokens, Some(5));
-        assert_eq!(usage.cache_read_tokens, None);
-        assert_eq!(usage.cache_creation_tokens, None);
+    fn convert_usage_surfaces_cache_read_and_reasoning() {
+        // OpenAI reports cached input and reasoning output. The converter
+        // surfaces them as `cache_read_tokens` / `reasoning_output_tokens` and
+        // reports `input_tokens` net of the cached subset, so cache-read tokens
+        // are billed at the cache tier rather than double-counted at full price.
+        // `cache_creation_tokens` stays `None`: OpenAI reports no cache-write.
+        let usage: ResponseUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_tokens_details": { "cached_tokens": 30 },
+            "output_tokens_details": { "reasoning_tokens": 8 }
+        }))
+        .unwrap();
+        let converted = convert_usage(usage);
+        assert_eq!(converted.input_tokens, Some(70));
+        assert_eq!(converted.output_tokens, Some(20));
+        assert_eq!(converted.total_tokens, Some(120));
+        assert_eq!(converted.cache_read_tokens, Some(30));
+        assert_eq!(converted.cache_creation_tokens, None);
+        assert_eq!(converted.reasoning_output_tokens, Some(8));
     }
 
     // ── Per-tool strict mode: request-side wiring ──
@@ -1135,13 +1195,18 @@ mod tests {
             converted[4].as_ref().unwrap(),
             StreamEvent::MessageDelta { usage } if usage.input_tokens == Some(10)
         ));
-        assert!(matches!(
-            converted[5].as_ref().unwrap(),
-            StreamEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                usage
-            } if usage.output_tokens == Some(5)
-        ));
+        assert!(
+            matches!(
+                converted[5].as_ref().unwrap(),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                    usage,
+                    id: Some(id),
+                    model: Some(model),
+                } if usage.output_tokens == Some(5) && id.as_str() == "resp_test" && model.as_str() == "gpt-4o"
+            ),
+            "response id and model should surface on MessageStop"
+        );
     }
 
     #[test]

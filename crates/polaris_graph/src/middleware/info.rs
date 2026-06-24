@@ -12,6 +12,8 @@ use crate::node::ContextMode;
 pub struct GraphInfo {
     /// Number of nodes in the graph.
     pub node_count: usize,
+    /// Run identifier for this execution.
+    pub run_id: crate::hooks::events::RunId,
 }
 
 /// Metadata passed to [`System`](super::System) middleware.

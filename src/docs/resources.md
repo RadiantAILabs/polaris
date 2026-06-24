@@ -79,7 +79,7 @@ Cross-cutting capabilities every agent typically needs.
 | [`ServerInfo`](crate::plugins::ServerInfo) | Global | Framework version and debug-mode flag. Provided by [`ServerInfoPlugin`](crate::plugins::ServerInfoPlugin). |
 | [`Clock`](crate::plugins::Clock) | Global | Wall-clock time. Provided by [`TimePlugin`](crate::plugins::TimePlugin); substitutable with `MockClock` under feature `test-utils`. |
 | [`Stopwatch`](crate::plugins::Stopwatch) | Local | Per-turn elapsed-time tracking. Provided by [`TimePlugin`](crate::plugins::TimePlugin). |
-| [`TracingConfig`](crate::plugins::TracingConfig) | Global | Current tracing log level (and, with the `dashboard` feature, the span-buffer capacity). Provided by [`TracingPlugin`](crate::plugins::TracingPlugin); consumed mostly by other plugins, occasionally by systems that adapt output verbosity. |
+| [`TracingConfig`](crate::plugins::TracingConfig) | Global | Current tracing log level. Provided by [`TracingPlugin`](crate::plugins::TracingPlugin); consumed mostly by other plugins, occasionally by systems that adapt output verbosity. |
 | [`UserIO`](crate::plugins::UserIO) | Local | Per-turn bidirectional I/O channel (used by interactive agents and the HTTP/SSE bridge). Provided by [`IOProvider`](crate::plugins::IOProvider) implementations — `StdioIOProvider` for CLIs, `HttpIOProvider` for HTTP, `MockIOProvider` under `test-utils`. |
 
 # Layer 3 — Shell

@@ -16,7 +16,9 @@ mod test_utils;
 
 use polaris_graph::executor::GraphExecutor;
 use polaris_graph::graph::Graph;
+use polaris_graph::hooks::RunId;
 use polaris_graph::middleware::MiddlewareAPI;
+use polaris_graph::middleware::info::GraphInfo;
 use polaris_graph::node::ContextPolicy;
 use polaris_system::param::{Res, ResMut, SystemAccess, SystemContext, SystemParam};
 use polaris_system::resource::{GlobalResource, LocalResource, Resources};
@@ -149,6 +151,60 @@ async fn full_server_graph_executor_flow() {
     // - Last output is available on the result
     let output = stats.output::<ComputeResult>().unwrap();
     assert_eq!(output.value, 30);
+}
+
+/// Graph-execution middleware must observe a populated `GraphInfo.run_id` that
+/// matches the run's `RunContext.run_id`.
+///
+/// This is the regression guard for the executor's run-correlation contract:
+/// the `polaris.run` tracing span the executor used to open was removed in
+/// favor of threading the `run_id` through `GraphInfo` to the L3 tracing
+/// middleware. The `ExecutionResult.run_id` returned to the caller is minted
+/// from the same `RunContext.run_id`, so it is the independent witness that the
+/// id the middleware saw is the run's real id (and not `RunId::default()`).
+#[tokio::test]
+async fn graph_execution_middleware_observes_matching_run_id() {
+    let server = Server::new();
+    let mut ctx = server.create_context();
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(SuccessSystem));
+
+    // Capture the `run_id` the middleware is handed via `GraphInfo`.
+    let seen: Arc<Mutex<Option<RunId>>> = Arc::new(Mutex::new(None));
+    let seen_handler = Arc::clone(&seen);
+    let middleware = MiddlewareAPI::new();
+    middleware.register_graph_execution("capture_run_id", move |info: GraphInfo, ctx, next| {
+        let seen = Arc::clone(&seen_handler);
+        Box::pin(async move {
+            *seen.lock().unwrap() = Some(info.run_id.clone());
+            next.run(ctx).await
+        })
+    });
+
+    let executor = GraphExecutor::new();
+    let result = executor
+        .execute(&graph, &mut ctx, None, Some(&middleware))
+        .await
+        .expect("graph execution should succeed");
+
+    let observed = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("graph_execution middleware must run and capture a run_id");
+
+    // The middleware's `run_id` must be the real run id the caller sees back,
+    // proving it was populated from `RunContext.run_id` (not a default).
+    assert_eq!(
+        &observed,
+        result.run_id(),
+        "GraphInfo.run_id must match the ExecutionResult.run_id (both from RunContext.run_id)"
+    );
+    assert!(
+        !observed.as_str().is_empty(),
+        "the propagated run_id must be a non-empty minted id"
+    );
 }
 
 #[tokio::test]

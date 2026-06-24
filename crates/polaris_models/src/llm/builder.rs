@@ -307,6 +307,8 @@ mod tests {
                 content: vec![AssistantBlock::Text(text.into())],
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
+                id: None,
+                model: None,
             })
         }
     }
@@ -358,6 +360,8 @@ mod tests {
                     content: vec![AssistantBlock::Text("ok".into())],
                     usage: Usage::default(),
                     stop_reason: StopReason::EndTurn,
+                    id: None,
+                    model: None,
                 })
             }
         }
@@ -399,6 +403,8 @@ mod tests {
                     content: vec![AssistantBlock::Text("ok".into())],
                     usage: Usage::default(),
                     stop_reason: StopReason::EndTurn,
+                    id: None,
+                    model: None,
                 })
             }
         }
@@ -440,6 +446,8 @@ mod tests {
                     content: vec![AssistantBlock::Text("ok".into())],
                     usage: Usage::default(),
                     stop_reason: StopReason::EndTurn,
+                    id: None,
+                    model: None,
                 })
             }
         }
@@ -479,6 +487,8 @@ mod tests {
                     content: vec![AssistantBlock::Text("hello".into())],
                     usage: Usage::default(),
                     stop_reason: StopReason::EndTurn,
+                    id: None,
+                    model: None,
                 })
             }
         }
@@ -591,6 +601,8 @@ mod tests {
                             total_tokens: Some(15),
                             ..Default::default()
                         },
+                        id: None,
+                        model: None,
                     }),
                 ];
 
@@ -673,6 +685,8 @@ mod tests {
                     Ok(StreamEvent::MessageStop {
                         stop_reason: StopReason::EndTurn,
                         usage: Usage::default(),
+                        id: None,
+                        model: None,
                     }),
                 ];
 

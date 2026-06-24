@@ -11,41 +11,7 @@
 
 mod fmt_layer;
 pub use fmt_layer::FmtConfig;
-#[cfg(feature = "dashboard")]
-mod buffer;
-mod capture;
-#[cfg(feature = "dashboard")]
-mod dashboard;
 mod instrument;
-mod span_record;
-mod span_store;
-#[cfg(feature = "dashboard")]
-mod usage;
-#[cfg(feature = "dashboard")]
-mod usage_pricing;
-#[cfg(feature = "dashboard")]
-pub use buffer::{RunSummary, SessionSummary, SpanBuffer, SpanEvent, SpanNode, SpanTree, TreeView};
-// `RecordingLayer` / `SpanRecordSink` are the subscriber-side capture
-// primitives. They are needed by `SpanStorePlugin` (durable history) and
-// by the dashboard's in-process buffer; expose them unconditionally so
-// either composition works without `dashboard`.
-pub use capture::{RecordingLayer, SpanRecordSink};
-#[cfg(feature = "dashboard")]
-pub use dashboard::SpansResponse;
-// `SpanRecord` / `SpanKind` are always exposed — they're the wire types
-// shared by the `dashboard` buffer and the `file-store` backend, and
-// gating them on either feature would force the umbrella to pull both
-// when only one is wanted.
-pub use span_record::{SpanKind, SpanRecord};
-pub use span_store::{
-    DynSpanStore, InMemorySpanStore, SpanStore, SpanStoreError, SpanStoreHandle, SpanStorePlugin,
-};
-#[cfg(feature = "file-store")]
-pub use span_store::{FileSpanStore, FileSpanStoreError};
-#[cfg(feature = "dashboard")]
-pub use usage::{TokenUsageBreakdown, TokenUsageResponse, TokenUsageTotals};
-#[cfg(feature = "dashboard")]
-pub use usage_pricing::{ModelPricing, UsagePricing};
 
 use crate::ServerInfoPlugin;
 use crate::tracing_plugin::instrument::llm::TracingLlmProvider;
@@ -75,7 +41,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// Access this resource from another plugin's `build()` method to register
 /// custom tracing layers:
 ///
-/// ```
+/// ```no_run
 /// use polaris_system::server::Server;
 /// use polaris_system::plugin::{Plugin, PluginId, Version};
 /// use polaris_core_plugins::{ServerInfoPlugin, TracingLayers, TracingPlugin};
@@ -101,8 +67,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 ///
 /// let mut server = Server::new();
 /// server.add_plugins(ServerInfoPlugin);
-/// # #[cfg(feature = "dashboard")]
-/// # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 /// # server.add_plugins(polaris_models::ModelsPlugin);
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// server.add_plugins(TracingPlugin::new());
@@ -186,13 +150,6 @@ pub enum TracingFormat {
 pub struct TracingConfig {
     /// The configured log level.
     pub level: Level,
-    /// Capacity of the dashboard's [`SpanBuffer`] ring — the maximum
-    /// number of recent records retained for the `/v1/tracing/*` and
-    /// `/v1/sessions/{id}/runs[/...]` endpoints. Older records are
-    /// evicted on overflow. Set via
-    /// [`TracingPlugin::with_span_buffer_capacity`].
-    #[cfg(feature = "dashboard")]
-    pub span_buffer_capacity: usize,
 }
 
 impl GlobalResource for TracingConfig {}
@@ -218,46 +175,11 @@ impl GlobalResource for TracingConfig {}
 /// | [`TracingConfig`] | Global | Tracing configuration (read-only) |
 /// | [`TracingLayers`] | Build-time | Layer registration for other plugins |
 ///
-/// # APIs Provided
-///
-/// | API | Description |
-/// |-----|-------------|
-/// | [`SpanBuffer`] *(feature `dashboard`)* | In-process ring buffer of recent records. Backs the `/v1/tracing/*` and `/v1/sessions/{id}/runs[/...]` dashboard endpoints. |
-/// | [`UsagePricing`] *(feature `dashboard`)* | Build-time per-`(provider, model)` rate table consulted by the usage endpoints. Empty by default; consumers populate it during `build()`. |
-///
-/// The layer registry itself is exposed as the mutable [`TracingLayers`]
-/// **resource** (`get_resource_mut`), not via
-/// [`Server::insert_api`](polaris_system::server::Server::insert_api) — see
-/// the *Resources Provided* table.
-///
 /// # Dependencies
 ///
 /// - [`ServerInfoPlugin`]
 /// - [`ModelsPlugin`](polaris_models::ModelsPlugin) — for LLM provider instrumentation
 /// - [`ToolsPlugin`](polaris_tools::ToolsPlugin) — for tool instrumentation
-/// - [`AppPlugin`](polaris_app::AppPlugin) — when the `dashboard` feature is enabled
-///
-/// # Routes Provided
-///
-/// Mounted only when the `dashboard` feature is enabled, against the
-/// [`HttpRouter`](polaris_app::HttpRouter) owned by `AppPlugin`. Every
-/// handler is read-only (`GET`) and reads its parameters from axum
-/// `Path` / `Query` extractors.
-///
-/// | Method | Path | Description |
-/// |--------|------|-------------|
-/// | `GET` | `/v1/tracing/spans` | Flat tail of recent span/event records. |
-/// | `GET` | `/v1/tracing/runs` | Distinct runs observed in the buffer. |
-/// | `GET` | `/v1/tracing/runs/{run_id}` | Hierarchical span tree for a run. |
-/// | `GET` | `/v1/tracing/runs/{run_id}/spans/{span_id}` | One span's close record. |
-/// | `GET` | `/v1/tracing/runs/{run_id}/usage` | Token-usage rollup for one run. |
-/// | `GET` | `/v1/tracing/sessions` | Distinct sessions observed in the buffer. |
-/// | `GET` | `/v1/tracing/usage` | Buffer-wide token-usage rollup (optional `?label=key:value`). |
-/// | `GET` | `/v1/sessions/{session_id}/runs` | Runs filtered by the `session_id` label. |
-/// | `GET` | `/v1/sessions/{session_id}/runs/{run_id}/tree` | Span tree, gated on session membership. |
-/// | `GET` | `/v1/sessions/{session_id}/runs/{run_id}/spans/{span_id}` | One span, gated on session membership. |
-/// | `GET` | `/v1/sessions/{session_id}/usage` | Token-usage rollup summed across the session's runs. |
-/// | `GET` | `/v1/sessions/{session_id}/runs/{run_id}/usage` | Per-run token-usage rollup, gated on session membership. |
 ///
 /// # Middleware Registered
 ///
@@ -298,15 +220,11 @@ impl GlobalResource for TracingConfig {}
 ///
 /// - **`build()`** — inserts [`TracingConfig`] and the [`TracingLayers`]
 ///   resource, optionally pushes the fmt layer, and registers the graph
-///   instrumentation middleware and hooks. With the `dashboard` feature
-///   on, also installs the span buffer, usage-pricing API, recording
-///   layer, and HTTP routes.
+///   instrumentation middleware and hooks.
 /// - **`ready()`** — installs the global `tracing` subscriber from all
 ///   accumulated layers, then decorates the [`ModelRegistry`](polaris_models::ModelRegistry)
 ///   and [`ToolRegistry`](polaris_tools::ToolRegistry) by rebuilding them
 ///   with tracing-instrumented providers and tools.
-/// - The `dashboard` feature gates the buffer, the usage-pricing API, the
-///   `AppPlugin` dependency, and every route above.
 /// - Registers no tick schedules.
 ///
 /// # Extends
@@ -322,21 +240,16 @@ impl GlobalResource for TracingConfig {}
 /// - [`ToolRegistry`](polaris_tools::ToolRegistry) (from
 ///   [`ToolsPlugin`](polaris_tools::ToolsPlugin)) — in `ready()`, wraps
 ///   each registered tool in a tracing decorator.
-/// - [`HttpRouter`](polaris_app::HttpRouter) (from
-///   [`AppPlugin`](polaris_app::AppPlugin)) *(feature `dashboard`)* —
-///   mounts the dashboard routes listed above.
 ///
 /// # Example
 ///
-/// ```
+/// ```no_run
 /// use polaris_system::server::Server;
 /// use polaris_core_plugins::{ServerInfoPlugin, TracingPlugin, FmtConfig, TracingFormat};
 /// use tracing::Level;
 ///
 /// let mut server = Server::new();
 /// server.add_plugins(ServerInfoPlugin);
-/// # #[cfg(feature = "dashboard")]
-/// # server.add_plugins(polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")));
 /// # server.add_plugins(polaris_models::ModelsPlugin);
 /// # server.add_plugins(polaris_tools::ToolsPlugin);
 /// server.add_plugins(
@@ -356,9 +269,6 @@ pub struct TracingPlugin {
     fmt: Option<FmtConfig>,
     /// Whether to capture `GenAI` content attributes on instrumentation spans.
     capture_genai_content: bool,
-    /// Capacity of the dashboard's [`SpanBuffer`] ring.
-    #[cfg(feature = "dashboard")]
-    span_buffer_capacity: usize,
 }
 
 /// Builds a `TracingPlugin` with **no output layers attached**.
@@ -375,8 +285,6 @@ impl Default for TracingPlugin {
             level: Level::INFO,
             fmt: None,
             capture_genai_content: false,
-            #[cfg(feature = "dashboard")]
-            span_buffer_capacity: SpanBuffer::DEFAULT_CAPACITY,
         }
     }
 }
@@ -464,21 +372,6 @@ impl TracingPlugin {
         self.capture_genai_content = true;
         self
     }
-
-    /// Sets the capacity of the dashboard's [`SpanBuffer`] ring.
-    ///
-    /// The buffer retains the most recent `capacity` records and evicts the
-    /// oldest on overflow. The default ([`SpanBuffer::DEFAULT_CAPACITY`], 1024)
-    /// is fine for short-lived or low-volume sessions, but a moderately active
-    /// session can exceed it within a day — at which point older history is
-    /// dropped before it can be queried (the buffer logs a one-time warning).
-    /// Raise this for deployments that need more in-memory retention.
-    #[cfg(feature = "dashboard")]
-    #[must_use]
-    pub fn with_span_buffer_capacity(mut self, capacity: usize) -> Self {
-        self.span_buffer_capacity = capacity;
-        self
-    }
 }
 
 impl Plugin for TracingPlugin {
@@ -489,17 +382,13 @@ impl Plugin for TracingPlugin {
         // Declares the `TracingLayers` capability so layer contributors (e.g.
         // `OpenTelemetryPlugin`) can depend on the layer-registry type rather than naming
         // `TracingPlugin`. The registry is inserted imperatively in `build()`. The other
-        // relationships this plugin has (decorating the model/tool registries in `ready()`,
-        // the dashboard route under `HttpRouter`) remain expressed via `dependencies()`.
+        // relationships this plugin has (decorating the model/tool registries in `ready()`)
+        // remain expressed via `dependencies()`.
         PluginAccess::new().provides::<TracingLayers>(TracingLayers::CONTRACT_VERSION)
     }
 
     fn build(&self, server: &mut Server) {
-        server.insert_global(TracingConfig {
-            level: self.level,
-            #[cfg(feature = "dashboard")]
-            span_buffer_capacity: self.span_buffer_capacity,
-        });
+        server.insert_global(TracingConfig { level: self.level });
 
         server.insert_resource(TracingLayers::new());
 
@@ -512,9 +401,6 @@ impl Plugin for TracingPlugin {
         }
 
         self.register_instrumentation(server);
-
-        #[cfg(feature = "dashboard")]
-        dashboard::install(server, self.span_buffer_capacity);
     }
 
     async fn ready(&self, server: &mut Server) {
@@ -533,27 +419,16 @@ impl Plugin for TracingPlugin {
     }
 
     fn dependencies(&self) -> Vec<PluginId> {
-        #[cfg_attr(
-            not(feature = "dashboard"),
-            expect(unused_mut, reason = "mutated only when `dashboard` is enabled")
-        )]
-        let mut deps = vec![
+        vec![
             PluginId::of::<ServerInfoPlugin>(),
             PluginId::of::<polaris_models::ModelsPlugin>(),
             PluginId::of::<polaris_tools::ToolsPlugin>(),
-        ];
-        #[cfg(feature = "dashboard")]
-        deps.push(PluginId::of::<polaris_app::AppPlugin>());
-        deps
+        ]
     }
 
     /// Auto-registers the zero-config dependencies so a user adding only
     /// `TracingPlugin` (or `DefaultPlugins`) doesn't have to wire each
     /// satellite plugin by hand.
-    ///
-    /// [`AppPlugin`](polaris_app::AppPlugin) is intentionally omitted —
-    /// it requires explicit host/port configuration, so a default
-    /// instance would mask configuration mistakes rather than help.
     fn default_dependencies(&self) -> DefaultDependencies {
         DefaultDependencies::new()
             .add::<ServerInfoPlugin>()
@@ -649,15 +524,20 @@ mod tests {
     async fn build_registers_config_and_layers_api() {
         let mut server = Server::new();
         server.add_plugins(ServerInfoPlugin);
-        // `TracingPlugin` always depends on ModelsPlugin + ToolsPlugin (for
-        // instrumentation decoration). `dashboard` additionally requires
-        // AppPlugin for HTTP-router wiring.
-        #[cfg(feature = "dashboard")]
-        server.add_plugins(polaris_app::AppPlugin::new(
-            polaris_app::AppConfig::new().with_host("127.0.0.1"),
-        ));
         server.add_plugins(polaris_models::ModelsPlugin);
         server.add_plugins(polaris_tools::ToolsPlugin);
+        // Under `--all-features`, `dashboard` makes `ModelsPlugin`/`ToolsPlugin`
+        // require `AppPlugin`. Bind an ephemeral listener so `finish()` does not
+        // claim a fixed port.
+        #[cfg(feature = "dashboard")]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral port");
+            server.add_plugins(
+                polaris_app::AppPlugin::new(polaris_app::AppConfig::new()).with_listener(listener),
+            );
+        }
         server.add_plugins(TracingPlugin::default());
         server.finish().await.unwrap();
 
@@ -668,52 +548,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dashboard")]
-    #[test]
-    fn with_span_buffer_capacity_sizes_the_registered_buffer() {
-        // Build directly rather than via `finish()`: only one test per
-        // binary may install the global tracing subscriber, and AppPlugin's
-        // `build` must run first so the dashboard wiring finds HttpRouter.
-        let mut server = Server::new();
-        Plugin::build(
-            &polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")),
-            &mut server,
-        );
-        TracingPlugin::default()
-            .with_span_buffer_capacity(7)
-            .build(&mut server);
-
-        assert_eq!(
-            server
-                .get_global::<TracingConfig>()
-                .expect("TracingConfig global")
-                .span_buffer_capacity,
-            7,
-            "builder should thread capacity into TracingConfig"
-        );
-        assert_eq!(
-            server
-                .api::<SpanBuffer>()
-                .expect("SpanBuffer API")
-                .capacity(),
-            7,
-            "configured capacity should reach the registered SpanBuffer"
-        );
-    }
-
     #[test]
     fn build_creates_layers_api() {
         let mut server = Server::new();
         server.add_plugins(ServerInfoPlugin);
-        // This test calls `plugin.build(...)` directly rather than through
-        // `add_plugins`, so AppPlugin's own `build` must run first to make
-        // the HttpRouter API available to the dashboard wiring inside
-        // TracingPlugin::build.
-        #[cfg(feature = "dashboard")]
-        Plugin::build(
-            &polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")),
-            &mut server,
-        );
 
         let plugin = TracingPlugin::default();
         plugin.build(&mut server);
@@ -758,14 +596,11 @@ mod tests {
         async fn decoration_preserves_permission_overrides() {
             let mut server = Server::new();
 
-            // `dashboard` makes ToolsPlugin require AppPlugin. This test
-            // calls `tools.build` directly, so AppPlugin's own `build` must
-            // be invoked the same way to install the HttpRouter API.
+            // Under `--all-features`, `dashboard` makes `ToolsPlugin::build`
+            // reach for the `HttpRouter` API from `AppPlugin`. Build it first so
+            // the router exists.
             #[cfg(feature = "dashboard")]
-            Plugin::build(
-                &polaris_app::AppPlugin::new(polaris_app::AppConfig::new().with_host("127.0.0.1")),
-                &mut server,
-            );
+            polaris_app::AppPlugin::new(polaris_app::AppConfig::new()).build(&mut server);
 
             let tools = ToolsPlugin;
             tools.build(&mut server);

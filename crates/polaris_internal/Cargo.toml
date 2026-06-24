@@ -26,28 +26,20 @@ openai = ["polaris_model_providers/openai"]
 bedrock = ["polaris_model_providers/bedrock"]
 tiktoken = ["polaris_models/tiktoken"]
 # Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s
-# HTTP request spans to OTel HTTP semantic-convention field names. Does not
-# extract incoming W3C `traceparent` headers — each request starts a fresh
-# trace.
+# HTTP request spans to OTel HTTP semantic-convention field names. Extracts
+# incoming W3C `traceparent` headers (via the propagator installed by
+# `OpenTelemetryPlugin`) to continue a distributed trace; requests with no
+# upstream context start a fresh trace.
 otel = ["polaris_core_plugins/otel", "polaris_app/otel"]
 sessions-http = ["polaris_sessions/sessions-http"]
 # `MockClock` and `MockIOProvider` for downstream test code.
 test-utils = ["polaris_core_plugins/test-utils"]
-# Filesystem-backed stores: `polaris_sessions::FileStore` for session
-# state, and `polaris_core_plugins::FileSpanStore` for tracing-dashboard
-# run history. Both bring in `tokio/fs`. Propagated to both crates so a
-# consumer that enables `file-store` on the umbrella gets both backends.
-file-store = [
-    "polaris_sessions/file-store",
-    "polaris_core_plugins/file-store",
-]
-typegen = [
-    "polaris_sessions/typegen",
-    "polaris_core_plugins/typegen",
-]
-# Enables the dashboard HTTP surface (tools/models snapshots, tracing
-# spans & usage) across `polaris_tools`, `polaris_models`, and
-# `polaris_core_plugins`. Pulls axum and `polaris_app` into the graph.
+# Filesystem-backed `polaris_sessions::FileStore` for session state.
+file-store = ["polaris_sessions/file-store"]
+typegen = ["polaris_sessions/typegen"]
+# Enables the dashboard HTTP surface (tools/models snapshots) across `polaris_tools` and `polaris_models`.
+# Pulls axum and `polaris_app` into the graph. `polaris_core_plugins/dashboard` forwards to the same
+# tools/models surface so the umbrella knob stays consistent across every plugin crate.
 dashboard = [
     "polaris_tools/dashboard",
     "polaris_models/dashboard",
@@ -55,16 +47,16 @@ dashboard = [
 ]
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.4" }
-polaris_graph = { path = "../polaris_graph", version = "0.4" }
-polaris_agent = { path = "../polaris_agent", version = "0.4" }
-polaris_tools = { path = "../polaris_tools", version = "0.4" }
-polaris_model_providers = { path = "../polaris_model_providers", version = "0.4" }
-polaris_models = { path = "../polaris_models", version = "0.4" }
-polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.4" }
-polaris_sessions = { path = "../polaris_sessions", version = "0.4", default-features = false }
-polaris_shell = { path = "../polaris_shell", version = "0.4" }
-polaris_app = { path = "../polaris_app", version = "0.4", default-features = false }
+polaris_system = { path = "../polaris_system", version = "0.5" }
+polaris_graph = { path = "../polaris_graph", version = "0.5" }
+polaris_agent = { path = "../polaris_agent", version = "0.5" }
+polaris_tools = { path = "../polaris_tools", version = "0.5" }
+polaris_model_providers = { path = "../polaris_model_providers", version = "0.5" }
+polaris_models = { path = "../polaris_models", version = "0.5" }
+polaris_core_plugins = { path = "../polaris_core_plugins", version = "0.5" }
+polaris_sessions = { path = "../polaris_sessions", version = "0.5", default-features = false }
+polaris_shell = { path = "../polaris_shell", version = "0.5" }
+polaris_app = { path = "../polaris_app", version = "0.5", default-features = false }
 
 [lints]
 workspace = true
