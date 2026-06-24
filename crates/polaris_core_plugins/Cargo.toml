@@ -57,8 +57,6 @@ tokio = { version = "1.43", features = [
     "io-util",
 ] }
 tokio-test = "0.4"
-reqwest = { version = "0.13", features = ["json"] }
-tempfile = "3"
 # Used by the tracing_plugin tests under `--all-features`: with `dashboard`
 # enabled, `ModelsPlugin`/`ToolsPlugin` require `AppPlugin`.
 polaris_app = { path = "../polaris_app", default-features = false }
