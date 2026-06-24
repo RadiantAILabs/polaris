@@ -26,15 +26,25 @@ pub(super) fn serialize_input_messages(messages: &[Message]) -> String {
 /// `role`, `parts`, and `finish_reason` as required by `OutputMessage`.
 pub(super) fn serialize_output_messages(
     content: &[AssistantBlock],
-    finish_reason: &StopReason,
+    stop_reason: &StopReason,
 ) -> String {
     let parts: Vec<serde_json::Value> = content.iter().map(serialize_assistant_block).collect();
     let msg = json!({
         "role": "assistant",
         "parts": parts,
-        "finish_reason": finish_reason,
+        "finish_reason": finish_reason(stop_reason),
     });
     serde_json::to_string(&[msg]).unwrap_or_else(|_| "[]".to_string())
+}
+
+pub(super) fn finish_reason(stop_reason: &StopReason) -> &str {
+    match stop_reason {
+        StopReason::EndTurn | StopReason::StopSequence => "stop",
+        StopReason::MaxOutputTokens => "length",
+        StopReason::ToolUse => "tool_call",
+        StopReason::ContentFilter => "content_filter",
+        StopReason::Other(reason) => reason,
+    }
 }
 
 /// Serializes a system instruction string to the `OTel` `GenAI` format.
@@ -68,8 +78,17 @@ fn serialize_message(message: &Message) -> serde_json::Value {
     match message {
         Message::User { content } => {
             let parts: Vec<serde_json::Value> = content.iter().map(serialize_user_block).collect();
+            let role = if !content.is_empty()
+                && content
+                    .iter()
+                    .all(|block| matches!(block, UserBlock::ToolResult(_)))
+            {
+                "tool"
+            } else {
+                "user"
+            };
             json!({
-                "role": "user",
+                "role": role,
                 "parts": parts,
             })
         }
@@ -90,12 +109,15 @@ fn serialize_user_block(block: &UserBlock) -> serde_json::Value {
             json!({ "type": "text", "content": text.text })
         }
         UserBlock::Image(img) => {
-            // `BlobPart.content` contains raw binary and is intentionally omitted — embedding
-            // base64 data in trace attributes would produce unbounded payload sizes.
+            // The schema requires `content` on a `BlobPart`. Raw binary is
+            // intentionally elided (embedding base64 would produce unbounded
+            // payloads), so an empty-string sentinel satisfies the schema
+            // while signalling that the bytes were dropped.
             json!({
                 "type": "blob",
                 "modality": "image",
                 "mime_type": image_mime_type(&img.media_type),
+                "content": "",
             })
         }
         UserBlock::Audio(audio) => {
@@ -103,6 +125,7 @@ fn serialize_user_block(block: &UserBlock) -> serde_json::Value {
                 "type": "blob",
                 "modality": "audio",
                 "mime_type": audio_mime_type(&audio.media_type),
+                "content": "",
             })
         }
         UserBlock::Document(doc) => {
@@ -110,12 +133,18 @@ fn serialize_user_block(block: &UserBlock) -> serde_json::Value {
                 "type": "blob",
                 "modality": "document",
                 "mime_type": document_mime_type(&doc.media_type),
+                "content": "",
             })
         }
         UserBlock::ToolResult(result) => {
             let response = match &result.content {
-                ToolResultContent::Text(text) => text.clone(),
-                ToolResultContent::Image(_) => "[image]".to_string(),
+                ToolResultContent::Text(text) => json!(text),
+                ToolResultContent::Image(img) => json!({
+                    "type": "blob",
+                    "modality": "image",
+                    "mime_type": image_mime_type(&img.media_type),
+                    "content": "",
+                }),
             };
             json!({
                 "type": "tool_call_response",
@@ -219,7 +248,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed[0]["role"], "assistant");
-        assert_eq!(parsed[0]["finish_reason"], "tool_use");
+        assert_eq!(parsed[0]["finish_reason"], "tool_call");
         assert_eq!(parsed[0]["parts"][0]["type"], "tool_call");
         assert_eq!(parsed[0]["parts"][0]["id"], "call_1");
         assert_eq!(parsed[0]["parts"][0]["name"], "get_weather");
@@ -266,9 +295,63 @@ mod tests {
         let result = serialize_input_messages(&messages);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(
+            parsed[0]["role"], "tool",
+            "a tool-result-only user message uses role 'tool'"
+        );
         assert_eq!(parsed[0]["parts"][0]["type"], "tool_call_response");
         assert_eq!(parsed[0]["parts"][0]["id"], "tool_1");
         assert_eq!(parsed[0]["parts"][0]["response"], "42 degrees");
+    }
+
+    #[test]
+    fn image_tool_result_emits_blob_reference() {
+        let messages = vec![Message::User {
+            content: vec![UserBlock::ToolResult(ToolResult {
+                id: "tool_2".to_string(),
+                call_id: None,
+                content: ToolResultContent::Image(ImageBlock {
+                    data: DocumentSource::Base64("aGVsbG8=".to_string()),
+                    media_type: ImageMediaType::PNG,
+                    additional_params: None,
+                }),
+                status: ToolResultStatus::Success,
+            })],
+        }];
+        let result = serialize_input_messages(&messages);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        let response = &parsed[0]["parts"][0]["response"];
+        assert_eq!(
+            response["modality"], "image",
+            "image tool results keep modality"
+        );
+        assert_eq!(
+            response["mime_type"], "image/png",
+            "image tool results keep mime type"
+        );
+        assert_eq!(
+            response["content"], "",
+            "image bytes are dropped via empty content"
+        );
+    }
+
+    #[test]
+    fn image_block_includes_required_content_field() {
+        let messages = vec![Message::User {
+            content: vec![UserBlock::Image(ImageBlock {
+                data: DocumentSource::Base64("aGVsbG8=".to_string()),
+                media_type: ImageMediaType::PNG,
+                additional_params: None,
+            })],
+        }];
+        let result = serialize_input_messages(&messages);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(
+            parsed[0]["parts"][0]["content"], "",
+            "BlobPart requires a content field"
+        );
     }
 
     #[test]
@@ -284,7 +367,7 @@ mod tests {
         let result = serialize_output_messages(&content, &StopReason::EndTurn);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed[0]["finish_reason"], "end_turn");
+        assert_eq!(parsed[0]["finish_reason"], "stop");
         assert_eq!(parsed[0]["parts"][0]["type"], "reasoning");
         assert_eq!(
             parsed[0]["parts"][0]["content"],
@@ -314,6 +397,40 @@ mod tests {
     }
 
     #[test]
+    fn stop_reason_maps_to_canonical_finish_reason() {
+        assert_eq!(
+            finish_reason(&StopReason::EndTurn),
+            "stop",
+            "end_turn maps to the canonical stop reason"
+        );
+        assert_eq!(
+            finish_reason(&StopReason::StopSequence),
+            "stop",
+            "a stop sequence is still a natural stop"
+        );
+        assert_eq!(
+            finish_reason(&StopReason::MaxOutputTokens),
+            "length",
+            "token truncation maps to length"
+        );
+        assert_eq!(
+            finish_reason(&StopReason::ToolUse),
+            "tool_call",
+            "tool use maps to tool_call"
+        );
+        assert_eq!(
+            finish_reason(&StopReason::ContentFilter),
+            "content_filter",
+            "content filter maps directly"
+        );
+        assert_eq!(
+            finish_reason(&StopReason::Other("pause_turn".to_string())),
+            "pause_turn",
+            "provider-specific reasons pass through verbatim"
+        );
+    }
+
+    #[test]
     fn mixed_output_text_and_tool_call() {
         let content = vec![
             AssistantBlock::Text(TextBlock {
@@ -333,7 +450,7 @@ mod tests {
         let result = serialize_output_messages(&content, &StopReason::ToolUse);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed[0]["finish_reason"], "tool_use");
+        assert_eq!(parsed[0]["finish_reason"], "tool_call");
         assert_eq!(parsed[0]["parts"].as_array().unwrap().len(), 2);
         assert_eq!(parsed[0]["parts"][0]["type"], "text");
         assert_eq!(parsed[0]["parts"][1]["type"], "tool_call");

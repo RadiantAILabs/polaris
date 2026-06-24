@@ -880,11 +880,14 @@ impl SessionsAPI {
         );
 
         // The `polaris.label.*` fields below piggyback on the tracing
-        // span chain so child graph spans inherit the same labels via
-        // `RecordingLayer`, letting `/v1/sessions/{id}/runs` filter
-        // recorded runs by `session_id`.
+        // span chain so child graph spans inherit the same labels,
+        // letting downstream subscribers and OTel exporters correlate
+        // recorded spans by `session_id`.
         let turn_span = tracing::info_span!(
             "polaris.session.turn",
+            gen_ai.operation.name = "invoke_agent",
+            gen_ai.conversation.id = %id,
+            gen_ai.agent.name = %state.agent_type,
             polaris.session.id = %id,
             polaris.session.turn_number = turn,
             polaris.session.agent_type = %state.agent_type,

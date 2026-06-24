@@ -178,6 +178,15 @@ pub struct LlmResponse {
     pub usage: Usage,
     /// The reason generation stopped.
     pub stop_reason: StopReason,
+    /// Provider-assigned identifier for this response, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The concrete model that produced this response, when reported.
+    ///
+    /// May differ from the requested model (e.g. a dated alias resolving
+    /// to a specific snapshot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl LlmResponse {
@@ -198,6 +207,8 @@ impl LlmResponse {
     ///     content: vec![AssistantBlock::text("Hello, "), AssistantBlock::text("world!")],
     ///     usage: Usage::default(),
     ///     stop_reason: StopReason::EndTurn,
+    ///     id: None,
+    ///     model: None,
     /// };
     /// assert_eq!(response.text(), "Hello, world!");
     /// ```
@@ -262,6 +273,11 @@ pub struct Usage {
     /// ("write" being the billing-tier term for them).
     #[serde(default)]
     pub cache_creation_tokens: Option<u64>,
+    /// Output tokens spent on model reasoning, when the provider reports it
+    /// (e.g. `OpenAI` reasoning models via `output_tokens_details.reasoning_tokens`).
+    /// Providers that don't report reasoning tokens leave this `None`.
+    #[serde(default)]
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 // ─────────────────────
@@ -931,6 +947,12 @@ pub enum StreamEvent {
         stop_reason: StopReason,
         /// Final token counts for the complete request.
         usage: Usage,
+        /// Provider-assigned identifier for this response, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Model that produced this response, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
 }
 

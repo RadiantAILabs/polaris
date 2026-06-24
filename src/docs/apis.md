@@ -56,9 +56,7 @@ Cross-cutting plugin coordination.
 |-----|--------------------|-----------------|
 | [`PersistenceAPI`](crate::plugins::PersistenceAPI) | Open extension | Register serializers for `Storable` resources so session checkpoints can save/restore them. |
 | [`TracingLayers`](crate::plugins::TracingLayers) | Open extension | Push `tracing_subscriber::Layer` implementations into the global subscriber. *Stored as a server resource rather than via `insert_api` — accessed through `get_resource_mut`.* |
-| [`SpanBuffer`](crate::plugins::SpanBuffer) *(feature `dashboard`)* | Provider-scoped | In-memory span buffer feeding the `/v1/tracing/*` endpoints. |
-| [`UsagePricing`](crate::plugins::UsagePricing) *(feature `dashboard`)* | Open extension | Register price tables that the tracing dashboard uses to roll up cost from token-usage spans. |
-| [`SpanStoreHandle`](crate::plugins::SpanStoreHandle) | Provider-scoped | Trait-object handle (`Arc<dyn SpanStore>`) for querying the durable span/run history installed by `SpanStorePlugin` — survives process restarts, unlike `SpanBuffer`. |
+| [`SpanProcessorRegistry`](crate::plugins::SpanProcessorRegistry) *(feature `otel`)* | Open extension | Push OpenTelemetry `SpanProcessor` implementations into the export fan-out. *A `Contract`-only registry stored as a server resource — contributed to via `Extends<SpanProcessorRegistry>` during `build()`.* |
 
 # Layer 3 — Dashboard Snapshots
 

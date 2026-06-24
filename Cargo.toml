@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.5"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris"
@@ -117,8 +117,9 @@ tiktoken = ["polaris_internal/tiktoken"]
 # Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s
 # HTTP request spans to OTel HTTP semantic-convention field names
 # (`http.request.method`, `url.path`, etc., plus `otel.name` / `otel.kind`).
-# Does not extract incoming W3C `traceparent` headers — each request starts a
-# fresh trace.
+# Extracts incoming W3C `traceparent` headers (via the propagator installed by
+# `OpenTelemetryPlugin`) to continue a distributed trace; requests with no
+# upstream context start a fresh trace.
 otel = ["polaris_internal/otel"]
 sessions-http = ["polaris_internal/sessions-http"]
 # `MockClock` and `MockIOProvider` re-exports for downstream test code.
@@ -134,5 +135,5 @@ typegen = ["polaris_internal/typegen"]
 dashboard = ["polaris_internal/dashboard"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "0.4", default-features = false }
+polaris_internal = { path = "crates/polaris_internal", version = "0.5", default-features = false }
 tracing = { version = "0.1.43", default-features = false }

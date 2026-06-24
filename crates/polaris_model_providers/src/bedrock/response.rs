@@ -28,6 +28,8 @@ pub fn convert_response(response: ConverseOutput) -> Result<LlmResponse, Generat
         content,
         usage,
         stop_reason,
+        id: None,
+        model: None,
     })
 }
 
@@ -112,17 +114,19 @@ fn convert_reasoning(
 
 /// Converts Bedrock token usage to Polaris usage.
 ///
-/// `cache_read_tokens` / `cache_creation_tokens` are left `None`: prompt caching
-/// is wired only for Anthropic so far. Bedrock *does* report cache tokens
-/// upstream (`cacheReadInputTokens` / `cacheWriteInputTokens`), so surface them
-/// here when caching is enabled for this provider — otherwise cached input is
-/// silently under-counted in cost estimates.
+/// Bedrock reports cache tokens upstream (`cacheReadInputTokens` /
+/// `cacheWriteInputTokens`) and its `inputTokens` already excludes them, so the
+/// cache counts are surfaced directly as `cache_read_tokens` /
+/// `cache_creation_tokens` — otherwise cached input is silently under-counted in
+/// cost estimates. Bedrock does not report reasoning tokens.
 fn convert_usage(usage: Option<bedrock::TokenUsage>) -> polaris_llm::Usage {
     usage.map_or_else(polaris_llm::Usage::default, |u| polaris_llm::Usage {
         input_tokens: Some(u.input_tokens as u64),
         output_tokens: Some(u.output_tokens as u64),
         total_tokens: Some(u.total_tokens as u64),
-        ..Default::default()
+        cache_read_tokens: u.cache_read_input_tokens.map(|t| t as u64),
+        cache_creation_tokens: u.cache_write_input_tokens.map(|t| t as u64),
+        reasoning_output_tokens: None,
     })
 }
 
@@ -131,12 +135,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn convert_usage_leaves_cache_fields_none() {
-        // Prompt caching is wired only for Anthropic; the Bedrock converter must
-        // leave the cache tiers `None` so the usage rollup neither prices nor
-        // counts them — even though Bedrock *does* report cache tokens upstream.
-        // Set the upstream cache fields here to prove they are deliberately
-        // dropped, locking the contract against accidental future wiring.
+    fn convert_usage_surfaces_cache_tokens() {
+        // Bedrock reports cache read/write tokens upstream
+        // (`cacheReadInputTokens` / `cacheWriteInputTokens`); the converter
+        // surfaces them as `cache_read_tokens` / `cache_creation_tokens` so the
+        // usage rollup can bill them at the cache tiers. Bedrock's `inputTokens`
+        // already excludes cache, so it maps straight to the uncached count.
         let usage = bedrock::TokenUsage::builder()
             .input_tokens(10)
             .output_tokens(5)
@@ -151,8 +155,9 @@ mod tests {
         assert_eq!(converted.input_tokens, Some(10));
         assert_eq!(converted.output_tokens, Some(5));
         assert_eq!(converted.total_tokens, Some(15));
-        assert_eq!(converted.cache_read_tokens, None);
-        assert_eq!(converted.cache_creation_tokens, None);
+        assert_eq!(converted.cache_read_tokens, Some(7));
+        assert_eq!(converted.cache_creation_tokens, Some(3));
+        assert_eq!(converted.reasoning_output_tokens, None);
     }
 
     #[test]

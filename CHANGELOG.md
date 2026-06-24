@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-24
+
+Dashboard plugin refactor: the in-process tracing dashboard and its span-store / usage-rollup machinery are removed from `polaris_core_plugins`, and the `dashboard` feature now forwards to the `polaris_models` / `polaris_tools` snapshot surfaces instead of carrying its own span-buffer endpoints. Observability stays available through the OpenTelemetry export path, which gains a `SpanProcessor` extension point.
+
+### Added
+
+- **`SpanProcessorRegistry` extension point on `OpenTelemetryPlugin`** (`polaris_core_plugins`, feature `otel`) — consumers push their own OTel `SpanProcessor` implementations into the export fan-out via `Extends<SpanProcessorRegistry>` during `build()`. `OpenTelemetryPlugin` gains `with_span_processor(...)`, `without_export()`, and `with_protocol(...)` builders for configuring the exporter and its processors.
+
+- **`LlmProvider::endpoint()`** (`polaris_models`) — defaulted trait method that lets a provider publish the endpoint URL it targets.
+
+### Changed
+
+- **Source-breaking: new public fields on non-`#[non_exhaustive]` types** — downstream struct-literal construction breaks; switch to the constructors / `..Default::default()`. `LlmResponse` gains `id` and `model` (`polaris_models`); `Usage` gains `reasoning_output_tokens` (`polaris_models`); `StreamEvent::MessageStop` gains `id` and `model` (`polaris_models`); `GraphInfo` gains `run_id` (`polaris_graph`).
+
+### Removed
+
+- **In-process tracing dashboard + `/v1/tracing/*` HTTP routes** (`polaris_core_plugins`) — *breaking*. The span-buffer-backed tracing dashboard and all of its endpoints (`/v1/tracing/sessions`, `/v1/tracing/runs[...]`, `/v1/tracing/usage`, the per-session/per-run usage rollups, etc.) are removed. The `dashboard` feature now forwards to the `polaris_models` / `polaris_tools` snapshot surfaces only.
+
+- **Tracing span-store and usage machinery** (`polaris_core_plugins`) — *breaking*. `SpanBuffer`, `SpanStorePlugin`, `SpanStore`, `SpanStoreHandle`, `FileSpanStore`, `RecordingLayer`, and `UsagePricing` are removed, along with their query/aggregation surfaces. Live observability now flows through `OpenTelemetryPlugin` and its `SpanProcessorRegistry`.
+
+- **`file-store` and `typegen` Cargo features on `polaris_core_plugins`** — *breaking*. `file-store` backed the removed `FileSpanStore`; `typegen` derived the now-deleted tracing wire types (`SpanRecord`, `SpanKind`, `SpanEvent`, `SpanNode`, `SpanTree`, `RunSummary`, `SessionSummary`, `TokenUsageBreakdown`, `TokenUsageResponse`, `TokenUsageTotals`) and their TypeScript bindings. `polaris_sessions` remains the only crate that derives TS types.
+
+### Fixed
+
+- **`otel` feature docs corrected** (`polaris-ai`, `polaris_internal`) — the feature descriptions in `Cargo.toml`, `polaris_internal/Cargo.toml`, and `src/lib.rs` claimed the `otel` feature does **not** extract incoming W3C `traceparent` headers. Since the W3C trace-context work, `polaris_app`'s `otel`-gated HTTP middleware *does* extract `traceparent` (via the propagator `OpenTelemetryPlugin` installs) and continues the distributed trace. Docs now describe the actual behavior.
+
 ## [0.4.5] - 2026-06-23
 
 Per-tool **strict** preference and two registry-level levers — **exposure** and **selection** — that let agent authors control how tools are advertised to a model, plus provider-side handling of each provider's strict-tool limits. Strict mode opts a tool into constrained/structured decoding (a normalized JSON schema with `additionalProperties: false`); exposure filters which registered tools are advertised without removing the underlying capability. All three levers mirror the existing `permission_overrides` pattern on `ToolRegistry`, so they compose with it rather than special-casing it.

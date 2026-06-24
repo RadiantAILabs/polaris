@@ -146,8 +146,8 @@ fn extract_api_name_handles_common_shapes() {
         Some("SessionsAPI".into())
     );
     assert_eq!(
-        extract_api_name("impl polaris_system::api::API for SpanStoreHandle {}"),
-        Some("SpanStoreHandle".into())
+        extract_api_name("impl polaris_system::api::API for PersistenceAPI {}"),
+        Some("PersistenceAPI".into())
     );
     assert_eq!(
         extract_api_name("impl crate::api::API for Local {}"),

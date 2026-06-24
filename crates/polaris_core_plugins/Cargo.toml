@@ -19,11 +19,11 @@ rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.4" }
-polaris_graph = { path = "../polaris_graph", version = "0.4" }
-polaris_models = { path = "../polaris_models", version = "0.4" }
-polaris_tools = { path = "../polaris_tools", version = "0.4" }
-persistence_macros = { path = "persistence_macros", version = "0.4" }
+polaris_system = { path = "../polaris_system", version = "0.5" }
+polaris_graph = { path = "../polaris_graph", version = "0.5" }
+polaris_models = { path = "../polaris_models", version = "0.5" }
+polaris_tools = { path = "../polaris_tools", version = "0.5" }
+persistence_macros = { path = "persistence_macros", version = "0.5" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,41 +32,45 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-polaris_app = { path = "../polaris_app", version = "0.4", optional = true, default-features = false }
-axum = { version = "0.8", features = ["tokio"], optional = true }
-opentelemetry = { version = "0.31", optional = true }
-opentelemetry_sdk = { version = "0.31", features = [
+opentelemetry = { version = "0.32.0", optional = true }
+opentelemetry_sdk = { version = "0.32.1", features = [
     "rt-tokio",
 ], optional = true }
-opentelemetry-otlp = { version = "0.31", optional = true }
-tracing-opentelemetry = { version = "0.32", optional = true }
-ts-rs = { workspace = true, optional = true }
+opentelemetry-otlp = { version = "0.32.0", optional = true }
+tracing-opentelemetry = { version = "0.33.0", optional = true }
 
-tokio = { version = "1.43", features = ["rt", "sync", "time"], default-features = false }
+tokio = { version = "1.43", features = [
+    "rt",
+    "sync",
+    "time",
+], default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net", "fs", "io-util"] }
+tokio = { version = "1.43", features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "macros",
+    "time",
+    "net",
+    "fs",
+    "io-util",
+] }
 tokio-test = "0.4"
-reqwest = { version = "0.13", features = ["json"] }
-tempfile = "3"
+# Used by the tracing_plugin tests under `--all-features`: with `dashboard`
+# enabled, `ModelsPlugin`/`ToolsPlugin` require `AppPlugin`.
+polaris_app = { path = "../polaris_app", default-features = false }
 
 [features]
 default = []
-dashboard = ["dep:axum", "dep:polaris_app"]
-# Enables the durable, on-disk [`FileSpanStore`] backend for
-# `SpanStorePlugin`. Pulls in `tokio` fs support for atomic appends.
-# Intentionally does not imply `dashboard` — the wire types it needs
-# (`SpanRecord`, `SpanKind`) are exposed unconditionally so umbrella
-# `file-store` propagation does not drag the dashboard's axum dep into
-# the default build.
-file-store = ["tokio/fs", "tokio/io-util"]
 otel = [
     "opentelemetry",
     "opentelemetry_sdk",
     "opentelemetry-otlp",
     "tracing-opentelemetry",
 ]
+# Forwards the dashboard variant to the model/tool plugins. With it enabled,
+# `ModelsPlugin`/`ToolsPlugin` require `AppPlugin`; the tracing_plugin tests use
+# this flag to add `AppPlugin` when the dependency is present.
+dashboard = ["polaris_models/dashboard", "polaris_tools/dashboard"]
 test-utils = []
-# Generates TypeScript bindings for tracing dashboard wire types. Off by
-# default so release builds do not pull `ts-rs` into the dep graph.
-typegen = ["dashboard", "dep:ts-rs"]

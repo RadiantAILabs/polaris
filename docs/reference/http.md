@@ -399,24 +399,6 @@ server
     .add_plugins(HttpPlugin::new());
 ```
 
-## Tracing Endpoints (`dashboard` feature)
-
-When `polaris_core_plugins` is built with the `dashboard` feature, `TracingPlugin` mounts a family of endpoints over its in-memory `SpanBuffer`. Aged-out runs return 404. Sessions without LLM activity return zeroed usage bodies (not 404):
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/tracing/spans` | Flat tail of recent `SpanRecord`s |
-| `GET` | `/v1/tracing/runs?limit=N` | Distinct run summaries (most-recent first) with token totals |
-| `GET` | `/v1/tracing/runs/{run_id}` | Hierarchical `SpanTree` for one run; `?include=structure` omits payloads |
-| `GET` | `/v1/tracing/runs/{run_id}/spans/{span_id}` | Single-span payload (pair with structure-only tree loads) |
-| `GET` | `/v1/tracing/sessions?limit=N` | Sessions known to the buffer, including ephemeral ones already reclaimed by the session store |
-| `GET` | `/v1/tracing/usage[?label=key:value]` | Buffer-wide token usage rollup, optionally filtered by correlation label |
-| `GET` | `/v1/tracing/runs/{run_id}/usage` | Per-run token totals |
-| `GET` | `/v1/sessions/{id}/usage` | Per-session totals summed across runs in the buffer |
-| `GET` | `/v1/sessions/{id}/runs/{run_id}/usage` | Per-run totals, gated on session membership |
-
-Usage rollups derive from the OpenTelemetry `gen_ai.usage.input_tokens` / `output_tokens` attributes recorded by the LLM tracing instrumentation. With at least one rate registered through the `UsagePricing` API, the rollups also report `cost_usd`. See [DevTools](./devtools.md#dashboard-feature-tracing-buffer-and-span-store) for `SpanStorePlugin`, `SpanBuffer`, and `UsagePricing` wiring.
-
 ## Key Files
 
 | File | Purpose |

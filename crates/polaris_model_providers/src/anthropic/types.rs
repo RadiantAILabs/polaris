@@ -463,6 +463,12 @@ pub(crate) enum RawStreamEvent {
 pub(crate) struct MessageStartPayload {
     /// Token usage for the input.
     pub(crate) usage: UsageResponse,
+    /// Unique message ID.
+    #[serde(default)]
+    pub(crate) id: String,
+    /// Model that produced the response.
+    #[serde(default)]
+    pub(crate) model: String,
 }
 
 /// Content block types that can appear in streaming responses.
