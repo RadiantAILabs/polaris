@@ -894,6 +894,12 @@ impl SessionsAPI {
             gen_ai.conversation.id = %id,
             error.type = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
+            gen_ai.usage.cost = tracing::field::Empty,
+            polaris.usage.aggregate = tracing::field::Empty,
             polaris.session.id = %id,
             polaris.session.turn_number = turn,
             polaris.session.agent_type = %state.agent_type,
@@ -916,6 +922,10 @@ impl SessionsAPI {
             .execute_with_labels(&state.graph, ctx, hooks, middleware, labels)
             .instrument(turn_span.clone())
             .await;
+
+        // Stamp the rolled-up descendant `chat` usage/cost onto the turn span
+        // while it is still live.
+        polaris_core_plugins::record_turn_usage(&turn_span);
 
         if let Err(err) = &exec_result {
             // `error.type` is meant to be a low-cardinality discriminant, so

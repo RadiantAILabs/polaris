@@ -83,7 +83,9 @@ mod tracing_plugin;
 // Re-export plugins
 pub use server_info::ServerInfoPlugin;
 pub use time::{Clock, ClockProvider, Stopwatch, TimePlugin};
-pub use tracing_plugin::{FmtConfig, TracingConfig, TracingFormat, TracingLayers, TracingPlugin};
+pub use tracing_plugin::{
+    FmtConfig, TracingConfig, TracingFormat, TracingLayers, TracingPlugin, record_turn_usage,
+};
 
 // Re-export IO types
 pub use io::{

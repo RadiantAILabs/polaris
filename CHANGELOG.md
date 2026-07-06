@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-06
+
+### Added
+
+- **`UsageAggregationLayer`** (`polaris_core_plugins`): a `tracing_subscriber` layer that rolls token usage and cost from descendant `chat` spans up onto the enclosing `polaris.session.turn` span, so each `invoke_agent` span carries its whole subtree's `gen_ai.usage.*` totals and `gen_ai.usage.cost`. Installed unconditionally by `TracingPlugin`.
+
 ## [0.5.1] - 2026-07-06
 
 ### Added

@@ -12,6 +12,8 @@
 mod fmt_layer;
 pub use fmt_layer::FmtConfig;
 mod instrument;
+mod usage_aggregation;
+pub use usage_aggregation::record_turn_usage;
 
 use crate::ServerInfoPlugin;
 use crate::tracing_plugin::instrument::llm::TracingLlmProvider;
@@ -390,6 +392,14 @@ impl Plugin for TracingPlugin {
         server.insert_global(TracingConfig { level: self.level });
 
         server.insert_resource(TracingLayers::new());
+
+        // Rolls descendant `chat` usage/cost up onto the enclosing turn span.
+        // Installed unconditionally so turn spans carry aggregate usage
+        // regardless of which output/export layers are configured.
+        server
+            .get_resource_mut::<TracingLayers>()
+            .expect("TracingLayers must exist after insert")
+            .push(usage_aggregation::UsageAggregationLayer);
 
         if let Some(fmt) = &self.fmt {
             let mut api = server
