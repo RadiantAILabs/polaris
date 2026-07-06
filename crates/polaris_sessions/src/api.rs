@@ -883,10 +883,12 @@ impl SessionsAPI {
         // span chain so child graph spans inherit the same labels,
         // letting downstream subscribers and OTel exporters correlate
         // recorded spans by `session_id`.
+        // The `error.type`/`otel.status_code` placeholders stay `Empty`
+        // and are recorded only on the failure path below.
         let turn_span = tracing::info_span!(
             "polaris.session.turn",
-            otel.name = tracing::field::Empty,
-            otel.kind = tracing::field::Empty,
+            otel.name = %format_args!("invoke_agent {}", state.agent_type),
+            otel.kind = "Internal",
             gen_ai.operation.name = "invoke_agent",
             gen_ai.agent.name = %state.agent_type,
             gen_ai.conversation.id = %id,
@@ -899,11 +901,6 @@ impl SessionsAPI {
             polaris.label.agent_type = state.agent_type.as_str(),
             polaris.label.turn = %turn_str,
         );
-        turn_span.record(
-            "otel.name",
-            format!("invoke_agent {}", state.agent_type).as_str(),
-        );
-        turn_span.record("otel.kind", "Internal");
 
         // Start turn history + lifecycle recording before executor runs so
         // a Running entry is visible from the dashboard the moment a turn
@@ -920,9 +917,19 @@ impl SessionsAPI {
             .instrument(turn_span.clone())
             .await;
 
-        if exec_result.is_err() {
+        if let Err(err) = &exec_result {
+            // `error.type` is meant to be a low-cardinality discriminant, so
+            // record the `ExecutionError` variant name rather than the full
+            // `Display` (which embeds node ids and messages). The derived
+            // `Debug` renders the variant name first, so take the leading
+            // identifier before any payload delimiter (`(`, `{`, or space).
+            let error_debug = format!("{err:?}");
+            let error_type = error_debug
+                .split(['(', '{', ' '])
+                .next()
+                .unwrap_or("ExecutionError");
             turn_span.record("otel.status_code", "ERROR");
-            turn_span.record("error.type", "graph_execution_error");
+            turn_span.record("error.type", error_type);
         }
 
         // Finalize lifecycle + turn record regardless of success/failure,
