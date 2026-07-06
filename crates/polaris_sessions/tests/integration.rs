@@ -538,6 +538,195 @@ async fn process_turn_labels_events_with_session_and_agent_type() {
     assert_eq!(labels.get("agent_type"), Some("CounterAgent"));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// invoke_agent span semantics tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Span field capture layer for `polaris.session.turn` spans.
+///
+/// Intercepts both the initial span attributes (via `on_new_span`) and any
+/// later `.record()` calls (via `on_record`).
+mod span_capture {
+    use parking_lot::Mutex;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+    use tracing_subscriber::layer::Context as LayerContext;
+
+    #[derive(Default, Clone)]
+    pub struct CapturedFields {
+        pub otel_name: Option<String>,
+        pub gen_ai_operation_name: Option<String>,
+        pub gen_ai_agent_name: Option<String>,
+        pub otel_status_code: Option<String>,
+        pub error_type: Option<String>,
+    }
+
+    struct FieldData {
+        turn_span_ids: HashSet<span::Id>,
+        fields: CapturedFields,
+    }
+
+    /// A `tracing_subscriber::Layer` that captures fields from
+    /// `polaris.session.turn` spans.
+    #[derive(Clone)]
+    pub struct TurnSpanCapture(Arc<Mutex<FieldData>>);
+
+    impl TurnSpanCapture {
+        pub fn new() -> Self {
+            Self(Arc::new(Mutex::new(FieldData {
+                turn_span_ids: HashSet::new(),
+                fields: CapturedFields::default(),
+            })))
+        }
+
+        pub fn captured(&self) -> CapturedFields {
+            self.0.lock().fields.clone()
+        }
+    }
+
+    struct Visitor<'a>(&'a mut CapturedFields);
+
+    impl Visit for Visitor<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "otel.name" => self.0.otel_name = Some(value.to_owned()),
+                "gen_ai.operation.name" => self.0.gen_ai_operation_name = Some(value.to_owned()),
+                "otel.status_code" => self.0.otel_status_code = Some(value.to_owned()),
+                "error.type" => self.0.error_type = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
+            match field.name() {
+                "gen_ai.agent.name" => {
+                    self.0
+                        .gen_ai_agent_name
+                        .get_or_insert_with(|| format!("{value:?}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TurnSpanCapture {
+        fn on_new_span(
+            &self,
+            attrs: &span::Attributes<'_>,
+            id: &span::Id,
+            _ctx: LayerContext<'_, S>,
+        ) {
+            if attrs.metadata().name() != "polaris.session.turn" {
+                return;
+            }
+            let mut data = self.0.lock();
+            data.turn_span_ids.insert(id.clone());
+            let mut visitor = Visitor(&mut data.fields);
+            attrs.record(&mut visitor);
+        }
+
+        fn on_record(&self, id: &span::Id, values: &span::Record<'_>, _ctx: LayerContext<'_, S>) {
+            let mut data = self.0.lock();
+            if !data.turn_span_ids.contains(id) {
+                return;
+            }
+            let mut visitor = Visitor(&mut data.fields);
+            values.record(&mut visitor);
+        }
+    }
+}
+
+/// `polaris.session.turn` carries `otel.name = "invoke_agent {agent}"`,
+/// `gen_ai.operation.name = "invoke_agent"`, and `gen_ai.agent.name`.
+#[tokio::test]
+async fn turn_span_records_invoke_agent_semantics() {
+    use span_capture::TurnSpanCapture;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    let capture = TurnSpanCapture::new();
+    let subscriber = Registry::default().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let store = Arc::new(InMemoryStore::new());
+    let server = test_server(Arc::clone(&store)).await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    let id = SessionId::new();
+    create_test_session(&server, &id);
+
+    sessions
+        .process_turn(&id)
+        .await
+        .expect("turn should succeed");
+
+    let fields = capture.captured();
+    assert_eq!(
+        fields.otel_name.as_deref(),
+        Some("invoke_agent CounterAgent"),
+        "otel.name must be 'invoke_agent <agent>'"
+    );
+    assert_eq!(
+        fields.gen_ai_operation_name.as_deref(),
+        Some("invoke_agent"),
+        "gen_ai.operation.name must be 'invoke_agent'"
+    );
+    assert_eq!(
+        fields.gen_ai_agent_name.as_deref(),
+        Some("CounterAgent"),
+        "gen_ai.agent.name must match the registered agent name"
+    );
+    assert!(
+        fields.otel_status_code.is_none(),
+        "otel.status_code must not be set on a successful turn"
+    );
+}
+
+/// A failing graph causes the `polaris.session.turn` span to record
+/// `otel.status_code = "ERROR"` and `error.type = "graph_execution_error"`.
+#[tokio::test]
+async fn turn_span_records_error_on_graph_failure() {
+    use span_capture::TurnSpanCapture;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    let capture = TurnSpanCapture::new();
+    let subscriber = Registry::default().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let store = Arc::new(InMemoryStore::new());
+    let server = test_server(Arc::clone(&store)).await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    sessions.register_agent(DoubleAgent).unwrap();
+
+    let id = SessionId::new();
+    // Intentionally omit `DoubleInput` so Res<DoubleInput> fails to resolve.
+    sessions
+        .create_session(
+            server.create_context(),
+            &id,
+            &AgentTypeId::from_name("DoubleAgent"),
+        )
+        .unwrap();
+
+    let result = sessions.process_turn(&id).await;
+    assert!(
+        matches!(result, Err(SessionError::Execution(_))),
+        "expected Execution error, got {result:?}"
+    );
+
+    let fields = capture.captured();
+    assert_eq!(
+        fields.otel_status_code.as_deref(),
+        Some("ERROR"),
+        "otel.status_code must be ERROR on graph failure"
+    );
+    assert_eq!(
+        fields.error_type.as_deref(),
+        Some("graph_execution_error"),
+        "error.type must be 'graph_execution_error' on graph failure"
+    );
+}
+
 /// `try_process_turn` returns `SessionNotFound` for an unknown session.
 #[tokio::test]
 async fn try_process_turn_returns_session_not_found() {
