@@ -883,11 +883,17 @@ impl SessionsAPI {
         // span chain so child graph spans inherit the same labels,
         // letting downstream subscribers and OTel exporters correlate
         // recorded spans by `session_id`.
+        // The `error.type`/`otel.status_code` placeholders stay `Empty`
+        // and are recorded only on the failure path below.
         let turn_span = tracing::info_span!(
             "polaris.session.turn",
+            otel.name = %format_args!("invoke_agent {}", state.agent_type),
+            otel.kind = "Internal",
             gen_ai.operation.name = "invoke_agent",
-            gen_ai.conversation.id = %id,
             gen_ai.agent.name = %state.agent_type,
+            gen_ai.conversation.id = %id,
+            error.type = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
             polaris.session.id = %id,
             polaris.session.turn_number = turn,
             polaris.session.agent_type = %state.agent_type,
@@ -908,8 +914,23 @@ impl SessionsAPI {
         let exec_result = state
             .executor
             .execute_with_labels(&state.graph, ctx, hooks, middleware, labels)
-            .instrument(turn_span)
+            .instrument(turn_span.clone())
             .await;
+
+        if let Err(err) = &exec_result {
+            // `error.type` is meant to be a low-cardinality discriminant, so
+            // record the `ExecutionError` variant name rather than the full
+            // `Display` (which embeds node ids and messages). The derived
+            // `Debug` renders the variant name first, so take the leading
+            // identifier before any payload delimiter (`(`, `{`, or space).
+            let error_debug = format!("{err:?}");
+            let error_type = error_debug
+                .split(['(', '{', ' '])
+                .next()
+                .unwrap_or("ExecutionError");
+            turn_span.record("otel.status_code", "ERROR");
+            turn_span.record("error.type", error_type);
+        }
 
         // Finalize lifecycle + turn record regardless of success/failure,
         // so the dashboard reflects what actually happened.

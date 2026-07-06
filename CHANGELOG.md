@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-07-06
+
+### Added
+
+- **Agent spans** (`polaris_sessions`, `polaris_core_plugins`): session turns now emit a OTel GenAI `invoke_agent` span. The `polaris.session.turn` span carries `gen_ai.operation.name`, `gen_ai.agent.name`, and `gen_ai.conversation.id`, and sets `otel.name` to `invoke_agent {agent}` so OTel backends recognise it correctly. The redundant `polaris.graph.execute` wrapper span is removed.
+
+### Changed
+
+- **`gen_ai.usage.cost` replaces `polaris.gen_ai.cost_usd`** (`polaris_core_plugins`): the estimated cost attribute on `chat` spans is renamed to align with the convention used by other platforms, even though it is not part of the official GenAI semconv spec.
+
 ## [0.5.0] - 2026-06-24
 
 Dashboard plugin refactor: the in-process tracing dashboard and its span-store / usage-rollup machinery are removed from `polaris_core_plugins`, and the `dashboard` feature now forwards to the `polaris_models` / `polaris_tools` snapshot surfaces instead of carrying its own span-buffer endpoints. Observability stays available through the OpenTelemetry export path, which gains a `SpanProcessor` extension point.
