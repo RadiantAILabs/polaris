@@ -109,3 +109,21 @@ pub struct ScopeInfo {
     /// Number of nodes in the embedded graph.
     pub inner_node_count: usize,
 }
+
+/// Metadata passed to [`Dynamic`](super::Dynamic) middleware.
+#[derive(Debug, Clone)]
+pub struct DynamicInfo {
+    /// The node ID of the dynamic node.
+    pub node_id: NodeId,
+    /// The dynamic node's name.
+    pub node_name: &'static str,
+    /// High-level context-boundary classification — `Shared`, `Inherit`, or
+    /// `Isolated`. See [`ContextMode`] and
+    /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
+    pub mode: ContextMode,
+    /// Number of inline candidates (`Some`), or `None` when candidates come from
+    /// a [`SubgraphRegistry`](crate::registry::SubgraphRegistry) — that set is
+    /// per-session and not known at the node. `None` is distinct from
+    /// `Some(0)` (an inline source declared with no candidates).
+    pub candidate_count: Option<usize>,
+}

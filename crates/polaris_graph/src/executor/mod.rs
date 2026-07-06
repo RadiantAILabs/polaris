@@ -36,7 +36,7 @@ use crate::hooks::HooksAPI;
 use crate::hooks::events::{GraphEvent, RunId, RunLabels};
 use crate::hooks::schedule::{OnGraphComplete, OnGraphFailure, OnGraphStart, OnSystemStart};
 use crate::middleware::{self, MiddlewareAPI};
-use crate::node::{ContextPolicy, CrossingAction, Node, NodeId};
+use crate::node::{CandidateSource, ContextPolicy, CrossingAction, DynamicNode, Node, NodeId};
 use hashbrown::HashSet;
 use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
@@ -388,6 +388,14 @@ impl GraphExecutor {
         depth: usize,
     ) {
         if depth > self.max_recursion_depth {
+            // Don't truncate silently: a validation pass that skips subtrees
+            // past the cap would report success for layers it never looked at.
+            // Execution of the same nesting fails with RecursionLimitExceeded,
+            // so surfacing an error here is the pre-flight form of that fact.
+            errors.push(ResourceValidationError::ValidationDepthExceeded {
+                depth,
+                max: self.max_recursion_depth,
+            });
             return;
         }
 
@@ -421,7 +429,7 @@ impl GraphExecutor {
                         // and `share_rest` govern parent-chain visibility. Pure
                         // isolation (no `share` verbs) is `AllowOnly(empty)` — the
                         // child still sees globals through the parent.
-                        Self::validate_scope_crossings(scope, policy, ctx, errors);
+                        Self::validate_scope_crossings(&scope.id, scope.name, policy, ctx, errors);
                         let mut child = ctx.child_filtered(policy.parent_filter_arc());
                         Self::populate_validation_locals(policy, ctx, &mut child);
                         self.validate_graph_resources(
@@ -433,6 +441,53 @@ impl GraphExecutor {
                         );
                     }
                 }
+                // A dynamic node is validated against its *contract*, not its
+                // candidates: the contract is the interface every candidate must
+                // honor, so checking the parent can satisfy the contract subsumes
+                // per-candidate resource checking and covers registry-backed slots
+                // whose candidates are unknown until runtime. The existing
+                // recursion into inline candidates stays, but only to validate
+                // their internal structure (nested crossings, hook-provided
+                // outputs) against the same boundary.
+                Node::Dynamic(dynamic) => {
+                    let policy = &dynamic.context_policy;
+                    if policy.is_shared() {
+                        Self::validate_dynamic_contract_requires(dynamic, ctx, errors);
+                        if let CandidateSource::Inline(candidates) = &dynamic.source {
+                            for (_key, candidate) in candidates {
+                                self.validate_graph_resources(
+                                    candidate.as_ref(),
+                                    ctx,
+                                    hook_provided,
+                                    errors,
+                                    depth + 1,
+                                );
+                            }
+                        }
+                    } else {
+                        Self::validate_scope_crossings(
+                            &dynamic.id,
+                            dynamic.name,
+                            policy,
+                            ctx,
+                            errors,
+                        );
+                        let mut child = ctx.child_filtered(policy.parent_filter_arc());
+                        Self::populate_validation_locals(policy, ctx, &mut child);
+                        Self::validate_dynamic_contract_requires(dynamic, &child, errors);
+                        if let CandidateSource::Inline(candidates) = &dynamic.source {
+                            for (_key, candidate) in candidates {
+                                self.validate_graph_resources(
+                                    candidate.as_ref(),
+                                    &child,
+                                    hook_provided,
+                                    errors,
+                                    depth + 1,
+                                );
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -440,7 +495,7 @@ impl GraphExecutor {
         self.validate_output_reachability(graph, hook_provided, errors);
     }
 
-    /// Verifies that every per-resource crossing on a scope policy can be
+    /// Verifies that every per-resource crossing on a boundary policy can be
     /// satisfied from the parent context before execution:
     ///
     /// - `forward_fresh::<T>()` requires a registered factory reachable from
@@ -452,9 +507,12 @@ impl GraphExecutor {
     ///
     /// Both failures are surfaced before execution. The runtime path retains
     /// its own [`ExecutionError`] variants as a safety net for callers that
-    /// skip validation.
+    /// skip validation. `node_id` / `node_name` label the offending boundary —
+    /// a [`Scope`](Node::Scope) or a [`Dynamic`](Node::Dynamic) node's candidate
+    /// boundary — in the recorded error.
     fn validate_scope_crossings(
-        scope: &crate::node::ScopeNode,
+        node_id: &NodeId,
+        node_name: &'static str,
         policy: &ContextPolicy,
         ctx: &SystemContext<'_>,
         errors: &mut Vec<ResourceValidationError>,
@@ -464,8 +522,8 @@ impl GraphExecutor {
                 CrossingAction::ForwardFresh => {
                     if ctx.factory_fn_by_type_id(crossing.type_id).is_none() {
                         errors.push(ResourceValidationError::ScopeMissingFactory {
-                            scope: scope.id.clone(),
-                            scope_name: scope.name,
+                            scope: node_id.clone(),
+                            scope_name: node_name,
                             resource: crossing.type_name,
                         });
                     }
@@ -473,8 +531,8 @@ impl GraphExecutor {
                 CrossingAction::Forward(_) | CrossingAction::Fork(_) => {
                     if !ctx.contains_resource_by_type_id(crossing.type_id) {
                         errors.push(ResourceValidationError::ScopeMissingResource {
-                            scope: scope.id.clone(),
-                            scope_name: scope.name,
+                            scope: node_id.clone(),
+                            scope_name: node_name,
                             resource: crossing.type_name,
                             action: match crossing.action {
                                 CrossingAction::Fork(_) => "fork",
@@ -484,6 +542,34 @@ impl GraphExecutor {
                     }
                 }
                 CrossingAction::Share => {}
+            }
+        }
+    }
+
+    /// Checks that every resource a dynamic node's *contract* requires is
+    /// reachable from `ctx` — the context the selected candidate will run
+    /// against (the parent for a shared policy, else the filtered child).
+    ///
+    /// This is the `requires` half of the slot contract, the counterpart to
+    /// [`validate_output_reachability`](Self::validate_output_reachability)'s
+    /// `requires_outputs`/`produces` handling. Validating the contract rather
+    /// than the candidates makes the check independent of the candidate source:
+    /// under exact-match every admissible candidate requires exactly what the
+    /// contract does, and a registry-backed slot with no registered candidates
+    /// is still held to it.
+    fn validate_dynamic_contract_requires(
+        dynamic: &DynamicNode,
+        ctx: &SystemContext<'_>,
+        errors: &mut Vec<ResourceValidationError>,
+    ) {
+        for access in dynamic.contract().requires() {
+            if !ctx.contains_resource_by_type_id(access.type_id) {
+                errors.push(ResourceValidationError::DynamicContractMissingResource {
+                    node: dynamic.id.clone(),
+                    node_name: dynamic.name,
+                    resource: access.type_name,
+                    mode: access.mode,
+                });
             }
         }
     }
@@ -607,7 +693,44 @@ impl GraphExecutor {
                         }
                     }
                 }
+                // A scope's inner outputs are opaque across its boundary.
                 Node::Scope(_) => {}
+                // A dynamic node's contract is its interface. Its
+                // `requires_outputs` are free outputs the parent must supply to
+                // the selected candidate — but free outputs never cross a
+                // non-shared boundary inward (child contexts start with empty
+                // outputs and never walk the parent chain for them). So a
+                // non-shared policy with a nonempty `requires_outputs` is
+                // statically unsatisfiable, and a shared policy must have each
+                // required output produced upstream (or hook-provided). Its
+                // `produces` name exactly the outputs it merges back, so
+                // downstream `Out<T>` reads can rely on them.
+                Node::Dynamic(dynamic) => {
+                    let outputs = dynamic.contract().requires_outputs();
+                    if dynamic.context_policy.is_shared() {
+                        for access in outputs {
+                            if !produced_outputs.contains(&access.type_id)
+                                && !hook_provided.contains(&access.type_id)
+                            {
+                                errors.push(
+                                    ResourceValidationError::DynamicContractMissingOutput {
+                                        node: dynamic.id.clone(),
+                                        node_name: dynamic.name,
+                                        output: access.type_name,
+                                    },
+                                );
+                            }
+                        }
+                    } else if !outputs.is_empty() {
+                        errors.push(ResourceValidationError::DynamicContractOutputsBlocked {
+                            node: dynamic.id.clone(),
+                            node_name: dynamic.name,
+                        });
+                    }
+                    for access in dynamic.contract().produces() {
+                        produced_outputs.insert(access.type_id);
+                    }
+                }
             }
         }
     }
@@ -909,6 +1032,48 @@ mod tests {
     fn executor_with_custom_recursion_depth() {
         let executor = GraphExecutor::new().with_max_recursion_depth(128);
         assert_eq!(executor.max_recursion_depth, 128);
+    }
+
+    #[test]
+    fn validate_resources_surfaces_nesting_past_the_recursion_cap() {
+        // A graph whose scope nesting exceeds `max_recursion_depth` must fail
+        // `validate_resources` with `ValidationDepthExceeded` rather than
+        // silently skipping the layers past the cap — execution of the same
+        // nesting would fail with `RecursionLimitExceeded`, so a validation
+        // pass that reported success would be claiming more than it checked.
+        use crate::node::ContextPolicy;
+        use polaris_system::param::SystemContext;
+
+        async fn leaf() {}
+
+        // depth 0: outer graph → depth 1: scope → depth 2: scope > cap of 1.
+        let mut innermost = Graph::new();
+        innermost.add_system(leaf);
+        let mut middle = Graph::new();
+        middle.add_scope("middle", innermost, ContextPolicy::shared());
+        let mut graph = Graph::new();
+        graph.add_scope("outer", middle, ContextPolicy::shared());
+
+        let ctx = SystemContext::new();
+        let capped = GraphExecutor::new().with_max_recursion_depth(1);
+        let errors = capped
+            .validate_resources(&graph, &ctx, None)
+            .expect_err("nesting past the cap must not validate silently");
+        assert!(
+            errors.iter().any(|err| matches!(
+                err,
+                ResourceValidationError::ValidationDepthExceeded { depth: 2, max: 1 }
+            )),
+            "expected ValidationDepthExceeded at depth 2 with cap 1, got {errors:?}"
+        );
+
+        // The same nesting under the default cap validates fully.
+        assert!(
+            GraphExecutor::new()
+                .validate_resources(&graph, &ctx, None)
+                .is_ok(),
+            "the nesting is fine under the default recursion limit"
+        );
     }
 
     #[test]

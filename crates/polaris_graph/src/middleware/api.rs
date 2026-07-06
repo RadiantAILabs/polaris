@@ -5,8 +5,8 @@
 //! usage.
 
 use super::info::{
-    DecisionInfo, GraphInfo, LoopInfo, LoopIterationInfo, ParallelBranchInfo, ParallelInfo,
-    ScopeInfo, SwitchInfo, SystemInfo,
+    DecisionInfo, DynamicInfo, GraphInfo, LoopInfo, LoopIterationInfo, ParallelBranchInfo,
+    ParallelInfo, ScopeInfo, SwitchInfo, SystemInfo,
 };
 use crate::executor::ExecutionError;
 use futures::future::BoxFuture;
@@ -333,6 +333,7 @@ pub(crate) struct MiddlewareInner {
     pub(crate) loop_iteration: Chain<LoopIterationInfo>,
     pub(crate) parallel_branch: Chain<ParallelBranchInfo>,
     pub(crate) scope: Chain<ScopeInfo>,
+    pub(crate) dynamic: Chain<DynamicInfo>,
 }
 
 impl fmt::Debug for MiddlewareAPI {
@@ -478,6 +479,18 @@ impl MiddlewareAPI {
         handler: impl MiddlewareHandler<ScopeInfo>,
     ) -> &Self {
         self.inner.scope.push(name, handler);
+        self
+    }
+
+    /// Registers a middleware handler for [`Dynamic`](super::Dynamic) nodes.
+    ///
+    /// See the [module-level docs](super) for handler contract and examples.
+    pub fn register_dynamic(
+        &self,
+        name: impl Into<String>,
+        handler: impl MiddlewareHandler<DynamicInfo>,
+    ) -> &Self {
+        self.inner.dynamic.push(name, handler);
         self
     }
 }

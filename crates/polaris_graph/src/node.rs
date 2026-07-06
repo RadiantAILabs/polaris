@@ -3,8 +3,9 @@
 //! Nodes are the vertices in a graph, representing units of computation
 //! or control flow decisions.
 
-use crate::graph::Graph;
-use crate::predicate::BoxedPredicate;
+use crate::graph::{Graph, GraphSignature};
+use crate::predicate::{BoxedDiscriminator, BoxedPredicate, ErasedDiscriminator, ErasedPredicate};
+use crate::selector::{BoxedSelector, ErasedSelector};
 use core::any::Any;
 use hashbrown::{HashMap, HashSet};
 use polaris_system::plugin::{IntoScheduleIds, ScheduleId};
@@ -88,6 +89,26 @@ impl IntoIterator for NodeId {
     }
 }
 
+/// Translates a [`NodeId`] through an old → new remap built by
+/// [`Graph::duplicate`](crate::Graph::duplicate).
+///
+/// Every id reachable from a well-formed graph's nodes, edges, and
+/// `entry`/`last_node` markers is present in `map`, so a debug assertion guards
+/// that invariant to catch an internal `duplicate` inconsistency early in
+/// tests. In release builds the lookup falls back to the original id: that can
+/// only happen for a reference pointing outside the cloned node set — i.e. an
+/// already-malformed graph — which [`validate`](crate::Graph::validate) surfaces
+/// independently, so keeping the original is preferable to panicking in
+/// production.
+pub(crate) fn remap_node_id(map: &HashMap<NodeId, NodeId>, id: &NodeId) -> NodeId {
+    debug_assert!(
+        map.contains_key(id),
+        "remap_node_id: id {id} is absent from the clone map — \
+         duplicate built an inconsistent node mapping",
+    );
+    map.get(id).cloned().unwrap_or_else(|| id.clone())
+}
+
 /// A node in the graph.
 ///
 /// Each node represents either a computation unit (system) or a control flow
@@ -129,6 +150,9 @@ pub enum Node {
     Loop(LoopNode),
     /// Executes an embedded graph with a configurable context boundary.
     Scope(ScopeNode),
+    /// Selects one of a set of candidate subgraphs at runtime and executes it
+    /// through a context boundary — an opaque, signature-checked switch.
+    Dynamic(DynamicNode),
 }
 
 impl Node {
@@ -142,6 +166,7 @@ impl Node {
             Node::Parallel(n) => n.id.clone(),
             Node::Loop(n) => n.id.clone(),
             Node::Scope(n) => n.id.clone(),
+            Node::Dynamic(n) => n.id.clone(),
         }
     }
 
@@ -155,6 +180,79 @@ impl Node {
             Node::Parallel(n) => n.name,
             Node::Loop(n) => n.name,
             Node::Scope(n) => n.name,
+            Node::Dynamic(n) => n.name,
+        }
+    }
+
+    /// Clones this node for [`Graph::duplicate`](crate::Graph::duplicate).
+    ///
+    /// The node's own id and every internal [`NodeId`] reference are translated
+    /// through `map` (old → new), so the clone points only into the cloned node
+    /// set. The system / predicate / discriminator behavior is shared via
+    /// [`Arc`] rather than duplicated — it is immutable, so the clone and the
+    /// original execute identically while remaining structurally independent.
+    ///
+    /// A [`Scope`](Node::Scope) node's embedded graph is its own id namespace,
+    /// so it is recursively duplicated (minting its own fresh ids) and is
+    /// untouched by `map`.
+    pub(crate) fn remap(&self, map: &HashMap<NodeId, NodeId>) -> Node {
+        let id = remap_node_id(map, &self.id());
+        match self {
+            Node::System(n) => Node::System(SystemNode {
+                id,
+                system: Arc::clone(&n.system),
+                timeout: n.timeout,
+                retry_policy: n.retry_policy.clone(),
+                schedules: n.schedules.clone(),
+            }),
+            Node::Decision(n) => Node::Decision(DecisionNode {
+                id,
+                name: n.name,
+                predicate: n.predicate.clone(),
+                true_branch: n.true_branch.as_ref().map(|t| remap_node_id(map, t)),
+                false_branch: n.false_branch.as_ref().map(|t| remap_node_id(map, t)),
+            }),
+            Node::Switch(n) => Node::Switch(SwitchNode {
+                id,
+                name: n.name,
+                discriminator: n.discriminator.clone(),
+                cases: n
+                    .cases
+                    .iter()
+                    .map(|(case, target)| (*case, remap_node_id(map, target)))
+                    .collect(),
+                default: n.default.as_ref().map(|d| remap_node_id(map, d)),
+            }),
+            Node::Parallel(n) => Node::Parallel(ParallelNode {
+                id,
+                name: n.name,
+                branches: n.branches.iter().map(|b| remap_node_id(map, b)).collect(),
+            }),
+            Node::Loop(n) => Node::Loop(LoopNode {
+                id,
+                name: n.name,
+                termination: n.termination.clone(),
+                max_iterations: n.max_iterations,
+                body_entry: n.body_entry.as_ref().map(|b| remap_node_id(map, b)),
+            }),
+            Node::Scope(n) => Node::Scope(ScopeNode {
+                id,
+                name: n.name,
+                graph: n.graph.duplicate(),
+                context_policy: n.context_policy.clone(),
+            }),
+            // Selector and candidate set are immutable behavior/topology shared
+            // via `Arc`; `Inline` candidates keep their own id namespaces (like a
+            // scope's embedded graph), so `map` never touches them.
+            Node::Dynamic(n) => Node::Dynamic(DynamicNode {
+                id,
+                name: n.name,
+                selector: Arc::clone(&n.selector),
+                source: n.source.clone(),
+                default: n.default.clone(),
+                contract: n.contract.clone(),
+                context_policy: n.context_policy.clone(),
+            }),
         }
     }
 }
@@ -308,8 +406,12 @@ impl RetryPolicy {
 pub struct SystemNode {
     /// Unique identifier for this node.
     pub id: NodeId,
-    /// The boxed system to execute.
-    pub system: BoxedSystem,
+    /// The system to execute.
+    ///
+    /// Held behind an [`Arc`] so the immutable system behavior can be shared
+    /// cheaply when a graph is duplicated via [`Graph::duplicate`] — the clone
+    /// gets a fresh [`NodeId`] but reuses the same system code.
+    pub system: Arc<dyn ErasedSystem>,
     /// Optional timeout for this system's execution.
     /// If set and exceeded, the executor will follow any timeout edge if present.
     pub timeout: Option<Duration>,
@@ -327,7 +429,7 @@ impl SystemNode {
     pub fn new<S: ErasedSystem>(system: S) -> Self {
         Self {
             id: NodeId::new(),
-            system: Box::new(system),
+            system: Arc::new(system),
             timeout: None,
             retry_policy: None,
             schedules: Vec::new(),
@@ -339,7 +441,7 @@ impl SystemNode {
     pub fn new_boxed(system: BoxedSystem) -> Self {
         Self {
             id: NodeId::new(),
-            system,
+            system: Arc::from(system),
             timeout: None,
             retry_policy: None,
             schedules: Vec::new(),
@@ -423,7 +525,10 @@ pub struct DecisionNode {
     /// Human-readable name for debugging and tracing.
     pub name: &'static str,
     /// The predicate that determines which branch to take.
-    pub predicate: Option<BoxedPredicate>,
+    ///
+    /// Held behind an [`Arc`] so the immutable predicate is shared cheaply
+    /// across a [`Graph::duplicate`].
+    pub predicate: Option<Arc<dyn ErasedPredicate>>,
     /// Node ID for the true branch.
     pub true_branch: Option<NodeId>,
     /// Node ID for the false branch.
@@ -449,7 +554,7 @@ impl DecisionNode {
         Self {
             id: NodeId::new(),
             name,
-            predicate: Some(predicate),
+            predicate: Some(Arc::from(predicate)),
             true_branch: None,
             false_branch: None,
         }
@@ -505,7 +610,10 @@ pub struct SwitchNode {
     /// Human-readable name for debugging and tracing.
     pub name: &'static str,
     /// The discriminator that determines which case to take.
-    pub discriminator: Option<crate::predicate::BoxedDiscriminator>,
+    ///
+    /// Held behind an [`Arc`] so the immutable discriminator is shared cheaply
+    /// across a [`Graph::duplicate`].
+    pub discriminator: Option<Arc<dyn ErasedDiscriminator>>,
     /// Node IDs for each case, keyed by case name.
     pub cases: Vec<(&'static str, NodeId)>,
     /// Default case if no match.
@@ -527,14 +635,11 @@ impl SwitchNode {
 
     /// Creates a new switch node with a discriminator.
     #[must_use]
-    pub fn with_discriminator(
-        name: &'static str,
-        discriminator: crate::predicate::BoxedDiscriminator,
-    ) -> Self {
+    pub fn with_discriminator(name: &'static str, discriminator: BoxedDiscriminator) -> Self {
         Self {
             id: NodeId::new(),
             name,
-            discriminator: Some(discriminator),
+            discriminator: Some(Arc::from(discriminator)),
             cases: Vec::new(),
             default: None,
         }
@@ -643,7 +748,10 @@ pub struct LoopNode {
     /// Human-readable name for debugging and tracing.
     pub name: &'static str,
     /// The termination predicate (loop exits when this returns true).
-    pub termination: Option<BoxedPredicate>,
+    ///
+    /// Held behind an [`Arc`] so the immutable predicate is shared cheaply
+    /// across a [`Graph::duplicate`].
+    pub termination: Option<Arc<dyn ErasedPredicate>>,
     /// Maximum number of iterations (safety limit).
     pub max_iterations: Option<usize>,
     /// Entry point of the loop body.
@@ -669,7 +777,7 @@ impl LoopNode {
         Self {
             id: NodeId::new(),
             name,
-            termination: Some(termination),
+            termination: Some(Arc::from(termination)),
             max_iterations: None,
             body_entry: None,
         }
@@ -1228,6 +1336,211 @@ impl ScopeNode {
     pub fn context_policy(&self) -> &ContextPolicy {
         &self.context_policy
     }
+}
+
+/// A node that selects one of several candidate subgraphs at runtime and
+/// executes it through a context boundary.
+///
+/// A dynamic node is like a [`Switch`](Node::Switch) whose branches are opaque,
+/// signature-checked subgraphs that are *merged* back like a [`ScopeNode`]: a
+/// [selector](crate::selector::ErasedSelector) reads the context and returns a
+/// candidate key, the matching subgraph runs through the node's
+/// [`ContextPolicy`], and its outputs merge into the parent. The candidate set
+/// is either fixed at build time ([`Inline`](CandidateSource::Inline)) or held
+/// in a per-session [`SubgraphRegistry`](crate::registry::SubgraphRegistry) that
+/// can be mutated between turns ([`Registry`](CandidateSource::Registry)).
+///
+/// Every candidate's [`GraphSignature`] is checked against the node's contract
+/// before it can run — inline candidates at [`validate`](crate::Graph::validate)
+/// time, registry candidates when inserted — so selection never runs a subgraph
+/// whose shape was not verified against the slot.
+///
+/// Dynamic nodes are created through the [`Graph`] builder API
+/// ([`add_dynamic`](crate::Graph::add_dynamic) /
+/// [`add_dynamic_registry`](crate::Graph::add_dynamic_registry)).
+#[derive(Debug)]
+pub struct DynamicNode {
+    /// Unique identifier for this node.
+    pub id: NodeId,
+    /// Human-readable name for debugging and tracing.
+    pub name: &'static str,
+    /// Chooses the candidate key from the runtime context.
+    pub(crate) selector: Arc<dyn ErasedSelector>,
+    /// Where the candidate subgraphs come from.
+    pub(crate) source: CandidateSource,
+    /// Candidate key chosen when the selector's key is absent from the set.
+    pub(crate) default: Option<Arc<str>>,
+    /// The slot interface every candidate must be compatible with.
+    pub(crate) contract: GraphSignature,
+    /// Context sharing policy applied around the selected subgraph.
+    pub(crate) context_policy: ContextPolicy,
+}
+
+impl DynamicNode {
+    /// Creates a new dynamic node.
+    ///
+    /// The slot's fixed configuration — contract, boundary policy, and optional
+    /// default key — travels as one [`DynamicSlot`] value here too, so the
+    /// low-level constructor has no positional `None` holes either.
+    #[must_use]
+    pub fn new(
+        name: &'static str,
+        selector: BoxedSelector,
+        source: CandidateSource,
+        slot: DynamicSlot,
+    ) -> Self {
+        let DynamicSlot {
+            contract,
+            policy,
+            default,
+        } = slot;
+        Self {
+            id: NodeId::new(),
+            name,
+            selector: Arc::from(selector),
+            source,
+            default,
+            contract,
+            context_policy: policy,
+        }
+    }
+
+    /// Returns the slot contract every candidate must satisfy.
+    #[must_use]
+    pub fn contract(&self) -> &GraphSignature {
+        &self.contract
+    }
+
+    /// Returns the context policy applied around the selected subgraph.
+    #[must_use]
+    pub fn context_policy(&self) -> &ContextPolicy {
+        &self.context_policy
+    }
+
+    /// Returns the candidate source (inline set or registry reference).
+    #[must_use]
+    pub fn source(&self) -> &CandidateSource {
+        &self.source
+    }
+
+    /// Returns the default candidate key, if one is configured.
+    #[must_use]
+    pub fn default_key(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+}
+
+/// The fixed interface a [`Dynamic`](Node::Dynamic) node selects candidates
+/// against.
+///
+/// A slot bundles the three pieces of configuration that stay constant while
+/// candidates are swapped around them:
+///
+/// - `contract` — the [`GraphSignature`] every candidate must be
+///   [compatible](GraphSignature::compatible_with) with.
+/// - `policy` — the [`ContextPolicy`] applied around the selected subgraph.
+/// - `default` — the candidate key run when the selector's key is not present
+///   in the candidate set (optional).
+///
+/// It is the dynamic node's *unit of rewiring*: the same slot can anchor
+/// several graphs, or be cloned and given a different policy in one line.
+/// Passing it to [`add_dynamic`](crate::Graph::add_dynamic) /
+/// [`add_dynamic_registry`](crate::Graph::add_dynamic_registry) as a single
+/// value keeps the mandatory contract and policy as constructor arguments and
+/// the optional default as a chained setter — no positional `None` holes at the
+/// call site.
+///
+/// # Example
+///
+/// ```
+/// use polaris_graph::{ContextPolicy, DynamicSlot, GraphSignature};
+///
+/// struct Reply;
+///
+/// let slot = DynamicSlot::new(
+///     GraphSignature::new().produce::<Reply>(),
+///     ContextPolicy::shared(),
+/// )
+/// .with_default_key("respond");
+/// assert_eq!(slot.default_key(), Some("respond"));
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicSlot {
+    pub(crate) contract: GraphSignature,
+    pub(crate) policy: ContextPolicy,
+    pub(crate) default: Option<Arc<str>>,
+}
+
+impl DynamicSlot {
+    /// Creates a slot from its `contract` and boundary `policy`, with no default
+    /// candidate key.
+    #[must_use]
+    pub fn new(contract: GraphSignature, policy: ContextPolicy) -> Self {
+        Self {
+            contract,
+            policy,
+            default: None,
+        }
+    }
+
+    /// Sets the default candidate key — run when the selector's key is not
+    /// present in the candidate set.
+    ///
+    /// Accepts a runtime `String` as well as a `&'static str`, so the default
+    /// can be computed rather than fixed at compile time.
+    #[must_use]
+    pub fn with_default_key(mut self, key: impl Into<Arc<str>>) -> Self {
+        self.default = Some(key.into());
+        self
+    }
+
+    /// Returns the [`GraphSignature`] contract every candidate must satisfy.
+    #[must_use]
+    pub fn contract(&self) -> &GraphSignature {
+        &self.contract
+    }
+
+    /// Returns the [`ContextPolicy`] applied around the selected subgraph.
+    ///
+    /// Named to match [`DynamicNode::context_policy`] / `ScopeNode::context_policy`
+    /// — the same concept carries the same name at every level.
+    #[must_use]
+    pub fn context_policy(&self) -> &ContextPolicy {
+        &self.policy
+    }
+
+    /// Returns the default candidate key, if one is configured.
+    #[must_use]
+    pub fn default_key(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+}
+
+/// Where a [`DynamicNode`] draws its candidate subgraphs from.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum CandidateSource {
+    /// A closed set fixed at build time and validated by
+    /// [`Graph::validate`](crate::Graph::validate). Each entry pairs a key with
+    /// its candidate graph.
+    Inline(Vec<(Arc<str>, Arc<Graph>)>),
+    /// An open set held in a
+    /// [`SubgraphRegistry`](crate::registry::SubgraphRegistry) local resource,
+    /// validated on insertion and mutable between turns.
+    ///
+    /// The concrete `SubgraphRegistry` is always resolved from context; the
+    /// variant carries no publicly meaningful configuration today, so it is
+    /// `#[non_exhaustive]` — future slot-level registry options live on
+    /// [`DynamicSlot`], not here.
+    #[non_exhaustive]
+    Registry {
+        // Reserved for a future where a node could target one of several
+        // registry wrapper types; not consulted at lookup time today. Hidden
+        // from the public surface so it advertises no extension point it does
+        // not yet deliver.
+        #[doc(hidden)]
+        resource_type: TypeId,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

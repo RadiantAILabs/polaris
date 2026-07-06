@@ -457,6 +457,46 @@ pub enum GraphEvent {
         /// Total duration for scope execution.
         duration: Duration,
     },
+
+    /// Event emitted before a dynamic node selects and runs a candidate subgraph.
+    DynamicStart {
+        /// Identifier of this execution run.
+        run_id: RunId,
+        /// Caller-supplied correlation labels.
+        labels: RunLabels,
+        /// The node ID of the dynamic node.
+        node_id: NodeId,
+        /// The dynamic node's name.
+        node_name: &'static str,
+        /// High-level context-boundary classification — `Shared`, `Inherit`,
+        /// or `Isolated`. See
+        /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
+        mode: ContextMode,
+    },
+
+    /// Event emitted after a dynamic node's selected candidate completes and its
+    /// outputs are merged back into the parent context.
+    DynamicComplete {
+        /// Identifier of this execution run.
+        run_id: RunId,
+        /// Caller-supplied correlation labels.
+        labels: RunLabels,
+        /// The node ID of the dynamic node.
+        node_id: NodeId,
+        /// The dynamic node's name.
+        node_name: &'static str,
+        /// High-level context-boundary classification — `Shared`, `Inherit`,
+        /// or `Isolated`. See
+        /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
+        mode: ContextMode,
+        /// The candidate key that was selected and run.
+        selected: Arc<str>,
+        /// Total nodes executed inside the selected candidate.
+        nodes_executed: usize,
+        /// Total duration of the dynamic step — selector evaluation, candidate
+        /// lookup, and candidate execution.
+        duration: Duration,
+    },
 }
 
 impl GraphEvent {
@@ -483,6 +523,8 @@ impl GraphEvent {
             GraphEvent::ParallelComplete { .. } => "OnParallelComplete",
             GraphEvent::ScopeStart { .. } => "OnScopeStart",
             GraphEvent::ScopeComplete { .. } => "OnScopeComplete",
+            GraphEvent::DynamicStart { .. } => "OnDynamicStart",
+            GraphEvent::DynamicComplete { .. } => "OnDynamicComplete",
         }
     }
 
@@ -509,7 +551,9 @@ impl GraphEvent {
             | GraphEvent::ParallelStart { run_id, .. }
             | GraphEvent::ParallelComplete { run_id, .. }
             | GraphEvent::ScopeStart { run_id, .. }
-            | GraphEvent::ScopeComplete { run_id, .. } => run_id,
+            | GraphEvent::ScopeComplete { run_id, .. }
+            | GraphEvent::DynamicStart { run_id, .. }
+            | GraphEvent::DynamicComplete { run_id, .. } => run_id,
         }
     }
 
@@ -533,7 +577,9 @@ impl GraphEvent {
             | GraphEvent::ParallelStart { labels, .. }
             | GraphEvent::ParallelComplete { labels, .. }
             | GraphEvent::ScopeStart { labels, .. }
-            | GraphEvent::ScopeComplete { labels, .. } => labels,
+            | GraphEvent::ScopeComplete { labels, .. }
+            | GraphEvent::DynamicStart { labels, .. }
+            | GraphEvent::DynamicComplete { labels, .. } => labels,
         }
     }
 
@@ -560,7 +606,9 @@ impl GraphEvent {
             | GraphEvent::ParallelStart { node_id, .. }
             | GraphEvent::ParallelComplete { node_id, .. }
             | GraphEvent::ScopeStart { node_id, .. }
-            | GraphEvent::ScopeComplete { node_id, .. } => Some(node_id.clone()),
+            | GraphEvent::ScopeComplete { node_id, .. }
+            | GraphEvent::DynamicStart { node_id, .. }
+            | GraphEvent::DynamicComplete { node_id, .. } => Some(node_id.clone()),
         }
     }
 }
@@ -747,6 +795,34 @@ impl std::fmt::Display for GraphEvent {
                     "[{run}] ScopeComplete({node_name} @ {node_id:?}, mode: {mode}, executed: {nodes_executed}, duration: {duration:?})"
                 )
             }
+            GraphEvent::DynamicStart {
+                node_id,
+                node_name,
+                mode,
+                ..
+            } => {
+                write!(
+                    f,
+                    "[{run}] DynamicStart({node_name} @ {node_id:?}, mode: {mode})"
+                )
+            }
+            GraphEvent::DynamicComplete {
+                node_id,
+                node_name,
+                mode,
+                selected,
+                nodes_executed,
+                duration,
+                ..
+            } => {
+                // `{selected:?}` (Debug-escaped): the key comes from the
+                // selector, which may derive it from model or other untrusted
+                // input — never interpolate it raw into log text.
+                write!(
+                    f,
+                    "[{run}] DynamicComplete({node_name} @ {node_id:?}, mode: {mode}, selected: {selected:?}, executed: {nodes_executed}, duration: {duration:?})"
+                )
+            }
         }
     }
 }
@@ -784,5 +860,46 @@ mod serde_tests {
         assert_eq!(json, "{}");
         let restored: RunLabels = serde_json::from_str(&json).unwrap();
         assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn dynamic_events_report_their_schedules_and_render() {
+        use crate::node::{ContextMode, NodeId};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let start = GraphEvent::DynamicStart {
+            run_id: RunId::from_string("run-1"),
+            labels: RunLabels::empty(),
+            node_id: NodeId::from_string("node-1"),
+            node_name: "route",
+            mode: ContextMode::Shared,
+        };
+        assert_eq!(start.schedule_name(), "OnDynamicStart");
+        let rendered = start.to_string();
+        assert!(rendered.contains("DynamicStart(route"), "{rendered}");
+        assert!(rendered.contains("[run-1]"), "{rendered}");
+
+        // The selected key is selector-derived (potentially untrusted), so
+        // Display must render it Debug-escaped — a newline must not survive
+        // into the log line.
+        let complete = GraphEvent::DynamicComplete {
+            run_id: RunId::from_string("run-1"),
+            labels: RunLabels::empty(),
+            node_id: NodeId::from_string("node-1"),
+            node_name: "route",
+            mode: ContextMode::Shared,
+            selected: Arc::from("evil\nkey"),
+            nodes_executed: 3,
+            duration: Duration::from_millis(5),
+        };
+        assert_eq!(complete.schedule_name(), "OnDynamicComplete");
+        let rendered = complete.to_string();
+        assert!(
+            rendered.contains("selected: \"evil\\nkey\""),
+            "key must be Debug-escaped: {rendered}"
+        );
+        assert!(!rendered.contains('\n'), "no raw newline: {rendered}");
+        assert!(rendered.contains("executed: 3"), "{rendered}");
     }
 }

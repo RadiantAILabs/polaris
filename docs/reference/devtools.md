@@ -52,7 +52,7 @@ Enabling `with_event_tracing()` registers an observer on every graph schedule (`
 
 - Graph-level: `OnGraphStart`, `OnGraphComplete`, `OnGraphFailure`
 - System-level: `OnSystemStart`, `OnSystemComplete`, `OnSystemError`
-- Control flow: `OnDecisionStart/Complete`, `OnSwitchStart/Complete`, `OnLoopStart/Iteration/End`, `OnParallelStart/Complete`, `OnScopeStart/Complete`
+- Control flow: `OnDecisionStart/Complete`, `OnSwitchStart/Complete`, `OnLoopStart/Iteration/End`, `OnParallelStart/Complete`, `OnScopeStart/Complete`, `OnDynamicStart/Complete`
 
 Configure your `tracing_subscriber` to enable `DEBUG` level for the `polaris_graph` target to surface these logs:
 

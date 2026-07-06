@@ -1,5 +1,6 @@
 //! Error types for graph execution.
 
+use crate::graph::SignatureDiff;
 use crate::node::NodeId;
 use crate::predicate::PredicateError;
 use polaris_system::param::{AccessMode, ErrorContext};
@@ -81,6 +82,71 @@ pub enum ExecutionError {
         node: NodeId,
         /// The discriminator value that didn't match any case.
         key: &'static str,
+    },
+    /// A dynamic node's selector chose a candidate key not present in the
+    /// candidate set, and no usable default was configured.
+    DynamicCandidateNotFound {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        name: &'static str,
+        /// The candidate key that could not be resolved.
+        key: Arc<str>,
+    },
+    /// A registry-backed dynamic node resolved a [`SubgraphRegistry`] whose
+    /// contract is not compatible with the node's own slot contract.
+    ///
+    /// Registry candidates are signature-checked against the *registry's*
+    /// contract at insertion time, so running one against this node is only
+    /// sound if that contract fills this node's slot. When the contracts
+    /// diverge the check is refused rather than running a candidate whose shape
+    /// the parent graph was never validated against.
+    ///
+    /// [`SubgraphRegistry`]: crate::registry::SubgraphRegistry
+    DynamicContractMismatch {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        name: &'static str,
+        /// How the registry's contract diverges from this node's slot contract.
+        /// Boxed to keep [`ExecutionError`] small on the common success path.
+        diff: Box<SignatureDiff>,
+    },
+    /// A registry-backed dynamic node found no [`SubgraphRegistry`] in the
+    /// execution context.
+    ///
+    /// Distinct from [`DynamicCandidateNotFound`](Self::DynamicCandidateNotFound):
+    /// the key is not the problem, the registry itself is absent. Falling back to
+    /// the default key cannot recover, because the default resolves through the
+    /// same missing registry.
+    ///
+    /// [`SubgraphRegistry`]: crate::registry::SubgraphRegistry
+    DynamicRegistryMissing {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        name: &'static str,
+    },
+    /// A registry-backed dynamic node could not read the [`SubgraphRegistry`]
+    /// because it is currently held mutably (write-locked) during selection.
+    ///
+    /// [`SubgraphRegistry`]: crate::registry::SubgraphRegistry
+    DynamicRegistryBusy {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        name: &'static str,
+    },
+    /// A registry-backed dynamic node's [`SubgraphRegistry`] exists in the parent
+    /// context but is hidden by an enclosing scope's [`ContextPolicy`].
+    ///
+    /// [`SubgraphRegistry`]: crate::registry::SubgraphRegistry
+    /// [`ContextPolicy`]: crate::node::ContextPolicy
+    DynamicRegistryOutOfScope {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        name: &'static str,
     },
     /// An internal framework invariant was violated.
     InternalError(String),
@@ -172,6 +238,42 @@ impl fmt::Display for ExecutionError {
             }
             ExecutionError::NoMatchingCase { node, key } => {
                 write!(f, "no matching case for key '{key}' on switch node: {node}")
+            }
+            ExecutionError::DynamicCandidateNotFound { node, name, key } => {
+                // `{key:?}` (Debug-escaped): the key comes from the selector,
+                // which may derive it from model or other untrusted input —
+                // never interpolate it raw into log/error text.
+                write!(
+                    f,
+                    "no candidate {key:?} for dynamic node '{name}' ({node}) and no usable default"
+                )
+            }
+            ExecutionError::DynamicContractMismatch { node, name, diff } => {
+                write!(
+                    f,
+                    "subgraph registry contract is not compatible with the slot contract of dynamic node '{name}' ({node}): {diff}"
+                )
+            }
+            ExecutionError::DynamicRegistryMissing { node, name } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) found no SubgraphRegistry in context — seed one at session init or insert it via ResMut before selection"
+                )
+            }
+            ExecutionError::DynamicRegistryBusy { node, name } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) could not read the SubgraphRegistry — it is held mutably (write-locked) during selection"
+                )
+            }
+            ExecutionError::DynamicRegistryOutOfScope { node, name } => {
+                // Only the `share` verbs are suggested: `forward::<T>` requires
+                // `T: Clone`, which `SubgraphRegistry` does not implement
+                // (a forwarded clone would fork the candidate set).
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) SubgraphRegistry is hidden by an enclosing scope's policy — add a crossing verb (`.share::<SubgraphRegistry>()` or `.share_rest()`) to that scope's ContextPolicy"
+                )
             }
             ExecutionError::InternalError(msg) => write!(f, "internal error: {msg}"),
             ExecutionError::MiddlewareError {
@@ -316,6 +418,67 @@ pub enum ResourceValidationError {
         /// Which verb declared the crossing — `"forward"` or `"fork"`.
         action: &'static str,
     },
+    /// A dynamic node's slot contract requires a resource that is not reachable
+    /// from the context the selected candidate would run against.
+    ///
+    /// The contract is validated against the parent (the interface every
+    /// candidate must honor) rather than against candidates, so this surfaces
+    /// even for a registry-backed slot with no registered candidates.
+    DynamicContractMissingResource {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        node_name: &'static str,
+        /// The resource type the contract requires.
+        resource: &'static str,
+        /// The access mode the contract declared (read or write).
+        mode: AccessMode,
+    },
+    /// A dynamic node's slot contract requires a free output (`Out<T>`) that no
+    /// system produces upstream of the node on the linear chain.
+    ///
+    /// The dynamic sibling of [`MissingOutput`](Self::MissingOutput): the slot
+    /// declares it consumes `Out<T>` from its surroundings, but the parent graph
+    /// does not produce `T` before reaching the node.
+    DynamicContractMissingOutput {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        node_name: &'static str,
+        /// The output type the contract requires.
+        output: &'static str,
+    },
+    /// A dynamic node with a non-shared [`ContextPolicy`] declares a nonempty
+    /// `requires_outputs` in its slot contract.
+    ///
+    /// Free outputs never cross a non-shared boundary inward — a child context
+    /// starts with empty outputs and never walks the parent chain for them — so
+    /// such a contract is statically unsatisfiable regardless of which candidate
+    /// runs. Use a shared policy if the candidate must read free outputs from the
+    /// parent, or drop the `requires_outputs` from the contract.
+    ///
+    /// [`ContextPolicy`]: crate::node::ContextPolicy
+    DynamicContractOutputsBlocked {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        node_name: &'static str,
+    },
+    /// Resource validation stopped descending because scope/dynamic nesting
+    /// exceeded the executor's
+    /// [`max_recursion_depth`](super::GraphExecutor::with_max_recursion_depth).
+    ///
+    /// Executing the same nesting would fail with
+    /// [`ExecutionError::RecursionLimitExceeded`](super::ExecutionError::RecursionLimitExceeded)
+    /// before reaching the unvalidated layers, so this surfaces at validation
+    /// time what execution would surface mid-run: flatten the nesting or raise
+    /// the executor's recursion limit.
+    ValidationDepthExceeded {
+        /// The nesting depth at which validation stopped.
+        depth: usize,
+        /// The executor's configured recursion limit.
+        max: usize,
+    },
 }
 
 impl fmt::Display for ResourceValidationError {
@@ -367,6 +530,43 @@ impl fmt::Display for ResourceValidationError {
                 write!(
                     f,
                     "scope '{scope_name}' ({scope}) declared {action}::<{resource}>() but {resource} is not reachable from the parent context"
+                )
+            }
+            ResourceValidationError::DynamicContractMissingResource {
+                node,
+                node_name,
+                resource,
+                mode,
+            } => {
+                let mode_str = match mode {
+                    AccessMode::Read => "read",
+                    AccessMode::Write => "write",
+                };
+                write!(
+                    f,
+                    "dynamic node '{node_name}' ({node}) slot contract requires {mode_str} access to missing resource: {resource}"
+                )
+            }
+            ResourceValidationError::DynamicContractMissingOutput {
+                node,
+                node_name,
+                output,
+            } => {
+                write!(
+                    f,
+                    "dynamic node '{node_name}' ({node}) slot contract requires missing output: {output}"
+                )
+            }
+            ResourceValidationError::DynamicContractOutputsBlocked { node, node_name } => {
+                write!(
+                    f,
+                    "dynamic node '{node_name}' ({node}) has a non-shared context policy but its slot contract requires free outputs, which cannot cross the boundary — use a shared policy or drop the required outputs"
+                )
+            }
+            ResourceValidationError::ValidationDepthExceeded { depth, max } => {
+                write!(
+                    f,
+                    "resource validation stopped at nesting depth {depth}: exceeds the executor's max recursion depth ({max}) — execution would fail the same way; flatten the nesting or raise the limit via with_max_recursion_depth"
                 )
             }
         }

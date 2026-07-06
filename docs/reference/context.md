@@ -247,6 +247,15 @@ Application code rarely constructs `ParentFilter` directly. `ContextPolicy` buil
 
 Source: `polaris_system/src/param/mod.rs` — `ParentFilter`, `child_filtered`.
 
+### Dynamic
+
+A Dynamic node runs its **selected candidate** through the same boundary machinery as Scope — both node types share one executor path (`execute_embedded`), so every policy shape, verb, and runtime behavior in the Scope table above applies verbatim, with the candidate graph in place of the embedded graph. Two Dynamic-specific points:
+
+- **Selection happens in the parent context.** The selector reads the parent's resources and outputs to choose a candidate key *before* any child context exists; only the chosen candidate then runs through the `ContextPolicy` boundary declared on the node's `DynamicSlot`.
+- **Free outputs never cross a non-shared boundary inward.** A slot contract with a nonempty `requires_outputs` under a non-shared policy is rejected at `validate_resources` time (`DynamicContractOutputsBlocked`), because child contexts start with empty outputs and never walk the parent chain for them.
+
+See [Graph — Dynamic](graph.md#dynamic) for selection, contracts, and candidate sources.
+
 ## Outputs
 
 System return values are stored in the context's output storage, keyed by `TypeId`. Downstream systems access them via `Out<T>`.
@@ -266,7 +275,7 @@ async fn act(reasoning: Out<ReasoningResult>) -> ActionResult { /* ... */ }
 
 ### Output Merging
 
-When child contexts (from Parallel or Scope nodes) complete, their outputs are merged into the parent via `ctx.outputs_mut().merge_from(child_outputs)`. Merge is deterministic — branches are processed in order, so the last branch's output wins for duplicate types.
+When child contexts (from Parallel, Scope, or Dynamic nodes) complete, their outputs are merged into the parent via `ctx.outputs_mut().merge_from(child_outputs)`. Merge is deterministic — branches are processed in order, so the last branch's output wins for duplicate types.
 
 ## Resource Validation
 

@@ -245,6 +245,37 @@ pub struct OnScopeComplete;
 impl Schedule for OnScopeComplete {}
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Dynamic Schedules
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Marker type for hooks called before a dynamic node selects and runs a
+/// candidate subgraph.
+///
+/// This hook fires when execution reaches the dynamic node, before its selector
+/// chooses a candidate and the chosen subgraph runs.
+///
+/// # Validation
+///
+/// Resources provided by `OnDynamicStart` hooks are **not** considered during
+/// validation.
+///
+/// Event data: [`GraphEvent::DynamicStart`](super::events::GraphEvent::DynamicStart)
+pub struct OnDynamicStart;
+impl Schedule for OnDynamicStart {}
+
+/// Marker type for hooks called after a dynamic node's selected candidate
+/// completes and its outputs are merged back into the parent context.
+///
+/// # Validation
+///
+/// Resources provided by `OnDynamicComplete` hooks are **not** considered during
+/// validation.
+///
+/// Event data: [`GraphEvent::DynamicComplete`](super::events::GraphEvent::DynamicComplete)
+pub struct OnDynamicComplete;
+impl Schedule for OnDynamicComplete {}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Composite Schedule Type
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -288,4 +319,6 @@ pub type AllGraphSchedules = (
     OnParallelComplete,
     OnScopeStart,
     OnScopeComplete,
+    OnDynamicStart,
+    OnDynamicComplete,
 );

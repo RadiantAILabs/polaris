@@ -8,17 +8,18 @@ use crate::graph::Graph;
 use crate::hooks::HooksAPI;
 use crate::hooks::events::GraphEvent;
 use crate::hooks::schedule::{
-    OnDecisionComplete, OnDecisionStart, OnLoopEnd, OnLoopIteration, OnLoopStart,
-    OnParallelComplete, OnParallelStart, OnScopeComplete, OnScopeStart, OnSwitchComplete,
-    OnSwitchStart, OnSystemComplete, OnSystemError, OnSystemStart,
+    OnDecisionComplete, OnDecisionStart, OnDynamicComplete, OnDynamicStart, OnLoopEnd,
+    OnLoopIteration, OnLoopStart, OnParallelComplete, OnParallelStart, OnScopeComplete,
+    OnScopeStart, OnSwitchComplete, OnSwitchStart, OnSystemComplete, OnSystemError, OnSystemStart,
 };
 use crate::middleware::{self, MiddlewareAPI};
 use crate::node::{
-    CrossingAction, DecisionNode, LoopNode, Node, NodeId, ParallelNode, ScopeNode, SwitchNode,
-    SystemNode,
+    CandidateSource, ContextPolicy, CrossingAction, DecisionNode, DynamicNode, LoopNode, Node,
+    NodeId, ParallelNode, ScopeNode, SwitchNode, SystemNode,
 };
+use crate::registry::SubgraphRegistry;
 use futures::future::BoxFuture;
-use polaris_system::param::SystemContext;
+use polaris_system::param::{ParamError, SystemContext};
 use std::sync::Arc;
 
 /// Default case name for switch nodes when no match is found.
@@ -592,7 +593,84 @@ impl GraphExecutor {
         })
     }
 
-    /// Middleware callback body for scope nodes: context policy, inner graph execution.
+    /// Runs `graph` through a context boundary governed by `policy`, returning
+    /// the number of nodes executed.
+    ///
+    /// This is the shared core of [`Scope`](Node::Scope) and
+    /// [`Dynamic`](Node::Dynamic) execution: a shared policy reuses the parent
+    /// context directly, otherwise a filtered child context is created,
+    /// per-policy resource crossings are populated, the embedded graph runs, and
+    /// its outputs merge back into the parent on exit. The embedded graph's own
+    /// [`max_duration`](Graph::max_duration) wraps execution in a timeout.
+    ///
+    /// `name` labels the boundary in resource-crossing errors. Hooks and
+    /// node-specific tracing live in the per-node callers (`run_scope_body` /
+    /// `run_dynamic_body`), so both node types share provably identical boundary
+    /// semantics.
+    fn execute_embedded<'a>(
+        &'a self,
+        graph: &'a Graph,
+        policy: &'a ContextPolicy,
+        name: &'static str,
+        depth: usize,
+        hooks: Option<&'a HooksAPI>,
+        middleware: &'a MiddlewareAPI,
+        ctx: &'a mut SystemContext<'_>,
+        run_ctx: &'a RunContext,
+    ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
+        Box::pin(async move {
+            let start = std::time::Instant::now();
+            let entry = graph.entry().ok_or(ExecutionError::EmptyGraph)?;
+
+            let execute_body = async {
+                if policy.is_shared() {
+                    return self
+                        .execute_from(graph, ctx, entry, depth + 1, hooks, middleware, run_ctx)
+                        .await;
+                }
+
+                // Every non-shared boundary keeps a parent reference; the
+                // parent_filter expresses what's reachable through it. Pure
+                // isolation (no `share` / `share_rest`) is just an empty
+                // AllowOnly filter — globals still flow through, parent locals
+                // are blocked. Retaining the parent ref is what lets
+                // ParamError::ResourceOutOfScope distinguish a missing resource
+                // from one the policy is hiding.
+                let mut child = ctx.child_filtered(policy.parent_filter_arc());
+                Self::populate_child_locals(policy, name, ctx, &mut child)?;
+                let inner_count = self
+                    .execute_from(
+                        graph,
+                        &mut child,
+                        entry,
+                        depth + 1,
+                        hooks,
+                        middleware,
+                        run_ctx,
+                    )
+                    .await?;
+                let child_outputs = child.take_outputs();
+                drop(child);
+                ctx.outputs_mut().merge_from(child_outputs);
+                Ok(inner_count)
+            };
+
+            if let Some(max) = graph.max_duration {
+                match tokio::time::timeout(max, execute_body).await {
+                    Ok(inner) => inner,
+                    Err(_timeout) => {
+                        let elapsed = start.elapsed();
+                        Err(ExecutionError::GraphTimeout { elapsed, max })
+                    }
+                }
+            } else {
+                execute_body.await
+            }
+        })
+    }
+
+    /// Middleware callback body for scope nodes: hooks + the shared embedded
+    /// boundary.
     ///
     /// Accepts the parent's current `depth` so that the inner graph execution
     /// increments it, preventing nested scopes from bypassing the recursion limit.
@@ -623,61 +701,18 @@ impl GraphExecutor {
 
             let start = std::time::Instant::now();
 
-            let entry = scope.graph.entry().ok_or(ExecutionError::EmptyGraph)?;
-
-            let execute_scope = async {
-                let policy = &scope.context_policy;
-                if policy.is_shared() {
-                    return self
-                        .execute_from(
-                            &scope.graph,
-                            ctx,
-                            entry,
-                            depth + 1,
-                            hooks,
-                            middleware,
-                            run_ctx,
-                        )
-                        .await;
-                }
-
-                // Every non-shared scope keeps a parent reference; the
-                // parent_filter expresses what's reachable through it. Pure
-                // isolation (no `share` / `share_rest`) is just an empty
-                // AllowOnly filter — globals still flow through, parent
-                // locals are blocked. Retaining the parent ref is what lets
-                // ParamError::ResourceOutOfScope distinguish a missing
-                // resource from one the policy is hiding.
-                let mut child = ctx.child_filtered(policy.parent_filter_arc());
-                Self::populate_child_locals(scope, ctx, &mut child)?;
-                let inner_count = self
-                    .execute_from(
-                        &scope.graph,
-                        &mut child,
-                        entry,
-                        depth + 1,
-                        hooks,
-                        middleware,
-                        run_ctx,
-                    )
-                    .await?;
-                let child_outputs = child.take_outputs();
-                drop(child);
-                ctx.outputs_mut().merge_from(child_outputs);
-                Ok(inner_count)
-            };
-
-            let count = if let Some(max) = scope.graph.max_duration {
-                match tokio::time::timeout(max, execute_scope).await {
-                    Ok(inner) => inner?,
-                    Err(_timeout) => {
-                        let elapsed = start.elapsed();
-                        return Err(ExecutionError::GraphTimeout { elapsed, max });
-                    }
-                }
-            } else {
-                execute_scope.await?
-            };
+            let count = self
+                .execute_embedded(
+                    &scope.graph,
+                    &scope.context_policy,
+                    scope.name,
+                    depth,
+                    hooks,
+                    middleware,
+                    ctx,
+                    run_ctx,
+                )
+                .await?;
 
             Self::invoke_hook::<OnScopeComplete>(
                 hooks,
@@ -697,6 +732,175 @@ impl GraphExecutor {
         })
     }
 
+    /// Middleware callback body for dynamic nodes: select a candidate, then run
+    /// it through the shared embedded boundary with hooks.
+    fn run_dynamic_body<'a>(
+        &'a self,
+        node: &'a DynamicNode,
+        node_id: &'a NodeId,
+        depth: usize,
+        hooks: Option<&'a HooksAPI>,
+        middleware: &'a MiddlewareAPI,
+        ctx: &'a mut SystemContext<'_>,
+        run_ctx: &'a RunContext,
+    ) -> BoxFuture<'a, Result<usize, ExecutionError>> {
+        Box::pin(async move {
+            Self::invoke_hook::<OnDynamicStart>(
+                hooks,
+                ctx,
+                &GraphEvent::DynamicStart {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
+                    node_id: node_id.clone(),
+                    node_name: node.name,
+                    mode: node.context_policy.mode(),
+                },
+            );
+
+            // The reported duration covers the whole dynamic step — selection,
+            // lookup, and candidate execution — matching the event's "total
+            // duration" contract.
+            let start = std::time::Instant::now();
+
+            // Select a candidate key, then resolve it to a graph (falling back to
+            // the configured default key). Both lookups borrow `ctx` immutably and
+            // return an owned `Arc<Graph>`, so the borrow is released before the
+            // candidate runs against `&mut ctx`.
+            let key = node
+                .selector
+                .select(ctx)
+                .map_err(ExecutionError::PredicateError)?;
+            let (selected, candidate) = match Self::lookup_candidate(node, node_id, ctx, &key)? {
+                Some(candidate) => (key, candidate),
+                None => {
+                    let default_key = node.default.clone().ok_or_else(|| {
+                        ExecutionError::DynamicCandidateNotFound {
+                            node: node_id.clone(),
+                            name: node.name,
+                            key: key.clone(),
+                        }
+                    })?;
+                    let candidate = Self::lookup_candidate(node, node_id, ctx, &default_key)?
+                        .ok_or_else(|| ExecutionError::DynamicCandidateNotFound {
+                            node: node_id.clone(),
+                            name: node.name,
+                            key: default_key.clone(),
+                        })?;
+                    (default_key, candidate)
+                }
+            };
+
+            let count = self
+                .execute_embedded(
+                    &candidate,
+                    &node.context_policy,
+                    node.name,
+                    depth,
+                    hooks,
+                    middleware,
+                    ctx,
+                    run_ctx,
+                )
+                .await?;
+
+            Self::invoke_hook::<OnDynamicComplete>(
+                hooks,
+                ctx,
+                &GraphEvent::DynamicComplete {
+                    run_id: run_ctx.run_id.clone(),
+                    labels: run_ctx.labels.clone(),
+                    node_id: node_id.clone(),
+                    node_name: node.name,
+                    mode: node.context_policy.mode(),
+                    selected,
+                    nodes_executed: count,
+                    duration: start.elapsed(),
+                },
+            );
+
+            Ok(count)
+        })
+    }
+
+    /// Resolves a candidate key to its subgraph, cloning the `Arc<Graph>` out so
+    /// the caller can drop the context borrow before running it.
+    ///
+    /// `Ok(None)` means exclusively that the key is absent from an otherwise
+    /// resolvable registry (the caller falls back to the node's default). Every
+    /// other failure is a hard, typed `Err` that must not fall back, because the
+    /// default key resolves through the same registry and cannot recover:
+    ///
+    /// - the registry is absent from context
+    ///   ([`DynamicRegistryMissing`](ExecutionError::DynamicRegistryMissing)),
+    ///   write-locked ([`DynamicRegistryBusy`](ExecutionError::DynamicRegistryBusy)),
+    ///   or hidden by an enclosing scope policy
+    ///   ([`DynamicRegistryOutOfScope`](ExecutionError::DynamicRegistryOutOfScope));
+    /// - the registry's contract does not fill this node's slot
+    ///   ([`DynamicContractMismatch`](ExecutionError::DynamicContractMismatch)).
+    fn lookup_candidate(
+        node: &DynamicNode,
+        node_id: &NodeId,
+        ctx: &SystemContext<'_>,
+        key: &str,
+    ) -> Result<Option<Arc<Graph>>, ExecutionError> {
+        match &node.source {
+            CandidateSource::Inline(candidates) => Ok(candidates
+                .iter()
+                .find(|(candidate_key, _)| &**candidate_key == key)
+                .map(|(_, graph)| Arc::clone(graph))),
+            // v1 reads the concrete `SubgraphRegistry`; `resource_type` reserves
+            // the slot for future wrapper resource types.
+            CandidateSource::Registry { .. } => {
+                // A failed registry resolution is a distinct, unrecoverable
+                // cause — not a key miss. Preserve it as a typed error rather
+                // than laundering it into a default-key fallback that resolves
+                // through the same registry.
+                let registry = match ctx.get_resource::<SubgraphRegistry>() {
+                    Ok(registry) => registry,
+                    Err(ParamError::BorrowConflict(_)) => {
+                        return Err(ExecutionError::DynamicRegistryBusy {
+                            node: node_id.clone(),
+                            name: node.name,
+                        });
+                    }
+                    Err(ParamError::ResourceOutOfScope(_)) => {
+                        return Err(ExecutionError::DynamicRegistryOutOfScope {
+                            node: node_id.clone(),
+                            name: node.name,
+                        });
+                    }
+                    // `ResourceNotFound` — and any other variant, since the
+                    // output/error-context errors never arise from a resource
+                    // lookup — means the registry is not available. Surface that
+                    // rather than silently falling back to the default key, which
+                    // resolves through the same missing registry.
+                    Err(_) => {
+                        return Err(ExecutionError::DynamicRegistryMissing {
+                            node: node_id.clone(),
+                            name: node.name,
+                        });
+                    }
+                };
+                // Soundness: each candidate was checked against the registry's
+                // own contract at `register()` time, so it is only sound to run
+                // here if that contract fills this node's slot. Refuse rather
+                // than execute a candidate the parent graph never validated
+                // against. (v1 `compatible_with` is exact-set equality.) The
+                // common, compatible case runs on every execution, so use the
+                // allocation-free `compatible_with` check and only build the
+                // `SignatureDiff` on the (error) mismatch path.
+                if !registry.contract().compatible_with(&node.contract) {
+                    return Err(ExecutionError::DynamicContractMismatch {
+                        node: node_id.clone(),
+                        name: node.name,
+                        diff: Box::new(registry.contract().diff(&node.contract)),
+                    });
+                }
+                Ok(registry.get(key))
+            }
+        }
+    }
+
     /// Populates a child context with the resource values produced by each
     /// per-resource crossing on the policy.
     ///
@@ -714,11 +918,12 @@ impl GraphExecutor {
     ///
     /// [`GraphExecutor::validate_resources`]: super::GraphExecutor::validate_resources
     fn populate_child_locals(
-        scope: &ScopeNode,
+        policy: &ContextPolicy,
+        name: &'static str,
         parent: &SystemContext<'_>,
         child: &mut SystemContext<'_>,
     ) -> Result<(), ExecutionError> {
-        for crossing in scope.context_policy.crossings() {
+        for crossing in policy.crossings() {
             match &crossing.action {
                 CrossingAction::Share => {}
                 CrossingAction::Forward(clone_fn) | CrossingAction::Fork(clone_fn) => {
@@ -735,14 +940,14 @@ impl GraphExecutor {
                         // so the error names the real cause.
                         None if parent.contains_local_resource_by_type_id(crossing.type_id) => {
                             return Err(ExecutionError::ScopeResourceBusy {
-                                scope: scope.name,
+                                scope: name,
                                 resource: crossing.type_name,
                                 action,
                             });
                         }
                         None => {
                             return Err(ExecutionError::ScopeMissingResource {
-                                scope: scope.name,
+                                scope: name,
                                 resource: crossing.type_name,
                                 action,
                             });
@@ -753,7 +958,7 @@ impl GraphExecutor {
                 CrossingAction::ForwardFresh => {
                     let factory = parent.factory_fn_by_type_id(crossing.type_id).ok_or(
                         ExecutionError::ScopeMissingFactory {
-                            scope: scope.name,
+                            scope: name,
                             resource: crossing.type_name,
                         },
                     )?;
@@ -949,6 +1154,35 @@ impl GraphExecutor {
                             .await?;
                         (node_count, self.advance(graph, &current)?)
                     }
+                    Node::Dynamic(dynamic) => {
+                        let dynamic_id = current.clone();
+                        let candidate_count = match &dynamic.source {
+                            CandidateSource::Inline(candidates) => Some(candidates.len()),
+                            CandidateSource::Registry { .. } => None,
+                        };
+                        let dynamic_info = middleware::info::DynamicInfo {
+                            node_id: dynamic_id.clone(),
+                            node_name: dynamic.name,
+                            mode: dynamic.context_policy.mode(),
+                            candidate_count,
+                        };
+                        let node_count = middleware
+                            .inner
+                            .dynamic
+                            .execute(dynamic_info, ctx, |ctx| {
+                                self.run_dynamic_body(
+                                    dynamic,
+                                    &dynamic_id,
+                                    depth,
+                                    hooks,
+                                    middleware,
+                                    ctx,
+                                    run_ctx,
+                                )
+                            })
+                            .await?;
+                        (node_count, self.advance(graph, &current)?)
+                    }
                 };
 
                 nodes_executed += extra;
@@ -961,5 +1195,141 @@ impl GraphExecutor {
 
             Ok(nodes_executed)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::GraphSignature;
+    use crate::hooks::events::{RunId, RunLabels};
+    use crate::node::DynamicSlot;
+    use crate::predicate::PredicateError;
+    use crate::selector::{BoxedSelector, ErasedSelector, Selector};
+    use std::any::TypeId;
+
+    /// An empty-contract, registry-backed dynamic node driven by `selector`.
+    /// The write-locked branch below cannot arise through the single-threaded
+    /// executor, so the node is assembled by hand and `lookup_candidate` is
+    /// exercised directly.
+    fn registry_node(selector: BoxedSelector) -> DynamicNode {
+        DynamicNode::new(
+            "route",
+            selector,
+            CandidateSource::Registry {
+                resource_type: TypeId::of::<SubgraphRegistry>(),
+            },
+            DynamicSlot::new(GraphSignature::new(), ContextPolicy::shared()),
+        )
+    }
+
+    #[test]
+    fn lookup_candidate_reports_busy_when_registry_is_write_locked() {
+        // A `SubgraphRegistry` held mutably (an in-flight `ResMut`) when
+        // selection reads it resolves to `DynamicRegistryBusy`, not a misleading
+        // key-miss. This write-locked-during-selection state cannot arise through
+        // the single-threaded executor, so it is exercised directly against
+        // `lookup_candidate`.
+        let node = registry_node(Box::new(Selector::new(|_ctx| Arc::<str>::from("slot"))));
+        let ctx = SystemContext::new().with(SubgraphRegistry::new(GraphSignature::new()));
+
+        // Hold a mutable borrow of the registry across the lookup.
+        let guard = ctx.get_resource_mut::<SubgraphRegistry>().unwrap();
+        let err = GraphExecutor::lookup_candidate(&node, &node.id, &ctx, "slot")
+            .expect_err("a write-locked registry must not resolve");
+        assert!(
+            matches!(&err, ExecutionError::DynamicRegistryBusy { name, .. } if *name == "route"),
+            "expected DynamicRegistryBusy, got {err:?}"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn populate_child_locals_busy_and_missing_factory_name_the_dynamic_boundary() {
+        // `populate_child_locals` labels boundary-crossing failures with the
+        // node's name — a scope *or* a dynamic node. The forward/missing arm is
+        // pinned through the public executor in
+        // `tests/dynamic_node.rs::missing_forward_crossing_names_the_dynamic_boundary`;
+        // the write-locked (`ScopeResourceBusy`) and missing-factory
+        // (`ScopeMissingFactory`) arms cannot arise through the single-threaded
+        // executor / a factory-less test context on that path, so they are
+        // exercised directly with a dynamic node's name as the label.
+        #[derive(Clone)]
+        struct Crossed;
+        impl polaris_system::resource::LocalResource for Crossed {}
+
+        // Busy: the parent holds `Crossed` mutably while the crossing copies it.
+        let forward_policy = ContextPolicy::new().forward::<Crossed>();
+        let parent = SystemContext::new().with(Crossed);
+        let guard = parent.get_resource_mut::<Crossed>().unwrap();
+        let mut child = parent.child_filtered(forward_policy.parent_filter_arc());
+        let err =
+            GraphExecutor::populate_child_locals(&forward_policy, "route", &parent, &mut child)
+                .expect_err("a write-locked resource cannot be forwarded");
+        assert!(
+            matches!(
+                &err,
+                ExecutionError::ScopeResourceBusy {
+                    scope: "route",
+                    action: "forward",
+                    ..
+                }
+            ),
+            "expected ScopeResourceBusy naming the dynamic node, got {err:?}"
+        );
+        drop(guard);
+
+        // Missing factory: `forward_fresh` with no factory registered anywhere.
+        let fresh_policy = ContextPolicy::new().forward_fresh::<Crossed>();
+        let parent = SystemContext::new();
+        let mut child = parent.child_filtered(fresh_policy.parent_filter_arc());
+        let err = GraphExecutor::populate_child_locals(&fresh_policy, "route", &parent, &mut child)
+            .expect_err("forward_fresh without a factory cannot populate the child");
+        assert!(
+            matches!(
+                &err,
+                ExecutionError::ScopeMissingFactory { scope: "route", .. }
+            ),
+            "expected ScopeMissingFactory naming the dynamic node, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_body_maps_selector_error_to_predicate_error() {
+        // A fallible `ErasedSelector` returning `Err` surfaces as
+        // `ExecutionError::PredicateError`. This pins the mapping at the unit
+        // level; the public path through `add_dynamic_boxed` is covered by
+        // `tests/dynamic_node.rs::boxed_selector_error_propagates_as_predicate_error`.
+        struct FailingSelector;
+        impl ErasedSelector for FailingSelector {
+            fn select(&self, _ctx: &SystemContext<'_>) -> Result<Arc<str>, PredicateError> {
+                Err(PredicateError::ContextError("selector failed".into()))
+            }
+            fn input_type_name(&self) -> &'static str {
+                "FailingSelector"
+            }
+        }
+
+        let node = registry_node(Box::new(FailingSelector));
+        let mut ctx = SystemContext::new();
+        let run_ctx = RunContext {
+            run_id: RunId::new(),
+            labels: RunLabels::empty(),
+        };
+        let middleware = MiddlewareAPI::new();
+        let executor = GraphExecutor::new();
+
+        let err = executor
+            .run_dynamic_body(&node, &node.id, 0, None, &middleware, &mut ctx, &run_ctx)
+            .await
+            .expect_err("a selector error must abort the dynamic node");
+        assert!(
+            matches!(
+                &err,
+                ExecutionError::PredicateError(PredicateError::ContextError(msg))
+                    if msg == "selector failed"
+            ),
+            "expected PredicateError carrying the selector's message, got {err:?}"
+        );
     }
 }

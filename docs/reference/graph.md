@@ -23,7 +23,7 @@ graph
 
 The first node added becomes the graph's entry point. Each subsequent call to the builder connects the new node to the previous one via a sequential edge. This implicit chaining means that for linear pipelines, the builder reads as a sequence of steps.
 
-Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches; and loop nodes have a body and termination condition or iteration limit. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body and warning about conflicting output types in parallel branches.
+Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches; loop nodes have a body and termination condition or iteration limit; and dynamic nodes have a non-empty, key-unique inline candidate set whose every candidate is structurally valid, flat (no nested `Scope`/`Dynamic` boundary), and signature-compatible with the slot contract. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body and warning about conflicting output types in parallel branches.
 
 A separate runtime validation pass, `executor.validate_resources()`, checks that all `Res<T>`, `ResMut<T>`, and `Out<T>` parameters can be satisfied before execution begins. Output reachability is validated along the linear (sequential) chain — each system's `Out<T>` dependencies are checked against outputs produced by preceding systems. Non-system nodes contribute all output types reachable from their subgraphs. See [Execution Context — Resource Validation](context.md#resource-validation) for details.
 
@@ -189,6 +189,98 @@ At runtime the executor branches on the policy: `shared()` reuses the parent con
 
 After the inner graph completes, child outputs are merged back into the parent context. See [Execution Context — Context Flow](context.md#context-flow-through-graph-execution) for details.
 
+### Dynamic
+
+A dynamic node **selects** one of several pre-built candidate subgraphs at execution time and runs the chosen one through the same context boundary as [Scope](#scope). Use it to *pick* a subgraph by a runtime signal (where `Switch` only routes to branches wired at build time), or to *swap* the unit behind a slot between turns without rebuilding the parent graph.
+
+Selection is driven by a **selector** — a `Fn(&SystemContext<'_>) -> Arc<str>` that names a candidate key from anything readable in the context. The candidate set comes from one of two sources:
+
+| Source | Constructor | Candidate set | Mutable between turns |
+|---|---|---|---|
+| **Inline** | `add_dynamic(...)` | fixed at build time | no |
+| **Registry** | `add_dynamic_registry(...)` | a `SubgraphRegistry` local resource | yes |
+
+Every dynamic node declares a **contract** `GraphSignature` describing the slot's interface — the outputs/resources it requires from its surroundings and the outputs it produces. Each candidate's own signature is checked against this contract: inline candidates during `validate()`, registry candidates at `SubgraphRegistry::register` time. **No graph is ever selected whose shape was not verified against the slot first**, so the parent — validated once against the fixed contract — stays sound no matter which candidate runs. This is composition preserving *soundness* without preserving *semantics*: the signature bounds the swappable space; which candidate runs inside it is a runtime choice.
+
+A candidate is **sound to substitute** for the slot exactly when it demands no more than the slot guarantees and produces at least what the slot promises:
+
+- `candidate.requires ⊆ slot.requires` — it reads no more than what's guaranteed present. Needing *fewer* inputs is fine; the extra available inputs just go unused.
+- `candidate.requires_outputs ⊆ slot.requires_outputs` — the same logic for free `Out<T>` reads.
+- `candidate.produces ⊇ slot.produces` — it produces at least what downstream expects. Producing *more* is harmless; downstream ignores the extras.
+
+The rule is **contravariant in inputs, covariant in outputs**. v1 enforces the stricter special case — *exact-set match* (all three compare by `=`, not `⊆`/`⊇`), so a candidate must match the slot's interface exactly. That is a sound under-approximation: it never admits an unsound candidate, only rejects some safe ones. Loosening to the subset/superset rule above ("variance") is a localized future change. Where two signatures diverge, `GraphSignature::diff` reports the exact axes and types (returned as a `SignatureDiff`, and carried on every mismatch error), so a rejection reads as an edit rather than a puzzle.
+
+The contract is also validated against the parent's *surroundings*, not only the candidates — the contract is the interface, so this holds even for a registry slot with no registered candidates. At `validate_resources` time every resource the contract `requires` must be reachable from the context the candidate will run against (`DynamicContractMissingResource` otherwise), and every free `Out<T>` in `requires_outputs` must be produced upstream (`DynamicContractMissingOutput`). Free outputs never cross a non-shared boundary inward, so a non-shared `ContextPolicy` combined with a nonempty `requires_outputs` is statically unsatisfiable (`DynamicContractOutputsBlocked`). Finally, because signature derivation is opaque at nested context boundaries, a candidate that itself contains a `Scope` or `Dynamic` node is **rejected** until recursive derivation lands — inline candidates during `validate()` (`DynamicCandidateNested`), registry candidates at `register()` (`RegistryError::NestedCandidate`) — so candidates must be flat.
+
+The slot's fixed configuration — its `contract`, boundary `ContextPolicy`, and optional default key — is bundled into a `DynamicSlot`, passed as one value so there are no positional holes at the call site:
+
+```rust
+// Inline: route between two pre-built sub-agents by a runtime `Choice`.
+let contract = GraphSignature::new().require_read::<Base>().produce::<Reply>();
+graph.add_dynamic(
+    "route",
+    // The selector may return any `impl Into<Arc<str>>` — `&str` included.
+    |ctx| ctx.get_resource::<Choice>().map_or("fast", |c| c.pick),
+    [("fast", fast_agent), ("thorough", thorough_agent)],
+    DynamicSlot::new(contract.clone(), ContextPolicy::shared())
+        .with_default_key("fast"), // chosen when the selector's key is absent
+);
+
+// Registry: the slot's candidate is swapped between turns via `SubgraphRegistry`.
+graph.add_dynamic_registry(
+    "route",
+    select_plan,
+    DynamicSlot::new(contract.clone(), ContextPolicy::shared()),
+);
+
+let mut registry = SubgraphRegistry::new(contract);
+registry.register("v1", planner_v1)?; // rejected unless compatible with the contract
+ctx.insert(registry);
+```
+
+If the selector returns a key with no matching candidate, the node falls back to its configured default; with no default it fails with `ExecutionError::DynamicCandidateNotFound`. Registry *resolution* failures are distinct and unrecoverable — the default key resolves through the same registry — so they surface as their own typed errors rather than a candidate miss: no registry in context is `DynamicRegistryMissing`, a write-locked one is `DynamicRegistryBusy`, and one hidden by an enclosing scope's policy is `DynamicRegistryOutOfScope` (carrying crossing-verb guidance). For the registry source, the resolved `SubgraphRegistry`'s contract must itself be compatible with the node's slot contract — candidates are signature-checked against the *registry's* contract at `register()` time, so a registry whose contract diverges from the slot is refused at execution with `ExecutionError::DynamicContractMismatch` (which carries a `SignatureDiff` naming the divergence) rather than running a candidate the parent graph was never validated against. The chosen candidate runs under the node's `ContextPolicy` exactly like a scope — see [Scope](#scope) for the boundary and output-merge semantics.
+
+**Bounding runtime candidates.** Signature compatibility constrains a candidate's *interface*, not its *cost*: a candidate may contain arbitrarily many nodes. A candidate may **not**, however, nest another `Scope` or `Dynamic` node — signature derivation cannot see across those boundaries, so such candidates are rejected at build/registration time (see above). That also forecloses a self-referential dynamic candidate recursing unbounded, before the executor's recursion limit (`GraphExecutor::max_recursion_depth`, default 64) would ever catch it. Total node count and wall-clock time are still *not* bounded by default, so when candidates are generated or chosen from untrusted input (e.g. an LLM), set a [`max_duration`](https://docs.rs/polaris-ai/latest/polaris_ai/graph/struct.Graph.html#method.with_max_duration) on the candidate graphs; it wraps each candidate's execution in a timeout at the dynamic boundary.
+
+See the [`SubgraphRegistry`](https://docs.rs/polaris-ai/latest/polaris_ai/graph/struct.SubgraphRegistry.html) reference for the registry's scope, access pattern, and a worked example, and the [integration guide](./guide.md#common-integration-patterns) row *"Select or swap a subgraph behind a slot at runtime"* for where this pattern fits among the others.
+
+### Duplicating a Graph
+
+`Graph::duplicate()` returns a structurally independent copy with **fresh node and edge IDs**. Every internal reference — branch targets, switch cases, loop bodies, parallel branches, and the `entry` / `last_node` markers — is remapped to the new IDs, and a `Scope` node's embedded graph is duplicated recursively. Modifying the copy (adding, removing, or rewiring nodes) does not affect the original.
+
+This is the basis of the **duplicate-and-modify** workflow: build a base graph, duplicate it, mutate the copy, and compare. It is `duplicate()` rather than `Clone` on purpose — node/edge IDs are semantic identity, and they intentionally change in the copy.
+
+```rust
+let mut base = Graph::new();
+base.add_system(reason).add_system(act);
+
+let mut variant = base.duplicate();
+variant.add_system(reflect); // does not touch `base`
+```
+
+System, predicate, and discriminator *behavior* is immutable and is shared cheaply (via `Arc`) rather than duplicated, so the copy executes identically to the original. A graph that passes `validate()` duplicates to one that also passes it.
+
+### Finding Nodes by Name
+
+Built graphs expose nodes by `NodeId`, but IDs are random nanoids — to locate a node you know by name (the prerequisite for transforming it), use the name-based lookups:
+
+| Method | Returns |
+|--------|---------|
+| `find_node_by_name(name)` | `Option<&Node>` — the first node with that name |
+| `find_nodes_by_name(name)` | `impl Iterator<Item = &Node>` — every match in insertion order (yields nothing when none) |
+| `find_system_by_name(name)` | `Option<(NodeId, &SystemNode)>` — the first **system** node, skipping control-flow nodes |
+
+```rust
+let mut graph = Graph::new();
+graph.add_system(reason).add_system(respond);
+
+if let Some((id, _system)) = graph.find_system_by_name("reason") {
+    // `id` is the handle for rewiring edges to or from this node.
+}
+```
+
+Names are **not** unique: the branch subgraphs the builder produces (decision branches, switch cases, loop bodies, parallel branches) live in the same flat node list as the top level, so two nodes can share a name — `find_nodes_by_name` surfaces them all. A system node's name is its function name (`add_system(reason)` → `"reason"`); a control-flow node's name is its builder label. Lookup searches the graph's own node list only and does not descend into a `Scope` node's embedded graph, mirroring `nodes()` and `get_node()`.
+
 ### Per-Node Context Semantics
 
 Different node types have different relationships to the `SystemContext`:
@@ -201,6 +293,7 @@ Different node types have different relationships to the `SystemContext`:
 | **Loop** | No | Body runs in same context across iterations; outputs persist between iterations |
 | **Parallel** | Yes (per branch) | Each branch gets `ctx.child()`; outputs merged back after all branches complete |
 | **Scope** | Depends on policy | `shared()`: no child; every other policy: `ctx.child_filtered(...)` (pure isolation uses an empty `AllowOnly` filter — globals only) |
+| **Dynamic** | Depends on policy | Selects a candidate subgraph, then runs it through the same policy-governed boundary as Scope |
 
 ## Nodes
 
@@ -214,6 +307,7 @@ pub enum Node {
     Parallel(ParallelNode),
     Loop(LoopNode),
     Scope(ScopeNode),
+    Dynamic(DynamicNode),
 }
 ```
 
@@ -418,6 +512,11 @@ Both errors and timeouts count as failed attempts. After all retries are exhaust
 | `MissingBranch { node, branch }` | Decision node missing true/false branch target |
 | `MissingDiscriminator(NodeId)` | Switch node missing its discriminator |
 | `NoMatchingCase { node, key }` | Switch: no case for key and no default |
+| `DynamicCandidateNotFound { node, name, key }` | Dynamic: selector's key (and default) matched no candidate |
+| `DynamicContractMismatch { node, name, diff }` | Dynamic (registry): the registry's contract does not fill the node's slot; `diff` names the divergence |
+| `DynamicRegistryMissing { node, name }` | Dynamic (registry): no `SubgraphRegistry` in context |
+| `DynamicRegistryBusy { node, name }` | Dynamic (registry): the `SubgraphRegistry` is write-locked during selection |
+| `DynamicRegistryOutOfScope { node, name }` | Dynamic (registry): the `SubgraphRegistry` is hidden by an enclosing scope's policy |
 | `SystemError(Arc<str>)` | System execution returned an error |
 | `PredicateError(PredicateError)` | Predicate evaluation failed |
 | `MaxIterationsExceeded { node, max }` | Loop exceeded iteration limit |
@@ -472,6 +571,8 @@ Each hook is registered against one or more schedule types. The executor invokes
 **Parallel:** `OnParallelStart`, `OnParallelComplete` — fired before parallel branches start and after all branches complete.
 
 **Scope:** `OnScopeStart`, `OnScopeComplete` — fired before scope entry and after scope completion. Includes `mode` and inner node count.
+
+**Dynamic:** `OnDynamicStart`, `OnDynamicComplete` — fired before a dynamic node selects its candidate and after the chosen candidate completes. `OnDynamicComplete` includes the `selected` candidate key.
 
 When multiple hooks are registered for the same schedule, they execute in registration order, and each hook sees context changes made by previous hooks.
 
@@ -572,6 +673,7 @@ impl Plugin for TracingPlugin {
 | `Parallel` | `ParallelInfo` | Entire parallel node |
 | `ParallelBranch` | `ParallelBranchInfo` | Single parallel branch |
 | `Scope` | `ScopeInfo` | Scope node execution |
+| `Dynamic` | `DynamicInfo` | Dynamic node selection and execution |
 
 ### Layer Ordering
 
