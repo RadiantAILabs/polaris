@@ -189,7 +189,6 @@ impl GlobalResource for TracingConfig {}
 ///
 /// | Target | Behavior | Description |
 /// |--------|----------|-------------|
-/// | Graph execution | Wrap | Opens a `polaris.graph.execute` span around the whole run. |
 /// | System | Wrap | Opens a `polaris.graph.execute_system` span per system node. |
 /// | Loop / loop iteration | Wrap | Opens `polaris.graph.execute_loop` and `polaris.graph.loop_iteration` spans. |
 /// | Parallel / parallel branch | Wrap | Opens `polaris.graph.execute_parallel` and `polaris.graph.parallel_branch` spans. |

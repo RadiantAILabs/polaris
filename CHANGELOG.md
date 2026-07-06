@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.1] - 2026-07-03
+## [0.5.2] - 2026-07-06
 
 Runtime subgraph selection and graph duplication. A new `Dynamic` node picks among signature-checked candidate subgraphs at runtime — from a build-time inline set or a swappable per-session registry — and runs the chosen one through a `ContextPolicy` boundary like a scope. `Graph::duplicate()` produces a structurally independent copy of a graph for the duplicate-and-modify workflow. To support sharing immutable behavior across a copy, node payloads move from `Box` to `Arc` (source-breaking only for code that constructs node structs via field literals).
 
@@ -26,6 +26,16 @@ Shipping that field change in a **patch** release is deliberate: the crate is pr
 ### Fixed
 
 - **`Graph::append()` no longer rejects graphs with error/timeout handlers** (`polaris_graph`) — the connectivity check behind `append` followed only sequential and branch edges, so handler subgraphs (wired solely by error/timeout edges since `add_error_handler` landed) were reported as `MergeError::DisconnectedNodes` orphans even though the executor runs them. Connectivity now counts handler subgraphs as reachable.
+
+## [0.5.1] - 2026-07-06
+
+### Added
+
+- **Agent spans** (`polaris_sessions`, `polaris_core_plugins`): session turns now emit a OTel GenAI `invoke_agent` span. The `polaris.session.turn` span carries `gen_ai.operation.name`, `gen_ai.agent.name`, and `gen_ai.conversation.id`, and sets `otel.name` to `invoke_agent {agent}` so OTel backends recognise it correctly. The redundant `polaris.graph.execute` wrapper span is removed.
+
+### Changed
+
+- **`gen_ai.usage.cost` replaces `polaris.gen_ai.cost_usd`** (`polaris_core_plugins`): the estimated cost attribute on `chat` spans is renamed to align with the convention used by other platforms, even though it is not part of the official GenAI semconv spec.
 
 ## [0.5.0] - 2026-06-24
 

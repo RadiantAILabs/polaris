@@ -17,15 +17,6 @@ use tracing::field::Empty;
 
 /// Registers tracing middleware on all graph execution targets.
 pub(crate) fn register(mw: &MiddlewareAPI) {
-    mw.register_graph_execution("tracing", |info, ctx, next| {
-        let span = tracing::info_span!(
-            "polaris.graph.execute",
-            polaris.graph.node_count = info.node_count,
-            polaris.graph.run.id = info.run_id.as_str(),
-        );
-        Box::pin(async move { next.run(ctx).await }.instrument(span))
-    });
-
     mw.register_system("tracing", |info, ctx, next| {
         let span = tracing::info_span!(
             "polaris.graph.execute_system",
@@ -136,14 +127,12 @@ mod tests {
     use polaris_graph::graph::Graph;
     use polaris_system::param::SystemContext;
     use polaris_system::system::{BoxFuture, System, SystemError};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tracing::field::{Field, Visit};
     use tracing::span;
     use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
     use tracing_subscriber::registry::Registry;
 
-    /// No-op system so a single-node graph has something to execute.
     struct NoopSystem;
 
     impl System for NoopSystem {
@@ -161,41 +150,33 @@ mod tests {
         }
     }
 
-    /// Records the value of `polaris.graph.run.id` on the
-    /// `polaris.graph.execute` span when the span is created.
+    /// Captures `polaris.graph.system.name` from `polaris.graph.execute_system` spans.
     #[derive(Clone, Default)]
-    struct RunIdCapture(Arc<Mutex<Option<String>>>);
+    struct SystemNameCapture(Arc<Mutex<Option<String>>>);
 
-    impl RunIdCapture {
+    impl SystemNameCapture {
         fn recorded(&self) -> Option<String> {
             self.0.lock().clone()
         }
     }
 
-    /// Field visitor that pulls `polaris.graph.run.id` out of a span's attributes.
-    struct RunIdVisitor(HashMap<String, String>);
+    struct SystemNameVisitor(Option<String>);
 
-    impl Visit for RunIdVisitor {
+    impl Visit for SystemNameVisitor {
         fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "polaris.graph.run.id" {
-                self.0
-                    .insert("polaris.graph.run.id".to_string(), value.to_string());
+            if field.name() == "polaris.graph.system.name" {
+                self.0 = Some(value.to_string());
             }
         }
 
         fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
-            // `run.id` is recorded as `&str` (via `record_str`), but capture the
-            // debug form as a fallback so the test fails loudly with the actual
-            // value rather than silently missing it if the recording type changes.
-            if field.name() == "polaris.graph.run.id" {
-                self.0
-                    .entry("polaris.graph.run.id".to_string())
-                    .or_insert_with(|| format!("{value:?}"));
+            if field.name() == "polaris.graph.system.name" {
+                self.0.get_or_insert_with(|| format!("{value:?}"));
             }
         }
     }
 
-    impl<S> tracing_subscriber::Layer<S> for RunIdCapture
+    impl<S> tracing_subscriber::Layer<S> for SystemNameCapture
     where
         S: tracing::Subscriber,
     {
@@ -205,29 +186,23 @@ mod tests {
             _id: &span::Id,
             _ctx: LayerContext<'_, S>,
         ) {
-            if attrs.metadata().name() != "polaris.graph.execute" {
+            if attrs.metadata().name() != "polaris.graph.execute_system" {
                 return;
             }
-            let mut visitor = RunIdVisitor(HashMap::new());
+            let mut visitor = SystemNameVisitor(None);
             attrs.record(&mut visitor);
-            if let Some(run_id) = visitor.0.remove("polaris.graph.run.id") {
-                *self.0.lock() = Some(run_id);
+            if let Some(name) = visitor.0 {
+                *self.0.lock() = Some(name);
             }
         }
     }
 
     #[tokio::test]
-    async fn graph_execute_span_records_run_id() {
-        // Drive a real graph execution through the tracing middleware installed
-        // by `register`, and assert the `polaris.graph.execute` span carries
-        // `polaris.graph.run.id` equal to the run id the executor minted (which
-        // is also surfaced on the `ExecutionResult`).
-        let capture = RunIdCapture::default();
+    async fn execute_system_span_records_system_name() {
+        // Drive a single-system graph through the tracing middleware and assert
+        // that `polaris.graph.execute_system` carries the correct system name.
+        let capture = SystemNameCapture::default();
         let subscriber = Registry::default().with(capture.clone());
-        // Use the free `set_default` (thread-local, scoped) rather than
-        // `SubscriberInitExt::set_default`, which would also globally install the
-        // `log` bridge and make a later `TracingLayers::install()` panic with
-        // `SetLoggerError` when the full crate test suite runs in one binary.
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let mw = MiddlewareAPI::new();
@@ -237,22 +212,17 @@ mod tests {
         graph.add_boxed_system(Box::new(NoopSystem));
 
         let mut ctx = SystemContext::new();
-        let result = GraphExecutor::new()
+        GraphExecutor::new()
             .execute(&graph, &mut ctx, None, Some(&mw))
             .await
             .expect("graph execution should succeed");
 
         let recorded = capture
             .recorded()
-            .expect("polaris.graph.execute span should record polaris.graph.run.id");
+            .expect("polaris.graph.execute_system span should record polaris.graph.system.name");
         assert_eq!(
-            recorded,
-            result.run_id().as_str(),
-            "span run id should match the run id minted for the execution"
-        );
-        assert!(
-            !recorded.is_empty(),
-            "recorded run id should be non-empty: {recorded:?}"
+            recorded, "noop_system",
+            "span system name should match the system's name() return value"
         );
     }
 }

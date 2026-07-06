@@ -65,7 +65,7 @@ impl TracingLlmProvider {
             gen_ai.output.messages = tracing::field::Empty,
             gen_ai.system_instructions = tracing::field::Empty,
             gen_ai.tool.definitions = tracing::field::Empty,
-            polaris.gen_ai.cost_usd = tracing::field::Empty,
+            gen_ai.usage.cost = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             otel.status_description = tracing::field::Empty,
         );
@@ -213,7 +213,7 @@ impl DynLlmProvider for TracingLlmProvider {
     }
 }
 
-/// Records the estimated USD cost as `polaris.gen_ai.cost_usd` on `span`.
+/// Records the estimated USD cost as `gen_ai.usage.cost` on `span`.
 ///
 /// No-ops when the provider has no pricing for the model or both token
 /// counts are missing — partial counts (only input *or* only output known)
@@ -230,7 +230,7 @@ fn record_cost(span: &tracing::Span, pricing: Option<ModelPricing>, usage: &Usag
         usage.cache_read_tokens.unwrap_or(0),
         usage.cache_creation_tokens.unwrap_or(0),
     );
-    span.record("polaris.gen_ai.cost_usd", cost);
+    span.record("gen_ai.usage.cost", cost);
 }
 
 /// Records token-usage attributes from `usage` on `span`.
