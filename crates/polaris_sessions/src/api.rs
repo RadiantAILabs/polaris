@@ -885,9 +885,13 @@ impl SessionsAPI {
         // recorded spans by `session_id`.
         let turn_span = tracing::info_span!(
             "polaris.session.turn",
+            otel.name = tracing::field::Empty,
+            otel.kind = tracing::field::Empty,
             gen_ai.operation.name = "invoke_agent",
-            gen_ai.conversation.id = %id,
             gen_ai.agent.name = %state.agent_type,
+            gen_ai.conversation.id = %id,
+            error.type = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
             polaris.session.id = %id,
             polaris.session.turn_number = turn,
             polaris.session.agent_type = %state.agent_type,
@@ -895,6 +899,11 @@ impl SessionsAPI {
             polaris.label.agent_type = state.agent_type.as_str(),
             polaris.label.turn = %turn_str,
         );
+        turn_span.record(
+            "otel.name",
+            format!("invoke_agent {}", state.agent_type).as_str(),
+        );
+        turn_span.record("otel.kind", "Internal");
 
         // Start turn history + lifecycle recording before executor runs so
         // a Running entry is visible from the dashboard the moment a turn
@@ -908,8 +917,13 @@ impl SessionsAPI {
         let exec_result = state
             .executor
             .execute_with_labels(&state.graph, ctx, hooks, middleware, labels)
-            .instrument(turn_span)
+            .instrument(turn_span.clone())
             .await;
+
+        if exec_result.is_err() {
+            turn_span.record("otel.status_code", "ERROR");
+            turn_span.record("error.type", "graph_execution_error");
+        }
 
         // Finalize lifecycle + turn record regardless of success/failure,
         // so the dashboard reflects what actually happened.

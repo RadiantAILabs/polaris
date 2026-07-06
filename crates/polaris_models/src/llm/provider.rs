@@ -165,7 +165,7 @@ pub trait LlmProvider: Send + Sync + 'static {
     /// Returns per-million-token USD pricing for `model`, when known.
     ///
     /// Consumed to derive an estimated cost from reported token usage (e.g.
-    /// the `polaris.gen_ai.cost_usd` tracing attribute). The default returns
+    /// the `gen_ai.usage.cost` tracing attribute). The default returns
     /// `None`; providers with a published rate card should override it.
     fn pricing(&self, _model: &str) -> Option<ModelPricing> {
         None
