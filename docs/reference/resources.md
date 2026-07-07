@@ -139,6 +139,7 @@ every PR.
 - `AgentMemory` (or equivalent session-scoped scratchpad) — Local with `ResMut<T>` mutation contract.
 - [`RequestContext`](crate::app::RequestContext) — per-turn Local, inserted at request boundary, demonstrates the runtime-insertion pattern.
 - [`ForkStrategy`](crate::system::resource::ForkStrategy) — capability trait a Local implements to control how it crosses a scope boundary via `fork::<T>()`, for when `Clone` semantics are wrong (fresh-empty stores, `Arc`-shared handles). The exemplar for documenting a resource's cross-scope behavior.
+- [`SubgraphRegistry`](crate::graph::SubgraphRegistry) — consumer-supplied Local (no plugin registers it) with a `ResMut<T>` mutation-between-turns contract; its read consumer is the [`Dynamic`](crate::graph::DynamicNode) node executor rather than user systems. The exemplar for documenting a resource whose canonical reader is the framework and whose write path is the consumer's.
 
 ### Why this matters
 

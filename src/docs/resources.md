@@ -29,11 +29,13 @@ per the
 
 # Layer 2 — Graph Execution
 
-Per-execution metadata exposed to systems and middleware.
+Per-execution metadata and graph-execution state exposed to systems and
+middleware.
 
 | Resource | Scope | What systems use it for |
 |----------|-------|-------------------------|
 | [`SystemInfo`](crate::graph::SystemInfo) | Local | Inspect the current node — name, system type, retry attempt, etc. Provided by [`DevToolsPlugin`](crate::graph::DevToolsPlugin); used by tracing, logging, and custom instrumentation systems. |
+| [`SubgraphRegistry`](crate::graph::SubgraphRegistry) | Local | Hold the candidate subgraphs a [`Dynamic`](crate::graph::DynamicNode) node selects from, keyed by name, and swap them between turns to change what the slot runs. Inserted by the user (not a plugin); each candidate is signature-checked at registration. |
 
 # Layer 3 — Models
 

@@ -145,7 +145,7 @@ These map high-level goals to the files and patterns needed:
 | **Manage agent sessions** | `SessionsAPI` - register agent, create session, process turns | `polaris_sessions/src/api.rs` | [Sessions](docs/reference/sessions.md) |
 | **Inject per-turn resources** | Setup closure in `process_turn_with(\|ctx\| { ctx.insert(...) })` | `polaris_sessions/src/api.rs` | [Sessions - Turn Execution](docs/reference/sessions.md#turn-execution) |
 | **Bridge HTTP IO to agent** | `HttpIOProvider::new()` -> send input -> inject `UserIO` -> drain output | `polaris_sessions/src/http/io.rs` | [HTTP Integration - HttpIOProvider](docs/reference/http.md#httpioprovider-bridging-http-to-agent-io) |
-| **Understand context flow per node** | Parallel creates children; Loop shares context; Scope has 3 modes | `polaris_graph/src/executor/run.rs` | [Execution Context - Graph Flow](docs/reference/context.md#context-flow-through-graph-execution) |
+| **Understand context flow per node** | Parallel creates children; Loop shares context; Scope has 3 modes; Dynamic runs its selected candidate through a Scope-like boundary | `polaris_graph/src/executor/run.rs` | [Execution Context - Graph Flow](docs/reference/context.md#context-flow-through-graph-execution) |
 | **Add middleware to graph execution** | `MiddlewareAPI::register_system()` in plugin `build()` | `polaris_graph/src/middleware/` | [Graph - Middleware](docs/reference/graph.md#middleware) |
 | **Handle system errors in graph** | Fallible system + error edge + `ErrOut<CaughtError>` handler | `polaris_graph/src/executor/error.rs` | [Graph - Error Handling](docs/reference/graph.md#error-handling) |
 | **Schedule plugin updates** | `tick_schedules()` + `update()` + `server.tick::<S>()` | `polaris_system/src/server.rs` | [Scheduling](docs/reference/scheduling.md) |
@@ -205,7 +205,7 @@ Reference: `ServerInfoPlugin` in `crates/polaris_core_plugins/src/server_info.rs
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Layer 1: System Framework | Complete | Systems, Resources, Plugins, Server |
-| Layer 2: Graph Execution | Complete | All 5 node types, all 6 edge types |
+| Layer 2: Graph Execution | Complete | All 7 node types, all 6 edge types |
 | Layer 2: Agent Trait | Complete | Agent trait for pattern definition |
 | Layer 3: LLM Providers | Complete | Anthropic, OpenAI, Bedrock via `polaris_model_providers` |
 | Layer 3: Tool Registry | Complete | `#[tool]` / `#[toolset]` macros, `ToolRegistry`, `ToolsPlugin` |

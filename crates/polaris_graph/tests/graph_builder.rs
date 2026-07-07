@@ -661,6 +661,35 @@ fn append_with_control_flow() {
 }
 
 #[test]
+fn append_accepts_graphs_with_error_handlers() {
+    // Handler subgraphs hang off their source nodes by error edges alone.
+    // Connectivity must count them as reachable — the executor runs them — so
+    // a graph carrying an error handler is appendable in both positions
+    // (previously misreported as `MergeError::DisconnectedNodes`).
+    let build_with_handler = || {
+        let mut graph = Graph::new();
+        graph.add_boxed_system(Box::new(FailingSystem));
+        graph.add_error_handler(|g| {
+            g.add_system(fallback_system);
+        });
+        graph
+    };
+
+    // Handler on the receiving graph.
+    let mut left = build_with_handler();
+    let mut right = Graph::new();
+    right.add_system(finalize);
+    left.append(right)
+        .expect("a receiving graph with an error handler is fully connected");
+
+    // Handler on the appended graph.
+    let mut left = Graph::new();
+    left.add_system(first_step);
+    left.append(build_with_handler())
+        .expect("an appended graph with an error handler is fully connected");
+}
+
+#[test]
 fn last_node_accessor() {
     let mut graph = Graph::new();
     assert!(graph.last_node().is_none());

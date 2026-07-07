@@ -23,6 +23,7 @@
 //! | [`LoopIteration`] | [`LoopIterationInfo`](info::LoopIterationInfo) | Single loop iteration |
 //! | [`ParallelBranch`] | [`ParallelBranchInfo`](info::ParallelBranchInfo) | Single parallel branch |
 //! | [`Scope`] | [`ScopeInfo`](info::ScopeInfo) | Scope node execution |
+//! | [`Dynamic`] | [`DynamicInfo`](info::DynamicInfo) | Dynamic node execution |
 //!
 //! # Layer Ordering
 //!
@@ -102,6 +103,10 @@ pub struct Switch;
 
 /// Middleware target for scope node execution. See [`ScopeInfo`](info::ScopeInfo).
 pub struct Scope;
+
+/// Middleware target for dynamic node execution (selecting and running a
+/// candidate subgraph). See [`DynamicInfo`](info::DynamicInfo).
+pub struct Dynamic;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-node-level targets

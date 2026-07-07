@@ -4,14 +4,18 @@ use super::{Graph, MergeError};
 use crate::edge::{Edge, ErrorEdge, TimeoutEdge};
 use crate::executor::CaughtError;
 use crate::node::{
-    ContextPolicy, DecisionNode, IntoSystemNode, LoopNode, Node, NodeId, ParallelNode, RetryPolicy,
-    ScopeNode, SwitchNode, SystemNode,
+    CandidateSource, ContextPolicy, DecisionNode, DynamicNode, DynamicSlot, IntoSystemNode,
+    LoopNode, Node, NodeId, ParallelNode, RetryPolicy, ScopeNode, SwitchNode, SystemNode,
 };
 use crate::predicate::Predicate;
+use crate::registry::SubgraphRegistry;
+use crate::selector::{BoxedSelector, Selector};
 use hashbrown::HashSet;
 use polaris_system::param::{ERROR_CONTEXT, SystemAccess, SystemContext};
 use polaris_system::resource::Output;
 use polaris_system::system::{BoxFuture, BoxedSystem, System, SystemError};
+use std::any::TypeId;
+use std::sync::Arc;
 use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -741,6 +745,302 @@ impl Graph {
 
         self.nodes.push(Node::Scope(scope));
         self.last_node = Some(scope_id);
+
+        self
+    }
+
+    /// Adds a [`Dynamic`](Node::Dynamic) node with a fixed, inline set of
+    /// candidate subgraphs.
+    ///
+    /// At execution time, `selector` reads the context and returns a candidate
+    /// key; the matching candidate runs through the slot's
+    /// [`policy`](DynamicSlot) and its outputs merge back into the parent. If the
+    /// key is absent, the slot's [`default_key`](DynamicSlot::default_key) is
+    /// tried; if that is also absent (or unset), execution fails with
+    /// [`DynamicCandidateNotFound`](crate::executor::ExecutionError::DynamicCandidateNotFound).
+    ///
+    /// Each candidate's [signature](Graph::signature) is checked against the
+    /// slot's contract at [`validate`](Graph::validate) time, so a parent graph
+    /// that validates can never select an incompatible candidate.
+    ///
+    /// Unlike [`add_scope`](Self::add_scope) / [`add_switch`](Self::add_switch),
+    /// which take a builder closure over a single inner graph, `candidates` is a
+    /// set of independent, already-built `(key, Graph)` pairs: each candidate has
+    /// its own entry point and is signature-checked on its own, so there is no
+    /// shared graph for a closure to populate.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::{ContextPolicy, DynamicSlot, Graph, GraphSignature};
+    ///
+    /// async fn use_tool() -> i32 { 1 }
+    /// async fn respond() -> i32 { 2 }
+    ///
+    /// let mut tool = Graph::new();
+    /// tool.add_system(use_tool);
+    /// let mut reply = Graph::new();
+    /// reply.add_system(respond);
+    ///
+    /// let slot = DynamicSlot::new(
+    ///     GraphSignature::new().produce::<i32>(),
+    ///     ContextPolicy::shared(),
+    /// )
+    /// .with_default_key("respond");
+    ///
+    /// let mut graph = Graph::new();
+    /// graph.add_dynamic(
+    ///     "route",
+    ///     |_ctx| "respond",
+    ///     [("tool", tool), ("respond", reply)],
+    ///     slot,
+    /// );
+    /// assert!(graph.validate().is_ok());
+    /// ```
+    pub fn add_dynamic<S, R, I, K>(
+        &mut self,
+        name: &'static str,
+        selector: S,
+        candidates: I,
+        slot: DynamicSlot,
+    ) -> &mut Self
+    where
+        S: Fn(&SystemContext<'_>) -> R + Send + Sync + 'static,
+        R: Into<Arc<str>> + 'static,
+        I: IntoIterator<Item = (K, Graph)>,
+        K: Into<Arc<str>>,
+    {
+        let inline: Vec<(Arc<str>, Arc<Graph>)> = candidates
+            .into_iter()
+            .map(|(key, graph)| (key.into(), Arc::new(graph)))
+            .collect();
+        self.push_dynamic(
+            name,
+            Box::new(Selector::new(selector)),
+            CandidateSource::Inline(inline),
+            slot,
+        )
+    }
+
+    /// Adds a [`Dynamic`](Node::Dynamic) node whose candidates live in a
+    /// per-session [`SubgraphRegistry`] local
+    /// resource.
+    ///
+    /// Unlike [`add_dynamic`](Self::add_dynamic), the candidate set is open: it is
+    /// seeded and mutated at runtime via `ResMut<SubgraphRegistry>` (each
+    /// candidate is signature-checked against the registry contract on insertion).
+    /// Insert a [`SubgraphRegistry::new(contract)`](crate::registry::SubgraphRegistry::new)
+    /// whose contract matches the slot's contract into the session context before
+    /// running.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::{ContextPolicy, DynamicSlot, Graph, GraphSignature, SubgraphRegistry};
+    /// use polaris_system::param::SystemContext;
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     async fn plan() -> i32 { 1 }
+    ///
+    ///     let contract = GraphSignature::new().produce::<i32>();
+    ///
+    ///     // The "planner" slot resolves its candidate from the registry at run time.
+    ///     let mut graph = Graph::new();
+    ///     graph.add_dynamic_registry(
+    ///         "planner",
+    ///         |_ctx| "current",
+    ///         DynamicSlot::new(contract.clone(), ContextPolicy::shared()),
+    ///     );
+    ///     assert!(graph.validate().is_ok());
+    ///
+    ///     // Seed a registry whose contract matches the slot's, then insert it
+    ///     // into the session context before execution.
+    ///     let mut registry = SubgraphRegistry::new(contract);
+    ///     let mut candidate = Graph::new();
+    ///     candidate.add_system(plan);
+    ///     registry.register("current", candidate)?; // contract-checked on insert
+    ///     let _ctx = SystemContext::new().with(registry);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn add_dynamic_registry<S, R>(
+        &mut self,
+        name: &'static str,
+        selector: S,
+        slot: DynamicSlot,
+    ) -> &mut Self
+    where
+        S: Fn(&SystemContext<'_>) -> R + Send + Sync + 'static,
+        R: Into<Arc<str>> + 'static,
+    {
+        let source = CandidateSource::Registry {
+            resource_type: TypeId::of::<SubgraphRegistry>(),
+        };
+        self.push_dynamic(name, Box::new(Selector::new(selector)), source, slot)
+    }
+
+    /// Adds a [`Dynamic`](Node::Dynamic) node with an inline candidate set and a
+    /// pre-boxed selector.
+    ///
+    /// The [`BoxedSelector`] variant of [`add_dynamic`](Self::add_dynamic):
+    /// reach for it when the selection logic cannot be an infallible closure —
+    /// typically a hand-implemented [`ErasedSelector`](crate::selector::ErasedSelector)
+    /// whose `select` returns an error instead of falling back to a key.
+    /// Everything else (candidate checking, defaults, boundary policy) behaves
+    /// exactly like `add_dynamic`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::predicate::PredicateError;
+    /// use polaris_graph::selector::{BoxedSelector, ErasedSelector};
+    /// use polaris_graph::{ContextPolicy, DynamicSlot, Graph, GraphSignature};
+    /// use polaris_system::param::SystemContext;
+    /// use std::sync::Arc;
+    ///
+    /// struct Route { tool: bool }
+    /// async fn use_tool() -> i32 { 1 }
+    /// async fn respond() -> i32 { 2 }
+    ///
+    /// // A fallible selector: unlike a closure, it *errors* when its input is
+    /// // missing rather than routing to a fallback key.
+    /// struct RouteSelector;
+    /// impl ErasedSelector for RouteSelector {
+    ///     fn select(&self, ctx: &SystemContext<'_>) -> Result<Arc<str>, PredicateError> {
+    ///         let route = ctx
+    ///             .get_output::<Route>()
+    ///             .map_err(|_| PredicateError::OutputNotFound { type_name: "Route" })?;
+    ///         Ok(if route.tool { Arc::from("tool") } else { Arc::from("respond") })
+    ///     }
+    ///     fn input_type_name(&self) -> &'static str {
+    ///         "Route"
+    ///     }
+    /// }
+    ///
+    /// let mut tool = Graph::new();
+    /// tool.add_system(use_tool);
+    /// let mut reply = Graph::new();
+    /// reply.add_system(respond);
+    ///
+    /// let selector: BoxedSelector = Box::new(RouteSelector);
+    /// let mut graph = Graph::new();
+    /// graph.add_dynamic_boxed(
+    ///     "route",
+    ///     selector,
+    ///     [("tool", tool), ("respond", reply)],
+    ///     DynamicSlot::new(
+    ///         GraphSignature::new().require_output::<Route>().produce::<i32>(),
+    ///         ContextPolicy::shared(),
+    ///     ),
+    /// );
+    /// ```
+    pub fn add_dynamic_boxed<I, K>(
+        &mut self,
+        name: &'static str,
+        selector: BoxedSelector,
+        candidates: I,
+        slot: DynamicSlot,
+    ) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, Graph)>,
+        K: Into<Arc<str>>,
+    {
+        let inline: Vec<(Arc<str>, Arc<Graph>)> = candidates
+            .into_iter()
+            .map(|(key, graph)| (key.into(), Arc::new(graph)))
+            .collect();
+        self.push_dynamic(name, selector, CandidateSource::Inline(inline), slot)
+    }
+
+    /// Adds a [`Dynamic`](Node::Dynamic) node backed by a per-session
+    /// [`SubgraphRegistry`] with a pre-boxed selector.
+    ///
+    /// The [`BoxedSelector`] variant of
+    /// [`add_dynamic_registry`](Self::add_dynamic_registry) — see
+    /// [`add_dynamic_boxed`](Self::add_dynamic_boxed) for when to prefer a
+    /// hand-implemented selector over a closure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::predicate::PredicateError;
+    /// use polaris_graph::selector::{BoxedSelector, ErasedSelector};
+    /// use polaris_graph::{ContextPolicy, DynamicSlot, Graph, GraphSignature, SubgraphRegistry};
+    /// use polaris_system::param::SystemContext;
+    /// use std::sync::Arc;
+    ///
+    /// // A hand-implemented selector: reach for the `_boxed` form when selection
+    /// // must be fallible rather than an infallible closure.
+    /// struct PickCurrent;
+    /// impl ErasedSelector for PickCurrent {
+    ///     fn select(&self, _ctx: &SystemContext<'_>) -> Result<Arc<str>, PredicateError> {
+    ///         Ok(Arc::from("current"))
+    ///     }
+    ///     fn input_type_name(&self) -> &'static str {
+    ///         "()"
+    ///     }
+    /// }
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     async fn plan() -> i32 { 1 }
+    ///
+    ///     let contract = GraphSignature::new().produce::<i32>();
+    ///
+    ///     let selector: BoxedSelector = Box::new(PickCurrent);
+    ///     let mut graph = Graph::new();
+    ///     graph.add_dynamic_registry_boxed(
+    ///         "planner",
+    ///         selector,
+    ///         DynamicSlot::new(contract.clone(), ContextPolicy::shared()),
+    ///     );
+    ///     assert!(graph.validate().is_ok());
+    ///
+    ///     // Seed a registry whose contract matches the slot's, then insert it
+    ///     // into the session context before execution.
+    ///     let mut registry = SubgraphRegistry::new(contract);
+    ///     let mut candidate = Graph::new();
+    ///     candidate.add_system(plan);
+    ///     registry.register("current", candidate)?; // contract-checked on insert
+    ///     let _ctx = SystemContext::new().with(registry);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn add_dynamic_registry_boxed(
+        &mut self,
+        name: &'static str,
+        selector: BoxedSelector,
+        slot: DynamicSlot,
+    ) -> &mut Self {
+        let source = CandidateSource::Registry {
+            resource_type: TypeId::of::<SubgraphRegistry>(),
+        };
+        self.push_dynamic(name, selector, source, slot)
+    }
+
+    /// Shared construction for the `add_dynamic*` builders: builds the node and
+    /// wires it into the graph like `add_scope`.
+    fn push_dynamic(
+        &mut self,
+        name: &'static str,
+        selector: BoxedSelector,
+        source: CandidateSource,
+        slot: DynamicSlot,
+    ) -> &mut Self {
+        let dynamic = DynamicNode::new(name, selector, source, slot);
+        let dynamic_id = dynamic.id.clone();
+
+        // Connect to previous node if exists
+        if let Some(prev_id) = self.last_node.clone() {
+            self.add_sequential_edge(prev_id, dynamic_id.clone());
+        }
+
+        // Set as entry if first node
+        if self.entry.is_none() {
+            self.entry = Some(dynamic_id.clone());
+        }
+
+        self.nodes.push(Node::Dynamic(dynamic));
+        self.last_node = Some(dynamic_id);
 
         self
     }

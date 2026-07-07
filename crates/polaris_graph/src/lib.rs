@@ -57,6 +57,10 @@ pub mod node;
 
 pub mod predicate;
 
+pub mod selector;
+
+pub mod registry;
+
 pub mod hooks;
 
 pub mod dev;
@@ -74,18 +78,21 @@ pub mod prelude {
         ResourceValidationError,
     };
     pub use crate::graph::{
-        Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
+        Graph, GraphSignature, MergeError, SignatureDiff, SystemNodeBuilder, ValidationError,
+        ValidationResult, ValidationWarning,
     };
     pub use crate::middleware::{MiddlewareAPI, MiddlewareError};
     pub use crate::node::{
-        ContextMode, ContextPolicy, DecisionNode, IntoSystemNode, LoopNode, Node, NodeId,
-        NodeMarker, ParallelNode, RetryPolicy, ScheduledNodeMarker, ScopeNode, SwitchNode,
-        SystemNode,
+        CandidateSource, ContextMode, ContextPolicy, DecisionNode, DynamicNode, DynamicSlot,
+        IntoSystemNode, LoopNode, Node, NodeId, NodeMarker, ParallelNode, RetryPolicy,
+        ScheduledNodeMarker, ScopeNode, SwitchNode, SystemNode,
     };
     pub use crate::predicate::{
         BoxedDiscriminator, BoxedPredicate, Discriminator, ErasedDiscriminator, ErasedPredicate,
         Predicate, PredicateError,
     };
+    pub use crate::registry::{RegistryError, SubgraphRegistry};
+    pub use crate::selector::{BoxedSelector, ErasedSelector, Selector};
 }
 
 // Re-export key types at crate root for convenience
@@ -94,8 +101,14 @@ pub use executor::{
     CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor, ResourceValidationError,
 };
 pub use graph::{
-    Graph, MergeError, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
+    Graph, GraphSignature, MergeError, SignatureDiff, SystemNodeBuilder, ValidationError,
+    ValidationResult, ValidationWarning,
 };
 pub use hooks::{RunId, RunLabels};
 pub use middleware::{MiddlewareAPI, MiddlewareError};
-pub use node::{ContextMode, ContextPolicy, NodeId, RetryPolicy, ScopeNode};
+pub use node::{
+    CandidateSource, ContextMode, ContextPolicy, DynamicNode, DynamicSlot, NodeId, RetryPolicy,
+    ScopeNode,
+};
+pub use registry::{RegistryError, SubgraphRegistry};
+pub use selector::{BoxedSelector, ErasedSelector, Selector};

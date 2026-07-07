@@ -1,12 +1,13 @@
 //! Graph validation logic and error types.
 
-use super::Graph;
+use super::{Graph, SignatureDiff};
 use crate::edge::{Edge, EdgeId};
-use crate::node::{Node, NodeId};
+use crate::node::{CandidateSource, Node, NodeId};
 use hashbrown::{HashMap, HashSet};
 use polaris_system::param::ERROR_CONTEXT;
 use std::any::TypeId;
 use std::fmt;
+use std::sync::Arc;
 
 /// Context tag for timeout path validation.
 ///
@@ -503,6 +504,79 @@ impl Graph {
                     }
                 }
             }
+
+            // Dynamic nodes: validate each inline candidate recursively and check
+            // it against the slot contract. Registry candidates are checked on
+            // insertion ([`SubgraphRegistry::register`]), not here.
+            Node::Dynamic(dynamic) => {
+                if let CandidateSource::Inline(candidates) = &dynamic.source {
+                    if candidates.is_empty() {
+                        errors.push(ValidationError::EmptyDynamicSource {
+                            node: dynamic.id.clone(),
+                            name: dynamic.name,
+                        });
+                    }
+                    let mut seen_keys: HashSet<&str> = HashSet::new();
+                    for (key, _) in candidates {
+                        if !seen_keys.insert(key.as_ref()) {
+                            errors.push(ValidationError::DynamicCandidateDuplicate {
+                                node: dynamic.id.clone(),
+                                name: dynamic.name,
+                                key: Arc::clone(key),
+                            });
+                        }
+                    }
+                    for (key, candidate) in candidates {
+                        let inner_result = candidate.validate();
+                        let candidate_ok = inner_result.is_ok();
+                        for inner_err in inner_result.errors {
+                            errors.push(ValidationError::DynamicCandidateInvalid {
+                                node: dynamic.id.clone(),
+                                name: dynamic.name,
+                                key: Arc::clone(key),
+                                inner: Box::new(inner_err),
+                            });
+                        }
+                        for inner_warn in inner_result.warnings {
+                            warnings.push(ValidationWarning::DynamicCandidateWarning {
+                                node: dynamic.id.clone(),
+                                name: dynamic.name,
+                                key: Arc::clone(key),
+                                inner: Box::new(inner_warn),
+                            });
+                        }
+                        // A candidate that nests a Scope or Dynamic boundary
+                        // presents a signature that hides the IO crossing it, so
+                        // it cannot be soundly checked against the slot yet.
+                        // Reject it rather than trust an opaque signature.
+                        let nested = candidate.contains_nested_boundary();
+                        if nested {
+                            errors.push(ValidationError::DynamicCandidateNested {
+                                node: dynamic.id.clone(),
+                                name: dynamic.name,
+                                key: Arc::clone(key),
+                            });
+                        }
+                        // Only signature-check structurally valid, flat
+                        // candidates, to avoid stacking an incompatibility error
+                        // on top of a structural or nesting error (whose signature
+                        // is unreliable anyway). The diff names which axes diverge,
+                        // so the error explains the mismatch rather than just
+                        // flagging it.
+                        if candidate_ok && !nested {
+                            let diff = candidate.signature().diff(&dynamic.contract);
+                            if !diff.is_empty() {
+                                errors.push(ValidationError::DynamicCandidateIncompatible {
+                                    node: dynamic.id.clone(),
+                                    name: dynamic.name,
+                                    key: Arc::clone(key),
+                                    diff: Box::new(diff),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -601,6 +675,17 @@ pub enum ValidationWarning {
         /// The inner validation warning from the embedded graph.
         inner: Box<ValidationWarning>,
     },
+    /// A dynamic node's inline candidate has a validation warning.
+    DynamicCandidateWarning {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node name.
+        name: &'static str,
+        /// The candidate key.
+        key: Arc<str>,
+        /// The inner validation warning from the candidate graph.
+        inner: Box<ValidationWarning>,
+    },
 }
 
 impl fmt::Display for ValidationWarning {
@@ -620,6 +705,17 @@ impl fmt::Display for ValidationWarning {
                 write!(
                     f,
                     "scope node '{name}' ({node}) embedded graph warning: {inner}"
+                )
+            }
+            ValidationWarning::DynamicCandidateWarning {
+                node,
+                name,
+                key,
+                inner,
+            } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) candidate '{key}' warning: {inner}"
                 )
             }
         }
@@ -781,6 +877,65 @@ pub enum ValidationError {
         /// The inner validation error from the embedded graph.
         inner: Box<ValidationError>,
     },
+    /// A dynamic node's inline candidate source is empty.
+    EmptyDynamicSource {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node name.
+        name: &'static str,
+    },
+    /// A dynamic node's inline candidate has a validation error.
+    DynamicCandidateInvalid {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node name.
+        name: &'static str,
+        /// The candidate key.
+        key: Arc<str>,
+        /// The inner validation error from the candidate graph.
+        inner: Box<ValidationError>,
+    },
+    /// A dynamic node's inline candidate signature is not compatible with the
+    /// node's slot contract.
+    DynamicCandidateIncompatible {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node name.
+        name: &'static str,
+        /// The candidate key.
+        key: Arc<str>,
+        /// Which signature axes diverge, and in which direction. Boxed to keep
+        /// [`ValidationError`] small.
+        diff: Box<SignatureDiff>,
+    },
+    /// A dynamic node's inline candidate nests a [`Scope`](crate::node::Node::Scope)
+    /// or [`Dynamic`](crate::node::Node::Dynamic) node, which flat signature
+    /// derivation cannot see across, so the candidate cannot be soundly checked
+    /// against the slot contract.
+    DynamicCandidateNested {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node name.
+        name: &'static str,
+        /// The candidate key.
+        key: Arc<str>,
+    },
+    /// Two of a dynamic node's inline candidates share the same key.
+    ///
+    /// Inline lookup is first-match, so the later candidate can never be
+    /// selected — it is validated and signature-checked as if it participates,
+    /// then silently ignored at runtime. (A [`SubgraphRegistry`] replaces by
+    /// key instead, through its `Result`-returning `register`.)
+    ///
+    /// [`SubgraphRegistry`]: crate::registry::SubgraphRegistry
+    DynamicCandidateDuplicate {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node name.
+        name: &'static str,
+        /// The key shared by more than one candidate.
+        key: Arc<str>,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -887,6 +1042,46 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "scope node '{name}' ({node}) embedded graph error: {inner}"
+                )
+            }
+            ValidationError::EmptyDynamicSource { node, name } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) has an empty inline candidate set"
+                )
+            }
+            ValidationError::DynamicCandidateInvalid {
+                node,
+                name,
+                key,
+                inner,
+            } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) candidate '{key}' error: {inner}"
+                )
+            }
+            ValidationError::DynamicCandidateIncompatible {
+                node,
+                name,
+                key,
+                diff,
+            } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) candidate '{key}' is not compatible with the slot contract ({diff})"
+                )
+            }
+            ValidationError::DynamicCandidateNested { node, name, key } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) candidate '{key}' nests a scope or dynamic node; signature derivation does not yet see across nested context boundaries — flatten the candidate (recursive signatures are planned)"
+                )
+            }
+            ValidationError::DynamicCandidateDuplicate { node, name, key } => {
+                write!(
+                    f,
+                    "dynamic node '{name}' ({node}) has more than one inline candidate keyed '{key}' — lookup is first-match, so the later candidate can never be selected"
                 )
             }
         }

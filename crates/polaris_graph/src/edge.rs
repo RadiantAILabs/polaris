@@ -3,7 +3,8 @@
 //! Edges are the connections between nodes, defining control flow
 //! through the graph.
 
-use crate::node::NodeId;
+use crate::node::{NodeId, remap_node_id};
+use hashbrown::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -129,6 +130,47 @@ impl Edge {
             Edge::LoopBack(edge) => edge.from.clone(),
             Edge::Error(edge) => edge.from.clone(),
             Edge::Timeout(edge) => edge.from.clone(),
+        }
+    }
+
+    /// Clones this edge for [`Graph::duplicate`](crate::Graph::duplicate).
+    ///
+    /// Mints a fresh [`EdgeId`] and translates every endpoint [`NodeId`] through
+    /// `map` (old → new). Edge ids are not referenced by anything else in the
+    /// graph, so a fresh id is all that is needed to keep the clone independent.
+    pub(crate) fn remap(&self, map: &HashMap<NodeId, NodeId>) -> Edge {
+        match self {
+            Edge::Sequential(edge) => Edge::Sequential(SequentialEdge {
+                id: EdgeId::new(),
+                from: remap_node_id(map, &edge.from),
+                to: remap_node_id(map, &edge.to),
+            }),
+            Edge::Conditional(edge) => Edge::Conditional(ConditionalEdge {
+                id: EdgeId::new(),
+                from: remap_node_id(map, &edge.from),
+                true_target: remap_node_id(map, &edge.true_target),
+                false_target: remap_node_id(map, &edge.false_target),
+            }),
+            Edge::Parallel(edge) => Edge::Parallel(ParallelEdge {
+                id: EdgeId::new(),
+                from: remap_node_id(map, &edge.from),
+                targets: edge.targets.iter().map(|t| remap_node_id(map, t)).collect(),
+            }),
+            Edge::LoopBack(edge) => Edge::LoopBack(LoopBackEdge {
+                id: EdgeId::new(),
+                from: remap_node_id(map, &edge.from),
+                to: remap_node_id(map, &edge.to),
+            }),
+            Edge::Error(edge) => Edge::Error(ErrorEdge {
+                id: EdgeId::new(),
+                from: remap_node_id(map, &edge.from),
+                to: remap_node_id(map, &edge.to),
+            }),
+            Edge::Timeout(edge) => Edge::Timeout(TimeoutEdge {
+                id: EdgeId::new(),
+                from: remap_node_id(map, &edge.from),
+                to: remap_node_id(map, &edge.to),
+            }),
         }
     }
 }

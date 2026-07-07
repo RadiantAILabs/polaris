@@ -37,7 +37,7 @@ This layer defines how agent behavior is structured. `polaris_graph` provides th
 
 These primitives define *how agents are structured*. They are fixed building blocks for expressing any agent topology.
 
-**Scope.** Layer 2 owns the `Graph` structure and builder API, node types (system, decision, switch, parallel, loop), edge types (sequential, conditional, parallel, loop-back, error, timeout), control flow primitives (`Predicate`, `Discriminator`), the `GraphExecutor`, the hook system (`HooksAPI`, `GraphEvent`, schedule markers), the middleware system (`MiddlewareAPI`, targets, `Next`), the `Agent` trait, and concrete API definitions for agent orchestration. It does not contain specific agent implementations, tool or LLM abstractions, memory backends, or I/O mechanisms.
+**Scope.** Layer 2 owns the `Graph` structure and builder API, node types (system, decision, switch, parallel, loop, scope, dynamic), edge types (sequential, conditional, parallel, loop-back, error, timeout), control flow primitives (`Predicate`, `Discriminator`), the `GraphExecutor`, the hook system (`HooksAPI`, `GraphEvent`, schedule markers), the middleware system (`MiddlewareAPI`, targets, `Next`), the `Agent` trait, and concrete API definitions for agent orchestration. It does not contain specific agent implementations, tool or LLM abstractions, memory backends, or I/O mechanisms.
 
 See [graph.md](./reference/graph.md) for graph construction, execution, hooks, and middleware, and [agents.md](./reference/agents.md) for the agent trait.
 

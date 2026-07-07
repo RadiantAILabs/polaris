@@ -31,6 +31,7 @@ new node to the previous one via a sequential edge.
 | **Parallel** | Fork into concurrent branches | Each branch gets `ctx.child()` |
 | **Loop** | Repeat body until predicate or limit | Same context across iterations |
 | **Scope** | Embedded subgraph with configurable isolation | Shared, Inherit, or Isolated mode |
+| **Dynamic** | Select a signature-checked candidate subgraph at runtime | Like Scope, per its `ContextPolicy` |
 
 ## Construction Patterns
 
@@ -100,6 +101,32 @@ graph.add_loop::<LoopState, _, _>(
     "react_loop",
     |state| state.is_done,
     |g| { g.add_system(reason).add_system(act).add_system(observe); },
+);
+```
+
+**Dynamic selection** (runtime choice among signature-checked subgraphs; see
+[`SubgraphRegistry`](crate::graph::SubgraphRegistry) for a per-session,
+swappable candidate set):
+
+```no_run
+# use polaris_ai::graph::{ContextPolicy, DynamicSlot, Graph, GraphSignature};
+# async fn use_tool() -> i32 { 1 }
+# async fn respond() -> i32 { 2 }
+# let mut graph = Graph::new();
+let mut tool = Graph::new();
+tool.add_system(use_tool);
+let mut reply = Graph::new();
+reply.add_system(respond);
+
+graph.add_dynamic(
+    "route",
+    |_ctx| "respond", // any `impl Into<Arc<str>>` key
+    [("tool", tool), ("respond", reply)],
+    DynamicSlot::new(
+        GraphSignature::new().produce::<i32>(),
+        ContextPolicy::shared(),
+    )
+    .with_default_key("respond"),
 );
 ```
 
@@ -182,13 +209,13 @@ registered via [`HooksAPI`](crate::graph::hooks::HooksAPI).
 
 Schedules: `OnGraphStart/Complete/Failure`, `OnSystemStart/Complete/Error`,
 `OnDecisionStart/Complete`, `OnSwitchStart/Complete`, `OnLoopStart/Iteration/End`,
-`OnParallelStart/Complete`, `OnScopeStart/Complete`.
+`OnParallelStart/Complete`, `OnScopeStart/Complete`, `OnDynamicStart/Complete`.
 
 # Middleware
 
 Wraps execution units with logic that spans the unit's duration (e.g., tracing
 spans). Registered via [`MiddlewareAPI`](crate::graph::middleware::MiddlewareAPI) against a
-target type (Graph, System, Decision, Switch, Loop, Parallel, Scope).
+target type (Graph, System, Decision, Switch, Loop, Parallel, Scope, Dynamic).
 
 ```no_run
 # use polaris_ai::graph::middleware::{MiddlewareAPI, info::SystemInfo};

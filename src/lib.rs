@@ -134,7 +134,7 @@
 //!     );
 //! ```
 //!
-//! **Node types:** System, Decision, Switch, Parallel, Loop, Scope.
+//! **Node types:** System, Decision, Switch, Parallel, Loop, Scope, Dynamic.
 //! **Edge types:** `Sequential`, `Conditional`, `Parallel`, `LoopBack`, `Error`, `Timeout`.
 //!
 //! The graph's full topology is inspectable, validated before execution, and
@@ -196,6 +196,7 @@
 //! | Add tools for LLM | `#[tool]` macro + `ToolRegistry` | [`tools`] |
 //! | Add model provider | Implement `LlmProvider` + register via plugin | [`models`] |
 //! | Handle system errors | Fallible system + error edge + `ErrOut<CaughtError>` | [`graph`] |
+//! | Select/swap a subgraph at runtime | `add_dynamic` / `add_dynamic_registry` + `SubgraphRegistry` | [`graph`] |
 //! | Schedule plugin updates | `tick_schedules()` + `server.tick::<S>()` | [`system`] |
 //!
 //! # Crate Organisation
