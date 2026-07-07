@@ -35,7 +35,7 @@ middleware.
 | Resource | Scope | What systems use it for |
 |----------|-------|-------------------------|
 | [`SystemInfo`](crate::graph::SystemInfo) | Local | Inspect the current node — name, system type, retry attempt, etc. Provided by [`DevToolsPlugin`](crate::graph::DevToolsPlugin); used by tracing, logging, and custom instrumentation systems. |
-| [`SubgraphRegistry`](crate::graph::SubgraphRegistry) | Local | Hold the candidate subgraphs a [`Dynamic`](crate::graph::DynamicNode) node selects from, keyed by name. Inserted by the user (not a plugin); each candidate is signature-checked against the *registry's* contract at registration (the registry's contract must in turn fill the node's slot, re-verified at execution), then swapped between turns to change what the slot runs. |
+| [`SubgraphRegistry`](crate::graph::SubgraphRegistry) | Local | Hold the candidate subgraphs a [`Dynamic`](crate::graph::DynamicNode) node selects from, keyed by name, and swap them between turns to change what the slot runs. Inserted by the user (not a plugin); each candidate is signature-checked at registration. |
 
 # Layer 3 — Models
 

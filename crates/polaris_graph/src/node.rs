@@ -1382,6 +1382,48 @@ impl DynamicNode {
     /// The slot's fixed configuration — contract, boundary policy, and optional
     /// default key — travels as one [`DynamicSlot`] value here too, so the
     /// low-level constructor has no positional `None` holes either.
+    ///
+    /// This is the low-level primitive: most callers should build a dynamic node
+    /// through the [`add_dynamic`](crate::Graph::add_dynamic) family, which wires
+    /// it into the graph in one call. Reach for `new` only when assembling a
+    /// [`Node::Dynamic`] outside the builder.
+    ///
+    /// # Candidate source
+    ///
+    /// Only [`CandidateSource::Inline`] is constructible outside this crate: the
+    /// [`Registry`](CandidateSource::Registry) variant is `#[non_exhaustive]` and
+    /// carries a hidden field, so an external caller can pass this constructor an
+    /// inline set only. For a registry-backed node, go through
+    /// [`Graph::add_dynamic_registry`](crate::Graph::add_dynamic_registry) or
+    /// [`add_dynamic_registry_boxed`](crate::Graph::add_dynamic_registry_boxed),
+    /// which mint the registry source internally.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::selector::{BoxedSelector, Selector};
+    /// use polaris_graph::{
+    ///     CandidateSource, ContextPolicy, DynamicNode, DynamicSlot, Graph, GraphSignature,
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// async fn respond() -> i32 { 2 }
+    ///
+    /// let mut reply = Graph::new();
+    /// reply.add_system(respond);
+    ///
+    /// // The inline source is the only variant constructible outside the crate.
+    /// let source = CandidateSource::Inline(vec![(Arc::from("respond"), Arc::new(reply))]);
+    /// let selector: BoxedSelector = Box::new(Selector::new(|_ctx| "respond"));
+    ///
+    /// let node = DynamicNode::new(
+    ///     "route",
+    ///     selector,
+    ///     source,
+    ///     DynamicSlot::new(GraphSignature::new().produce::<i32>(), ContextPolicy::shared()),
+    /// );
+    /// assert_eq!(node.default_key(), None);
+    /// ```
     #[must_use]
     pub fn new(
         name: &'static str,
@@ -1464,7 +1506,7 @@ impl DynamicNode {
 /// .with_default_key("respond");
 /// assert_eq!(slot.default_key(), Some("respond"));
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicSlot {
     pub(crate) contract: GraphSignature,
     pub(crate) policy: ContextPolicy,

@@ -959,6 +959,52 @@ impl Graph {
     /// [`add_dynamic_registry`](Self::add_dynamic_registry) — see
     /// [`add_dynamic_boxed`](Self::add_dynamic_boxed) for when to prefer a
     /// hand-implemented selector over a closure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::predicate::PredicateError;
+    /// use polaris_graph::selector::{BoxedSelector, ErasedSelector};
+    /// use polaris_graph::{ContextPolicy, DynamicSlot, Graph, GraphSignature, SubgraphRegistry};
+    /// use polaris_system::param::SystemContext;
+    /// use std::sync::Arc;
+    ///
+    /// // A hand-implemented selector: reach for the `_boxed` form when selection
+    /// // must be fallible rather than an infallible closure.
+    /// struct PickCurrent;
+    /// impl ErasedSelector for PickCurrent {
+    ///     fn select(&self, _ctx: &SystemContext<'_>) -> Result<Arc<str>, PredicateError> {
+    ///         Ok(Arc::from("current"))
+    ///     }
+    ///     fn input_type_name(&self) -> &'static str {
+    ///         "()"
+    ///     }
+    /// }
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     async fn plan() -> i32 { 1 }
+    ///
+    ///     let contract = GraphSignature::new().produce::<i32>();
+    ///
+    ///     let selector: BoxedSelector = Box::new(PickCurrent);
+    ///     let mut graph = Graph::new();
+    ///     graph.add_dynamic_registry_boxed(
+    ///         "planner",
+    ///         selector,
+    ///         DynamicSlot::new(contract.clone(), ContextPolicy::shared()),
+    ///     );
+    ///     assert!(graph.validate().is_ok());
+    ///
+    ///     // Seed a registry whose contract matches the slot's, then insert it
+    ///     // into the session context before execution.
+    ///     let mut registry = SubgraphRegistry::new(contract);
+    ///     let mut candidate = Graph::new();
+    ///     candidate.add_system(plan);
+    ///     registry.register("current", candidate)?; // contract-checked on insert
+    ///     let _ctx = SystemContext::new().with(registry);
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn add_dynamic_registry_boxed(
         &mut self,
         name: &'static str,
