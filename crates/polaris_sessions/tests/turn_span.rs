@@ -8,6 +8,7 @@
 
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::PersistencePlugin;
+use polaris_graph::executor::ExecutionError;
 use polaris_graph::graph::Graph;
 use polaris_sessions::store::memory::InMemoryStore;
 use polaris_sessions::store::{AgentTypeId, SessionId};
@@ -246,15 +247,17 @@ async fn turn_span_records_error_status_on_failure() {
 
     assert_eq!(get(&fields, "otel.status_code").as_deref(), Some("ERROR"));
 
-    // The recorded discriminant matches the variant name the production code
-    // derives, and is not the retired constant.
+    // `FailingAgent`'s `Res<MissingInput>` cannot resolve, so the turn fails with
+    // `ExecutionError::SystemError`, whose `Debug` discriminant is what the span
+    // records. Assert that literal directly — deriving the expected value from
+    // `exec_err` (as an earlier revision did) merely re-runs the production code
+    // path and proves nothing.
+    assert!(
+        matches!(exec_err, ExecutionError::SystemError(_)),
+        "missing Res<MissingInput> should surface as ExecutionError::SystemError, got {exec_err:?}"
+    );
     let recorded = get(&fields, "error.type").expect("error.type should be recorded");
-    let expected_variant = format!("{exec_err:?}");
-    let expected_variant = expected_variant
-        .split(['(', '{', ' '])
-        .next()
-        .expect("debug output is non-empty");
-    assert_eq!(recorded, expected_variant);
+    assert_eq!(recorded, "SystemError");
     assert_ne!(recorded, "graph_execution_error");
 
     // Identity attributes are still present on a failing turn.

@@ -17,7 +17,7 @@ use polaris_graph::middleware::info::DynamicInfo;
 use polaris_graph::node::{ContextMode, ContextPolicy, DynamicSlot};
 use polaris_graph::registry::{RegistryError, SubgraphRegistry};
 use polaris_system::param::{AccessMode, SystemAccess, SystemContext};
-use polaris_system::resource::LocalResource;
+use polaris_system::resource::{ForkStrategy, LocalResource};
 use polaris_system::system::{BoxFuture, System, SystemError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -154,6 +154,55 @@ impl System for FailingCandidate {
 
     fn is_fallible(&self) -> bool {
         true
+    }
+}
+
+/// A [`ForkStrategy`] resource whose `fork` yields a fresh-empty ledger, so a
+/// forked child observes an empty log where a `forward` (clone) child would see
+/// the parent's entries — making the two boundary verbs distinguishable.
+#[derive(Default)]
+struct Ledger {
+    entries: Vec<i32>,
+}
+impl LocalResource for Ledger {}
+impl ForkStrategy for Ledger {
+    fn fork(&self) -> Self {
+        Ledger::default()
+    }
+}
+
+/// A candidate system reading [`Ledger`]: records and returns the entry count it
+/// observes, so a test can prove which side of a fork boundary it ran on.
+struct CountLedger {
+    recorder: Arc<Mutex<Vec<i32>>>,
+}
+
+impl System for CountLedger {
+    type Output = i32;
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let recorder = Arc::clone(&self.recorder);
+        Box::pin(async move {
+            let ledger = ctx
+                .get_resource::<Ledger>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            let count = ledger.entries.len() as i32;
+            recorder.lock().unwrap().push(count);
+            Ok(count)
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "count_ledger"
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.add_read::<Ledger>();
+        access
     }
 }
 
@@ -2047,5 +2096,194 @@ fn validate_resources_recurses_into_interiors_across_a_non_shared_boundary() {
                 if *system_name == "multiply" && resource_type.contains("Base")
         )),
         "expected the interior system's miss through the child filter, got {errors:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Boundary verbs, multi-candidate registry routing, per-session isolation, and
+// multi-node execution counts
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn fork_policy_forks_resource_into_dynamic_candidate() {
+    // Sibling to `forward_policy_copies_resource_into_dynamic_candidate`: a
+    // non-`Shared` policy whose crossing verb is `fork` rather than `forward`.
+    // `Ledger::fork` yields a fresh-empty ledger, so the candidate must observe
+    // an empty log (count 0) even though the parent's ledger holds an entry —
+    // proving the child ran against `ForkStrategy::fork`, not a clone of the
+    // parent (which `forward` would produce, yielding count 1).
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut forked = Graph::new();
+    forked.add_boxed_system(Box::new(CountLedger {
+        recorder: Arc::clone(&recorder),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "route",
+        |_ctx| Arc::from("a"),
+        [("a", forked)],
+        DynamicSlot::new(
+            GraphSignature::new()
+                .require_read::<Ledger>()
+                .produce::<i32>(),
+            ContextPolicy::new().fork::<Ledger>(),
+        ),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new().with(Ledger { entries: vec![7] });
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("forked dynamic execution should succeed");
+    assert_eq!(
+        *recorder.lock().unwrap(),
+        vec![0],
+        "candidate saw the fresh-forked ledger, not a clone of the parent's"
+    );
+}
+
+#[tokio::test]
+async fn registry_selector_routes_among_multiple_candidates_by_context() {
+    // Registry execution tests elsewhere use a constant selector; this drives the
+    // key from the `Choice` resource, so the runtime key must resolve among
+    // several concurrently-registered registry candidates.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        pick_choice,
+        DynamicSlot::new(contract(), ContextPolicy::shared()),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut registry = SubgraphRegistry::new(contract());
+    registry.register("a", candidate(10, &recorder)).unwrap();
+    registry.register("b", candidate(100, &recorder)).unwrap();
+
+    let mut ctx = SystemContext::new()
+        .with(Base { n: 4 })
+        .with(Choice { pick: "b" })
+        .with(registry);
+
+    // `Choice` picks "b" → the factor-100 candidate runs.
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("registry routing to 'b' should succeed");
+    assert_eq!(*recorder.lock().unwrap(), vec![400]);
+
+    // Flip the key to "a" (same registry, a different candidate) → factor 10.
+    {
+        let mut choice = ctx.get_resource_mut::<Choice>().unwrap();
+        choice.pick = "a";
+    }
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("registry routing to 'a' should succeed");
+    assert_eq!(*recorder.lock().unwrap(), vec![400, 40]);
+}
+
+#[tokio::test]
+async fn registry_candidates_are_isolated_per_session() {
+    // Two independent sessions each carry their own `SubgraphRegistry` behind the
+    // same slot key. A candidate registered in one context must not leak into the
+    // other — the registry is a `Local` resource scoped to its own context.
+    let rec_a = Arc::new(Mutex::new(Vec::new()));
+    let rec_b = Arc::new(Mutex::new(Vec::new()));
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("slot"),
+        DynamicSlot::new(contract(), ContextPolicy::shared()),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut reg_a = SubgraphRegistry::new(contract());
+    reg_a.register("slot", candidate(10, &rec_a)).unwrap();
+    let mut ctx_a = SystemContext::new().with(Base { n: 3 }).with(reg_a);
+
+    let mut reg_b = SubgraphRegistry::new(contract());
+    reg_b.register("slot", candidate(100, &rec_b)).unwrap();
+    let mut ctx_b = SystemContext::new().with(Base { n: 3 }).with(reg_b);
+
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx_a, None, None)
+        .await
+        .expect("session A should run its own candidate");
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx_b, None, None)
+        .await
+        .expect("session B should run its own candidate");
+
+    // Each session ran only the candidate registered in its own registry.
+    assert_eq!(*rec_a.lock().unwrap(), vec![30]);
+    assert_eq!(*rec_b.lock().unwrap(), vec![300]);
+}
+
+#[tokio::test]
+async fn dynamic_complete_reports_multi_node_candidate_execution_count() {
+    // Every other execution test runs a single-system candidate, so
+    // `DynamicComplete.nodes_executed` is only ever observed as 1. A candidate
+    // with two chained systems must report 2 — proving the count reflects real
+    // interior traversal rather than a fixed value.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut multi = Graph::new();
+    multi.add_boxed_system(Box::new(Multiply {
+        factor: 10,
+        recorder: Arc::clone(&recorder),
+    }));
+    multi.add_boxed_system(Box::new(Multiply {
+        factor: 100,
+        recorder: Arc::clone(&recorder),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "route",
+        |_ctx| Arc::from("multi"),
+        [("multi", multi)],
+        DynamicSlot::new(contract(), ContextPolicy::shared()),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let events: Arc<Mutex<Vec<GraphEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let hooks = HooksAPI::new();
+    let complete_log = Arc::clone(&events);
+    hooks
+        .register_observer::<OnDynamicComplete, _>("rec_complete", move |event: &GraphEvent| {
+            complete_log.lock().unwrap().push(event.clone());
+        })
+        .expect("hook registration should succeed");
+
+    let mut ctx = SystemContext::new().with(Base { n: 3 });
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, Some(&hooks), None)
+        .await
+        .expect("dynamic execution should succeed");
+
+    // Both interior systems ran, in order.
+    assert_eq!(*recorder.lock().unwrap(), vec![30, 300]);
+
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "expected a single DynamicComplete, got {events:?}"
+    );
+    assert!(
+        matches!(
+            &events[0],
+            GraphEvent::DynamicComplete {
+                node_name: "route",
+                nodes_executed: 2,
+                selected,
+                ..
+            } if &**selected == "multi"
+        ),
+        "expected DynamicComplete selecting 'multi' with 2 nodes executed, got {:?}",
+        events[0]
     );
 }

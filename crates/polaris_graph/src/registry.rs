@@ -499,6 +499,30 @@ mod tests {
     }
 
     #[test]
+    fn remove_returns_the_evicted_candidate_then_none() {
+        let mut registry = SubgraphRegistry::new(contract());
+        registry.register("v1", candidate()).unwrap();
+
+        // Removing a present key hands back its graph — contract-compatible by
+        // construction — and clears the slot.
+        let evicted = registry
+            .remove("v1")
+            .expect("removing a present key yields its graph");
+        assert!(
+            evicted.signature().compatible_with(registry.contract()),
+            "the evicted graph is the one that was registered"
+        );
+        assert!(!registry.contains("v1"));
+
+        // Removing an absent key is a no-op that returns `None`.
+        assert!(
+            registry.remove("v1").is_none(),
+            "a second remove of the same key finds nothing"
+        );
+        assert!(registry.remove("never-registered").is_none());
+    }
+
+    #[test]
     fn register_rejects_handler_io_the_contract_never_sanctioned() {
         // The candidate's happy path matches the contract exactly, but its
         // error handler produces `u8` — IO that would merge back unchecked if
