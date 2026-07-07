@@ -37,6 +37,7 @@ use crate::hooks::events::{GraphEvent, RunId, RunLabels};
 use crate::hooks::schedule::{OnGraphComplete, OnGraphFailure, OnGraphStart, OnSystemStart};
 use crate::middleware::{self, MiddlewareAPI};
 use crate::node::{CandidateSource, ContextPolicy, CrossingAction, DynamicNode, Node, NodeId};
+use crate::registry::SubgraphRegistry;
 use hashbrown::HashSet;
 use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
@@ -451,6 +452,7 @@ impl GraphExecutor {
                 // outputs) against the same boundary.
                 Node::Dynamic(dynamic) => {
                     let policy = &dynamic.context_policy;
+                    Self::validate_dynamic_registry_source(dynamic, ctx, errors);
                     if policy.is_shared() {
                         Self::validate_dynamic_contract_requires(dynamic, ctx, errors);
                         if let CandidateSource::Inline(candidates) = &dynamic.source {
@@ -493,6 +495,28 @@ impl GraphExecutor {
         }
 
         self.validate_output_reachability(graph, hook_provided, errors);
+    }
+
+    /// Checks that registry-backed dynamic nodes can resolve their registry from
+    /// the context where selection runs.
+    ///
+    /// The dynamic node's own [`ContextPolicy`] governs only the selected
+    /// candidate. Selection and registry lookup happen in the node's current
+    /// graph context, so validation must use `ctx` directly rather than the child
+    /// context constructed for non-shared candidate execution.
+    fn validate_dynamic_registry_source(
+        dynamic: &DynamicNode,
+        ctx: &SystemContext<'_>,
+        errors: &mut Vec<ResourceValidationError>,
+    ) {
+        if matches!(&dynamic.source, CandidateSource::Registry { .. })
+            && !ctx.contains_resource_by_type_id(TypeId::of::<SubgraphRegistry>())
+        {
+            errors.push(ResourceValidationError::DynamicRegistryUnavailable {
+                node: dynamic.id.clone(),
+                node_name: dynamic.name,
+            });
+        }
     }
 
     /// Verifies that every per-resource crossing on a boundary policy can be
@@ -563,7 +587,11 @@ impl GraphExecutor {
         errors: &mut Vec<ResourceValidationError>,
     ) {
         for access in dynamic.contract().requires() {
-            if !ctx.contains_resource_by_type_id(access.type_id) {
+            let reachable = match access.mode {
+                AccessMode::Read => ctx.contains_resource_by_type_id(access.type_id),
+                AccessMode::Write => ctx.contains_local_resource_by_type_id(access.type_id),
+            };
+            if !reachable {
                 errors.push(ResourceValidationError::DynamicContractMissingResource {
                     node: dynamic.id.clone(),
                     node_name: dynamic.name,

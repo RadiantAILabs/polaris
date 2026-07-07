@@ -464,6 +464,23 @@ pub enum ResourceValidationError {
         /// The dynamic node's name.
         node_name: &'static str,
     },
+    /// A registry-backed dynamic node cannot reach a [`SubgraphRegistry`] from
+    /// the context where candidate selection will run.
+    ///
+    /// Registry lookup happens before the selected candidate enters the dynamic
+    /// node's own [`ContextPolicy`] boundary, so this validates the dynamic node's
+    /// execution context directly. If the registry lives in a parent scope hidden
+    /// by an enclosing boundary policy, it is treated as unavailable here and
+    /// execution would later surface [`ExecutionError::DynamicRegistryOutOfScope`].
+    ///
+    /// [`SubgraphRegistry`]: crate::registry::SubgraphRegistry
+    /// [`ContextPolicy`]: crate::node::ContextPolicy
+    DynamicRegistryUnavailable {
+        /// The dynamic node ID.
+        node: NodeId,
+        /// The dynamic node's name.
+        node_name: &'static str,
+    },
     /// Resource validation stopped descending because scope/dynamic nesting
     /// exceeded the executor's
     /// [`max_recursion_depth`](super::GraphExecutor::with_max_recursion_depth).
@@ -561,6 +578,12 @@ impl fmt::Display for ResourceValidationError {
                 write!(
                     f,
                     "dynamic node '{node_name}' ({node}) has a non-shared context policy but its slot contract requires free outputs, which cannot cross the boundary — use a shared policy or drop the required outputs"
+                )
+            }
+            ResourceValidationError::DynamicRegistryUnavailable { node, node_name } => {
+                write!(
+                    f,
+                    "registry-backed dynamic node '{node_name}' ({node}) requires a reachable SubgraphRegistry in its execution context"
                 )
             }
             ResourceValidationError::ValidationDepthExceeded { depth, max } => {

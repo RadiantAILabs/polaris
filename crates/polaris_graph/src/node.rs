@@ -192,9 +192,10 @@ impl Node {
     /// [`Arc`] rather than duplicated — it is immutable, so the clone and the
     /// original execute identically while remaining structurally independent.
     ///
-    /// A [`Scope`](Node::Scope) node's embedded graph is its own id namespace,
-    /// so it is recursively duplicated (minting its own fresh ids) and is
-    /// untouched by `map`.
+    /// A [`Scope`](Node::Scope) node's embedded graph and a
+    /// [`Dynamic`](Node::Dynamic) node's inline candidates each have their own id
+    /// namespaces, so they are recursively duplicated (minting their own fresh
+    /// ids) and are untouched by `map`.
     pub(crate) fn remap(&self, map: &HashMap<NodeId, NodeId>) -> Node {
         let id = remap_node_id(map, &self.id());
         match self {
@@ -241,14 +242,14 @@ impl Node {
                 graph: n.graph.duplicate(),
                 context_policy: n.context_policy.clone(),
             }),
-            // Selector and candidate set are immutable behavior/topology shared
-            // via `Arc`; `Inline` candidates keep their own id namespaces (like a
-            // scope's embedded graph), so `map` never touches them.
+            // Selector behavior is immutable and shared via `Arc`; inline
+            // candidate topology is owned by this node, so it is duplicated like
+            // a scope's embedded graph.
             Node::Dynamic(n) => Node::Dynamic(DynamicNode {
                 id,
                 name: n.name,
                 selector: Arc::clone(&n.selector),
-                source: n.source.clone(),
+                source: n.source.duplicate_owned_graphs(),
                 default: n.default.clone(),
                 contract: n.contract.clone(),
                 context_policy: n.context_policy.clone(),
@@ -1583,6 +1584,28 @@ pub enum CandidateSource {
         #[doc(hidden)]
         resource_type: TypeId,
     },
+}
+
+impl CandidateSource {
+    /// Duplicates candidate graphs owned by this source.
+    ///
+    /// Inline candidates are part of the owning graph's topology and therefore
+    /// receive fresh node/edge ids when the graph is duplicated. Registry
+    /// candidates live in a runtime resource, so the duplicated node keeps the
+    /// same registry source and resolves whatever the session resource contains.
+    pub(crate) fn duplicate_owned_graphs(&self) -> Self {
+        match self {
+            CandidateSource::Inline(candidates) => CandidateSource::Inline(
+                candidates
+                    .iter()
+                    .map(|(key, graph)| (Arc::clone(key), Arc::new(graph.duplicate())))
+                    .collect(),
+            ),
+            CandidateSource::Registry { resource_type } => CandidateSource::Registry {
+                resource_type: *resource_type,
+            },
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

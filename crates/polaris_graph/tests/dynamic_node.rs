@@ -11,10 +11,10 @@ use polaris_graph::executor::{ExecutionError, GraphExecutor, ResourceValidationE
 use polaris_graph::graph::{Graph, GraphSignature, ValidationError};
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::hooks::events::GraphEvent;
-use polaris_graph::hooks::schedule::{OnDynamicComplete, OnDynamicStart};
+use polaris_graph::hooks::schedule::{OnDynamicComplete, OnDynamicStart, OnGraphStart};
 use polaris_graph::middleware::MiddlewareAPI;
 use polaris_graph::middleware::info::DynamicInfo;
-use polaris_graph::node::{ContextMode, ContextPolicy, DynamicSlot};
+use polaris_graph::node::{CandidateSource, ContextMode, ContextPolicy, DynamicSlot, Node};
 use polaris_graph::registry::{RegistryError, SubgraphRegistry};
 use polaris_system::param::{AccessMode, SystemAccess, SystemContext};
 use polaris_system::resource::{ForkStrategy, LocalResource};
@@ -48,6 +48,11 @@ struct Choice {
     pick: &'static str,
 }
 impl LocalResource for Choice {}
+
+/// A hook-provided output type used to prove Dynamic contract validation credits
+/// output providers registered on graph/system start schedules.
+struct HookProvidedOutput;
+impl LocalResource for HookProvidedOutput {}
 
 /// A candidate system: reads [`Base`], records and returns `base.n * factor`.
 struct Multiply {
@@ -245,6 +250,10 @@ fn contract() -> GraphSignature {
     GraphSignature::new()
         .require_read::<Base>()
         .produce::<i32>()
+}
+
+fn registry_for_contract() -> SubgraphRegistry {
+    SubgraphRegistry::new(contract())
 }
 
 /// Selector reading the `Choice` resource; falls back to `"a"` if absent.
@@ -782,6 +791,34 @@ fn validate_resources_flags_contract_requires_missing_for_registry_slot() {
 }
 
 #[test]
+fn validate_resources_flags_missing_registry_for_registry_slot() {
+    // A registry-backed dynamic node uses `SubgraphRegistry` as framework input
+    // before candidate execution. Missing it is a graph wiring error that should
+    // surface in pre-flight validation rather than only at lookup time.
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("slot"),
+        DynamicSlot::new(GraphSignature::new(), ContextPolicy::shared()),
+    );
+
+    let ctx = SystemContext::new();
+    let errors = GraphExecutor::new()
+        .validate_resources(&graph, &ctx, None)
+        .expect_err("registry-backed node requires a reachable SubgraphRegistry");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::DynamicRegistryUnavailable {
+                node_name: "route",
+                ..
+            }
+        )),
+        "expected DynamicRegistryUnavailable, got {errors:?}"
+    );
+}
+
+#[test]
 fn validate_resources_flags_missing_require_write_resource() {
     // The `requires` axis carries an access mode: a slot contract declaring
     // `require_write::<Base>()` surfaces the same missing-resource error as a
@@ -828,7 +865,9 @@ fn validate_resources_checks_contract_requires_across_a_non_shared_boundary() {
         graph
     };
 
-    let with_base = SystemContext::new().with(Base { n: 1 });
+    let with_base = SystemContext::new()
+        .with(Base { n: 1 })
+        .with(registry_for_contract());
     assert!(
         GraphExecutor::new()
             .validate_resources(&build(), &with_base, None)
@@ -836,7 +875,7 @@ fn validate_resources_checks_contract_requires_across_a_non_shared_boundary() {
         "Base is reachable through the shared parent chain"
     );
 
-    let without_base = SystemContext::new();
+    let without_base = SystemContext::new().with(registry_for_contract());
     let errors = GraphExecutor::new()
         .validate_resources(&build(), &without_base, None)
         .expect_err("Base is not reachable, so the contract cannot be honored");
@@ -846,6 +885,61 @@ fn validate_resources_checks_contract_requires_across_a_non_shared_boundary() {
             ResourceValidationError::DynamicContractMissingResource { .. }
         )),
         "expected DynamicContractMissingResource, got {errors:?}"
+    );
+}
+
+#[test]
+fn validate_resources_requires_write_must_be_local_to_dynamic_boundary() {
+    // `require_write::<Base>()` models `ResMut<Base>`, whose lookup is
+    // current-scope only. A shared boundary uses the parent scope directly, and
+    // a `forward` policy populates the child scope, so both validate. A `share`
+    // policy only exposes `Base` through the parent chain, which is enough for
+    // `Res<Base>` but not `ResMut<Base>`.
+    let build = |policy| {
+        let mut graph = Graph::new();
+        graph.add_dynamic_registry(
+            "route",
+            |_ctx| Arc::from("slot"),
+            DynamicSlot::new(
+                GraphSignature::new()
+                    .require_write::<Base>()
+                    .produce::<i32>(),
+                policy,
+            ),
+        );
+        graph
+    };
+
+    let ctx = SystemContext::new()
+        .with(Base { n: 1 })
+        .with(SubgraphRegistry::new(
+            GraphSignature::new()
+                .require_write::<Base>()
+                .produce::<i32>(),
+        ));
+    assert!(
+        GraphExecutor::new()
+            .validate_resources(&build(ContextPolicy::shared()), &ctx, None)
+            .is_ok(),
+        "shared policy runs in the parent scope, where Base is local"
+    );
+    assert!(
+        GraphExecutor::new()
+            .validate_resources(&build(ContextPolicy::new().forward::<Base>()), &ctx, None)
+            .is_ok(),
+        "forward policy populates Base into the child scope"
+    );
+
+    let errors = GraphExecutor::new()
+        .validate_resources(&build(ContextPolicy::new().share::<Base>()), &ctx, None)
+        .expect_err("share exposes Base by parent-chain read only, not ResMut");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::DynamicContractMissingResource { resource, mode, .. }
+                if resource.contains("Base") && *mode == AccessMode::Write
+        )),
+        "expected DynamicContractMissingResource(Write) for shared parent-chain Base, got {errors:?}"
     );
 }
 
@@ -918,12 +1012,54 @@ fn validate_resources_accepts_required_output_produced_upstream() {
         ),
     );
 
-    let ctx = SystemContext::new();
+    let ctx = SystemContext::new().with(SubgraphRegistry::new(
+        GraphSignature::new().require_output::<i32>(),
+    ));
     assert!(
         GraphExecutor::new()
             .validate_resources(&graph, &ctx, None)
             .is_ok(),
         "the required output is produced by the upstream system"
+    );
+}
+
+#[test]
+fn validate_resources_accepts_dynamic_required_output_from_hook_provider() {
+    // Dynamic `requires_outputs` is satisfied by the same hook-provided output
+    // set that ordinary `Out<T>` validation consults.
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("slot"),
+        DynamicSlot::new(
+            GraphSignature::new().require_output::<HookProvidedOutput>(),
+            ContextPolicy::shared(),
+        ),
+    );
+
+    let ctx = SystemContext::new().with(SubgraphRegistry::new(
+        GraphSignature::new().require_output::<HookProvidedOutput>(),
+    ));
+    assert!(
+        GraphExecutor::new()
+            .validate_resources(&graph, &ctx, None)
+            .is_err(),
+        "without a provider, the required free output is missing"
+    );
+
+    let hooks = HooksAPI::new();
+    hooks
+        .register_provider::<OnGraphStart, HookProvidedOutput, _>(
+            "provide_dynamic_output",
+            |_event| Some(HookProvidedOutput),
+        )
+        .expect("hook registration should succeed");
+
+    assert!(
+        GraphExecutor::new()
+            .validate_resources(&graph, &ctx, Some(&hooks))
+            .is_ok(),
+        "hook-provided output should satisfy the dynamic slot's required output"
     );
 }
 
@@ -997,6 +1133,46 @@ async fn registry_falls_back_to_default_when_key_absent() {
 }
 
 #[tokio::test]
+async fn registry_default_key_also_absent_errors_on_the_default_key() {
+    // Registry source sibling of the inline default-miss test: the selector key
+    // misses, the configured default also misses, and the error names the
+    // unresolved default key.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("missing-selector-key"),
+        DynamicSlot::new(contract(), ContextPolicy::shared())
+            .with_default_key("missing-default-key"),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut registry = SubgraphRegistry::new(contract());
+    registry
+        .register("present", candidate(10, &recorder))
+        .unwrap();
+    let mut ctx = SystemContext::new().with(Base { n: 1 }).with(registry);
+
+    let err = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect_err("neither the selector key nor the default is present");
+    assert!(
+        matches!(
+            &err,
+            ExecutionError::DynamicCandidateNotFound { key, .. }
+                if &**key == "missing-default-key"
+        ),
+        "expected DynamicCandidateNotFound naming the unresolved default key, got {err:?}"
+    );
+    assert!(
+        recorder.lock().unwrap().is_empty(),
+        "no candidate may run after the failed lookup, got {:?}",
+        recorder.lock().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn registry_absent_from_context_errors() {
     let mut graph = Graph::new();
     graph.add_dynamic_registry(
@@ -1012,6 +1188,20 @@ async fn registry_absent_from_context_errors() {
     // misconfiguration for a registry-backed dynamic node. The error names the
     // real cause (missing registry) rather than a misleading candidate miss.
     let mut ctx = SystemContext::new().with(Base { n: 1 });
+    let validation_errors = GraphExecutor::new()
+        .validate_resources(&graph, &ctx, None)
+        .expect_err("pre-flight validation should catch the missing registry");
+    assert!(
+        validation_errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::DynamicRegistryUnavailable {
+                node_name: "route",
+                ..
+            }
+        )),
+        "expected DynamicRegistryUnavailable before execution, got {validation_errors:?}"
+    );
+
     let err = GraphExecutor::new()
         .execute(&graph, &mut ctx, None, None)
         .await
@@ -1039,6 +1229,20 @@ async fn registry_hidden_by_scope_policy_errors_out_of_scope() {
 
     let registry = SubgraphRegistry::new(GraphSignature::new());
     let mut ctx = SystemContext::new().with(registry);
+    let validation_errors = GraphExecutor::new()
+        .validate_resources(&graph, &ctx, None)
+        .expect_err("pre-flight validation should catch the hidden registry");
+    assert!(
+        validation_errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::DynamicRegistryUnavailable {
+                node_name: "route",
+                ..
+            }
+        )),
+        "expected DynamicRegistryUnavailable before execution, got {validation_errors:?}"
+    );
+
     let err = GraphExecutor::new()
         .execute(&graph, &mut ctx, None, None)
         .await
@@ -1281,6 +1485,7 @@ async fn dynamic_node_emits_start_and_complete_hooks() {
         ],
         DynamicSlot::new(contract(), ContextPolicy::shared()).with_default_key("a"),
     );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
 
     let events: Arc<Mutex<Vec<GraphEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let hooks = HooksAPI::new();
@@ -1350,6 +1555,7 @@ async fn dynamic_middleware_observes_info() {
         ],
         DynamicSlot::new(contract(), ContextPolicy::shared()).with_default_key("a"),
     );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
 
     let observed: Arc<Mutex<Option<DynamicInfo>>> = Arc::new(Mutex::new(None));
     let observed_clone = Arc::clone(&observed);
@@ -1393,6 +1599,7 @@ async fn dynamic_middleware_reports_no_count_for_registry_source() {
         |_ctx| Arc::from("slot"),
         DynamicSlot::new(contract(), ContextPolicy::shared()),
     );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
 
     let observed: Arc<Mutex<Option<DynamicInfo>>> = Arc::new(Mutex::new(None));
     let observed_clone = Arc::clone(&observed);
@@ -1428,6 +1635,30 @@ async fn dynamic_middleware_reports_no_count_for_registry_source() {
 // duplicate
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn inline_dynamic_candidate_node_ids(graph: &Graph) -> Vec<Vec<String>> {
+    let dynamic = graph
+        .nodes()
+        .iter()
+        .find_map(|node| match node {
+            Node::Dynamic(dynamic) if dynamic.name == "route" => Some(dynamic),
+            _ => None,
+        })
+        .expect("route dynamic node");
+    let CandidateSource::Inline(candidates) = dynamic.source() else {
+        panic!("route should use inline candidates");
+    };
+    candidates
+        .iter()
+        .map(|(_, candidate)| {
+            candidate
+                .nodes()
+                .iter()
+                .map(|node| node.id().as_str().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn duplicate_preserves_inline_dynamic_selection() {
     let recorder = Arc::new(Mutex::new(Vec::new()));
@@ -1445,8 +1676,8 @@ async fn duplicate_preserves_inline_dynamic_selection() {
     let clone = original.duplicate();
     assert!(clone.validate().is_ok(), "{:?}", clone.validate().errors);
 
-    // The clone mints a fresh node id but shares the selector and inline
-    // candidate set via `Arc`, so it selects and runs the same candidate.
+    // The clone mints a fresh node id, shares selector behavior, and duplicates
+    // owned inline candidate topology with fresh ids.
     let orig_id = original
         .nodes()
         .iter()
@@ -1463,6 +1694,26 @@ async fn duplicate_preserves_inline_dynamic_selection() {
         orig_id, clone_id,
         "duplicate must remap the dynamic node id"
     );
+    let orig_candidate_ids = inline_dynamic_candidate_node_ids(&original);
+    let clone_candidate_ids = inline_dynamic_candidate_node_ids(&clone);
+    assert_eq!(
+        orig_candidate_ids.len(),
+        clone_candidate_ids.len(),
+        "duplicate preserves the candidate set shape"
+    );
+    for (orig_ids, clone_ids) in orig_candidate_ids.iter().zip(&clone_candidate_ids) {
+        assert_eq!(
+            orig_ids.len(),
+            clone_ids.len(),
+            "duplicate preserves each candidate graph shape"
+        );
+        for (orig, cloned) in orig_ids.iter().zip(clone_ids) {
+            assert_ne!(
+                orig, cloned,
+                "inline candidate graph nodes should receive fresh ids"
+            );
+        }
+    }
 
     let mut ctx = SystemContext::new().with(Base { n: 3 });
     GraphExecutor::new()
@@ -1778,8 +2029,8 @@ async fn dynamic_failure_is_not_caught_by_a_parent_error_handler() {
     let dynamic_id = graph
         .nodes()
         .iter()
-        .find(|node| matches!(node, polaris_graph::node::Node::Dynamic(_)))
-        .map(polaris_graph::node::Node::id)
+        .find(|node| matches!(node, Node::Dynamic(_)))
+        .map(Node::id)
         .expect("the graph contains the dynamic node");
     graph.add_error_handler_for([dynamic_id], |g| {
         g.add_boxed_system(Box::new(Multiply {
@@ -1830,8 +2081,8 @@ async fn dynamic_timeout_is_not_caught_by_a_parent_timeout_handler() {
     let dynamic_id = graph
         .nodes()
         .iter()
-        .find(|node| matches!(node, polaris_graph::node::Node::Dynamic(_)))
-        .map(polaris_graph::node::Node::id)
+        .find(|node| matches!(node, Node::Dynamic(_)))
+        .map(Node::id)
         .expect("the graph contains the dynamic node");
     graph.add_timeout_handler([dynamic_id], |g| {
         g.add_boxed_system(Box::new(Multiply {

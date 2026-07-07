@@ -160,16 +160,17 @@ impl Graph {
     ///
     /// async fn reason() -> i32 { 1 }
     ///
-    /// # fn run() -> Option<()> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut graph = Graph::new();
     /// graph.add_system(reason);
     ///
-    /// let node = graph.find_node_by_name("reason")?;
+    /// let node = graph
+    ///     .find_node_by_name("reason")
+    ///     .ok_or_else(|| std::io::Error::other("missing reason node"))?;
     /// assert_eq!(node.name(), "reason");
     /// assert!(graph.find_node_by_name("missing").is_none());
-    /// # Some(())
+    /// # Ok(())
     /// # }
-    /// # run().unwrap();
     /// ```
     #[must_use]
     pub fn find_node_by_name(&self, name: &str) -> Option<&Node> {
@@ -238,16 +239,17 @@ impl Graph {
     ///
     /// async fn reason() -> i32 { 1 }
     ///
-    /// # fn run() -> Option<()> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut graph = Graph::new();
     /// graph.add_system(reason);
     ///
-    /// let (id, system) = graph.find_system_by_name("reason")?;
+    /// let (id, system) = graph
+    ///     .find_system_by_name("reason")
+    ///     .ok_or_else(|| std::io::Error::other("missing reason system"))?;
     /// assert_eq!(system.name(), "reason");
     /// assert!(graph.get_node(id).is_some());
-    /// # Some(())
+    /// # Ok(())
     /// # }
-    /// # run().unwrap();
     /// ```
     #[must_use]
     pub fn find_system_by_name(&self, name: &str) -> Option<(NodeId, &SystemNode)> {
