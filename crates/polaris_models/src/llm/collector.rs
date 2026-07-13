@@ -110,6 +110,7 @@ enum BlockAccumulator {
         arguments: String,
     },
     Reasoning {
+        id: Option<String>,
         text: String,
         signature: Option<String>,
     },
@@ -125,7 +126,8 @@ impl BlockAccumulator {
                 name,
                 arguments: String::new(),
             },
-            ContentBlockStartData::Reasoning => Self::Reasoning {
+            ContentBlockStartData::Reasoning { id } => Self::Reasoning {
+                id,
                 text: String::new(),
                 signature: None,
             },
@@ -194,11 +196,13 @@ impl BlockAccumulator {
                     additional_params: None,
                 }))
             }
-            Self::Reasoning { text, signature } => Ok(AssistantBlock::Reasoning(ReasoningBlock {
-                id: None,
-                reasoning: vec![text],
-                signature,
-            })),
+            Self::Reasoning { id, text, signature } => Ok(AssistantBlock::Reasoning(
+                ReasoningBlock {
+                    id,
+                    reasoning: vec![text],
+                    signature,
+                },
+            )),
         }
     }
 }
@@ -327,7 +331,7 @@ mod tests {
         let stream = EventStream(vec![
             Ok(StreamEvent::ContentBlockStart {
                 index: 0,
-                block: ContentBlockStartData::Reasoning,
+                block: ContentBlockStartData::Reasoning { id: None },
             }),
             Ok(StreamEvent::ContentBlockDelta {
                 index: 0,
@@ -350,11 +354,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_block_preserves_stream_id() {
+        let stream = EventStream(vec![
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStartData::Reasoning {
+                    id: Some("rs_test".into()),
+                },
+            }),
+            Ok(StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::Reasoning("plan".into()),
+            }),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
+            Ok(message_stop(StopReason::EndTurn, usage(1, 1))),
+        ]);
+
+        let response = stream.collect_response().await.expect("should succeed");
+
+        assert!(
+            matches!(
+                &response.content[0],
+                AssistantBlock::Reasoning(r) if r.id.as_deref() == Some("rs_test") && r.reasoning == vec!["plan"]
+            ),
+            "reasoning stream id should round-trip through collect_response"
+        );
+    }
+
+    #[tokio::test]
     async fn mixed_block_types() {
         let stream = EventStream(vec![
             Ok(StreamEvent::ContentBlockStart {
                 index: 0,
-                block: ContentBlockStartData::Reasoning,
+                block: ContentBlockStartData::Reasoning { id: None },
             }),
             Ok(StreamEvent::ContentBlockDelta {
                 index: 0,
@@ -642,7 +674,7 @@ mod tests {
         let stream = EventStream(vec![
             Ok(StreamEvent::ContentBlockStart {
                 index: 0,
-                block: ContentBlockStartData::Reasoning,
+                block: ContentBlockStartData::Reasoning { id: None },
             }),
             Ok(StreamEvent::ContentBlockStop { index: 0 }),
             Ok(message_stop(StopReason::EndTurn, usage(5, 0))),
@@ -689,7 +721,7 @@ mod tests {
             }),
             Ok(StreamEvent::ContentBlockStart {
                 index: 0,
-                block: ContentBlockStartData::Reasoning,
+                block: ContentBlockStartData::Reasoning { id: None },
             }),
         ]);
 

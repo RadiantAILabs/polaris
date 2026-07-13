@@ -209,7 +209,9 @@ impl<S> AnthropicStreamAdapter<S> {
                             name,
                         }
                     }
-                    StreamContentBlock::Thinking { .. } => ContentBlockStartData::Reasoning,
+                    StreamContentBlock::Thinking { .. } => {
+                        ContentBlockStartData::Reasoning { id: None }
+                    }
                     StreamContentBlock::RedactedThinking { .. } => {
                         self.filtered_indices.push(index);
                         return None;
@@ -879,7 +881,7 @@ mod tests {
         assert!(matches!(
             converted[0].as_ref().unwrap(),
             StreamEvent::ContentBlockStart {
-                block: ContentBlockStartData::Reasoning,
+                block: ContentBlockStartData::Reasoning { id: None },
                 ..
             }
         ));

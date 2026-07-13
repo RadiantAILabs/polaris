@@ -622,7 +622,7 @@ impl<S> OpenAiStreamAdapter<S> {
                     // ResponseOutputTextDelta on this content_index will silently
                     // no-op (get_block_index returns None).
                     OutputContent::Refusal(_) => return false,
-                    OutputContent::ReasoningText(_) => ContentBlockStartData::Reasoning,
+                    OutputContent::ReasoningText(_) => ContentBlockStartData::Reasoning { id: None },
                 };
                 let index = self.assign_block_index(event.output_index, event.content_index);
                 self.pending
@@ -706,7 +706,9 @@ impl<S> OpenAiStreamAdapter<S> {
                 let index = self.assign_block_index(event.output_index, event.summary_index);
                 self.pending.push_back(Ok(StreamEvent::ContentBlockStart {
                     index,
-                    block: ContentBlockStartData::Reasoning,
+                    block: ContentBlockStartData::Reasoning {
+                        id: Some(event.item_id.clone()),
+                    },
                 }));
                 true
             }
@@ -1352,7 +1354,7 @@ mod tests {
             converted[0].as_ref().unwrap(),
             StreamEvent::ContentBlockStart {
                 index: 0,
-                block: ContentBlockStartData::Reasoning
+                block: ContentBlockStartData::Reasoning { id: Some(id) } if id == "rs_1"
             }
         ));
         assert!(matches!(
@@ -1418,7 +1420,7 @@ mod tests {
             events[0].as_ref().unwrap(),
             StreamEvent::ContentBlockStart {
                 index: 0,
-                block: ContentBlockStartData::Reasoning
+                block: ContentBlockStartData::Reasoning { id: Some(id) } if id == "rs_1"
             }
         ));
         // Text gets index 1

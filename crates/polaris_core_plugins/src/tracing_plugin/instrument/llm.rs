@@ -382,7 +382,7 @@ impl StreamOutputAccumulator {
                         arguments: String::new(),
                     });
                 }
-                ContentBlockStartData::Reasoning => {
+                ContentBlockStartData::Reasoning { .. } => {
                     self.blocks.push(PartialBlock::Reasoning(String::new()));
                 }
             },
@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn accumulator_reconstructs_reasoning_across_deltas() {
         let blocks = accumulate(&[
-            block_start(0, ContentBlockStartData::Reasoning),
+            block_start(0, ContentBlockStartData::Reasoning { id: None }),
             block_delta(0, ContentBlockDelta::Reasoning("Let me ".to_string())),
             block_delta(0, ContentBlockDelta::Reasoning("think.".to_string())),
         ]);

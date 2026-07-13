@@ -863,7 +863,10 @@ pub enum ContentBlockStartData {
         name: String,
     },
     /// A reasoning/thinking block.
-    Reasoning,
+    Reasoning {
+        /// Provider-assigned item id (e.g. OpenAI `rs_*`). `None` when unavailable.
+        id: Option<String>,
+    },
 }
 
 /// An incremental content block payload.
