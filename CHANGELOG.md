@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Minimum supported Rust version increased from 1.93.0 to 1.97.0.** Contributors and downstream users must use Rust 1.97.0 or newer.
+
 ## [0.5.2] - 2026-07-06
 
 Runtime subgraph selection and graph duplication. A new `Dynamic` node picks among signature-checked candidate subgraphs at runtime — from a build-time inline set or a swappable per-session registry — and runs the chosen one through a `ContextPolicy` boundary like a scope. `Graph::duplicate()` produces a structurally independent copy of a graph for the duplicate-and-modify workflow. To support sharing immutable behavior across a copy, node payloads move from `Box` to `Arc` (source-breaking only for code that constructs node structs via field literals).

@@ -113,9 +113,8 @@ Map `LlmRequest` (provider-agnostic) to your vendor's request shape, call the AP
 ### 2. Plugin Wiring
 
 ```rust
-use polaris_models::{ModelRegistry, ModelsPlugin};
-use polaris_system::plugin::{Plugin, PluginId, Version};
-use polaris_system::server::Server;
+use polaris_models::ModelRegistry;
+use polaris_system::plugin::{self, Extends, Plugin};
 
 pub struct MyProviderPlugin {
     api_key: String,
@@ -130,19 +129,10 @@ impl MyProviderPlugin {
     }
 }
 
+#[plugin(id = "my_crate::provider::myprovider", version = "0.0.1")]
 impl Plugin for MyProviderPlugin {
-    const ID: &'static str = "my_crate::provider::myprovider";
-    const VERSION: Version = Version::new(0, 0, 1);
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<ModelsPlugin>()]
-    }
-
-    fn build(&self, server: &mut Server) {
+    fn build(&self, mut registry: Extends<ModelRegistry>) {
         let provider = MyProvider::new(self.api_key.clone());
-        let mut registry = server
-            .get_resource_mut::<ModelRegistry>()
-            .expect("ModelsPlugin must be registered before MyProviderPlugin");
         registry.register_llm_provider(provider);
     }
 }
@@ -150,7 +140,7 @@ impl Plugin for MyProviderPlugin {
 
 Key rules:
 
-- **Declare `ModelsPlugin` as a dependency.** The dependency graph ensures `ModelsPlugin::build()` runs first, so `ModelRegistry` exists when `MyProviderPlugin::build()` runs.
+- **Declare `Extends<ModelRegistry>` in `build()`.** The `#[plugin]` macro derives the capability relationship, and the resolver verifies that a compatible provider such as `ModelsPlugin` exists and orders it before this plugin.
 - **Register in `build()`, not `ready()`.** `ModelsPlugin` freezes the registry into a `GlobalResource` during its own `ready()`, so any provider registration must complete during the build phase.
 - **Do not register twice.** `register_llm_provider` panics on duplicate provider names.
 

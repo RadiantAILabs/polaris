@@ -95,8 +95,8 @@ hands per-iteration state to a loop body without polluting the surrounding
 session.
 
 The full resolution rules — including how `Parallel` nodes fork contexts and
-how `Scope` nodes choose between inherit / fresh / hybrid modes — are
-documented in [context.md](./context.md#resource-lookup-order).
+how `Scope` and `Dynamic` nodes apply per-resource `ContextPolicy` crossing
+verbs — are documented in [context.md](./context.md#resource-lookup-order).
 
 ## Documentation Standard
 
