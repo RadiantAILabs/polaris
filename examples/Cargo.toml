@@ -3,7 +3,7 @@ name = "examples"
 version = "0.0.1"
 edition = "2024"
 repository = "https://github.com/RadiantAILabs/polaris"
-rust-version = "1.93.0"
+rust-version = "1.97.0"
 publish = false
 
 [features]

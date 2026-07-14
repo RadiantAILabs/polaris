@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/polaris-ai.svg)](https://crates.io/crates/polaris-ai)
 [![docs.rs](https://docs.rs/polaris-ai/badge.svg)](https://docs.rs/polaris-ai)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/rust-1.93.0%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.97.0%2B-orange.svg)](https://www.rust-lang.org/)
 
 > **Alpha** — Core APIs are stabilizing but may change between releases. See [Project Status](#project-status).
 
@@ -67,11 +67,15 @@ See [`examples`](examples/README.md) for a full implementation of a file assista
 polaris-ai = "0.4.1"
 ```
 
-Requires **Rust 1.93.0+** (Edition 2024). Run `cargo make test` for the full test suite.
+Requires **Rust 1.97.0+** (Edition 2024). Run `cargo make test` for the full test suite.
 
 ## Documentation
 
 Architecture, design patterns, and API reference are available in the [docs](docs/README.md) directory.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the pull request workflow. Use the [Pull Request Review Standards](docs/contributing/review-standards.md) to self-review architecture, APIs, tests, documentation, and security before submitting a change.
 
 ## Project Status
 
@@ -83,7 +87,7 @@ Architecture, design patterns, and API reference are available in the [docs](doc
 | Model Registry and Providers | **Implemented** |
 | Tool Registry | **Implemented** |
 | IO Plugin | **Implemented** |
-| Agent Plugins | **Implemented** |
+| Agent Plugins | **Example available** — ReAct lives in `examples/`; concrete agent-pattern plugins are downstream |
 | Sessions, Groups, CLI/HTTP Interfaces | **Implemented** |
 
 ## License

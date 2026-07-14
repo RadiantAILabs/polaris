@@ -5,6 +5,11 @@
 - [**Philosophy**](./philosophy.md) — Design rationale behind Polaris
 - [**Taxonomy**](./taxonomy.md) — Overview of the layered architecture
 
+## Contributing
+
+- [**Contributor Guide**](../CONTRIBUTING.md) — Development setup, implementation standards, and pull request workflow
+- [**Pull Request Review Standards**](./contributing/review-standards.md) — Public architecture, API, test, documentation, and security review checklist
+
 ## Reference
 
 - [**Systems**](./reference/system.md) — Systems, parameters, and the `#[system]` macro

@@ -32,7 +32,7 @@ version = "0.5.2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris"
-rust-version = "1.93.0"
+rust-version = "1.97.0"
 
 [workspace.dependencies]
 ts-rs = "12"
