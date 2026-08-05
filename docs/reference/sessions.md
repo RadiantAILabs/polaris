@@ -32,13 +32,48 @@ Before creating sessions, register agent types:
 sessions.register_agent(MyReActAgent)?;
 ```
 
-Registration validates the agent's graph at registration time. Structural errors return `SessionError::GraphValidation`. Warnings are logged but do not prevent registration.
+Registration validates the agent's graph at registration time. Structural errors return `SessionError::GraphValidation`. Warnings are logged but do not prevent registration. The graph built for validation is also used to cache the agent's `GraphSignature`, so signature reads (contract satisfaction, the authenticated agent-type details endpoint) never rebuild it.
 
 ```rust
 // Query registered agents
 let agents: Vec<&str> = sessions.registered_agents();
 let agent_type: Option<AgentTypeId> = sessions.find_agent_type("react");
+let signature: Option<GraphSignature> = sessions.agent_signature("react");
 ```
+
+## Capability Contracts
+
+A **capability contract** is a slot `GraphSignature` registered under a well-known name. It answers a question no out-of-process caller can answer soundly on its own — "which registered agents can do X?" — because signature matching compares `TypeId`s, which do not unify across separately compiled binaries. The check therefore runs in the server process: consumers register named contracts, the sessions layer matches each agent's cached signature against them, and satisfied contract names are advertised per agent only on trusted surfaces (in-process via `agent_type_infos()`, over HTTP via authenticated [`GET /v1/sessions/agent-types/details`](./http.md)). Remote callers with access to that private route filter on the advertised capability and pick by name, never re-implementing the check.
+
+Contract names are validated coordination keys: they must be non-empty, have no leading or trailing whitespace, and contain no control characters. Use `ContractName::new` when constructing one directly; `register_contract` and `contract_diff` validate string inputs automatically.
+
+```rust
+use polaris_ai::graph::GraphSignature;
+
+// The plugin that defines a capability registers its contract…
+sessions.register_contract(
+    "self-learn",
+    GraphSignature::new().require_read::<TraceLine>().produce::<Triples>(),
+)?;
+
+// …and asserts at startup that its own agent satisfies it.
+let diff = sessions.contract_diff("self-learn", "ExtractionAgent")?;
+assert!(diff.is_empty(), "agent drifted from its contract: {diff}");
+
+// Any consumer can snapshot every agent with its satisfied contracts.
+for info in sessions.agent_type_infos() {
+    println!("{}: {:?} — {}", info.name, info.contracts, info.signature);
+}
+```
+
+Matching uses `GraphSignature::satisfies` — **subsumption**, not the exact-set `compatible_with` used for `Dynamic` slot substitution (see [Graph — Dynamic](./graph.md#dynamic)). An agent's extra `requires` are presumed environment-provided by its registrant's setup (conservative derivation reports self-inserted resources as required), and extra `produces` merge back harmlessly; only a free-output read the slot never sanctioned disqualifies. The residual risk is deliberate: an agent whose extra requires nothing actually provides still advertises the contract and fails loudly on first turn — the same honor-system boundary as declared access generally.
+
+Behavioral notes:
+
+- **No contract is registered by default** — the registry is consumer-supplied, like `SubgraphRegistry`.
+- **Order never matters.** Satisfaction is computed at read time from signatures cached at `register_agent`, so agents and contracts can be registered in either order and nothing re-evaluates on registration events.
+- **Names are coordination points.** Re-registering a name with an identical signature is a no-op; a different signature returns `SessionError::ContractConflict` rather than silently redefining another plugin's capability.
+- The term collides with `polaris_system::plugin::Contract` (the plugin-capability version marker); a capability contract here is a graph-interface slot signature, the same sense in which `Dynamic` slots call their signatures contracts.
 
 ## Session Lifecycle
 
@@ -315,6 +350,9 @@ Each session holds:
 | `SessionError::Execution` | Graph execution failed |
 | `SessionError::Setup` | Agent `setup()` returned error |
 | `SessionError::OutputNotFound` | `run_oneshot` graph completed but didn't produce expected type |
+| `SessionError::ContractNotFound` | Named capability contract not registered |
+| `SessionError::ContractConflict` | `register_contract` reused an existing name with a different signature |
+| `SessionError::InvalidContractName` | Contract name was empty or not normalized |
 
 ## Key Files
 

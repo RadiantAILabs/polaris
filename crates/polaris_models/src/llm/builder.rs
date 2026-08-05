@@ -52,6 +52,8 @@ pub struct LlmRequestBuilder<'a, S = Empty> {
     llm: &'a Llm,
     tools: Vec<ToolDefinition>,
     system: Option<String>,
+    system_prompt_name: Option<String>,
+    system_prompt_version: Option<String>,
     messages: Vec<Message>,
     tool_choice: Option<ToolChoice>,
     cache: CacheControl,
@@ -82,6 +84,26 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
     #[must_use]
     pub fn system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
+        self
+    }
+
+    /// Names the system prompt variant in use, for observability.
+    ///
+    /// It is recommended to use a short name that does not contain PII as this field
+    /// may appear in logs and traces.
+    #[must_use]
+    pub fn system_prompt_name(mut self, name: impl Into<String>) -> Self {
+        self.system_prompt_name = Some(name.into());
+        self
+    }
+
+    /// Versions the system prompt variant in use, for observability.
+    ///
+    /// It is recommended to use a short version label that does not contain PII
+    /// as this field may appear in logs and traces.
+    #[must_use]
+    pub fn system_prompt_version(mut self, version: impl Into<String>) -> Self {
+        self.system_prompt_version = Some(version.into());
         self
     }
 
@@ -168,6 +190,8 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
             llm: self.llm,
             tools: self.tools,
             system: self.system,
+            system_prompt_name: self.system_prompt_name,
+            system_prompt_version: self.system_prompt_version,
             messages: self.messages,
             tool_choice: self.tool_choice,
             cache: self.cache,
@@ -217,6 +241,8 @@ impl<'a> LlmRequestBuilder<'a, Ready> {
 
         let request = LlmRequest {
             system: self.system,
+            system_prompt_name: self.system_prompt_name,
+            system_prompt_version: self.system_prompt_version,
             messages: self.messages,
             tools,
             tool_choice: self.tool_choice,
@@ -277,6 +303,8 @@ impl<'a> LlmRequestBuilder<'a, Empty> {
             llm,
             tools: Vec::new(),
             system: None,
+            system_prompt_name: None,
+            system_prompt_version: None,
             messages: Vec::new(),
             tool_choice: None,
             cache: CacheControl::default(),
@@ -467,6 +495,58 @@ mod tests {
         assert_eq!(response.text(), "ok");
     }
 
+    /// Mock provider that runs `assert` against every request it receives,
+    /// letting a test parameterize only the expectation over a shared response.
+    struct AssertingProvider<F>(F);
+
+    impl<F: Fn(&LlmRequest) + Send + Sync + 'static> crate::llm::provider::LlmProvider
+        for AssertingProvider<F>
+    {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn generate(
+            &self,
+            _model: &str,
+            request: LlmRequest,
+        ) -> Result<LlmResponse, GenerationError> {
+            (self.0)(&request);
+            Ok(LlmResponse {
+                content: vec![AssistantBlock::Text("ok".into())],
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                id: None,
+                model: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_passes_system_prompt_name_and_version() {
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(AssertingProvider(|request: &LlmRequest| {
+            assert_eq!(
+                request.system_prompt_name.as_deref(),
+                Some("greeting"),
+                "system_prompt_name() should populate the request's system_prompt_name"
+            );
+            assert_eq!(
+                request.system_prompt_version.as_deref(),
+                Some("v3"),
+                "system_prompt_version() should populate the request's system_prompt_version"
+            );
+        }));
+        let llm = registry.llm("mock/test").unwrap();
+        llm.builder()
+            .system_prompt_name("greeting")
+            .system_prompt_version("v3")
+            .user("Hi")
+            .generate()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn send_without_tools_sets_none() {
         struct MockProvider;
@@ -617,6 +697,8 @@ mod tests {
         // Test Llm::stream() directly
         let request = LlmRequest {
             system: None,
+            system_prompt_name: None,
+            system_prompt_version: None,
             messages: vec![Message::user("Hello stream")],
             tools: None,
             tool_choice: None,

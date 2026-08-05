@@ -46,7 +46,7 @@ pub mod store;
 #[cfg(feature = "sessions-http")]
 mod uptime;
 
-pub use api::{SessionsAPI, SessionsPlugin};
+pub use api::{AgentTypeInfo, ContractName, ContractNameError, SessionsAPI, SessionsPlugin};
 pub use error::{SessionError, WiringError};
 pub use guard::SessionGuard;
 #[cfg(feature = "sessions-http")]
@@ -62,7 +62,9 @@ pub use store::file::FileStore;
 pub mod prelude {
     pub use polaris_system::system::BoxFuture;
 
-    pub use crate::api::{SessionsAPI, SessionsPlugin};
+    pub use crate::api::{
+        AgentTypeInfo, ContractName, ContractNameError, SessionsAPI, SessionsPlugin,
+    };
     pub use crate::error::{SessionError, WiringError};
     pub use crate::guard::SessionGuard;
     pub use crate::info::{SessionInfo, SessionMetadata, SessionStatus};

@@ -9,13 +9,21 @@ The `polaris_agent` crate defines a minimal abstraction for defining reusable ag
 
 ## Overview
 
-The `Agent` trait has two required methods (`build` and `name`) and two optional methods (`setup` and `to_graph`):
+The `Agent` trait has two required methods (`build` and `name`) and four optional methods (`version`, `description`, `setup`, and `to_graph`):
 
 ```rust
 pub trait Agent: Send + Sync + 'static {
     fn build(&self, graph: &mut Graph);
 
     fn name(&self) -> &'static str;
+
+    fn version(&self) -> Option<&str> {
+        None // default: no version
+    }
+
+    fn description(&self) -> Option<&str> {
+        None // default: no description
+    }
 
     fn setup(&self, _ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
         Ok(()) // default no-op
@@ -30,7 +38,9 @@ pub trait Agent: Send + Sync + 'static {
 ```
 
 - **`build`** — Populates a `Graph` with systems and control flow. Called once when the agent is registered.
-- **`name`** — Returns a stable, user-defined name for this agent type.
+- **`name`** — Returns a stable, user-defined name for this agent type. Emitted in logs and traces and therefore should not contain PII.
+- **`version`** — Optional agent version. Emitted in logs and traces and therefore should not contain PII.
+- **`description`** — Optional human-readable description of the agent's purpose. Emitted in logs and traces and therefore should not contain PII.
 - **`setup`** — Initializes session resources before the first turn. Called automatically by the sessions layer during session creation and resume. The default is a no-op.
 - **`to_graph`** — Convenience method that creates a new `Graph` and passes it to `build`.
 

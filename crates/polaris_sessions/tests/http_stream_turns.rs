@@ -119,6 +119,28 @@ impl Agent for EmitThenFailAgent {
     }
 }
 
+#[system]
+async fn emit_burst(io: Res<UserIO>) {
+    let _ = io.receive().await.expect("should receive a message");
+    for index in 0..300 {
+        io.send(IOMessage::system_text(format!("burst-{index}")))
+            .await
+            .expect("should send burst message");
+    }
+}
+
+struct BurstAgent;
+
+impl Agent for BurstAgent {
+    fn build(&self, graph: &mut Graph) {
+        graph.add_system(emit_burst);
+    }
+
+    fn name(&self) -> &'static str {
+        "BurstAgent"
+    }
+}
+
 /// Binds to an ephemeral port and returns the listener with its port.
 async fn bind_ephemeral() -> (tokio::net::TcpListener, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -167,6 +189,7 @@ async fn test_server(listener: tokio::net::TcpListener, port: u16) -> Server {
     sessions.register_agent(BlockingAgent).unwrap();
     sessions.register_agent(FailingAgent).unwrap();
     sessions.register_agent(EmitThenFailAgent).unwrap();
+    sessions.register_agent(BurstAgent).unwrap();
 
     server
 }
@@ -288,6 +311,45 @@ async fn stream_turn_echo() {
         "expected nodes_executed > 0"
     );
     assert_eq!(done_data["execution"]["turn_number"], 1);
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+async fn stream_turn_bounds_retained_history_without_truncating_sse() {
+    let (listener, port) = bind_ephemeral().await;
+    let mut server = test_server(listener, port).await;
+    wait_for_server(port).await;
+
+    let session_id = create_session(port, "BurstAgent").await;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/v1/sessions/{session_id}/turns/stream"
+        ))
+        .json(&serde_json::json!({ "message": "go" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let frames = parse_sse_frames(&response.text().await.unwrap());
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.event == "system")
+            .count(),
+        300,
+        "history limits must not truncate the live SSE response"
+    );
+    assert_eq!(frames.last().unwrap().event, "done");
+
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    let session_id = polaris_sessions::store::SessionId::from_string(session_id);
+    let summary = sessions.turn_history(&session_id, true).unwrap().remove(0);
+    assert_eq!(summary.io_message_count, 300);
+    assert_eq!(summary.messages.unwrap().len(), 256);
+    assert!(summary.messages_truncated);
+    assert_eq!(summary.last_message_preview.as_deref(), Some("burst-299"));
 
     server.cleanup().await;
 }

@@ -10,6 +10,26 @@
 //! with it — so composition stays sound even when the concrete subgraph is
 //! chosen (or swapped) at runtime.
 //!
+//! # Two comparison semantics
+//!
+//! Signatures are compared under two relations, each named for its soundness
+//! envelope:
+//!
+//! - [`compatible_with`](GraphSignature::compatible_with) — **exact-set
+//!   match**, used for [`Dynamic`](crate::node::Node::Dynamic) slot
+//!   substitution, where the parent graph was validated against the slot's
+//!   precise interface and any divergence could break it.
+//! - [`satisfies`](GraphSignature::satisfies) — **subsumption**, used for
+//!   capability matching (e.g. a sessions contract registry asking "is this
+//!   agent a knowledge accumulator?"): the candidate may require *more* than
+//!   the slot names (extra requires are presumed environment-provided by the
+//!   registrant's setup) and produce *more* (extra outputs merge back
+//!   harmlessly), but may not read free outputs the slot never sanctioned.
+//!
+//! Each relation ships with a lockstep diff mode ([`diff`](GraphSignature::diff)
+//! / [`satisfies_diff`](GraphSignature::satisfies_diff)) so a rejection reads
+//! as an edit rather than a puzzle.
+//!
 //! # Conservative resource handling (v1)
 //!
 //! [`Graph::signature`] aggregates each system's declared [`SystemAccess`]. It
@@ -179,6 +199,35 @@ impl GraphSignature {
         &self.produces
     }
 
+    /// Converts the signature into human-readable type-name strings.
+    ///
+    /// Each axis is rendered in parameter terms — `Res<T>` / `ResMut<T>` for
+    /// resources, `Out<T>` for outputs — in canonical (sorted, deduplicated)
+    /// order. See [`RenderedSignature`] for why the result is display-only
+    /// and deliberately not convertible back into a `GraphSignature`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_graph::GraphSignature;
+    ///
+    /// let rendered = GraphSignature::new()
+    ///     .require_read::<u8>()
+    ///     .produce::<u16>()
+    ///     .to_rendered();
+    ///
+    /// assert_eq!(rendered.requires, vec!["Res<u8>"]);
+    /// assert_eq!(rendered.produces, vec!["Out<u16>"]);
+    /// ```
+    #[must_use]
+    pub fn to_rendered(&self) -> RenderedSignature {
+        RenderedSignature {
+            requires: self.requires.iter().map(render_resource).collect(),
+            requires_outputs: self.requires_outputs.iter().map(render_output).collect(),
+            produces: self.produces.iter().map(render_output).collect(),
+        }
+    }
+
     /// Returns `true` if a candidate carrying `self` may fill a slot declaring
     /// `slot`.
     ///
@@ -197,11 +246,106 @@ impl GraphSignature {
     /// load-bearing invariant (asserted in tests): a future variance relaxation
     /// (accept a subset of `requires`, a superset of `produces`) must relax both
     /// in lockstep so the error messages stay correct.
+    ///
+    /// For capability matching — where a candidate carrying *more* than the
+    /// slot names should still qualify — use [`satisfies`](Self::satisfies)
+    /// instead; the two relations are deliberately separate, each named for
+    /// its soundness envelope.
     #[must_use]
     pub fn compatible_with(&self, slot: &GraphSignature) -> bool {
         self.requires == slot.requires
-            && self.requires_outputs == slot.requires_outputs
+            && access_types_equal(&self.requires_outputs, &slot.requires_outputs)
             && self.produces == slot.produces
+    }
+
+    /// Returns `true` if a candidate carrying `self` **satisfies** a `slot`
+    /// contract by subsumption.
+    ///
+    /// Unlike the exact-set [`compatible_with`](Self::compatible_with) (used
+    /// for [`Dynamic`](crate::node::Node::Dynamic) slot substitution), this is
+    /// the *capability* relation: it asks whether the candidate can do at
+    /// least what the slot describes, in an environment its registrant
+    /// controls. Per axis:
+    ///
+    /// - the slot's `requires` must be a **subset** of the candidate's —
+    ///   extra candidate requires are presumed environment-provided (e.g. a
+    ///   resource the agent's own `setup` inserts, which conservative
+    ///   derivation still reports as required);
+    /// - the candidate's `requires_outputs` must not exceed the slot's — a
+    ///   free `Out<T>` read the slot never sanctioned would dangle at runtime;
+    /// - the slot's `produces` must be a **subset** of the candidate's —
+    ///   extra candidate outputs merge back harmlessly.
+    ///
+    /// Subsumption trusts the registrant's environment claim: a candidate
+    /// whose extra `requires` nothing actually provides still satisfies the
+    /// slot here and fails loudly on first execution — the same honor-system
+    /// boundary as declared access generally.
+    ///
+    /// The `satisfies` ⇔ empty-[`satisfies_diff`](Self::satisfies_diff)
+    /// equivalence is a load-bearing invariant (asserted in tests), mirroring
+    /// the [`compatible_with`](Self::compatible_with) ⇔ [`diff`](Self::diff)
+    /// lockstep: any relaxation must move both in step so error messages stay
+    /// correct.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_graph::GraphSignature;
+    ///
+    /// let contract = GraphSignature::new()
+    ///     .require_read::<u8>()
+    ///     .produce::<u16>();
+    /// let candidate = GraphSignature::new()
+    ///     .require_read::<u8>()
+    ///     .require_read::<u32>()
+    ///     .produce::<u16>()
+    ///     .produce::<u64>();
+    ///
+    /// assert!(candidate.satisfies(&contract));
+    /// ```
+    #[must_use]
+    pub fn satisfies(&self, slot: &GraphSignature) -> bool {
+        is_subset(&slot.requires, &self.requires)
+            && is_type_subset(&self.requires_outputs, &slot.requires_outputs)
+            && is_subset(&slot.produces, &self.produces)
+    }
+
+    /// Computes the subsumption violations between this candidate signature
+    /// and a `slot` contract — the diff mode of [`satisfies`](Self::satisfies).
+    ///
+    /// Only the directions that *violate* subsumption are populated:
+    /// `missing_requires` (slot requires the candidate lacks),
+    /// `extra_requires_outputs` (free output reads the slot never
+    /// sanctioned), and `missing_produces` (slot outputs the candidate does
+    /// not produce). Divergence the relation permits — extra requires, fewer
+    /// free output reads, extra produces — never appears. An empty diff means
+    /// the candidate [satisfies](Self::satisfies) the slot.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_graph::GraphSignature;
+    ///
+    /// let contract = GraphSignature::new().produce::<u16>();
+    /// let candidate = GraphSignature::new();
+    ///
+    /// let diff = candidate.satisfies_diff(&contract);
+    /// assert!(!diff.is_empty());
+    /// assert_eq!(diff.missing_produces().len(), 1);
+    /// ```
+    #[must_use]
+    pub fn satisfies_diff(&self, slot: &GraphSignature) -> SignatureDiff {
+        SignatureDiff {
+            missing_requires: access_difference(&slot.requires, &self.requires),
+            extra_requires: Vec::new(),
+            missing_requires_outputs: Vec::new(),
+            extra_requires_outputs: access_type_difference(
+                &self.requires_outputs,
+                &slot.requires_outputs,
+            ),
+            missing_produces: access_difference(&slot.produces, &self.produces),
+            extra_produces: Vec::new(),
+        }
     }
 
     /// Computes the per-axis difference between this candidate signature and a
@@ -217,11 +361,11 @@ impl GraphSignature {
         SignatureDiff {
             missing_requires: access_difference(&slot.requires, &self.requires),
             extra_requires: access_difference(&self.requires, &slot.requires),
-            missing_requires_outputs: access_difference(
+            missing_requires_outputs: access_type_difference(
                 &slot.requires_outputs,
                 &self.requires_outputs,
             ),
-            extra_requires_outputs: access_difference(
+            extra_requires_outputs: access_type_difference(
                 &self.requires_outputs,
                 &slot.requires_outputs,
             ),
@@ -231,8 +375,52 @@ impl GraphSignature {
     }
 }
 
+impl fmt::Display for GraphSignature {
+    /// Renders the full interface on one line, all three axes in canonical
+    /// order — e.g. `requires: [Res<TraceLine>]; requires_outputs: [];
+    /// produces: [Out<Triples>]`. The same advisory-only caveats as
+    /// [`to_rendered`](GraphSignature::to_rendered) apply.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "requires: [{}]; requires_outputs: [{}]; produces: [{}]",
+            render_list(&self.requires, render_resource),
+            render_list(&self.requires_outputs, render_output),
+            render_list(&self.produces, render_output),
+        )
+    }
+}
+
+/// A human-readable rendering of a [`GraphSignature`], produced by
+/// [`GraphSignature::to_rendered`].
+///
+/// Each axis holds rendered type-name strings in parameter terms —
+/// `Res<T>` / `ResMut<T>` for resources, `Out<T>` for outputs.
+///
+/// This form is **advisory and display-only, by construction**: it carries no
+/// `TypeId`s, so it cannot be turned back into a `GraphSignature` and cannot
+/// participate in [`compatible_with`](GraphSignature::compatible_with) /
+/// [`satisfies`](GraphSignature::satisfies) — equality and compatibility
+/// checks stay in-process, on the typed signature. That is deliberate:
+/// type-name strings do not unify across separately compiled binaries, so a
+/// wire form built from them must not masquerade as a checkable contract.
+/// The rendered text is also unstable — [`std::any::type_name`] makes no
+/// format guarantee — so treat it as documentation for humans, never parse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderedSignature {
+    /// Rendered `requires` axis (`Res<T>` / `ResMut<T>` entries).
+    pub requires: Vec<String>,
+    /// Rendered `requires_outputs` axis (`Out<T>` entries).
+    pub requires_outputs: Vec<String>,
+    /// Rendered `produces` axis (`Out<T>` entries).
+    pub produces: Vec<String>,
+}
+
 /// The per-axis difference between a candidate [`GraphSignature`] and a slot
-/// contract, as computed by [`GraphSignature::diff`].
+/// contract, as computed by [`GraphSignature::diff`] (exact-match mode) or
+/// [`GraphSignature::satisfies_diff`] (subsumption mode, violating
+/// directions only).
 ///
 /// Each axis lists the [`Access`] entries the two signatures disagree on, split
 /// by direction:
@@ -242,8 +430,10 @@ impl GraphSignature {
 /// - `extra_*` — the candidate declares it but the slot does not (the candidate
 ///   demands or produces something the slot never sanctioned).
 ///
-/// A diff empty on every axis means the signatures match — that is exactly what
-/// [`GraphSignature::compatible_with`] returns. [`Display`](fmt::Display)
+/// A diff empty on every axis means the check that produced it passed —
+/// [`GraphSignature::compatible_with`] for [`diff`](GraphSignature::diff),
+/// [`GraphSignature::satisfies`] for
+/// [`satisfies_diff`](GraphSignature::satisfies_diff). [`Display`](fmt::Display)
 /// renders only the non-empty axes, in human terms (`Res<T>` / `ResMut<T>` for
 /// resources, `Out<T>` for outputs).
 ///
@@ -329,7 +519,7 @@ impl SignatureDiff {
 impl fmt::Display for SignatureDiff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_empty() {
-            return f.write_str("signatures are compatible");
+            return f.write_str("no signature differences");
         }
         let mut clauses: Vec<String> = Vec::new();
         push_axis(
@@ -357,6 +547,31 @@ impl fmt::Display for SignatureDiff {
     }
 }
 
+/// Returns `true` if every element of `sub` (by `(type_id, mode)`) is present
+/// in `sup`. Allocation-free equivalent of `access_difference(sub, sup)` being
+/// empty; both inputs are canonicalized and tiny, so the quadratic scan is
+/// cheaper than hashing.
+fn is_subset(sub: &[Access], sup: &[Access]) -> bool {
+    sub.iter().all(|access| {
+        sup.iter()
+            .any(|other| access.type_id == other.type_id && access.mode == other.mode)
+    })
+}
+
+/// Returns `true` if two access slices name the same set of types, ignoring
+/// access mode. Used for `requires_outputs`, where access mode is only a
+/// storage detail.
+fn access_types_equal(left: &[Access], right: &[Access]) -> bool {
+    is_type_subset(left, right) && is_type_subset(right, left)
+}
+
+/// Returns `true` if every type in `sub` is present in `sup`, ignoring access
+/// mode.
+fn is_type_subset(sub: &[Access], sup: &[Access]) -> bool {
+    sub.iter()
+        .all(|access| sup.iter().any(|other| access.type_id == other.type_id))
+}
+
 /// Elements of `from` (by `(type_id, mode)`) not present in `remove`. Both
 /// inputs are canonicalized, so the result keeps canonical order.
 fn access_difference(from: &[Access], remove: &[Access]) -> Vec<Access> {
@@ -366,6 +581,16 @@ fn access_difference(from: &[Access], remove: &[Access]) -> Vec<Access> {
                 .iter()
                 .any(|other| access.type_id == other.type_id && access.mode == other.mode)
         })
+        .cloned()
+        .collect()
+}
+
+/// Elements of `from` whose type is not present in `remove`, ignoring access
+/// mode. Used for `requires_outputs`, where access mode is only a storage
+/// detail.
+fn access_type_difference(from: &[Access], remove: &[Access]) -> Vec<Access> {
+    from.iter()
+        .filter(|access| !remove.iter().any(|other| access.type_id == other.type_id))
         .cloned()
         .collect()
 }
@@ -929,7 +1154,7 @@ mod tests {
             .produce::<Final>();
         let diff = signature.diff(&signature.clone());
         assert!(diff.is_empty());
-        assert_eq!(diff.to_string(), "signatures are compatible");
+        assert_eq!(diff.to_string(), "no signature differences");
     }
 
     #[test]
@@ -989,6 +1214,214 @@ mod tests {
         );
         assert!(rendered.contains("produces: candidate lacks"), "{rendered}");
         assert!(!rendered.contains("requires_outputs"), "{rendered}");
+    }
+
+    // ── Subsumption (`satisfies`) ────────────────────────────────────────────
+
+    #[test]
+    fn satisfies_allows_extra_requires_and_extra_produces() {
+        // The capability relation: a candidate that needs more (environment-
+        // provided) and produces more (merges back harmlessly) still
+        // satisfies the slot — exactly the case exact-match rejects.
+        let slot = GraphSignature::new()
+            .require_read::<Mid>()
+            .produce::<Final>();
+        let candidate = GraphSignature::new()
+            .require_read::<Mid>()
+            .require_write::<HandlerRes>() // setup-provided environment
+            .produce::<Final>()
+            .produce::<Seed>(); // extra output
+
+        assert!(candidate.satisfies(&slot));
+        assert!(!candidate.compatible_with(&slot), "exact match rejects it");
+    }
+
+    #[test]
+    fn satisfies_requires_every_slot_demand() {
+        let slot = GraphSignature::new()
+            .require_read::<Mid>()
+            .produce::<Final>();
+
+        // Missing the slot's required read.
+        let no_read = GraphSignature::new().produce::<Final>();
+        assert!(!no_read.satisfies(&slot));
+
+        // Missing the slot's produced output.
+        let no_produce = GraphSignature::new().require_read::<Mid>();
+        assert!(!no_produce.satisfies(&slot));
+
+        // Mode matters on the requires axis: the slot demands a read, the
+        // candidate only declares a write.
+        let wrong_mode = GraphSignature::new()
+            .require_write::<Mid>()
+            .produce::<Final>();
+        assert!(!wrong_mode.satisfies(&slot));
+
+        // …and strictly in the reverse direction: a slot demanding a write
+        // is not satisfied by a candidate that only declares a read. Modes
+        // compare exactly — there is no "write subsumes read" relaxation.
+        let write_slot = GraphSignature::new()
+            .require_write::<Mid>()
+            .produce::<Final>();
+        let read_candidate = GraphSignature::new()
+            .require_read::<Mid>()
+            .produce::<Final>();
+        assert!(!read_candidate.satisfies(&write_slot));
+    }
+
+    #[test]
+    fn satisfies_bounds_free_output_reads_by_the_slot() {
+        let slot = GraphSignature::new().require_output::<Seed>();
+
+        // Reading fewer free outputs than the slot sanctions is fine…
+        let reads_none = GraphSignature::new();
+        assert!(reads_none.satisfies(&slot));
+
+        // …but a free read the slot never sanctioned would dangle at runtime.
+        let reads_extra = GraphSignature::new()
+            .require_output::<Seed>()
+            .require_output::<Mid>();
+        assert!(!reads_extra.satisfies(&slot));
+    }
+
+    #[test]
+    fn compatible_signatures_always_satisfy() {
+        // Exact match is the degenerate case of subsumption, so
+        // `compatible_with` must imply `satisfies`.
+        let signature = GraphSignature::new()
+            .require_read::<Mid>()
+            .require_output::<Seed>()
+            .produce::<Final>();
+        assert!(signature.compatible_with(&signature.clone()));
+        assert!(signature.satisfies(&signature.clone()));
+    }
+
+    #[test]
+    fn satisfies_agrees_with_empty_satisfies_diff() {
+        // The lockstep invariant, mirrored from `compatible_with` ⇔ `diff`:
+        // `satisfies` and `satisfies_diff` must never disagree, so error
+        // messages always name the real violation.
+        let slot = GraphSignature::new()
+            .require_read::<Mid>()
+            .require_output::<Seed>()
+            .produce::<Final>();
+
+        for candidate in [
+            // Satisfying: exact, extra require, extra produce, fewer free reads.
+            slot.clone(),
+            slot.clone().require_write::<HandlerRes>(),
+            slot.clone().produce::<Seed>(),
+            GraphSignature::new()
+                .require_read::<Mid>()
+                .produce::<Final>(),
+            // Violating: each subsumption axis in turn.
+            GraphSignature::new()
+                .require_output::<Seed>()
+                .produce::<Final>(), // missing slot require
+            slot.clone().require_output::<Mid>(), // unsanctioned free read
+            GraphSignature::new()
+                .require_read::<Mid>()
+                .require_output::<Seed>(), // missing slot produce
+        ] {
+            assert_eq!(
+                candidate.satisfies(&slot),
+                candidate.satisfies_diff(&slot).is_empty(),
+                "satisfies must equal satisfies_diff-is-empty for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn satisfies_diff_reports_only_violating_directions() {
+        // Candidate has an extra require and an extra produce (both permitted)
+        // but misses the slot's produce and reads an unsanctioned free output.
+        let slot = GraphSignature::new()
+            .require_read::<Mid>()
+            .produce::<Final>();
+        let candidate = GraphSignature::new()
+            .require_read::<Mid>()
+            .require_read::<Seed>() // permitted: environment-provided
+            .require_output::<HandlerRes>() // violation: unsanctioned free read
+            .produce::<Mid>(); // permitted extra, but Final is missing
+
+        let diff = candidate.satisfies_diff(&slot);
+        assert!(!diff.is_empty());
+        // Permitted divergence never appears.
+        assert!(diff.extra_requires().is_empty());
+        assert!(diff.missing_requires_outputs().is_empty());
+        assert!(diff.extra_produces().is_empty());
+        // Violations are named.
+        assert!(diff.missing_requires().is_empty());
+        assert_eq!(diff.extra_requires_outputs().len(), 1);
+        assert_eq!(
+            diff.extra_requires_outputs()[0].type_id,
+            TypeId::of::<HandlerRes>()
+        );
+        assert_eq!(diff.missing_produces().len(), 1);
+        assert_eq!(diff.missing_produces()[0].type_id, TypeId::of::<Final>());
+    }
+
+    #[test]
+    fn derived_signature_satisfies_a_narrower_capability_slot() {
+        // The motivating case: derivation conservatively reports a
+        // setup-provided resource as required, so the derived signature is
+        // wider than the capability slot — subsumption still admits it.
+        struct ReadsEnvProducesFinal;
+        impl System for ReadsEnvProducesFinal {
+            type Output = Final;
+            fn run<'a>(
+                &'a self,
+                _ctx: &'a SystemContext<'_>,
+            ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn name(&self) -> &'static str {
+                "reads_env_produces_final"
+            }
+            fn access(&self) -> SystemAccess {
+                SystemAccess::new()
+                    .with_read::<Mid>()
+                    .with_read::<HandlerRes>()
+            }
+        }
+
+        let mut graph = Graph::new();
+        graph.add_boxed_system(Box::new(ReadsEnvProducesFinal));
+
+        // The slot names only the input read and the produced output; the
+        // graph's extra `HandlerRes` read is presumed environment-provided.
+        let slot = GraphSignature::new()
+            .require_read::<Mid>()
+            .produce::<Final>();
+        assert!(graph.signature().satisfies(&slot));
+        assert!(!graph.signature().compatible_with(&slot));
+    }
+
+    // ── Rendering ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rendered_covers_all_axes_in_parameter_terms() {
+        let signature = GraphSignature::new()
+            .require_read::<Mid>()
+            .require_write::<Seed>()
+            .require_output::<HandlerRes>()
+            .produce::<Final>();
+
+        // Canonical order sorts by opaque `TypeId`, so compare as sets.
+        let mut rendered = signature.to_rendered();
+        rendered.requires.sort();
+        assert_eq!(rendered.requires, vec!["Res<u8>", "ResMut<u32>"]);
+        assert_eq!(rendered.requires_outputs, vec!["Out<u64>"]);
+        assert_eq!(rendered.produces, vec!["Out<u16>"]);
+    }
+
+    #[test]
+    fn display_renders_all_axes_even_when_empty() {
+        let signature = GraphSignature::new().produce::<Final>();
+        assert_eq!(
+            signature.to_string(),
+            "requires: []; requires_outputs: []; produces: [Out<u16>]"
+        );
     }
 
     #[test]

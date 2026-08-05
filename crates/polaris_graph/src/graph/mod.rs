@@ -11,7 +11,7 @@ use crate::edge::{Edge, EdgeId, SequentialEdge};
 use crate::node::{Node, NodeId, SystemNode, remap_node_id};
 pub use builder::SystemNodeBuilder;
 use hashbrown::{HashMap, HashSet};
-pub use signature::{GraphSignature, SignatureDiff};
+pub use signature::{GraphSignature, RenderedSignature, SignatureDiff};
 use std::any::TypeId;
 use std::time::Duration;
 pub use validation::{MergeError, ValidationError, ValidationResult, ValidationWarning};

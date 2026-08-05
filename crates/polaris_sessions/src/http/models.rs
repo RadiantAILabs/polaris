@@ -182,17 +182,71 @@ pub struct ListStoredSessionsResponse {
 // Agent types (A9 — dashboard)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Summary of a registered agent type, returned by
-/// `GET /v1/sessions/agent-types`.
+/// Human-readable rendering of an agent graph's IO signature, embedded in
+/// [`AgentTypeSummary`].
+///
+/// Each axis holds rendered type-name strings in parameter terms —
+/// `Res<T>` / `ResMut<T>` for resources, `Out<T>` for outputs — produced by
+/// [`GraphSignature::to_rendered`](polaris_graph::GraphSignature::to_rendered).
+///
+/// **Advisory and display-only.** Type-name strings do not unify across
+/// separately compiled binaries and `std::any::type_name` makes no format
+/// guarantee, so never parse or compare these strings; capability checks
+/// belong to the server-side contract registry, surfaced through
+/// [`AgentTypeSummary::contracts`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(TS), ts(export))]
+pub struct AgentSignature {
+    /// Non-global resources the agent's graph reads from its context
+    /// (`Res<T>` / `ResMut<T>` entries).
+    pub requires: Vec<String>,
+    /// Free outputs the graph reads but does not produce (`Out<T>` entries).
+    pub requires_outputs: Vec<String>,
+    /// Outputs the graph produces (`Out<T>` entries).
+    pub produces: Vec<String>,
+}
+
+impl From<polaris_graph::RenderedSignature> for AgentSignature {
+    fn from(rendered: polaris_graph::RenderedSignature) -> Self {
+        Self {
+            requires: rendered.requires,
+            requires_outputs: rendered.requires_outputs,
+            produces: rendered.produces,
+        }
+    }
+}
+
+/// Summary of a registered agent type, returned by the agent-type listing
+/// routes.
+///
+/// The public `GET /v1/sessions/agent-types` route populates only
+/// [`name`](Self::name). The `signature` and `contracts` fields contain
+/// private graph-interface metadata and are only populated by the
+/// authenticated `GET /v1/sessions/agent-types/details` route. They are also
+/// additive: servers predating them omit both, and `#[serde(default)]` lets a
+/// newer client deserialize such a response (`signature: None`, empty
+/// `contracts`).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(TS), ts(export))]
 pub struct AgentTypeSummary {
     /// The agent's stable type name.
     pub name: String,
+    /// Human-readable rendering of the agent graph's IO signature.
+    ///
+    /// `None` only when deserializing a response from a server that predates
+    /// signature advertisement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typegen", ts(optional))]
+    pub signature: Option<AgentSignature>,
+    /// Names of the registered capability contracts this agent satisfies,
+    /// sorted (e.g. `["self-learn"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contracts: Vec<String>,
 }
 
-/// Response body for `GET /v1/sessions/agent-types`.
+/// Response body for the agent-type listing routes.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(TS), ts(export))]
@@ -221,9 +275,11 @@ pub enum TurnStatus {
 
 /// Summary entry for `GET /v1/sessions/{id}/turns`.
 ///
-/// When the request includes `?include=messages`, the full
+/// When the request includes `?include=messages`, the retained
 /// [`IOMessage`] array is embedded in [`messages`](Self::messages).
-/// Otherwise that field is omitted from the JSON payload.
+/// Otherwise that field is omitted from the JSON payload. The
+/// [`messages_truncated`](Self::messages_truncated) flag indicates whether
+/// recording limits omitted any data.
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(TS), ts(export))]
@@ -240,9 +296,13 @@ pub struct TurnSummary {
     /// Number of IO messages emitted during the turn.
     #[cfg_attr(feature = "typegen", ts(type = "number"))]
     pub io_message_count: u32,
+    /// Whether one or more messages or payload bytes were omitted from
+    /// retained turn history because a recording limit was reached.
+    #[serde(default)]
+    pub messages_truncated: bool,
     /// Truncated text of the most recent IO message, if any.
     pub last_message_preview: Option<String>,
-    /// Full IO messages, only present when the request was made with
+    /// Retained IO messages, only present when the request was made with
     /// `?include=messages`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typegen", ts(optional, type = "unknown[]"))]
@@ -258,7 +318,7 @@ pub struct ListTurnsResponse {
     pub items: Vec<TurnSummary>,
 }
 
-/// Full turn payload returned by `GET /v1/sessions/{id}/turns/{n}`.
+/// Retained turn payload returned by `GET /v1/sessions/{id}/turns/{n}`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(TS), ts(export))]
@@ -272,7 +332,11 @@ pub struct Turn {
     pub finished_at: Option<String>,
     /// Outcome of the turn.
     pub status: TurnStatus,
-    /// IO messages emitted during the turn, in arrival order.
+    /// Whether retained turn history omitted message data because a recording
+    /// limit was reached.
+    #[serde(default)]
+    pub messages_truncated: bool,
+    /// Retained IO messages emitted during the turn, in arrival order.
     #[cfg_attr(feature = "typegen", ts(type = "unknown[]"))]
     pub messages: Vec<IOMessage>,
 }

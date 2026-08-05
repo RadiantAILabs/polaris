@@ -123,15 +123,18 @@ impl ServerHandle {
 /// Provides an axum-based HTTP server that other plugins extend with routes.
 /// Plugins register route fragments via [`HttpRouter`] during `build()`.
 /// The server merges all routes, applies Tower middleware, and starts
-/// listening in `ready()`. Graceful shutdown occurs in `cleanup()`.
+/// listening in `ready()`. Protected route fragments are mounted only when
+/// an [`AuthProvider`](crate::AuthProvider) is configured, and they ignore
+/// public-path allowlist exemptions. Graceful shutdown occurs in `cleanup()`.
 ///
 /// # Lifecycle
 ///
 /// - **`build()`** — inserts [`AppConfig`] as a global resource, registers
 ///   [`HttpRouter`] and [`WsRouter`](crate::ws::WsRouter) as build-time APIs.
 /// - **`ready()`** — merges all registered HTTP and WebSocket routes, applies
-///   middleware (CORS, tracing, request ID, optional auth), spawns the axum
-///   server, and registers [`ServerHandle`] as a build-time API.
+///   middleware (CORS, tracing, request ID, optional auth), wraps protected
+///   route fragments in required auth, spawns the axum server, and registers
+///   [`ServerHandle`] as a build-time API.
 /// - **`cleanup()`** — sends shutdown signal via [`ServerHandle`] and awaits
 ///   graceful drain (5-second timeout).
 ///
@@ -145,7 +148,7 @@ impl ServerHandle {
 ///
 /// | API | Description |
 /// |-----|-------------|
-/// | [`HttpRouter`] | Build-time. Other plugins call [`HttpRouter::add_routes`](crate::router::HttpRouter::add_routes) or [`add_routes_with`](crate::router::HttpRouter::add_routes_with) during `build()` to register REST route fragments and optional [`AuthProvider`](crate::auth::AuthProvider). |
+/// | [`HttpRouter`] | Build-time. Other plugins call [`HttpRouter::add_routes`](crate::router::HttpRouter::add_routes), [`add_routes_with`](crate::router::HttpRouter::add_routes_with), or their protected counterparts during `build()` to register REST route fragments and optional [`AuthProvider`](crate::auth::AuthProvider). |
 /// | [`WsRouter`](crate::ws::WsRouter) | Build-time. Plugins register WebSocket upgrade routes that pass through the same middleware stack as REST. |
 /// | [`ServerHandle`] | Runtime (installed in `ready()`). Provides programmatic graceful shutdown via [`ServerHandle::shutdown`]. |
 ///
@@ -227,7 +230,9 @@ impl Plugin for AppPlugin {
         // Drain everything up front so the router API is not borrowed while
         // builders run (they receive `&Server` and may call `server.api::<_>()`).
         let fragments = router_api.take_routes();
+        let protected_fragments = router_api.take_protected_routes();
         let builders = router_api.take_builders();
+        let protected_builders = router_api.take_protected_builders();
         let auth = router_api.take_auth();
 
         let mut app = axum::Router::new();
@@ -237,6 +242,29 @@ impl Plugin for AppPlugin {
         for build in builders {
             app = app.merge(build(&*server));
         }
+
+        let has_protected_routes =
+            !protected_fragments.is_empty() || !protected_builders.is_empty();
+        let protected_app = if has_protected_routes {
+            if auth.is_some() {
+                let mut protected_app = axum::Router::new();
+                for fragment in protected_fragments {
+                    protected_app = protected_app.merge(fragment);
+                }
+                for build in protected_builders {
+                    protected_app = protected_app.merge(build(&*server));
+                }
+                Some(protected_app)
+            } else {
+                tracing::warn!(
+                    "protected HTTP routes were registered without an AuthProvider; \
+                     protected routes will not be mounted"
+                );
+                None
+            }
+        } else {
+            None
+        };
 
         // Merge WebSocket route fragments. WS routes are merged before
         // middleware so upgrade requests pass through the same auth,
@@ -255,7 +283,14 @@ impl Plugin for AppPlugin {
             let config = server
                 .get_global::<AppConfig>()
                 .expect("AppConfig must exist (registered in build)");
-            let app = middleware::apply_middleware(app, &config, auth);
+            let mut app = middleware::apply_middleware(app, &config, auth.clone());
+            if let (Some(protected_app), Some(provider)) = (protected_app, auth) {
+                app = app.merge(middleware::apply_required_middleware(
+                    protected_app,
+                    &config,
+                    provider,
+                ));
+            }
             let addr = config.addr();
             (app, addr)
         };

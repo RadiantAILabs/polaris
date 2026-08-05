@@ -725,6 +725,8 @@ mod tests {
         let c = counter();
         let request = LlmRequest {
             system: Some("You are a helpful assistant.".to_owned()),
+            system_prompt_name: None,
+            system_prompt_version: None,
             messages: vec![Message::user("What's the weather?")],
             tools: Some(vec![ToolDefinition {
                 name: "get_weather".to_owned(),
@@ -764,6 +766,8 @@ mod tests {
         let c = counter();
         let request = LlmRequest {
             system: None,
+            system_prompt_name: None,
+            system_prompt_version: None,
             messages: vec![Message::user("Hi")],
             tools: None,
             tool_choice: None,
@@ -785,6 +789,8 @@ mod tests {
     fn unknown_model_propagates_inexact_through_request() {
         let request = LlmRequest {
             system: Some("System".to_owned()),
+            system_prompt_name: None,
+            system_prompt_version: None,
             messages: vec![Message::user("Hello")],
             tools: None,
             tool_choice: None,
@@ -978,6 +984,8 @@ mod tests {
     fn error_propagates_through_request() {
         let request = LlmRequest {
             system: Some("System".to_owned()),
+            system_prompt_name: None,
+            system_prompt_version: None,
             messages: vec![Message::user("Hello")],
             tools: None,
             tool_choice: None,
@@ -1016,6 +1024,8 @@ mod tests {
 
         let request = LlmRequest {
             system: Some("System".to_owned()),
+            system_prompt_name: None,
+            system_prompt_version: None,
             messages: vec![Message::user("Hello")],
             tools: None,
             tool_choice: None,

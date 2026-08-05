@@ -67,15 +67,11 @@ See [`examples`](examples/README.md) for a full implementation of a file assista
 polaris-ai = "0.4.1"
 ```
 
-Requires **Rust 1.97.0+** (Edition 2024). Run `cargo make test` for the full test suite.
+Requires **Rust 1.97+** (Edition 2024). Run `cargo make test` for the full test suite.
 
 ## Documentation
 
 Architecture, design patterns, and API reference are available in the [docs](docs/README.md) directory.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the pull request workflow. Use the [Pull Request Review Standards](docs/contributing/review-standards.md) to self-review architecture, APIs, tests, documentation, and security before submitting a change.
 
 ## Project Status
 
@@ -87,7 +83,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the pull reques
 | Model Registry and Providers | **Implemented** |
 | Tool Registry | **Implemented** |
 | IO Plugin | **Implemented** |
-| Agent Plugins | **Example available** — ReAct lives in `examples/`; concrete agent-pattern plugins are downstream |
+| Agent Plugins | **Implemented** |
 | Sessions, Groups, CLI/HTTP Interfaces | **Implemented** |
 
 ## License

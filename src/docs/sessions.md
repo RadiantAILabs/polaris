@@ -69,6 +69,39 @@ let result = sessions.try_process_turn_with(&session_id, |ctx| {
 # }
 ```
 
+# Capability Contracts
+
+Named slot signatures let out-of-process callers discover capable agents
+without re-implementing signature checks (which cannot be sound across
+binaries — `TypeId`s do not unify). The plugin defining a capability
+registers a contract; every agent whose cached signature satisfies it by
+subsumption advertises the contract's name via
+[`agent_type_infos`](crate::sessions::SessionsAPI::agent_type_infos) and
+authenticated `GET /v1/sessions/agent-types/details`:
+
+Contract names must be non-empty, have no surrounding whitespace, and contain
+no control characters. `register_contract` validates string inputs, while
+direct construction uses `ContractName::new`.
+
+```no_run
+# use polaris_ai::sessions::SessionsAPI;
+# use polaris_ai::graph::GraphSignature;
+# #[derive(Clone)] struct TraceLine(String);
+# impl polaris_ai::system::resource::LocalResource for TraceLine {}
+# #[derive(Clone)] struct Triples(u32);
+# fn example(sessions: &SessionsAPI) -> Result<(), Box<dyn std::error::Error>> {
+sessions.register_contract(
+    "self-learn",
+    GraphSignature::new().require_read::<TraceLine>().produce::<Triples>(),
+)?;
+
+// The registrant asserts at startup that its own agent satisfies it.
+let diff = sessions.contract_diff("self-learn", "ExtractionAgent")?;
+assert!(diff.is_empty(), "agent drifted from its contract: {diff}");
+# Ok(())
+# }
+```
+
 # Recipes
 
 ## One-Shot Execution
@@ -166,7 +199,7 @@ Backends: `InMemoryStore` (default), `FileStore` (with `file-store` feature).
 
 | Feature | Adds public items | Existing surface it uses | Runtime effect |
 |---------|-------------------|--------------------------|----------------|
-| `sessions-http` | [`HttpPlugin`](crate::sessions::HttpPlugin), [`http`](crate::sessions::http), [`http::models`](crate::sessions::http::models) | Integrates with [`crate::app::HttpRouter`] and requires [`HttpPlugin`](crate::sessions::HttpPlugin) to be registered alongside [`crate::app::AppPlugin`] | Registers REST routes, handlers, and request/response models for session management |
+| `sessions-http` | [`HttpPlugin`](crate::sessions::HttpPlugin), [`http`](crate::sessions::http), [`http::routes`](crate::sessions::http::routes), [`http::models`](crate::sessions::http::models) | Integrates with [`crate::app::HttpRouter`] and requires [`HttpPlugin`](crate::sessions::HttpPlugin) to be registered alongside [`crate::app::AppPlugin`] | Registers REST routes, handlers, and request/response models for session management |
 
 # Related
 

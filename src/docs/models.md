@@ -84,15 +84,10 @@ reported separately on [`Usage`](crate::models::llm::Usage)
 
 1. Implement `LlmProvider` (the `name()` becomes the prefix in model identifiers)
 2. Create a plugin that registers it via `ModelRegistry::register_llm_provider()`
-3. Declare `Extends<ModelRegistry>` as the plugin's `build()` parameter so the
-   resolver selects and orders a compatible registry provider
+3. Declare `ModelsPlugin` as a dependency so the registry exists during `build()`
 
 ```no_run
-# use polaris_ai::polaris_system;
 use polaris_ai::models::llm::{LlmProvider, LlmRequest, LlmResponse, GenerationError};
-use polaris_ai::models::ModelRegistry;
-use polaris_ai::system::plugin;
-use polaris_ai::system::plugin::{Extends, Plugin};
 
 struct MyProvider { api_key: String }
 
@@ -103,17 +98,6 @@ impl LlmProvider for MyProvider {
         -> Result<LlmResponse, GenerationError> {
         // Translate LlmRequest -> vendor request, call API, translate response
         todo!()
-    }
-}
-
-struct MyProviderPlugin { api_key: String }
-
-#[plugin(id = "my_crate::provider::myprovider", version = "0.0.1")]
-impl Plugin for MyProviderPlugin {
-    fn build(&self, mut registry: Extends<ModelRegistry>) {
-        registry.register_llm_provider(MyProvider {
-            api_key: self.api_key.clone(),
-        });
     }
 }
 ```

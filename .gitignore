@@ -42,4 +42,6 @@ data/
 temp/
 
 # Claude code
-.claude/
+.claude/settings.local.json
+.claude/agents
+.claude/agent-memory-local

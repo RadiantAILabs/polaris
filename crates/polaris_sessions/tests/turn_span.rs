@@ -74,6 +74,69 @@ impl Agent for FailingAgent {
     }
 }
 
+/// An agent that supplies the optional version and description identity, so the
+/// turn span's handling of present values can be tested alongside
+/// [`MarkerAgent`]'s absent-value case.
+struct IdentifiedAgent;
+
+impl Agent for IdentifiedAgent {
+    fn build(&self, graph: &mut Graph) {
+        graph.add_system(touch_marker);
+    }
+
+    fn name(&self) -> &'static str {
+        "IdentifiedAgent"
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some("2.1.0")
+    }
+
+    fn description(&self) -> Option<&str> {
+        Some("Touches the marker, with a name tag on")
+    }
+}
+
+/// A redeployed build of [`IdentifiedAgent`] with same agent-type name, bumped
+/// version and description.
+struct RedeployedAgent;
+
+impl Agent for RedeployedAgent {
+    fn build(&self, graph: &mut Graph) {
+        graph.add_system(touch_marker);
+    }
+
+    fn name(&self) -> &'static str {
+        "IdentifiedAgent"
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some("3.0.0")
+    }
+
+    fn description(&self) -> Option<&str> {
+        Some("Redeployed marker toucher")
+    }
+}
+
+/// An agent that supplies only a version, leaving `description` at its default
+/// `None`.
+struct VersionOnlyAgent;
+
+impl Agent for VersionOnlyAgent {
+    fn build(&self, graph: &mut Graph) {
+        graph.add_system(touch_marker);
+    }
+
+    fn name(&self) -> &'static str {
+        "VersionOnlyAgent"
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some("1.4.2")
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Span capture
 // ─────────────────────────────────────────────────────────────────────────────
@@ -141,13 +204,13 @@ where
     }
 }
 
-/// Builds a minimal sessions server (no persistence, auto-checkpoint off) and
+/// Builds a minimal sessions server (auto-checkpoint off) backed by `store` and
 /// registers `agent`.
-async fn server_with(agent: impl Agent) -> Server {
+async fn server_with_store(agent: impl Agent, store: Arc<InMemoryStore>) -> Server {
     let mut server = Server::new();
     server
         .add_plugins(PersistencePlugin)
-        .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())).without_auto_checkpoint());
+        .add_plugins(SessionsPlugin::new(store).without_auto_checkpoint());
     server.finish().await.unwrap();
     server
         .api::<SessionsAPI>()
@@ -155,6 +218,12 @@ async fn server_with(agent: impl Agent) -> Server {
         .register_agent(agent)
         .unwrap();
     server
+}
+
+/// Builds a minimal sessions server (fresh store, auto-checkpoint off) and
+/// registers `agent`.
+async fn server_with(agent: impl Agent) -> Server {
+    server_with_store(agent, Arc::new(InMemoryStore::new())).await
 }
 
 fn get(fields: &Fields, key: &str) -> Option<String> {
@@ -214,6 +283,142 @@ async fn turn_span_records_invoke_agent_semantics() {
     // Success leaves the error placeholders as `Empty` — never recorded.
     assert_eq!(get(&fields, "otel.status_code"), None);
     assert_eq!(get(&fields, "error.type"), None);
+    assert_eq!(
+        get(&fields, "gen_ai.agent.version"),
+        None,
+        "agent supplying no version should leave gen_ai.agent.version unrecorded"
+    );
+    assert_eq!(
+        get(&fields, "gen_ai.agent.description"),
+        None,
+        "agent supplying no description should leave gen_ai.agent.description unrecorded"
+    );
+}
+
+/// When an agent supplies a version and description, the turn span records
+/// both onto its `gen_ai.agent.*` fields.
+#[tokio::test(flavor = "current_thread")]
+async fn turn_span_records_optional_agent_identity_when_present() {
+    let fields: Fields = Arc::new(Mutex::new(HashMap::new()));
+    let subscriber = Registry::default().with(TurnSpanCapture {
+        fields: Arc::clone(&fields),
+    });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = server_with(IdentifiedAgent).await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    let id = SessionId::new();
+    sessions
+        .create_session_with(
+            server.create_context(),
+            &id,
+            &AgentTypeId::from_name("IdentifiedAgent"),
+            |ctx| {
+                ctx.insert(Marker::default());
+            },
+        )
+        .unwrap();
+
+    sessions.process_turn(&id).await.unwrap();
+
+    assert_eq!(
+        get(&fields, "gen_ai.agent.version").as_deref(),
+        Some("2.1.0"),
+        "agent-supplied version should be recorded onto gen_ai.agent.version"
+    );
+    assert_eq!(
+        get(&fields, "gen_ai.agent.description").as_deref(),
+        Some("Touches the marker, with a name tag on"),
+        "agent-supplied description should be recorded onto gen_ai.agent.description"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn turn_span_records_partial_agent_identity() {
+    let fields: Fields = Arc::new(Mutex::new(HashMap::new()));
+    let subscriber = Registry::default().with(TurnSpanCapture {
+        fields: Arc::clone(&fields),
+    });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = server_with(VersionOnlyAgent).await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    let id = SessionId::new();
+    sessions
+        .create_session_with(
+            server.create_context(),
+            &id,
+            &AgentTypeId::from_name("VersionOnlyAgent"),
+            |ctx| {
+                ctx.insert(Marker::default());
+            },
+        )
+        .unwrap();
+
+    sessions.process_turn(&id).await.unwrap();
+
+    assert_eq!(
+        get(&fields, "gen_ai.agent.version").as_deref(),
+        Some("1.4.2"),
+        "the supplied version should be recorded even when description is absent"
+    );
+    assert_eq!(
+        get(&fields, "gen_ai.agent.description"),
+        None,
+        "an absent description should stay unrecorded even when version is present"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn turn_span_reflects_redeployed_agent_version_after_resume() {
+    let fields: Fields = Arc::new(Mutex::new(HashMap::new()));
+    let subscriber = Registry::default().with(TurnSpanCapture {
+        fields: Arc::clone(&fields),
+    });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let store = Arc::new(InMemoryStore::new());
+    let id = SessionId::new();
+
+    // First deployment: create a session under v2.1.0 and persist it.
+    {
+        let server = server_with_store(IdentifiedAgent, Arc::clone(&store)).await;
+        let sessions = server.api::<SessionsAPI>().unwrap();
+        sessions
+            .create_session_with(
+                server.create_context(),
+                &id,
+                &AgentTypeId::from_name("IdentifiedAgent"),
+                |ctx| {
+                    ctx.insert(Marker::default());
+                },
+            )
+            .unwrap();
+        sessions.save_session(&id).await.unwrap();
+    }
+
+    // Redeploy: fresh server on the same store, same agent-type name at v3.0.0.
+    let server = server_with_store(RedeployedAgent, store).await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    sessions
+        .resume_session_with(server.create_context(), &id, |ctx| {
+            ctx.insert(Marker::default());
+        })
+        .await
+        .unwrap();
+
+    sessions.process_turn(&id).await.unwrap();
+
+    assert_eq!(
+        get(&fields, "gen_ai.agent.version").as_deref(),
+        Some("3.0.0"),
+        "a session resumed after a redeploy should report the newly-registered version"
+    );
+    assert_eq!(
+        get(&fields, "gen_ai.agent.description").as_deref(),
+        Some("Redeployed marker toucher"),
+        "a session resumed after a redeploy should report the newly-registered description"
+    );
 }
 
 /// A failing turn records `otel.status_code = "ERROR"` and derives

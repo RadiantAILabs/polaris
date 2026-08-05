@@ -141,8 +141,9 @@ Custom providers implement the `LlmProvider` trait and register with the `ModelR
 
 ```rust
 use polaris_models::llm::{LlmProvider, LlmRequest, LlmResponse, GenerationError};
-use polaris_models::ModelRegistry;
-use polaris_system::plugin::{self, Extends, Plugin};
+use polaris_models::{ModelRegistry, ModelsPlugin};
+use polaris_system::plugin::{Plugin, PluginId, Version};
+use polaris_system::server::Server;
 
 pub struct MyProvider { /* ... */ }
 
@@ -154,7 +155,7 @@ impl MyProvider {
 
 impl LlmProvider for MyProvider {
     fn name(&self) -> &'static str {
-        "myprovider"
+        "my_provider"
     }
 
     async fn generate(
@@ -169,18 +170,22 @@ impl LlmProvider for MyProvider {
 
 pub struct MyProviderPlugin { /* ... */ }
 
-#[plugin(id = "my_crate::provider::myprovider", version = "0.0.1")]
 impl Plugin for MyProviderPlugin {
-    fn build(&self, mut registry: Extends<ModelRegistry>) {
+    const ID: &'static str = "my_provider";
+    const VERSION: Version = Version::new(0, 0, 1);
+
+    fn build(&self, server: &mut Server) {
+        server.add_plugins(ModelsPlugin);
+
+        let mut registry = server.get_resource_mut::<ModelRegistry>()
+            .expect("ModelsPlugin must be added first");
         registry.register_llm_provider(MyProvider::new());
     }
+
+    fn ready(&self, _server: &mut Server) {}
 }
 ```
 
-`Extends<ModelRegistry>` declares the capability relationship and gives the
-plugin mutable access during `build()`. The resolver requires a compatible
-provider such as `ModelsPlugin` and orders it before this plugin. During
-`ModelsPlugin::ready()`, the registry becomes an immutable global for
-thread-safe runtime access.
+The registry is available as a mutable resource during the `build()` phase, allowing providers to register themselves. After the `ready()` phase, it becomes an immutable global for thread-safe access at runtime.
 
 Models are then accessible via `"myprovider/model-name"`.

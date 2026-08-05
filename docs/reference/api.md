@@ -65,7 +65,7 @@ of three buckets:
 | Policy | Who may mutate | Mechanism | Examples |
 |--------|----------------|-----------|----------|
 | **Open extension** | Any plugin during `build()` (and sometimes `ready()`) | `RwLock`-guarded collection that accepts entries | [`HttpRouter`](crate::app::HttpRouter), [`MiddlewareAPI`](crate::graph::MiddlewareAPI), [`PersistenceAPI`](crate::plugins::PersistenceAPI) |
-| **Provider-scoped** | Only the providing plugin | `Arc`-wrapped inner state, public methods read-only | [`SessionsAPI`](crate::sessions::SessionsAPI) (writes go through the plugin's own systems) |
+| **Provider-scoped** | Only the providing plugin | `Arc`-wrapped inner state, public methods read-only | [`SessionsAPI`](crate::sessions::SessionsAPI) (session/turn writes go through the plugin's own systems; its capability-contract registry is a documented consumer-writable exception) |
 | **Single-replace** | Replaced wholesale by a successor `insert_api` call, not contributed to | No interior mutability needed | Configuration-style APIs |
 
 State the API's policy in its rustdoc — that's the question consumers have, not
@@ -209,7 +209,7 @@ fn build(&self, server: &mut Server) {
 
 ### HttpRouter: Route Registration
 
-`HttpRouter` is an API that collects axum route fragments from plugins during `build()`, then merges them into a single router when `AppPlugin` enters `ready()`.
+`HttpRouter` is an API that collects axum route fragments from plugins during `build()`, then merges them into a single router when `AppPlugin` enters `ready()`. Protected route fragments are mounted only when an auth provider is configured and are wrapped in an auth check that ignores public-path allowlist exemptions.
 
 **Provider** (`AppPlugin`):
 
@@ -222,6 +222,7 @@ async fn ready(&self, server: &mut Server) {
     let router_api = server.api::<HttpRouter>()
         .expect("HttpRouter API must exist");
     let fragments = router_api.take_routes();
+    let protected = router_api.take_protected_routes();
     let auth = router_api.take_auth();
     // merge fragments and start HTTP server...
 }
@@ -238,6 +239,20 @@ fn build(&self, server: &mut Server) {
     server.api::<HttpRouter>()
         .expect("AppPlugin must be added first")
         .add_routes(router);
+}
+```
+
+Use `add_protected_routes` / `add_protected_routes_with` for routes that
+expose private metadata or administrative controls:
+
+```rust
+fn build(&self, server: &mut Server) {
+    let router = Router::new()
+        .route("/admin/metadata", get(metadata));
+
+    server.api::<HttpRouter>()
+        .expect("AppPlugin must be added first")
+        .add_protected_routes(router);
 }
 ```
 
@@ -295,7 +310,7 @@ These APIs satisfy the standard and can be copied as a starting point:
 
 - [`HttpRouter`](crate::app::HttpRouter) — open-extension API: any plugin contributes routes.
 - [`PersistenceAPI`](crate::plugins::PersistenceAPI) — open-extension API: any plugin registers serializers.
-- [`SessionsAPI`](crate::sessions::SessionsAPI) — provider-scoped: the API exposes operations (create session, run turn), but writes flow through `SessionsPlugin`'s own machinery.
+- [`SessionsAPI`](crate::sessions::SessionsAPI) — provider-scoped: the API exposes operations (create session, run turn), but writes flow through `SessionsPlugin`'s own machinery. Its capability-contract registry is the deliberate exception — an open-extension point any plugin may write via `register_contract` after `ready()` — and its rustdoc `# Composition` section says so, which is exactly the standard's point.
 
 ## Summary
 
