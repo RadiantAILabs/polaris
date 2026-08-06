@@ -15,6 +15,16 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+#[test]
+fn http_router_contract_version_remains_caret_compatible() {
+    use polaris_system::plugin::{Contract, VersionReq};
+
+    assert!(
+        VersionReq::caret(Version::new(0, 1, 0)).matches(HttpRouter::CONTRACT_VERSION),
+        "protected route registration is additive and must remain compatible with ^0.1.0"
+    );
+}
+
 /// A test plugin that registers a simple health check route.
 struct TestRoutePlugin;
 
@@ -376,6 +386,9 @@ mod allowlist_tests {
                     .route("/dashboard/submit", post(|| async { "spa-post" }))
                     .route("/v1/sessions", post(|| async { "sessions-post" })),
             );
+            http_router.add_protected_routes(
+                Router::new().route("/private/metadata", get(|| async { "private" })),
+            );
         }
 
         fn dependencies(&self) -> Vec<PluginId> {
@@ -493,6 +506,98 @@ mod allowlist_tests {
             401,
             "/v1/sessions is outside the allowlist prefix and must stay protected"
         );
+
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn protected_routes_ignore_public_prefixes() {
+        let (mut server, port) = start_server(
+            AppConfig::new()
+                .with_allow_any_cors_origin()
+                .with_public_prefix("/private/"),
+        )
+        .await;
+
+        let base = format!("http://127.0.0.1:{port}");
+
+        let resp = reqwest::get(format!("{base}/private/metadata"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "protected routes must require AuthProvider approval even under a public prefix"
+        );
+
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn protected_routes_authenticate_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingAuth {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl AuthProvider for CountingAuth {
+            fn authenticate(&self, _parts: &http::request::Parts) -> Result<(), AuthRejection> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        struct CountingProtectedPlugin {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Plugin for CountingProtectedPlugin {
+            const ID: &'static str = "test::counting_protected_route";
+            const VERSION: Version = Version::new(0, 0, 1);
+
+            fn build(&self, server: &mut Server) {
+                let router = server.api::<HttpRouter>().expect("HttpRouter must exist");
+                router.set_auth(CountingAuth {
+                    calls: Arc::clone(&self.calls),
+                });
+                router.add_protected_routes(
+                    Router::new().route("/private/count", get(|| async { "private" })),
+                );
+            }
+
+            fn dependencies(&self) -> Vec<PluginId> {
+                vec![PluginId::of::<AppPlugin>()]
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (listener, port) = bind_ephemeral().await;
+        let mut server = Server::new();
+        server.add_plugins(
+            AppPlugin::new(
+                AppConfig::new()
+                    .with_host("127.0.0.1")
+                    .with_port(port)
+                    .with_allow_any_cors_origin()
+                    .with_public_prefix("/private/"),
+            )
+            .with_listener(listener),
+        );
+        server.add_plugins(CountingProtectedPlugin {
+            calls: Arc::clone(&calls),
+        });
+        server.finish().await.unwrap();
+        wait_for_server(port).await;
+
+        let response = reqwest::get(format!("http://127.0.0.1:{port}/private/count"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "private");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         server.cleanup().await;
     }

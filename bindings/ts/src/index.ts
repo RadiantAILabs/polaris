@@ -3,6 +3,7 @@
 // (`cargo test --features typegen`) and add a matching line below.
 // Keep entries alphabetized.
 
+export type { AgentSignature } from "./AgentSignature";
 export type { AgentTypeId } from "./AgentTypeId";
 export type { AgentTypeSummary } from "./AgentTypeSummary";
 export type { BucketGranularity } from "./BucketGranularity";

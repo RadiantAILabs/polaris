@@ -149,7 +149,26 @@ pub trait Agent: Send + Sync + 'static {
     fn build(&self, graph: &mut Graph);
 
     /// Returns a stable, user-defined name for this agent type.
+    ///
+    /// It is recommended to use a short name that does not contain PII as this
+    /// field may appear in logs and traces.
     fn name(&self) -> &'static str;
+
+    /// Returns the version of this agent.
+    ///
+    /// It is recommended to use a short version label that does not contain PII
+    /// as this field may appear in logs and traces.
+    fn version(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns a human-readable description of this agent's purpose.
+    ///
+    /// It is recommended to keep this a short, static summary that does not
+    /// contain PII as this field may appear in logs and traces.
+    fn description(&self) -> Option<&str> {
+        None
+    }
 
     /// Initializes session resources before the first turn.
     ///

@@ -51,6 +51,8 @@ impl TracingLlmProvider {
             gen_ai.output.type = tracing::field::Empty,
             gen_ai.request.model = %model,
             gen_ai.request.stream = stream,
+            gen_ai.prompt.name = tracing::field::Empty,
+            gen_ai.prompt.version = tracing::field::Empty,
             gen_ai.response.finish_reasons = tracing::field::Empty,
             gen_ai.response.id = tracing::field::Empty,
             gen_ai.response.model = tracing::field::Empty,
@@ -75,6 +77,12 @@ impl TracingLlmProvider {
         }
         if let Some(endpoint) = self.inner.endpoint() {
             span.record("server.address", endpoint.as_str());
+        }
+        if let Some(name) = &request.system_prompt_name {
+            span.record("gen_ai.prompt.name", name.as_str());
+        }
+        if let Some(version) = &request.system_prompt_version {
+            span.record("gen_ai.prompt.version", version.as_str());
         }
 
         span
@@ -1051,6 +1059,76 @@ mod tests {
         assert_eq!(
             parsed[0]["parts"][1]["arguments"]["q"], "rust",
             "the streamed tool-call arguments should round-trip as JSON"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Prompt identity (`gen_ai.prompt.name` / `gen_ai.prompt.version`)
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn message_stop_events() -> Vec<Result<StreamEvent, GenerationError>> {
+        vec![Ok(StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+            id: None,
+            model: None,
+        })]
+    }
+
+    #[test]
+    fn chat_span_records_prompt_identity_when_present() {
+        let fields = capture_span_fields(|| {
+            let provider = TracingLlmProvider::new(
+                Arc::new(StubStreamProvider::new(message_stop_events())),
+                false,
+            );
+            let request = LlmRequest {
+                system_prompt_name: Some("greeting".to_string()),
+                system_prompt_version: Some("v3".to_string()),
+                ..empty_request()
+            };
+            let mut stream = block_on_ready(provider.stream("test-model", request))
+                .expect("stream should be constructed");
+            drain_stream(&mut stream);
+        });
+
+        assert_eq!(
+            fields.get("gen_ai.prompt.name").map(String::as_str),
+            Some("greeting"),
+            "the request's prompt name should be recorded on the chat span"
+        );
+        assert_eq!(
+            fields.get("gen_ai.prompt.version").map(String::as_str),
+            Some("v3"),
+            "the request's prompt version should be recorded on the chat span"
+        );
+    }
+
+    #[test]
+    fn chat_span_omits_prompt_identity_when_absent() {
+        let fields = capture_span_fields(|| {
+            let provider = TracingLlmProvider::new(
+                Arc::new(StubStreamProvider::new(message_stop_events())),
+                false,
+            );
+            let mut stream = block_on_ready(provider.stream("test-model", empty_request()))
+                .expect("stream should be constructed");
+            drain_stream(&mut stream);
+        });
+
+        // Canary: prove the capture layer actually reached this span.
+        assert_eq!(
+            fields.get("gen_ai.request.model").map(String::as_str),
+            Some("test-model"),
+            "the chat span should always be captured, regardless of prompt identity"
+        );
+        assert!(
+            !fields.contains_key("gen_ai.prompt.name"),
+            "prompt name should be omitted from the span when the request doesn't set one"
+        );
+        assert!(
+            !fields.contains_key("gen_ai.prompt.version"),
+            "prompt version should be omitted from the span when the request doesn't set one"
         );
     }
 }

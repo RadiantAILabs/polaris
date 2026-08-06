@@ -46,6 +46,10 @@ impl Plugin for HealthPlugin {
 
 Key points:
 - Routes are registered during `build()` via `HttpRouter::add_routes()`
+  / `add_routes_with()`
+- Routes that expose private metadata or privileged control surfaces use
+  `add_protected_routes()` / `add_protected_routes_with()`, which require an
+  `AuthProvider` and ignore public-path allowlist exemptions
 - `HttpRouter` uses interior mutability (`RwLock`) — `server.api::<HttpRouter>()` returns `&HttpRouter`
 - Declare `AppPlugin` as a dependency so the `HttpRouter` API exists
 - All route fragments are merged into a single router in `AppPlugin::ready()`
@@ -63,7 +67,7 @@ The `AuthProvider` trait is synchronous. For async auth, register a Tower layer 
 
 ## Deferred Router Construction
 
-The core challenge: routes are registered in `build()`, but the APIs they need (e.g., `SessionsAPI`) are registered by *other* plugins' `build()` methods, and may not exist yet. `HttpRouter::add_routes_with` solves this by accepting a closure that runs during `AppPlugin::ready()`, once every plugin has finished `build()` and all APIs are resolvable.
+The core challenge: routes are registered in `build()`, but the APIs they need (e.g., `SessionsAPI`) are registered by *other* plugins' `build()` methods, and may not exist yet. `HttpRouter::add_routes_with` solves this by accepting a closure that runs during `AppPlugin::ready()`, once every plugin has finished `build()` and all APIs are resolvable. Use `add_protected_routes_with` for the same deferred construction when the route must stay behind authentication even if a broad public-path allowlist is configured.
 
 ```rust
 impl Plugin for MyHttpPlugin {
@@ -91,7 +95,7 @@ async fn my_handler(
 }
 ```
 
-Use `add_routes` for stateless fragments (`/healthz`, static content) and `add_routes_with` whenever the router's state comes from another plugin's API. `polaris_sessions::HttpPlugin` uses this pattern for all session REST endpoints.
+Use `add_routes` for stateless fragments (`/healthz`, static content) and `add_routes_with` whenever the router's state comes from another plugin's API. Use the protected variants for private metadata or administrative controls; `AppPlugin` mounts those fragments only when an `AuthProvider` is configured and wraps them in an auth check that does not consult `AppConfig` public-path exemptions. `polaris_sessions::HttpPlugin` uses this pattern for the private agent-type metadata route.
 
 **Note:** builders are drained once during `AppPlugin::ready()`. Calling `add_routes` or `add_routes_with` *from* a builder closure has no effect — register everything for your plugin before returning the `Router`.
 
@@ -374,7 +378,7 @@ When the `http` feature is enabled on `polaris_sessions`, `HttpPlugin` registers
 | `DELETE` | `/v1/sessions/{id}` | Delete a session |
 | `POST` | `/v1/sessions/{id}/turns` | Process a turn (buffered response) |
 | `POST` | `/v1/sessions/{id}/turns/stream` | Process a turn, stream `IOMessage`s as SSE |
-| `GET` | `/v1/sessions/{id}/turns` | List turn summaries; `?include=messages` embeds full message arrays |
+| `GET` | `/v1/sessions/{id}/turns` | List turn summaries; `?include=messages` embeds retained message arrays and `messages_truncated` reports recording limits |
 | `GET` | `/v1/sessions/{id}/turns/{n}` | Full per-turn payload |
 | `GET` | `/v1/sessions/{id}/uptime` | Bucketed lifecycle time-series (`?bucket=1m\|5m\|15m\|1h`, `?since=`/`?until=` ISO 8601, 24h default range) |
 | `POST` | `/v1/sessions/{id}/checkpoints` | Create a checkpoint |
@@ -382,9 +386,16 @@ When the `http` feature is enabled on `polaris_sessions`, `HttpPlugin` registers
 | `POST` | `/v1/sessions/{id}/rollback` | Rollback to checkpoint |
 | `POST` | `/v1/sessions/{id}/save` | Persist to store |
 | `POST` | `/v1/sessions/{id}/resume` | Resume from store |
-| `GET` | `/v1/sessions/agent-types` | Enumerate registered agent types |
+| `GET` | `/v1/sessions/agent-types` | Enumerate registered agent type names; omits graph signatures and capability contracts |
+| `GET` | `/v1/sessions/agent-types/details` | Auth-protected agent type metadata with rendered graph signatures and satisfied [capability contracts](./sessions.md#capability-contracts) |
 
 Per-session uptime is backed by an in-memory lifecycle recorder (`Created` / `Active` / `Idle` / `Terminated` transitions). Records are bounded and recycle as sessions terminate — they do not persist across restart.
+
+The `/v1/sessions/agent-types/details` entries carry `signature` (the agent graph's IO interface rendered as type-name strings — `Res<T>` / `ResMut<T>` / `Out<T>`) and `contracts` (names of registered capability contracts the agent satisfies). Both fields are private: type names can reveal internal module paths, resource names, and graph shape, while contract names can reveal product capability boundaries. `HttpPlugin` therefore registers the detail route with `HttpRouter::add_protected_routes_with`; `AppPlugin` mounts it only when an [`AuthProvider`](#authentication) is configured, and the protected auth check ignores public-path allowlist exemptions. The public `/v1/sessions/agent-types` route returns names only.
+
+The rendered signature is **advisory and display-only** — type names do not unify across binaries and have no format guarantee, so remote callers must never parse or compare them; capability decisions belong to the server-side contract check, surfaced through `contracts` on the protected route. Both fields are additive with `#[serde(default)]`, so a newer client deserializes an older or public response (`signature` absent, `contracts` empty).
+
+The public route table is also available standalone: `polaris_sessions::http::routes(sessions)` returns the mount-point-relative router for embedding in your own axum server. Nesting it under `/api` serves `/api/v1/sessions/*`. The provided `SessionsAPI` must come from a finished `SessionsPlugin` (or be manually wired with `set_context_factory`) before stateful routes such as `POST /v1/sessions` can create contexts. A self-mounted router bypasses `AppPlugin`'s middleware entirely: the [`AuthProvider`](#authentication) posture, CORS, and tracing apply only to routes registered through `HttpRouter`, so a standalone mount must layer its own protection for turn execution, session deletion, and other state-changing endpoints. Private graph-signature metadata is intentionally not included in `routes()`.
 
 ### Setup
 

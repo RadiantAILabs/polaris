@@ -2,7 +2,7 @@
 import type { AgentTypeSummary } from "./AgentTypeSummary";
 
 /**
- * Response body for `GET /v1/sessions/agent-types`.
+ * Response body for the agent-type listing routes.
  */
 export type ListAgentTypesResponse = { 
 /**

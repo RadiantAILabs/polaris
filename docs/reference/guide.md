@@ -30,10 +30,12 @@ The most common things downstream consumers want to do, and what they reach for.
 | Run a one-shot agent | `sessions.run_oneshot::<T>(&agent_type, \|ctx\| { ctx.insert(...) })` | [`SessionsAPI`](crate::sessions::SessionsAPI) | [Sessions — One-Shot](./sessions.md#one-shot-execution) |
 | Run a multi-turn agent with cleanup | `sessions.scoped_session(&agent_type, ...)` → `guard.process_turn()` | [`SessionGuard`](crate::sessions::SessionGuard) | [Sessions — Scoped Sessions](./sessions.md#scoped-sessions-raii-guard) |
 | Execute an agent from an HTTP request | `add_routes_with(...)` → `State<SessionsAPI>` → `HttpIOProvider` → `process_turn` | [`HttpRouter`](crate::app::HttpRouter), [`HttpIOProvider`](crate::sessions::http::HttpIOProvider) | [HTTP Integration](./http.md) |
-| Register HTTP routes from a plugin | `server.api::<HttpRouter>().add_routes(router)` (stateless) or `add_routes_with(\|server\| ...)` (needs another plugin's API) inside `build()` | [`HttpRouter`](crate::app::HttpRouter) | [HTTP Integration](./http.md) |
+| Register HTTP routes from a plugin | `server.api::<HttpRouter>().add_routes(router)` / `add_routes_with(\|server\| ...)`; use protected variants for private metadata or admin routes | [`HttpRouter`](crate::app::HttpRouter) | [HTTP Integration](./http.md) |
 | Access Polaris APIs from HTTP handlers | `add_routes_with` closure resolves APIs against `&Server` during `AppPlugin::ready()`, then `.with_state(api)` on the returned `Router` | [`HttpRouter`](crate::app::HttpRouter) | [HTTP — Deferred Router Construction](./http.md#deferred-router-construction) |
 | Create contexts outside the server | `ContextFactory` from `server.context_factory()` in `ready()` | [`ContextFactory`](crate::system::server::ContextFactory) | [Context — `ContextFactory`](./context.md#via-contextfactory) |
 | Manage agent sessions | `SessionsAPI` — register agent, create session, process turns | [`SessionsAPI`](crate::sessions::SessionsAPI) | [Sessions](./sessions.md) |
+| Advertise or discover agent capabilities | `sessions.register_contract(name, GraphSignature)` — satisfying agents advertise the name via `agent_type_infos()` / authenticated `GET /v1/sessions/agent-types/details` | [`SessionsAPI`](crate::sessions::SessionsAPI), [`GraphSignature`](crate::graph::GraphSignature) | [Sessions — Capability Contracts](./sessions.md#capability-contracts) |
+| Mount the canonical sessions REST routes on your own router | `polaris_sessions::http::routes(sessions)` — the mount-point-relative public route table carries no auth and intentionally excludes private graph-signature metadata | [`routes`](crate::sessions::http::routes), [`SessionsAPI`](crate::sessions::SessionsAPI) | [HTTP — Session HTTP Endpoints](./http.md#session-http-endpoints) |
 | Inject per-turn resources | Setup closure on `process_turn_with(\|ctx\| { ctx.insert(...) })` | `Res<T>`, [`LocalResource`](crate::system::resource::LocalResource) | [Sessions — Turn Execution](./sessions.md#turn-execution) |
 | Bridge HTTP I/O to an agent | `HttpIOProvider::new()` → send input → inject `UserIO` → drain output | [`HttpIOProvider`](crate::sessions::http::HttpIOProvider), [`UserIO`](crate::plugins::UserIO) | [HTTP — `HttpIOProvider`](./http.md#httpioprovider-bridging-http-to-agent-io) |
 | Understand context flow per graph node | Parallel forks children; Loop shares context; Scope composes per-resource crossing verbs (`share`/`forward`/`fork`/`forward_fresh`/`exclude`/`share_rest`) | [`ContextPolicy`](crate::graph::ContextPolicy) | [Context — Graph Flow](./context.md#context-flow-through-graph-execution) |
@@ -46,8 +48,7 @@ The most common things downstream consumers want to do, and what they reach for.
 | Schedule plugin updates | `tick_schedules()` + `update()` + `server.tick::<S>()` | — | [Scheduling](./scheduling.md) |
 | Persist resources across session restart | Implement `Storable` + register via [`PersistenceAPI`](crate::plugins::PersistenceAPI) | [`PersistenceAPI`](crate::plugins::PersistenceAPI) | [Sessions — Persistence](./sessions.md#persistence-saveresume) |
 | Add LLM tracing or token-cost annotation | [`TracingPlugin`](crate::plugins::TracingPlugin) is always on; declare per-model rates via [`LlmProvider::pricing()`](crate::models::llm::LlmProvider::pricing) to annotate spans with cost | [`TracingPlugin`](crate::plugins::TracingPlugin), [`LlmProvider`](crate::models::llm::LlmProvider) | [`DevTools`](./devtools.md) |
-| Extend OpenTelemetry export | Enable the `otel` feature, then add a processor directly with `OpenTelemetryPlugin::with_span_processor` or contribute through `Extends<SpanProcessorRegistry>` from a plugin | [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin), [`SpanProcessorRegistry`](crate::plugins::SpanProcessorRegistry) | [Plugins — Capability-Based Dependencies](./plugins.md#capability-based-dependencies), [API Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/apis/) |
-| Add a new LLM provider | Implement [`LlmProvider`](crate::models::llm::LlmProvider), then register it during plugin `build()` through `Extends<ModelRegistry>` | [`LlmProvider`](crate::models::llm::LlmProvider), [`ModelRegistry`](crate::models::ModelRegistry) | [Model Providers](./model-providers.md) |
+| Add a new LLM provider | Implement [`LlmProvider`](crate::models::llm::LlmProvider), register with [`ModelRegistry`](crate::models::ModelRegistry) from a plugin's `ready()` | [`LlmProvider`](crate::models::llm::LlmProvider) | [Model Providers](./model-providers.md) |
 | Cache an LLM prompt prefix to cut input cost | `llm.builder().cache_prefix()` for the stable system+tools prefix; `.cache_breakpoint()` as you assemble the window for incremental history caching | [`LlmRequestBuilder`](crate::models::llm::LlmRequestBuilder), [`CacheControl`](crate::models::llm::CacheControl) | [Model Providers — Prompt Caching](./model-providers.md#prompt-caching) |
 | Make a function callable by an LLM | `#[tool]` macro on the function, register with [`ToolRegistry`](crate::tools::ToolRegistry) from a plugin | [`ToolRegistry`](crate::tools::ToolRegistry) | [Tools](./tools.md) |
 | Run shell commands from a tool | [`ShellPlugin`](crate::shell::ShellPlugin) + [`ShellPermission`](crate::shell::ShellPermission) gate | [`ShellExecutor`](crate::shell::ShellExecutor) | — |
@@ -61,12 +62,10 @@ The most common framework-extension tasks and where to make the change.
 
 | Task | Primary files | Secondary files |
 |------|---------------|-----------------|
-| Add a node type | `polaris_graph/src/node.rs` | `graph/builder.rs`, `graph/validation.rs`, `executor/mod.rs`, `executor/run.rs` |
-| Add an edge type | `polaris_graph/src/edge.rs` | `graph/mod.rs`, `graph/validation.rs`, `executor/run.rs` |
-| Add a hook schedule | `polaris_graph/src/hooks/schedule.rs` | `hooks/events.rs`, `executor/mod.rs`, `executor/run.rs` |
-| Add a plugin | New file in the owning Layer 3 crate | Crate `lib.rs`; [plugins.md](./plugins.md); [Plugin Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/plugins/) |
-| Add an API | Providing plugin and API type | [api.md](./api.md); [API Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/apis/) |
-| Register hooks or middleware from a plugin | Plugin `build()` via `HooksAPI` or `MiddlewareAPI` | [Graph — Hooks](./graph.md#hooks); [Graph — Middleware](./graph.md#middleware) |
+| Add a node type | `polaris_graph/src/node.rs` | `executor.rs`, `graph.rs` |
+| Add an edge type | `polaris_graph/src/edge.rs` | `executor.rs`, `graph.rs` |
+| Add a hook schedule | `polaris_graph/src/hooks/schedule.rs` | `hooks/events.rs`, `executor.rs` |
+| Add a plugin | New file in `polaris_core_plugins/src/` | `polaris_core_plugins/src/lib.rs` |
 | Define a system | Any file with the `#[system]` macro | — |
 | Add a resource | Plugin file | Register in `build()`; see [resources.md — Documentation Standard](./resources.md#documentation-standard) |
 | Add a tool | `polaris_tools/src/` with the `#[tool]` macro | Register in a plugin via [`ToolRegistry`](crate::tools::ToolRegistry) |
@@ -78,29 +77,27 @@ The most common framework-extension tasks and where to make the change.
 
 ## Step-by-Step: Adding a Node Type
 
-1. `crates/polaris_graph/src/node.rs` — add the struct and `Node` enum variant.
-2. `crates/polaris_graph/src/graph/builder.rs` and `graph/validation.rs` — add builder and validation support.
-3. `crates/polaris_graph/src/executor/mod.rs` and `executor/run.rs` — add validation and execution dispatch.
-4. Add focused unit and integration tests; use [graph.md](./graph.md) as the behavior contract.
+1. `crates/polaris_graph/src/node.rs` — add struct and enum variant
+2. `crates/polaris_graph/src/executor.rs` — add execution logic in `run_node()`
+3. `crates/polaris_graph/src/graph.rs` — add a builder method if needed
+4. Add tests in `node.rs` under `#[cfg(test)]`
 
 ## Step-by-Step: Adding an Edge Type
 
-1. `crates/polaris_graph/src/edge.rs` — add the struct and `Edge` enum variant.
-2. `crates/polaris_graph/src/graph/mod.rs` and `graph/validation.rs` — update graph construction and validation.
-3. `crates/polaris_graph/src/executor/run.rs` — add traversal logic.
-4. Add focused unit and integration tests; use [graph.md](./graph.md) as the behavior contract.
+1. `crates/polaris_graph/src/edge.rs` — add struct and enum variant
+2. `crates/polaris_graph/src/executor.rs` — add traversal logic
+3. `crates/polaris_graph/src/graph.rs` — add a builder method if needed
+4. Add tests in `edge.rs` under `#[cfg(test)]`
 
 ## Step-by-Step: Adding a Plugin
 
-Plugins can provide resources or APIs and extend registries by contributing routes, tools, hooks, middleware, model providers, or other capabilities. Start with [plugins.md](./plugins.md); follow [api.md](./api.md), [resources.md](./resources.md), [Graph — Hooks](./graph.md#hooks), and [Graph — Middleware](./graph.md#middleware) for the capability-specific contracts.
-
-1. Create the plugin in the Layer 3 crate that owns the capability and export it from that crate's `lib.rs`.
-2. Declare capability relationships with the `#[plugin]` typed build parameters where possible; use `dependencies()` only for pure ordering or lifecycle relationships not represented by a capability.
-3. Register or extend the relevant resources, APIs, hooks, middleware, routes, tools, or provider registries in the lifecycle phase required by their reference documentation.
-4. Add the plugin to [`DefaultPlugins`](crate::plugins::DefaultPlugins) or [`MinimalPlugins`](crate::plugins::MinimalPlugins) only when it belongs in that default composition.
-5. Add focused tests and document the plugin per [plugins.md — Documentation Standard](./plugins.md#documentation-standard), including its applicable conditional sections.
-6. Add or update the [Plugin Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/plugins/) and this guide when the plugin creates a new downstream integration goal.
-7. If capability declarations alter the representative plugin graph, regenerate and commit `examples/plugins.lock` with `POLARIS_BLESS_PLUGINS_LOCK=1 cargo test -p examples --test plugins_lock`.
+1. Create `crates/polaris_core_plugins/src/my_plugin.rs`
+2. Define resource types implementing [`GlobalResource`](crate::system::resource::GlobalResource) or [`LocalResource`](crate::system::resource::LocalResource)
+3. Implement [`Plugin`](crate::system::plugin::Plugin) with `build()`, `ready()`, and `cleanup()` as needed
+4. Add `mod my_plugin;` and re-export in `crates/polaris_core_plugins/src/lib.rs`
+5. Add to [`DefaultPlugins`](crate::plugins::DefaultPlugins) or [`MinimalPlugins`](crate::plugins::MinimalPlugins) if appropriate
+6. Document the plugin per [plugins.md — Documentation Standard](./plugins.md#documentation-standard)
+7. Add a row to the [Plugin Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/plugins/) (the catalog drift guard at `tests/plugin_catalog.rs` enforces this)
 
 ## Step-by-Step: Adding an API
 

@@ -92,7 +92,11 @@ async fn my_handler(State(_sessions): State<SessionsAPI>) -> &'static str {
 
 Handlers use `State<SessionsAPI>` directly — no `Option` unwrap, no
 "server not ready" branch. Use `add_routes` for stateless fragments and
-`add_routes_with` whenever the router needs another plugin's API.
+`add_routes_with` whenever the router needs another plugin's API. Use
+`add_protected_routes` / `add_protected_routes_with` for private metadata or
+administrative routes; `AppPlugin` mounts those fragments only when an
+`AuthProvider` is configured and the protected auth check ignores public-path
+allowlist exemptions.
 
 # `HttpIOProvider`
 

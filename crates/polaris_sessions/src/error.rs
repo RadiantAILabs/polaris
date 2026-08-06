@@ -1,5 +1,6 @@
 //! Error types for session operations.
 
+use crate::api::{ContractName, ContractNameError};
 use crate::store::{SessionId, TurnNumber};
 use polaris_agent::SetupError;
 use polaris_graph::ValidationResult;
@@ -44,6 +45,27 @@ pub enum SessionError {
     /// No agent has been registered with the given type name.
     #[error("agent not found: {0}")]
     AgentNotFound(String),
+
+    /// A capability contract name was empty or not normalized.
+    #[error(transparent)]
+    InvalidContractName(#[from] ContractNameError),
+
+    /// No capability contract has been registered with the given name.
+    #[error("contract not found: {0}")]
+    ContractNotFound(ContractName),
+
+    /// A capability contract name was re-registered with a different
+    /// signature.
+    ///
+    /// Contracts are cross-plugin coordination points, so
+    /// [`SessionsAPI::register_contract`](crate::SessionsAPI::register_contract)
+    /// refuses to silently replace one; re-registering an identical
+    /// signature is a no-op.
+    #[error("contract '{name}' is already registered with a different signature")]
+    ContractConflict {
+        /// Name of the contract that was re-registered.
+        name: ContractName,
+    },
 
     /// No checkpoint exists for the given turn number.
     #[error("turn not found: {0}")]

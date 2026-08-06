@@ -55,6 +55,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tokio-test = "0.4"
 reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1"
+# `oneshot` for exercising the standalone `http::routes` router without a
+# listener.
+tower = { version = "0.5", features = ["util"] }
 # `polaris_models` and `polaris_tools` are needed in tests because
 # `TracingPlugin` requires their plugins as dependencies for LLM and
 # tool instrumentation decoration.

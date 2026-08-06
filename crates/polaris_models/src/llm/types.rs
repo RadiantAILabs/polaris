@@ -14,6 +14,10 @@ use std::pin::Pin;
 pub struct LlmRequest {
     /// System prompt for the model.
     pub system: Option<String>,
+    /// Name of the system prompt variant in use, for observability.
+    pub system_prompt_name: Option<String>,
+    /// Version of the system prompt variant in use, for observability.
+    pub system_prompt_version: Option<String>,
     /// The messages to send to the model.
     pub messages: Vec<Message>,
     /// Available tools the model can call.

@@ -5,7 +5,9 @@
 //! `polaris_app` provides an axum-based HTTP server that integrates with the
 //! Polaris plugin lifecycle. Plugins register route fragments during `build()`
 //! via the [`HttpRouter`] API, and [`AppPlugin`] merges and serves them with
-//! Tower middleware (CORS, tracing, request ID).
+//! Tower middleware (CORS, tracing, request ID). Private surfaces can be
+//! registered as protected routes, which are mounted only behind
+//! [`AuthProvider`] and ignore public-path allowlist exemptions.
 //!
 //! This crate is the shared infrastructure for `polaris-http`, `polaris-mcp`
 //! (SSE transport), and any future product that needs an HTTP interface.

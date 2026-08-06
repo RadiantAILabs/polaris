@@ -78,8 +78,8 @@ pub mod prelude {
         ResourceValidationError,
     };
     pub use crate::graph::{
-        Graph, GraphSignature, MergeError, SignatureDiff, SystemNodeBuilder, ValidationError,
-        ValidationResult, ValidationWarning,
+        Graph, GraphSignature, MergeError, RenderedSignature, SignatureDiff, SystemNodeBuilder,
+        ValidationError, ValidationResult, ValidationWarning,
     };
     pub use crate::middleware::{MiddlewareAPI, MiddlewareError};
     pub use crate::node::{
@@ -101,8 +101,8 @@ pub use executor::{
     CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor, ResourceValidationError,
 };
 pub use graph::{
-    Graph, GraphSignature, MergeError, SignatureDiff, SystemNodeBuilder, ValidationError,
-    ValidationResult, ValidationWarning,
+    Graph, GraphSignature, MergeError, RenderedSignature, SignatureDiff, SystemNodeBuilder,
+    ValidationError, ValidationResult, ValidationWarning,
 };
 pub use hooks::{RunId, RunLabels};
 pub use middleware::{MiddlewareAPI, MiddlewareError};

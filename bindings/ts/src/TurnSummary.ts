@@ -4,9 +4,11 @@ import type { TurnStatus } from "./TurnStatus";
 /**
  * Summary entry for `GET /v1/sessions/{id}/turns`.
  *
- * When the request includes `?include=messages`, the full
+ * When the request includes `?include=messages`, the retained
  * [`IOMessage`] array is embedded in [`messages`](Self::messages).
- * Otherwise that field is omitted from the JSON payload.
+ * Otherwise that field is omitted from the JSON payload. The
+ * [`messages_truncated`](Self::messages_truncated) flag indicates whether
+ * recording limits omitted any data.
  */
 export type TurnSummary = { 
 /**
@@ -30,11 +32,16 @@ status: TurnStatus,
  */
 io_message_count: number, 
 /**
+ * Whether one or more messages or payload bytes were omitted from
+ * retained turn history because a recording limit was reached.
+ */
+messages_truncated: boolean, 
+/**
  * Truncated text of the most recent IO message, if any.
  */
 last_message_preview: string | null, 
 /**
- * Full IO messages, only present when the request was made with
+ * Retained IO messages, only present when the request was made with
  * `?include=messages`.
  */
 messages?: unknown[], };

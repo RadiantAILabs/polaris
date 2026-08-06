@@ -36,7 +36,7 @@ Plugin-composed HTTP surface.
 
 | API | Composition policy | What it enables |
 |-----|--------------------|-----------------|
-| [`HttpRouter`](crate::app::HttpRouter) | Open extension | Plugins contribute axum routes during `build()`; `AppPlugin` merges and serves them in `ready()`. |
+| [`HttpRouter`](crate::app::HttpRouter) | Open extension | Plugins contribute public or protected axum routes during `build()`; `AppPlugin` merges and serves them in `ready()`, mounting protected fragments only behind `AuthProvider`. |
 | [`WsRouter`](crate::app::WsRouter) | Open extension | WebSocket route contributions, mirrored on `HttpRouter`. |
 | [`ServerHandle`](crate::app::ServerHandle) | Provider-scoped | Bound address and shutdown signal for the running HTTP server, populated by `AppPlugin` in `ready()`. |
 
@@ -46,7 +46,7 @@ Agent session lifecycle and turn execution.
 
 | API | Composition policy | What it enables |
 |-----|--------------------|-----------------|
-| [`SessionsAPI`](crate::sessions::SessionsAPI) | Provider-scoped | Register agent types, create sessions, run turns, manage checkpoints. Writes flow through `SessionsPlugin`'s own machinery; consumers call its methods rather than mutating internal state directly. |
+| [`SessionsAPI`](crate::sessions::SessionsAPI) | Provider-scoped (open contract registry) | Register agent types, create sessions, run turns, manage checkpoints; register named capability contracts matched against cached agent signatures. Session and turn writes flow through `SessionsPlugin`'s own machinery, but the capability-contract registry is an open-extension point: any plugin may `register_contract` a named slot after `ready()`. |
 
 # Layer 3 — Core Infrastructure
 

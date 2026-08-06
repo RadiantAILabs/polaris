@@ -17,6 +17,16 @@ pub trait Agent: Send + Sync + 'static {
     /// Stable, user-defined name for this agent type.
     fn name(&self) -> &'static str;
 
+    /// Optional agent version, recorded on the turn span for observability.
+    fn version(&self) -> Option<&str> {
+        None
+    }
+
+    /// Optional description of the agent's purpose, recorded on the turn span.
+    fn description(&self) -> Option<&str> {
+        None
+    }
+
     /// Initialize session resources before the first turn.
     fn setup(&self, ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
         Ok(())
@@ -32,7 +42,13 @@ pub trait Agent: Send + Sync + 'static {
 ```
 
 - **`build`** -- called once when the agent is registered; populates the graph
-- **`name`** -- stable identifier for agent type resolution
+- **`name`** -- stable identifier for agent type resolution; emitted in logs and
+  traces and therefore should not contain PII
+- **`version`** -- optional agent version; emitted in logs and traces and
+  therefore should not contain PII. Defaults to `None`
+- **`description`** -- optional human-readable summary of the agent's purpose;
+  emitted in logs and traces and therefore should not contain PII. Defaults to
+  `None`
 - **`setup`** -- called at session creation and resume; reads config from `&self`
   and the context to initialize per-session resources
 - **`to_graph`** -- convenience that creates a `Graph` and delegates to `build`

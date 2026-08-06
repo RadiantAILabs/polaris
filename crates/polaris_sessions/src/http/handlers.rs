@@ -16,13 +16,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use parking_lot::Mutex;
 use polaris_app::HttpHeaders;
 use polaris_core_plugins::{IOError, IOMessage, IOProvider, IOSource, UserIO};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -120,6 +118,12 @@ pub(crate) async fn process_turn(
     // apply backpressure on agents that emit faster than we drain.
     let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, TURN_OUTPUT_BUFFER);
     let provider = Arc::new(provider);
+    let recording = Arc::new(RecordingIOProvider {
+        inner: Arc::clone(&provider),
+        sessions: sessions.clone(),
+        session_id: session_id.clone(),
+        turn: turn_before,
+    });
 
     // Send user message and close the input channel.
     input_tx
@@ -128,18 +132,12 @@ pub(crate) async fn process_turn(
         .map_err(|_| ApiError::IoChannelClosed)?;
     drop(input_tx);
 
-    // Execute the turn, injecting the IO provider and raw request headers.
-    // `RequestContextPlugin`'s `OnGraphStart` hook parses `HttpHeaders` into
-    // a `RequestContext` before any system runs. `executed` is set inside the
-    // setup closure, which only runs once the session lock is held — proof
-    // this task owns `turn_before` (mirrors the streaming handler).
-    let io_provider = Arc::clone(&provider);
-    let executed = Arc::new(AtomicBool::new(false));
-    let executed_setup = Arc::clone(&executed);
+    // Execute the turn, injecting the recording IO provider and raw request
+    // headers. `RequestContextPlugin`'s `OnGraphStart` hook parses
+    // `HttpHeaders` into a `RequestContext` before any system runs.
     let result = sessions
         .try_process_turn_with(&session_id, move |ctx| {
-            executed_setup.store(true, Ordering::Release);
-            ctx.insert(UserIO::new(io_provider));
+            ctx.insert(UserIO::new(recording));
             ctx.insert(HttpHeaders(headers));
         })
         .await;
@@ -149,16 +147,6 @@ pub(crate) async fn process_turn(
     let mut messages = Vec::new();
     while let Ok(msg) = output_rx.try_recv() {
         messages.push(msg);
-    }
-
-    // Record iff this task actually executed the turn. A pre-execution
-    // short-circuit (`SessionBusy`/`ReadOnly`/`SessionNotFound`) never ran
-    // `setup`, so `turn_before` is another task's record and writing our
-    // empty capture would clobber it. A turn we executed but that failed
-    // keeps its partial output, matching its `Failed` status. The error is
-    // still surfaced to the client below.
-    if executed.load(Ordering::Acquire) {
-        sessions.record_turn_messages(&session_id, turn_before, messages.clone());
     }
 
     let result = result?;
@@ -248,15 +236,11 @@ pub(crate) async fn process_turn_stream(
 
     let (provider, input_tx, output_rx) = HttpIOProvider::new(1, TURN_OUTPUT_BUFFER);
     let provider = Arc::new(provider);
-    // Wrap with a recorder so the spawned task can flush the full
-    // message array to the session's turn history once the turn ends.
-    // The wrapper records on `send`, before the bounded channel is
-    // touched, so it captures every message even if the SSE consumer
-    // is still draining `output_rx` when we finalize the record.
-    let recorded: Arc<Mutex<Vec<IOMessage>>> = Arc::new(Mutex::new(Vec::new()));
     let recording = Arc::new(RecordingIOProvider {
         inner: Arc::clone(&provider),
-        recorded: Arc::clone(&recorded),
+        sessions: sessions.clone(),
+        session_id: session_id.clone(),
+        turn: turn_before,
     });
 
     input_tx
@@ -276,16 +260,9 @@ pub(crate) async fn process_turn_stream(
     let sessions_bg = sessions.clone();
     let session_id_bg = session_id.clone();
     let recording_bg = Arc::clone(&recording);
-    let recorded_bg = Arc::clone(&recorded);
-    // Set inside the setup closure, which `execute_turn` runs only after it
-    // has acquired the session lock and created the turn record. It is the
-    // proof that this task owns `turn_before`; see the recording guard below.
-    let executed = Arc::new(AtomicBool::new(false));
-    let executed_bg = Arc::clone(&executed);
     tokio::spawn(async move {
         let result = sessions_bg
             .try_process_turn_with(&session_id_bg, move |ctx| {
-                executed_bg.store(true, Ordering::Release);
                 ctx.insert(UserIO::new(recording_bg));
                 ctx.insert(HttpHeaders(headers));
             })
@@ -293,22 +270,6 @@ pub(crate) async fn process_turn_stream(
 
         // Close the output channel so the IOMessage stream terminates.
         provider.close().await;
-
-        // Flush captured messages to the turn history — but only when this
-        // task actually executed the turn, i.e. the setup closure ran. The
-        // pre-execution short-circuits (`SessionBusy` when another client
-        // holds the session, `ReadOnly`, `SessionNotFound`) return before
-        // `setup`, so this task never owned `turn_before`: that record
-        // belongs to someone else (e.g. the race winner's in-flight turn),
-        // and writing our empty capture would clobber it. A turn we *did*
-        // execute but that failed mid-run keeps its partial capture, so the
-        // recorded messages stay faithful to the turn's `Failed` status.
-        // Cloning is fine — a turn's IO volume is bounded by the agent's
-        // behavior, not by the channel buffer.
-        if executed.load(Ordering::Acquire) {
-            let captured = recorded_bg.lock().clone();
-            sessions_bg.record_turn_messages(&session_id_bg, turn_before, captured);
-        }
 
         // Send terminal event.
         let event = match result {
@@ -449,15 +410,39 @@ pub(crate) async fn list_stored_sessions(
 // Dashboard endpoints (A9)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `GET /v1/sessions/agent-types` — enumerate registered agent types.
+/// `GET /v1/sessions/agent-types` — enumerate registered agent type names.
 pub(crate) async fn list_agent_types(
     State(sessions): State<SessionsAPI>,
 ) -> Json<ListAgentTypesResponse> {
-    let items = sessions
-        .registered_agents()
+    let mut names = sessions.registered_agents();
+    names.sort_unstable();
+    let items = names
         .into_iter()
         .map(|name| AgentTypeSummary {
             name: name.to_owned(),
+            signature: None,
+            contracts: Vec::new(),
+        })
+        .collect();
+    Json(ListAgentTypesResponse { items })
+}
+
+/// `GET /v1/sessions/agent-types/details` — enumerate registered agent
+/// types with private graph signatures and satisfied capability contracts.
+pub(crate) async fn list_agent_type_details(
+    State(sessions): State<SessionsAPI>,
+) -> Json<ListAgentTypesResponse> {
+    let items = sessions
+        .agent_type_infos()
+        .into_iter()
+        .map(|info| AgentTypeSummary {
+            name: info.name.to_owned(),
+            signature: Some(info.signature.to_rendered().into()),
+            contracts: info
+                .contracts
+                .into_iter()
+                .map(crate::ContractName::into_string)
+                .collect(),
         })
         .collect();
     Json(ListAgentTypesResponse { items })
@@ -468,7 +453,7 @@ pub(crate) async fn list_agent_types(
 pub(crate) struct TurnsListQuery {
     /// Comma-separated list of optional sections to include. Currently
     /// the only recognized token is `messages` — when present, each
-    /// summary embeds the full IO message array.
+    /// summary embeds the retained IO message array.
     include: Option<String>,
 }
 
@@ -492,7 +477,7 @@ pub(crate) async fn list_turns(
     Ok(Json(ListTurnsResponse { items }))
 }
 
-/// `GET /v1/sessions/{id}/turns/{n}` — fetch a single turn's full payload.
+/// `GET /v1/sessions/{id}/turns/{n}` — fetch a single turn's retained payload.
 pub(crate) async fn get_turn(
     State(sessions): State<SessionsAPI>,
     Path((id, turn)): Path<(String, TurnNumber)>,
@@ -569,21 +554,22 @@ pub(crate) async fn get_uptime(
 // Turn-message recording (shared between sync + SSE turn handlers)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// IO provider that mirrors every outbound message into a shared `Vec`
-/// before delegating to an inner [`HttpIOProvider`].
+/// IO provider that records each outbound message before delegating to an
+/// inner [`HttpIOProvider`].
 ///
-/// Used by [`process_turn_stream`] so the SSE handler can attach the full
-/// IO message array to the session's turn history *after* the turn ends,
-/// without the synchronous handler's "drain `output_rx`" trick (the SSE
-/// stream is consumed by Axum's response loop, not the handler body).
+/// Recording writes directly into the bounded turn-history entry, so SSE
+/// execution never accumulates a second unbounded message buffer.
 struct RecordingIOProvider {
     inner: Arc<HttpIOProvider>,
-    recorded: Arc<Mutex<Vec<IOMessage>>>,
+    sessions: SessionsAPI,
+    session_id: SessionId,
+    turn: TurnNumber,
 }
 
 impl IOProvider for RecordingIOProvider {
     async fn send(&self, message: IOMessage) -> Result<(), IOError> {
-        self.recorded.lock().push(message.clone());
+        self.sessions
+            .record_turn_message(&self.session_id, self.turn, &message);
         self.inner.send(message).await
     }
 

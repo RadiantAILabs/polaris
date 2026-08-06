@@ -31,6 +31,39 @@ pub(crate) fn apply_middleware(
     config: &AppConfig,
     auth: Option<Arc<dyn AuthProvider>>,
 ) -> axum::Router {
+    let auth = auth.map(|provider| AuthMode::Allowlisted {
+        provider,
+        allowlist: Arc::new(PublicAllowlist::from_config(config)),
+    });
+    apply_middleware_with_auth(router, config, auth)
+}
+
+/// Applies the complete middleware stack to routes that always require auth.
+///
+/// Protected route fragments are wrapped separately from ordinary routes so
+/// they receive exactly one provider call and cannot inherit a public-path
+/// allowlist exemption.
+pub(crate) fn apply_required_middleware(
+    router: axum::Router,
+    config: &AppConfig,
+    provider: Arc<dyn AuthProvider>,
+) -> axum::Router {
+    apply_middleware_with_auth(router, config, Some(AuthMode::Required(provider)))
+}
+
+enum AuthMode {
+    Allowlisted {
+        provider: Arc<dyn AuthProvider>,
+        allowlist: Arc<PublicAllowlist>,
+    },
+    Required(Arc<dyn AuthProvider>),
+}
+
+fn apply_middleware_with_auth(
+    router: axum::Router,
+    config: &AppConfig,
+    auth: Option<AuthMode>,
+) -> axum::Router {
     let cors = build_cors_layer(config, auth.is_some());
 
     let router = router
@@ -40,13 +73,19 @@ pub(crate) fn apply_middleware(
     // Auth layer is applied between CORS and tracing so that:
     // - CORS preflight requests pass through (browsers need them)
     // - Rejected requests still appear in trace logs
-    let router = if let Some(provider) = auth {
-        let allowlist = Arc::new(PublicAllowlist::from_config(config));
-        router.layer(axum::middleware::from_fn(move |req, next| {
+    let router = match auth {
+        Some(AuthMode::Allowlisted {
+            provider,
+            allowlist,
+        }) => router.layer(axum::middleware::from_fn(move |req, next| {
             auth_middleware(provider.clone(), allowlist.clone(), req, next)
-        }))
-    } else {
-        router
+        })),
+        Some(AuthMode::Required(provider)) => {
+            router.layer(axum::middleware::from_fn(move |req, next| {
+                required_auth_middleware(provider.clone(), req, next)
+            }))
+        }
+        None => router,
     };
 
     router
@@ -96,6 +135,22 @@ async fn auth_middleware(
         let req = Request::from_parts(parts, body);
         return next.run(req).await;
     }
+    match provider.authenticate(&parts) {
+        Ok(()) => {
+            let req = Request::from_parts(parts, body);
+            next.run(req).await
+        }
+        Err(rejection) => *rejection,
+    }
+}
+
+/// Axum middleware for protected route fragments.
+async fn required_auth_middleware(
+    provider: Arc<dyn AuthProvider>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let (parts, body) = req.into_parts();
     match provider.authenticate(&parts) {
         Ok(()) => {
             let req = Request::from_parts(parts, body);

@@ -2,7 +2,7 @@
 import type { TurnStatus } from "./TurnStatus";
 
 /**
- * Full turn payload returned by `GET /v1/sessions/{id}/turns/{n}`.
+ * Retained turn payload returned by `GET /v1/sessions/{id}/turns/{n}`.
  */
 export type Turn = { 
 /**
@@ -22,6 +22,11 @@ finished_at: string | null,
  */
 status: TurnStatus, 
 /**
- * IO messages emitted during the turn, in arrival order.
+ * Whether retained turn history omitted message data because a recording
+ * limit was reached.
+ */
+messages_truncated: boolean, 
+/**
+ * Retained IO messages emitted during the turn, in arrival order.
  */
 messages: unknown[], };
