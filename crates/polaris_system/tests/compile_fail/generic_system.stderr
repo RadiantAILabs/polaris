@@ -1,0 +1,13 @@
+error: system functions cannot be generic; the generated system struct would discard the generic parameters
+  --> tests/compile_fail/generic_system.rs:18:24
+   |
+18 | async fn generic_system<T: Send>(counter: Res<Counter>) {
+   |                        ^^^^^^^^^
+
+warning: unused import: `polaris_system::param::Res`
+ --> tests/compile_fail/generic_system.rs:6:5
+  |
+6 | use polaris_system::param::Res;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

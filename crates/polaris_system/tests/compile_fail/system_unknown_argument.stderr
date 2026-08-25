@@ -1,0 +1,5 @@
+error: unknown `#[system]` argument `observe`; expected `inspect`
+ --> tests/compile_fail/system_unknown_argument.rs:6:10
+  |
+6 | #[system(observe)]
+  |          ^^^^^^^

@@ -58,12 +58,14 @@
 //! ```
 
 mod access;
+pub mod inspect;
 
 use crate::resource::{
     LocalResource, Output, OutputRef, Outputs, Resource, ResourceRef, ResourceRefMut, Resources,
 };
 pub use access::{Access, AccessMode, SystemAccess};
 use hashbrown::HashSet;
+use inspect::InspectionSink;
 use std::any::{Any, TypeId, type_name};
 use std::sync::{Arc, OnceLock};
 use variadics_please::all_tuples;
@@ -219,6 +221,15 @@ pub struct SystemContext<'parent> {
     /// `HashSet`. The unrestricted default is a shared singleton (see
     /// [`unrestricted_parent_filter`]).
     parent_filter: Arc<ParentFilter>,
+    /// Sink receiving captured parameter values, if one is installed.
+    ///
+    /// Held directly rather than resolved as a resource so the generated
+    /// capture code pays a single `Option` check when no sink is installed,
+    /// instead of a failed walk up the context hierarchy per parameter.
+    ///
+    /// Cloned into child contexts, so installing a sink on a root context
+    /// covers every scope, branch, and loop iteration beneath it.
+    inspection: Option<Arc<dyn InspectionSink>>,
 }
 
 /// Returns the process-wide shared unrestricted [`ParentFilter`].
@@ -343,6 +354,7 @@ impl<'parent> SystemContext<'parent> {
             resources: Resources::new(),
             outputs: Outputs::new(),
             parent_filter: unrestricted_parent_filter(),
+            inspection: None,
         }
     }
 
@@ -359,6 +371,7 @@ impl<'parent> SystemContext<'parent> {
             resources: Resources::new(),
             outputs: Outputs::new(),
             parent_filter: unrestricted_parent_filter(),
+            inspection: None,
         }
     }
 
@@ -397,6 +410,7 @@ impl<'parent> SystemContext<'parent> {
             resources: Resources::new(),
             outputs: Outputs::new(),
             parent_filter: unrestricted_parent_filter(),
+            inspection: self.inspection.clone(),
         }
     }
 
@@ -444,15 +458,238 @@ impl<'parent> SystemContext<'parent> {
             resources: Resources::new(),
             outputs: Outputs::new(),
             parent_filter: parent_filter.into(),
+            inspection: self.inspection.clone(),
         }
+    }
+
+    /// Installs a sink to receive captured parameter values, returning the sink
+    /// it displaced.
+    ///
+    /// One sink is installed at a time, so this is a replacement: whoever
+    /// installed the displaced sink stops receiving records unless the new sink
+    /// forwards to it. A caller that finds a sink already installed should
+    /// chain onto it rather than cut the previous owner off — see
+    /// [`inspection_arc`](Self::inspection_arc), which hands back the owned
+    /// handle that makes chaining expressible and carries the recipe.
+    ///
+    /// Child contexts created after this call inherit the sink, so installing
+    /// it on a root context covers the whole execution beneath it.
+    ///
+    /// Which parameters are *capturable* is fixed at compile time by
+    /// `#[system(inspect(..))]`; this controls whether capture is live. With no
+    /// sink installed, the generated code pays one `Option` check and never
+    /// renders a value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::param::SystemContext;
+    /// use polaris_system::param::inspect::{Inspection, InspectionSink, ParamMeta};
+    /// use std::sync::Arc;
+    ///
+    /// struct Discard;
+    /// impl InspectionSink for Discard {
+    ///     fn record(&self, _meta: ParamMeta, _render: &dyn Fn() -> Inspection) {}
+    /// }
+    ///
+    /// let mut ctx = SystemContext::new();
+    /// assert!(ctx.inspection().is_none());
+    ///
+    /// assert!(ctx.replace_inspection(Arc::new(Discard)).is_none());
+    /// assert!(ctx.inspection().is_some());
+    ///
+    /// // A second install hands back the sink it displaced.
+    /// let displaced = ctx.replace_inspection(Arc::new(Discard));
+    /// assert!(displaced.is_some());
+    /// ```
+    #[must_use = "the displaced sink belongs to whoever installed it, and dropping \
+                  it silently cuts that owner off — bind it to `_` to record that \
+                  losing it is intended"]
+    pub fn replace_inspection(
+        &mut self,
+        sink: Arc<dyn InspectionSink>,
+    ) -> Option<Arc<dyn InspectionSink>> {
+        self.inspection.replace(sink)
+    }
+
+    /// Builder form of [`replace_inspection`](Self::replace_inspection).
+    ///
+    /// Returning `Self` leaves nowhere to hand a displaced sink back, so this
+    /// **discards** whatever was already installed, with no signal to whoever
+    /// installed it. That includes a sink inherited from a parent — [`child`]
+    /// clones the handle into the child's own slot, so `parent.child()` arrives
+    /// already occupied — and one installed by an earlier `with_inspection` in
+    /// the same chain.
+    ///
+    /// Use this on a context you just created. When a sink may already be in
+    /// force, reach for [`inspection_arc`](Self::inspection_arc) plus
+    /// [`replace_inspection`](Self::replace_inspection) instead, which report
+    /// the displacement and make chaining expressible.
+    ///
+    /// [`child`]: Self::child
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::param::SystemContext;
+    /// use polaris_system::param::inspect::{Inspection, InspectionSink, ParamMeta};
+    /// use std::sync::Arc;
+    ///
+    /// struct Discard;
+    /// impl InspectionSink for Discard {
+    ///     fn record(&self, _meta: ParamMeta, _render: &dyn Fn() -> Inspection) {}
+    /// }
+    ///
+    /// let ctx = SystemContext::new().with_inspection(Arc::new(Discard));
+    /// assert!(ctx.inspection().is_some());
+    /// ```
+    #[must_use]
+    pub fn with_inspection(mut self, sink: Arc<dyn InspectionSink>) -> Self {
+        // `-> Self` leaves nowhere to report the displacement, so discarding it
+        // is structural rather than safe — the rustdoc above carries the warning.
+        let _ = self.replace_inspection(sink);
+        self
+    }
+
+    /// Returns the installed parameter-inspection sink, if any.
+    ///
+    /// Called by the code `#[system(inspect(..))]` generates. Returning `None`
+    /// is the inactive path and must stay cheap — it is a single discriminant
+    /// read, not a resource lookup.
+    ///
+    /// This is a borrow, so it cannot outlive the context. Use
+    /// [`inspection_arc`](Self::inspection_arc) to keep a handle.
+    #[must_use]
+    pub fn inspection(&self) -> Option<&dyn InspectionSink> {
+        self.inspection.as_deref()
+    }
+
+    /// Returns an owned handle to the installed parameter-inspection sink.
+    ///
+    /// Unlike [`inspection`](Self::inspection), the returned `Arc` can be stored
+    /// — which is what makes composition possible: a plugin can capture the
+    /// caller's sink, install its own, and forward records to both rather than
+    /// replacing the caller's.
+    ///
+    /// The handle outlives this borrow and is `Send + Sync`, so a caller who
+    /// receives it can retain the sink past the context's lifetime, move it
+    /// across threads, and push records of their own choosing into it. That is
+    /// what handing out the handle grants, and it is why this is a separate
+    /// accessor from [`inspection`](Self::inspection) rather than its return
+    /// type.
+    ///
+    /// # Chaining is not idempotent
+    ///
+    /// Each application wraps whatever is installed in a *new* wrapper, so
+    /// re-running the recipe against a context reused across runs adds a link
+    /// per run — deepening [`record()`](InspectionSink::record) recursion
+    /// without bound and delivering one
+    /// duplicate record per link. Guard on the identity of the handle you
+    /// installed, as the example below does. Testing `is_some()` does not help,
+    /// and neither does comparing against your own sink, because the wrapper
+    /// hides it.
+    ///
+    /// Nothing in this layer bounds the result: the slot holds one sink, and it
+    /// does not measure chain depth, recognize a re-applied wrapper, or isolate
+    /// a branch. The guard is the caller's to write.
+    ///
+    /// Two properties a wrapper does not inherit from the sink it wraps. Policy:
+    /// it receives the un-rendered closure straight from the capture site, so it
+    /// sees values the wrapped sink would have withheld. Failure isolation: a
+    /// wrapper that forwards in order stops at the first branch that panics, so
+    /// a sink placed in front can silence the one behind it. Both argue for
+    /// delivering to one sink that fans out flatly over wrapping sinks around
+    /// one another. The full rules live in the repository's
+    /// `docs/reference/context.md` under "Chaining onto an Installed Sink".
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::param::SystemContext;
+    /// use polaris_system::param::inspect::{Inspection, InspectionSink, ParamMeta};
+    /// use std::sync::Arc;
+    ///
+    /// struct Discard;
+    /// impl InspectionSink for Discard {
+    ///     fn record(&self, _meta: ParamMeta, _render: &dyn Fn() -> Inspection) {}
+    /// }
+    ///
+    /// /// Forwards every record to both sinks.
+    /// struct Tee(Arc<dyn InspectionSink>, Arc<dyn InspectionSink>);
+    /// impl InspectionSink for Tee {
+    ///     fn record(&self, meta: ParamMeta, render: &dyn Fn() -> Inspection) {
+    ///         self.0.record(meta, render);
+    ///         self.1.record(meta, render);
+    ///     }
+    /// }
+    ///
+    /// let mut ctx = SystemContext::new().with_inspection(Arc::new(Discard));
+    ///
+    /// // The handle we installed, retained so a later pass can recognize it.
+    /// let mut ours: Option<Arc<dyn InspectionSink>> = None;
+    ///
+    /// // Run the recipe twice: the guard must make the second pass a no-op.
+    /// for _ in 0..2 {
+    ///     let live = ctx.inspection_arc();
+    ///     let still_ours = match (&ours, &live) {
+    ///         (Some(mine), Some(live)) => Arc::ptr_eq(mine, live),
+    ///         _ => false,
+    ///     };
+    ///     if !still_ours {
+    ///         // Chain onto whatever the caller installed instead of dropping it.
+    ///         let wrapper: Arc<dyn InspectionSink> = match live {
+    ///             Some(existing) => Arc::new(Tee(existing, Arc::new(Discard))),
+    ///             None => Arc::new(Discard),
+    ///         };
+    ///         let _ = ctx.replace_inspection(Arc::clone(&wrapper));
+    ///         ours = Some(wrapper);
+    ///     }
+    /// }
+    ///
+    /// // One `Tee`, not two: the second pass recognized our wrapper and skipped.
+    /// let live = ctx.inspection_arc().expect("a sink is installed");
+    /// assert!(Arc::ptr_eq(ours.as_ref().expect("we installed one"), &live));
+    /// ```
+    #[must_use]
+    pub fn inspection_arc(&self) -> Option<Arc<dyn InspectionSink>> {
+        self.inspection.clone()
     }
 
     /// Inserts a local resource into this context's scope.
     ///
     /// This resource will shadow any resource of the same type in parent scopes
     /// for read access, and will be the target for mutable access.
-    pub fn insert<R: LocalResource>(&mut self, resource: R) {
-        self.resources.insert(resource);
+    ///
+    /// Returns the resource this call displaced from *this* scope, or `None` if
+    /// the scope had no resource of type `R`. A `Some` return means the write
+    /// overwrote a value the caller may not have known about — shadowed values
+    /// in parent scopes and globals are untouched and never reported here.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when this scope already holds an entry under
+    /// `R`'s type ID that is not an `R` — see [`Resources::insert`]. Only a
+    /// prior [`insert_boxed`](Self::insert_boxed) that broke its
+    /// type-correctness contract can set that up, so keep any placeholder
+    /// written through the type-erased forms stored under its own type.
+    ///
+    /// [`Resources::insert`]: crate::resource::Resources::insert
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_system::param::SystemContext;
+    /// # use polaris_system::resource::LocalResource;
+    /// #[derive(Clone)]
+    /// struct Counter { value: i32 }
+    /// impl LocalResource for Counter {}
+    ///
+    /// let mut ctx = SystemContext::new();
+    /// assert!(ctx.insert(Counter { value: 1 }).is_none());
+    /// assert_eq!(ctx.insert(Counter { value: 2 }).unwrap().value, 1);
+    /// ```
+    pub fn insert<R: LocalResource>(&mut self, resource: R) -> Option<R> {
+        self.resources.insert(resource)
     }
 
     /// Inserts any resource into this context's scope.
@@ -463,8 +700,15 @@ impl<'parent> SystemContext<'parent> {
     ///
     /// Note: Resources inserted this way can still only be mutated via
     /// `ResMut<T>` if they implement `LocalResource`.
-    pub fn insert_resource<R: Resource>(&mut self, resource: R) {
-        self.resources.insert(resource);
+    ///
+    /// Returns the displaced resource, as [`insert`](Self::insert) does.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds on a type-ID/type mismatch in the displaced
+    /// entry, on the same terms as [`insert`](Self::insert).
+    pub fn insert_resource<R: Resource>(&mut self, resource: R) -> Option<R> {
+        self.resources.insert(resource)
     }
 
     /// Inserts a type-erased resource into this context's scope.
@@ -472,8 +716,15 @@ impl<'parent> SystemContext<'parent> {
     /// This is used internally by the server to instantiate local resources
     /// from factories. The `type_id` must match the correct type of the boxed
     /// resource.
-    pub fn insert_boxed(&mut self, type_id: TypeId, resource: Box<dyn Any + Send + Sync>) {
-        self.resources.insert_boxed(type_id, resource);
+    ///
+    /// Returns the displaced resource still boxed, since the concrete type is
+    /// not known here. Downcast it with `Box::downcast` if you need the value.
+    pub fn insert_boxed(
+        &mut self,
+        type_id: TypeId,
+        resource: Box<dyn Any + Send + Sync>,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        self.resources.insert_boxed(type_id, resource)
     }
 
     /// Inserts a type-erased resource together with the factory that produced it.
@@ -484,9 +735,24 @@ impl<'parent> SystemContext<'parent> {
     /// `forward_fresh::<T>()` at a scope boundary to produce a clean
     /// child-scope value without needing access to the `Server`.
     ///
+    /// Returns the displaced resource still boxed, as [`insert_boxed`] does.
+    /// Only the *value* comes back: the displaced entry's own factory (and any
+    /// clone function registered on it) is dropped. Neither is recoverable from
+    /// the return, so a caller who needs to restore the previous entry must
+    /// capture what it wants **before** writing —
+    /// [`factory_fn_by_type_id`](Self::factory_fn_by_type_id) yields a clone of
+    /// the factory still in force, but it walks parents and globals; when
+    /// scope-local truth is what you need, read this scope alone with
+    /// [`resources().factory_fn_by_type_id()`][scoped]. After the write there
+    /// is nothing left to read.
+    ///
+    /// [scoped]: crate::resource::Resources::factory_fn_by_type_id
+    ///
     /// See [`Resources::insert_boxed_with_factory`] for the type-correctness
     /// contract — mismatched `type_id` / `resource` / `factory_fn` will surface
     /// as runtime downcast panics on access.
+    ///
+    /// [`insert_boxed`]: Self::insert_boxed
     ///
     /// # Example
     ///
@@ -508,9 +774,9 @@ impl<'parent> SystemContext<'parent> {
         type_id: TypeId,
         resource: Box<dyn Any + Send + Sync>,
         factory_fn: crate::resource::ResourceFactory,
-    ) {
+    ) -> Option<Box<dyn Any + Send + Sync>> {
         self.resources
-            .insert_boxed_with_factory(type_id, resource, factory_fn);
+            .insert_boxed_with_factory(type_id, resource, factory_fn)
     }
 
     /// Looks up the factory function for a resource type, walking this scope
@@ -813,17 +1079,37 @@ impl<'parent> SystemContext<'parent> {
     /// Inserts a system output.
     ///
     /// Called by the executor after a system returns a value.
-    /// If an output of this type already exists, it is replaced.
-    pub fn insert_output<O: Output>(&mut self, output: O) {
-        self.outputs.insert(output);
+    /// If an output of this type already exists, it is replaced and returned —
+    /// a `Some` return means an earlier producer's value for this type was
+    /// dropped, which for outputs is usual (a later node supersedes an earlier
+    /// one) but worth checking when two nodes are meant to produce distinct
+    /// types.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when this scope already holds an entry under
+    /// `O`'s type ID that is not an `O`, which only a prior
+    /// [`insert_output_boxed`](Self::insert_output_boxed) that broke its
+    /// type-correctness contract can set up — see [`Outputs::insert`].
+    ///
+    /// [`Outputs::insert`]: crate::resource::Outputs::insert
+    pub fn insert_output<O: Output>(&mut self, output: O) -> Option<O> {
+        self.outputs.insert(output)
     }
 
     /// Inserts a type-erased system output.
     ///
     /// Called by the executor when the concrete output type is not known
     /// at compile time. The `type_id` must match the correct type of the value.
-    pub fn insert_output_boxed(&mut self, type_id: TypeId, output: Box<dyn Any + Send + Sync>) {
-        self.outputs.insert_boxed(type_id, output);
+    ///
+    /// Returns the displaced output still boxed, since the concrete type is not
+    /// known here.
+    pub fn insert_output_boxed(
+        &mut self,
+        type_id: TypeId,
+        output: Box<dyn Any + Send + Sync>,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        self.outputs.insert_boxed(type_id, output)
     }
 
     /// Returns `true` if an output of type `O` exists.
@@ -1208,6 +1494,7 @@ all_tuples!(impl_system_param_tuple, 1, 8, P);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::param::inspect::{Inspection, ParamKind, ParamMeta, Phase};
     use crate::resource::LocalResource;
 
     #[derive(Debug, PartialEq)]
@@ -2088,5 +2375,434 @@ mod tests {
                 .factory_fn_by_type_id(TypeId::of::<Counter>())
                 .is_none()
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Displaced-value returns (SC-3307)
+    //
+    // Every context write hands back what it overwrote, so an overwrite is
+    // observable at the boundary users touch instead of silent.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_returns_displaced_resource() {
+        let mut ctx = SystemContext::new();
+
+        assert_eq!(ctx.insert(Counter { value: 1 }), None);
+        assert_eq!(ctx.insert(Counter { value: 2 }), Some(Counter { value: 1 }));
+        assert_eq!(ctx.get_resource::<Counter>().unwrap().value, 2);
+    }
+
+    #[test]
+    fn insert_reports_nothing_displaced_when_shadowing_a_parent() {
+        let mut parent = SystemContext::new();
+        parent.insert(Counter { value: 1 });
+
+        let mut child = parent.child();
+        // The parent's value is shadowed, not displaced — this scope was empty.
+        assert_eq!(child.insert(Counter { value: 2 }), None);
+
+        assert_eq!(child.get_resource::<Counter>().unwrap().value, 2);
+        assert_eq!(parent.get_resource::<Counter>().unwrap().value, 1);
+    }
+
+    #[test]
+    fn insert_resource_returns_displaced_resource() {
+        let mut ctx = SystemContext::new();
+
+        assert_eq!(ctx.insert_resource(Config { name: "a".into() }), None);
+        assert_eq!(
+            ctx.insert_resource(Config { name: "b".into() }),
+            Some(Config { name: "a".into() })
+        );
+        assert_eq!(ctx.get_resource::<Config>().unwrap().name, "b");
+    }
+
+    #[test]
+    fn insert_boxed_returns_displaced_resource_boxed() {
+        let type_id = TypeId::of::<Counter>();
+        let mut ctx = SystemContext::new();
+
+        let first: Box<dyn Any + Send + Sync> = Box::new(Counter { value: 1 });
+        assert!(ctx.insert_boxed(type_id, first).is_none());
+
+        let second: Box<dyn Any + Send + Sync> = Box::new(Counter { value: 2 });
+        let displaced = ctx
+            .insert_boxed(type_id, second)
+            .expect("occupied slot should hand back its previous occupant");
+        assert_eq!(displaced.downcast::<Counter>().unwrap().value, 1);
+        assert_eq!(ctx.get_resource::<Counter>().unwrap().value, 2);
+    }
+
+    #[test]
+    fn insert_boxed_with_factory_returns_displaced_resource_boxed() {
+        use crate::resource::ResourceFactory;
+
+        let type_id = TypeId::of::<Counter>();
+        let mut ctx = SystemContext::new();
+
+        let first = ResourceFactory::new(|| Box::new(Counter { value: 1 }));
+        assert!(
+            ctx.insert_boxed_with_factory(type_id, first.produce(), first)
+                .is_none()
+        );
+
+        let second = ResourceFactory::new(|| Box::new(Counter { value: 2 }));
+        let displaced = ctx
+            .insert_boxed_with_factory(type_id, second.produce(), second)
+            .expect("occupied slot should hand back its previous occupant");
+        assert_eq!(displaced.downcast::<Counter>().unwrap().value, 1);
+
+        assert_eq!(ctx.get_resource::<Counter>().unwrap().value, 2);
+        // Only the value is handed back: the displaced entry's factory is
+        // dropped and unrecoverable. `is_some()` would hold for either factory,
+        // so produce from the survivor and check which one it is.
+        let surviving = ctx
+            .factory_fn_by_type_id(type_id)
+            .expect("the new entry keeps its own factory");
+        assert_eq!(
+            surviving.produce().downcast::<Counter>().unwrap().value,
+            2,
+            "the surviving factory should be the new entry's, not the displaced one's"
+        );
+    }
+
+    #[test]
+    fn typed_insert_over_a_boxed_occupant_of_the_same_type_does_not_assert() {
+        use crate::resource::ResourceFactory;
+
+        // The mismatch `debug_assert!` fires on a slot whose occupant is not a
+        // `T`. Filling that slot through the type-erased forms is how the
+        // framework's own local-resource-factory path populates a context, so
+        // a later typed write over one is the well-behaved case: the assert
+        // must stay silent and the occupant must come back downcast.
+        let type_id = TypeId::of::<Counter>();
+
+        let mut from_boxed = SystemContext::new();
+        let boxed: Box<dyn Any + Send + Sync> = Box::new(Counter { value: 1 });
+        assert!(from_boxed.insert_boxed(type_id, boxed).is_none());
+        assert_eq!(
+            from_boxed.insert(Counter { value: 2 }),
+            Some(Counter { value: 1 })
+        );
+        assert_eq!(from_boxed.get_resource::<Counter>().unwrap().value, 2);
+
+        let mut from_factory = SystemContext::new();
+        let factory = ResourceFactory::new(|| Box::new(Counter { value: 3 }));
+        assert!(
+            from_factory
+                .insert_boxed_with_factory(type_id, factory.produce(), factory)
+                .is_none()
+        );
+        assert_eq!(
+            from_factory.insert(Counter { value: 4 }),
+            Some(Counter { value: 3 })
+        );
+        assert_eq!(from_factory.get_resource::<Counter>().unwrap().value, 4);
+    }
+
+    #[test]
+    fn typed_insert_output_over_a_boxed_occupant_of_the_same_type_does_not_assert() {
+        // The `Outputs` twin of the case above.
+        let mut ctx = SystemContext::new();
+        let boxed: Box<dyn Any + Send + Sync> = Box::new(ReasoningResult {
+            action: "first".into(),
+        });
+
+        assert!(
+            ctx.insert_output_boxed(TypeId::of::<ReasoningResult>(), boxed)
+                .is_none()
+        );
+
+        let displaced = ctx
+            .insert_output(ReasoningResult {
+                action: "second".into(),
+            })
+            .expect("a correctly typed boxed occupant should come back downcast");
+        assert_eq!(displaced.action, "first");
+        assert_eq!(
+            ctx.get_output::<ReasoningResult>().unwrap().action,
+            "second"
+        );
+    }
+
+    #[test]
+    fn insert_output_returns_displaced_output() {
+        let mut ctx = SystemContext::new();
+
+        assert_eq!(
+            ctx.insert_output(ReasoningResult {
+                action: "first".into()
+            }),
+            None
+        );
+        let displaced = ctx
+            .insert_output(ReasoningResult {
+                action: "second".into(),
+            })
+            .expect("second producer should hand back the first value");
+        assert_eq!(displaced.action, "first");
+        assert_eq!(
+            ctx.get_output::<ReasoningResult>().unwrap().action,
+            "second"
+        );
+    }
+
+    #[test]
+    fn insert_output_boxed_returns_displaced_output_boxed() {
+        let type_id = TypeId::of::<ReasoningResult>();
+        let mut ctx = SystemContext::new();
+
+        let first: Box<dyn Any + Send + Sync> = Box::new(ReasoningResult {
+            action: "first".into(),
+        });
+        assert!(ctx.insert_output_boxed(type_id, first).is_none());
+
+        let second: Box<dyn Any + Send + Sync> = Box::new(ReasoningResult {
+            action: "second".into(),
+        });
+        let displaced = ctx
+            .insert_output_boxed(type_id, second)
+            .expect("occupied slot should hand back its previous occupant");
+        assert_eq!(
+            displaced.downcast::<ReasoningResult>().unwrap().action,
+            "first"
+        );
+        assert_eq!(
+            ctx.get_output::<ReasoningResult>().unwrap().action,
+            "second"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Inspection-sink composition (SC-3307)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Records the names of the parameters it is offered.
+    #[derive(Default)]
+    struct Recorder {
+        seen: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Recorder {
+        fn seen(&self) -> Vec<&'static str> {
+            self.seen.lock().expect("sink mutex poisoned").clone()
+        }
+    }
+
+    impl InspectionSink for Recorder {
+        fn record(&self, meta: ParamMeta, _render: &dyn Fn() -> Inspection) {
+            self.seen
+                .lock()
+                .expect("sink mutex poisoned")
+                .push(meta.param);
+        }
+    }
+
+    /// Forwards every record to both sinks — what `inspection_arc` makes
+    /// expressible.
+    struct Tee(Arc<dyn InspectionSink>, Arc<dyn InspectionSink>);
+
+    impl InspectionSink for Tee {
+        fn record(&self, meta: ParamMeta, render: &dyn Fn() -> Inspection) {
+            self.0.record(meta, render);
+            self.1.record(meta, render);
+        }
+    }
+
+    fn param_meta(param: &'static str) -> ParamMeta {
+        ParamMeta::new(
+            "test_system",
+            param,
+            "Counter",
+            ParamKind::Res,
+            Phase::Before,
+        )
+    }
+
+    #[test]
+    fn replace_inspection_returns_the_same_sink_that_was_installed() {
+        let first = Arc::new(Recorder::default());
+        let second = Arc::new(Recorder::default());
+        let mut ctx = SystemContext::new();
+
+        assert!(ctx.replace_inspection(first.clone()).is_none());
+
+        let displaced = ctx
+            .replace_inspection(second.clone())
+            .expect("replacing an installed sink must hand it back");
+
+        // Identity, not merely "a sink": a return that cloned the *argument*
+        // would satisfy `is_some()` while still losing the caller's sink.
+        assert!(
+            Arc::ptr_eq(&displaced, &(first as Arc<dyn InspectionSink>)),
+            "the displaced handle must be the sink that was previously installed"
+        );
+        assert!(Arc::ptr_eq(
+            &ctx.inspection_arc().expect("the new sink is installed"),
+            &(second as Arc<dyn InspectionSink>)
+        ));
+    }
+
+    #[test]
+    fn inspection_arc_reports_none_when_no_sink_is_installed() {
+        let ctx = SystemContext::new();
+
+        assert!(ctx.inspection_arc().is_none());
+        // The `else` half of the documented chaining recipe: with nothing to
+        // chain onto, a plugin installs its own sink outright.
+        assert!(ctx.child().inspection_arc().is_none());
+    }
+
+    #[test]
+    fn inspection_arc_hands_back_a_storable_handle() {
+        let caller_sink = Arc::new(Recorder::default());
+        let ctx = SystemContext::new().with_inspection(caller_sink.clone());
+
+        let handle = ctx.inspection_arc().expect("sink should be retrievable");
+        // Owned, so it outlives the borrow and can be stored by the caller.
+        drop(ctx);
+        handle.record(param_meta("held"), &|| Inspection::debug(&7));
+
+        assert_eq!(caller_sink.seen(), ["held"]);
+    }
+
+    #[test]
+    fn plugin_can_chain_onto_the_callers_sink_instead_of_replacing_it() {
+        let caller_sink = Arc::new(Recorder::default());
+        let plugin_sink = Arc::new(Recorder::default());
+
+        let mut ctx = SystemContext::new().with_inspection(caller_sink.clone());
+
+        // What `InspectionPlugin`'s middleware should do: take the sink already
+        // installed, wrap it, and reinstall — rather than dropping it.
+        let existing = ctx
+            .inspection_arc()
+            .expect("caller's sink should be visible");
+        let _ = ctx.replace_inspection(Arc::new(Tee(existing, plugin_sink.clone())));
+
+        ctx.inspection()
+            .unwrap()
+            .record(param_meta("chained"), &|| Inspection::debug(&7));
+
+        // Both the caller and the plugin see the record.
+        assert_eq!(caller_sink.seen(), ["chained"]);
+        assert_eq!(plugin_sink.seen(), ["chained"]);
+    }
+
+    #[test]
+    fn unguarded_reapplication_of_the_chaining_recipe_duplicates_records() {
+        let caller_sink = Arc::new(Recorder::default());
+        let plugin_sink = Arc::new(Recorder::default());
+
+        let mut ctx = SystemContext::new().with_inspection(caller_sink.clone());
+
+        // A consumer that re-runs the recipe against a context it has already
+        // wrapped — the sessions shape, where one context serves many turns —
+        // adds a link per application: Tee(Tee(Tee(caller, p), p), p).
+        for _ in 0..3 {
+            match ctx.inspection_arc() {
+                Some(existing) => {
+                    let _ = ctx.replace_inspection(Arc::new(Tee(existing, plugin_sink.clone())));
+                }
+                None => {
+                    let _ = ctx.replace_inspection(plugin_sink.clone());
+                }
+            }
+        }
+
+        ctx.inspection()
+            .unwrap()
+            .record(param_meta("dup"), &|| Inspection::debug(&7));
+
+        // The caller sits at the leaf of the left spine, so it is still reached
+        // exactly once — which is why the defect is easy to miss. The cost lands
+        // on the re-applying consumer: one duplicate record per link, over a
+        // `record()` recursion that deepens without bound.
+        //
+        // This is a characterization test: it pins today's documented semantics,
+        // not a guarantee worth keeping. If the framework ever guards internally,
+        // delete this test rather than fixing it — its sibling,
+        // `an_identity_guard_makes_the_chaining_recipe_idempotent`, is the one
+        // that encodes the consumer-side remedy.
+        assert_eq!(
+            caller_sink.seen().len(),
+            1,
+            "the caller sits at the leaf, so re-application never duplicates for it"
+        );
+        assert_eq!(
+            plugin_sink.seen().len(),
+            3,
+            "each unguarded re-application adds a link that re-delivers the record"
+        );
+    }
+
+    #[test]
+    fn an_identity_guard_makes_the_chaining_recipe_idempotent() {
+        let caller_sink = Arc::new(Recorder::default());
+        let plugin_sink = Arc::new(Recorder::default());
+
+        let mut ctx = SystemContext::new().with_inspection(caller_sink.clone());
+
+        // The guard a Layer-3 consumer must carry: remember the handle you
+        // installed and skip when it is still the one in force. Comparing
+        // against the plugin's *own* sink is not enough — wrapping hides that
+        // identity behind the `Tee`.
+        let mut installed_by_us: Option<Arc<dyn InspectionSink>> = None;
+
+        for _ in 0..3 {
+            let live = ctx.inspection_arc();
+            let ours_still_in_force = match (&installed_by_us, &live) {
+                (Some(mine), Some(live)) => Arc::ptr_eq(mine, live),
+                _ => false,
+            };
+            if ours_still_in_force {
+                continue;
+            }
+            let wrapper: Arc<dyn InspectionSink> = match live {
+                Some(existing) => Arc::new(Tee(existing, plugin_sink.clone())),
+                None => plugin_sink.clone(),
+            };
+            let _ = ctx.replace_inspection(wrapper.clone());
+            installed_by_us = Some(wrapper);
+        }
+
+        ctx.inspection()
+            .unwrap()
+            .record(param_meta("once"), &|| Inspection::debug(&7));
+
+        assert_eq!(caller_sink.seen(), ["once"]);
+        assert_eq!(
+            plugin_sink.seen(),
+            ["once"],
+            "the chain must stay one link deep however often the recipe runs"
+        );
+    }
+
+    #[test]
+    fn replace_inspection_on_a_child_returns_the_inherited_sink() {
+        let parent_sink = Arc::new(Recorder::default());
+        let parent = SystemContext::new().with_inspection(parent_sink.clone());
+
+        let mut child = parent.child();
+
+        // Unlike resources — which a child *shadows*, leaving the parent's copy
+        // in the parent's scope and returning `None` — the sink is inherited by
+        // value at `child()`, so it genuinely occupies the child's own scope and
+        // replacing it displaces something. Compare
+        // `insert_reports_nothing_displaced_when_shadowing_a_parent`.
+        let displaced = child
+            .replace_inspection(Arc::new(Recorder::default()))
+            .expect("the inherited sink lives in this scope and is displaced");
+        assert!(Arc::ptr_eq(
+            &displaced,
+            &(parent_sink.clone() as Arc<dyn InspectionSink>)
+        ));
+
+        // The parent keeps its own sink: inheritance was a copy of the handle.
+        assert!(Arc::ptr_eq(
+            &parent.inspection_arc().expect("parent keeps its sink"),
+            &(parent_sink as Arc<dyn InspectionSink>)
+        ));
     }
 }

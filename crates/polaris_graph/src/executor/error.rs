@@ -58,6 +58,38 @@ pub enum ExecutionError {
     },
     /// A loop node has no termination condition (neither predicate nor `max_iterations`).
     NoTerminationCondition(NodeId),
+    /// A main-chain loop's termination predicate input was absent when
+    /// execution started.
+    ///
+    /// The termination predicate is evaluated *before* the first iteration,
+    /// so its input must exist when the loop is reached — deposited by a node
+    /// earlier on the sequential chain (a system's output, a branch or
+    /// parallel subgraph's, a scope's merged-back outputs, or a dynamic
+    /// contract's `produces`), or already present in the context. Outputs are
+    /// the work products of systems: a context-present input normally arrived
+    /// from a system earlier in an enclosing shared chain, or was pre-seeded
+    /// by the caller via
+    /// [`SystemContext::insert_output`](polaris_system::param::SystemContext::insert_output)
+    /// before execution. Hook and middleware code is not a sanctioned writer
+    /// of the output channel. Raised only when *no*
+    /// earlier chain node could deposit the input and the context lacks it,
+    /// detected before any node runs — replacing the mid-run
+    /// [`PredicateError::OutputNotFound`] the first predicate evaluation
+    /// would otherwise raise. An input produced only conditionally (e.g. by
+    /// one decision branch) passes this check and, if genuinely absent at the
+    /// loop, still raises the mid-run error; the same holds for loops inside
+    /// branch interiors, which execute conditionally and are not
+    /// entry-checked.
+    ///
+    /// [`PredicateError::OutputNotFound`]: crate::predicate::PredicateError::OutputNotFound
+    LoopPredicateInputMissingOnEntry {
+        /// The loop node whose predicate input is missing.
+        node: NodeId,
+        /// The loop node's name.
+        name: &'static str,
+        /// The output type the predicate expects.
+        output_type: &'static str,
+    },
     /// A system execution timed out.
     Timeout {
         /// The node that timed out.
@@ -220,6 +252,20 @@ impl fmt::Display for ExecutionError {
             }
             ExecutionError::NoTerminationCondition(id) => {
                 write!(f, "loop node has no termination condition: {id}")
+            }
+            ExecutionError::LoopPredicateInputMissingOnEntry {
+                node,
+                name,
+                output_type,
+            } => {
+                write!(
+                    f,
+                    "loop node '{name}' ({node}) termination predicate reads output type \
+                     '{output_type}', which is neither produced earlier in the graph nor \
+                     present in the context at execution start; produce it with a system \
+                     before the loop (a caller driving this graph directly may instead \
+                     pre-seed it via SystemContext::insert_output)"
+                )
             }
             ExecutionError::Timeout { node, timeout } => {
                 write!(f, "system timed out after {:?} on node: {node}", timeout)

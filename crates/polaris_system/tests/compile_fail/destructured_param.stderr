@@ -1,0 +1,5 @@
+error: system parameters must be simple identifiers
+ --> tests/compile_fail/destructured_param.rs:4:30
+  |
+4 | async fn destructured_system((a, b): (i32, i32)) -> i32 {
+  |                              ^^^^^^

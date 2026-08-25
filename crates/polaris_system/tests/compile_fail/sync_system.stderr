@@ -1,0 +1,5 @@
+error: system functions must be async
+ --> tests/compile_fail/sync_system.rs:4:1
+  |
+4 | fn sync_system() -> i32 {
+  | ^^

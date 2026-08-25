@@ -560,6 +560,20 @@ impl Graph {
     /// returns `true`. The predicate evaluates the output of a system
     /// within the loop body.
     ///
+    /// The predicate is evaluated **before each iteration, including the
+    /// first** — before the body has ever run. Its input must therefore
+    /// exist when the loop is reached: produce it earlier in the graph (any
+    /// node whose outputs land before the loop counts — most simply a
+    /// preceding init system). Outputs are the work products of systems, so
+    /// production is the normative source; a caller driving the graph
+    /// directly may instead pre-seed the context via
+    /// [`SystemContext::insert_output`](polaris_system::param::SystemContext::insert_output)
+    /// before executing. If no earlier node can produce it and the context
+    /// lacks it, the executor fails at run start with
+    /// [`ExecutionError::LoopPredicateInputMissingOnEntry`](crate::executor::ExecutionError::LoopPredicateInputMissingOnEntry).
+    /// The derived [`Graph::signature`] lists the input in `requires_outputs`
+    /// unless a preceding system is guaranteed to produce it.
+    ///
     /// # Type Parameters
     ///
     /// * `T` - The output type to evaluate for termination
@@ -577,10 +591,13 @@ impl Graph {
     /// ```
     /// # use polaris_graph::Graph;
     /// # struct LoopState { is_done: bool, iterations: usize }
+    /// # async fn init_state() -> LoopState { LoopState { is_done: false, iterations: 0 } }
     /// # async fn reason() -> LoopState { LoopState { is_done: false, iterations: 0 } }
     /// # async fn act() -> i32 { 1 }
     /// # async fn observe() -> i32 { 2 }
     /// # let mut graph = Graph::new();
+    /// // The first termination check reads `LoopState` before the body runs.
+    /// graph.add_system(init_state);
     /// graph.add_loop::<LoopState, _, _>(
     ///     "react_loop",
     ///     |state| state.is_done || state.iterations >= 10,

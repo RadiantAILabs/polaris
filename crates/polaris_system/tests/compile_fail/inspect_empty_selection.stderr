@@ -1,0 +1,5 @@
+error: `inspect(..)` needs at least one parameter name or `return`; write bare `inspect` to select every parameter
+ --> tests/compile_fail/inspect_empty_selection.rs:7:10
+  |
+7 | #[system(inspect())]
+  |          ^^^^^^^

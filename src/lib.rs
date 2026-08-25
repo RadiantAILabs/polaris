@@ -250,6 +250,16 @@
 //! [`models::ModelRegistry`] and [`tools::ToolRegistry`]. With no subscriber
 //! attached the spans have no observable cost.
 //!
+//! Parameter *values* are a separate, off-by-default axis:
+//! [`plugins::InspectionPlugin`] (in [`DefaultPlugins`](plugins::DefaultPlugins))
+//! delivers `#[system(inspect(..))]` captures to registered listeners once
+//! [`plugins::InspectionAPI`] enables recording, and its shipped tracing
+//! listener lands them on the same per-step spans. The same API withholds
+//! covered values as `Redacted` — never formatted — via
+//! [`plugins::RedactionRules`], and discovers and toggles typed
+//! [`plugins::InspectionListenerName`] identities, the shipped one
+//! ([`plugins::INSPECTION_TRACING_LISTENER`]) included, at run time.
+//!
 //! | Feature | Exported item | Effect |
 //! |---------|---------------|--------|
 //! | `otel` | [`plugins::OpenTelemetryPlugin`] | Adds OTLP export via the tracing subscriber and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names |

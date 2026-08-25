@@ -28,11 +28,19 @@ args = ["check", "."]
 
 [tasks.test-clippy]
 description = "Run clippy lints"
+# `--workspace` is load-bearing: the root manifest is the `polaris-ai` package,
+# so a bare `cargo clippy` lints only that crate and never a member crate's
+# test targets. Without it, lints in `crates/*/src/**` `#[cfg(test)]` modules
+# and `crates/*/tests/*.rs` stay invisible to CI.
+workspace = false
 command = "cargo"
-args = ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
 
 [tasks.test-workspace]
 description = "Run all workspace tests"
+# `workspace = false` for the same reason as `test-clippy`: without it cargo-make
+# re-runs this task once per member crate instead of once with `--workspace`.
+workspace = false
 command = "cargo"
 args = ["test", "--verbose", "--workspace", "--all-targets", "--all-features"]
 

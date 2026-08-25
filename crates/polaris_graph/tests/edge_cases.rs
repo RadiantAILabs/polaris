@@ -5,10 +5,15 @@
 
 mod test_utils;
 
+use polaris_graph::NodeId;
 use polaris_graph::executor::{ErrorKind, ExecutionError, GraphExecutor};
-use polaris_graph::graph::Graph;
-use polaris_graph::node::{ContextPolicy, RetryPolicy};
+use polaris_graph::graph::{Graph, GraphSignature};
+use polaris_graph::hooks::schedule::{OnGraphFailure, OnGraphStart};
+use polaris_graph::hooks::{GraphEvent, HooksAPI};
+use polaris_graph::node::{ContextPolicy, DynamicSlot, RetryPolicy};
+use polaris_graph::predicate::PredicateError;
 use polaris_system::param::SystemContext;
+use polaris_system::resource::LocalResource;
 use polaris_system::system::{BoxFuture, System, SystemError};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +24,16 @@ use test_utils::{
     SuccessSystem, SwitchKeySystem, SwitchOutput, TestConfig, branch, create_test_server,
     get_hooks,
 };
+
+/// Asserts the structural precondition shared by runtime graph tests.
+fn assert_graph_valid(graph: &Graph) {
+    let validation = graph.validate();
+    assert!(
+        validation.is_ok(),
+        "graph should be structurally valid before execution: {:?}",
+        validation.errors
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ERROR HANDLING TESTS
@@ -354,6 +369,918 @@ async fn loop_predicate_terminates_early() {
         *counter.lock().unwrap(),
         3,
         "loop should have run exactly 3 times before predicate terminated"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP ENTRY GUARANTEE TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verifies that an unseeded loop-first graph fails before any node runs.
+///
+/// The termination predicate is evaluated before the first iteration, so a
+/// main-chain loop whose predicate input is neither produced earlier on the
+/// chain nor present in the context is caught at run start with
+/// `LoopPredicateInputMissingOnEntry` — not mid-run with a `PredicateError`.
+#[tokio::test]
+async fn loop_entry_predicate_input_missing_fails_before_any_node() {
+    let mut graph = Graph::new();
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "unseeded_loop",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    // The graph is structurally valid: the body produces the predicate type
+    // (the necessary body-side check). The entry-side guarantee depends on
+    // the live context, so it is enforced at run start instead.
+    assert_graph_valid(&graph);
+
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    match result {
+        Err(ExecutionError::LoopPredicateInputMissingOnEntry {
+            name, output_type, ..
+        }) => {
+            assert_eq!(name, "unseeded_loop", "error names the loop");
+            assert!(
+                output_type.contains("LoopState"),
+                "error names the missing type: {output_type}"
+            );
+        }
+        other => panic!("expected LoopPredicateInputMissingOnEntry, got: {other:?}"),
+    }
+    assert_eq!(
+        *counter.lock().unwrap(),
+        0,
+        "no loop iteration may run when the entry check fails"
+    );
+}
+
+/// The entry check fires before *any* node executes — not merely before the
+/// loop. A system ahead of the loop on the chain must not run either: without
+/// this flag, a zero iteration count could not distinguish the run-start
+/// failure from the old mid-run predicate error (the body never ran in either
+/// case).
+#[tokio::test]
+async fn loop_entry_check_fires_before_preceding_nodes_run() {
+    let mut graph = Graph::new();
+    let flag = Arc::new(Mutex::new(false));
+    let counter = Arc::new(Mutex::new(0usize));
+
+    // Produces `()`, which never credits the loop's predicate input.
+    graph.add_boxed_system(Box::new(FlagSystem {
+        flag: Arc::clone(&flag),
+    }));
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "unseeded_loop",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ExecutionError::LoopPredicateInputMissingOnEntry { .. })
+        ),
+        "expected the run-start entry error, got: {result:?}"
+    );
+    assert!(
+        !*flag.lock().unwrap(),
+        "the entry check must fail before any node runs — the preceding system must not execute"
+    );
+    assert_eq!(*counter.lock().unwrap(), 0, "no loop iteration may run");
+}
+
+/// Verifies that a caller pre-seeding the predicate input into the context
+/// satisfies the run-start check. Production by a system earlier in the graph
+/// is the normative source (outputs are system work products); the caller
+/// pre-seed via `SystemContext::insert_output` is the supported alternative
+/// for code driving a graph directly.
+#[tokio::test]
+async fn loop_entry_predicate_input_seeded_via_context_succeeds() {
+    let mut graph = Graph::new();
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "seeded_loop",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+    ctx.insert_output(LoopState { iteration: 0 });
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(result.is_ok(), "seeded loop should run: {result:?}");
+    assert_eq!(
+        *counter.lock().unwrap(),
+        3,
+        "loop should iterate until the predicate terminates it"
+    );
+}
+
+/// Verifies the entry check at a shared scope boundary: a seed produced on the
+/// parent chain is visible to the shared inner graph's loop.
+#[tokio::test]
+async fn loop_entry_input_crosses_shared_scope_boundary() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let counter_clone = Arc::clone(&counter);
+    let mut inner = Graph::new();
+    inner.add_loop::<LoopState, _, _>(
+        "inner_loop",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(InitialStateSystem));
+    graph.add_scope("episode", inner, ContextPolicy::shared());
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "parent-produced seed crosses a shared boundary: {result:?}"
+    );
+    assert_eq!(*counter.lock().unwrap(), 3, "inner loop should iterate");
+}
+
+/// The error message names the loop, the missing type, and the remedy —
+/// produce the input with a system upstream — plus the caller pre-seed
+/// alternative for code driving the graph directly.
+#[test]
+fn loop_predicate_input_missing_on_entry_display() {
+    let err = ExecutionError::LoopPredicateInputMissingOnEntry {
+        node: NodeId::from_string("1"),
+        name: "unseeded_loop",
+        output_type: "LoopState",
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("unseeded_loop"));
+    assert!(msg.contains("LoopState"));
+    assert!(msg.contains("before the loop"));
+    assert!(msg.contains("insert_output"));
+}
+
+/// Verifies that outputs never cross a non-shared boundary: even a seeded
+/// parent context cannot satisfy an isolated inner loop, and the failure is
+/// the upfront entry error rather than a mid-run predicate error.
+#[tokio::test]
+async fn loop_entry_input_blocked_by_isolated_scope_fails_fast() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let counter_clone = Arc::clone(&counter);
+    let mut inner = Graph::new();
+    inner.add_loop::<LoopState, _, _>(
+        "inner_loop",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope("episode", inner, ContextPolicy::new());
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+    // The parent seed does not cross the isolated boundary.
+    ctx.insert_output(LoopState { iteration: 0 });
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    match result {
+        Err(ExecutionError::LoopPredicateInputMissingOnEntry {
+            name, output_type, ..
+        }) => {
+            assert_eq!(name, "inner_loop", "error names the inner loop");
+            assert!(
+                output_type.contains("LoopState"),
+                "error names the missing type: {output_type}"
+            );
+        }
+        other => panic!("expected LoopPredicateInputMissingOnEntry, got: {other:?}"),
+    }
+    assert_eq!(
+        *counter.lock().unwrap(),
+        0,
+        "no inner iteration may run when the entry check fails"
+    );
+}
+
+/// The dynamic twin of the isolated-scope fail-fast: a loop-heading candidate
+/// behind a non-shared dynamic boundary cannot see the parent seed, and the
+/// failure is the upfront entry error at the boundary. Scope and dynamic
+/// nodes share `execute_embedded`; this pins the dynamic side against future
+/// divergence.
+#[tokio::test]
+async fn loop_entry_input_blocked_by_isolated_dynamic_fails_fast() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let counter_clone = Arc::clone(&counter);
+    let mut candidate = Graph::new();
+    candidate.add_loop::<LoopState, _, _>(
+        "inner_loop",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    // The contract matches the candidate exactly: it demands the seed
+    // (`require_output`) and advertises the body's production.
+    let contract = GraphSignature::new()
+        .require_output::<LoopState>()
+        .produce::<LoopState>();
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "route",
+        |_ctx| Arc::from("episode"),
+        [("episode", candidate)],
+        DynamicSlot::new(contract, ContextPolicy::new()),
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+    // The parent seed does not cross the non-shared boundary.
+    ctx.insert_output(LoopState { iteration: 0 });
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    match result {
+        Err(ExecutionError::LoopPredicateInputMissingOnEntry {
+            name, output_type, ..
+        }) => {
+            assert_eq!(name, "inner_loop", "error names the candidate's loop");
+            assert!(
+                output_type.contains("LoopState"),
+                "error names the missing type: {output_type}"
+            );
+        }
+        other => panic!("expected LoopPredicateInputMissingOnEntry, got: {other:?}"),
+    }
+    assert_eq!(
+        *counter.lock().unwrap(),
+        0,
+        "no candidate iteration may run when the entry check fails"
+    );
+}
+
+/// A max-iterations-only loop (`add_loop_n`, no termination predicate) heading
+/// a graph needs no entry input: the run-start check skips loops without a
+/// termination predicate.
+#[tokio::test]
+async fn loop_n_heading_graph_runs_with_empty_context() {
+    let mut graph = Graph::new();
+    let counter = Arc::new(Mutex::new(0usize));
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop_n("fixed_loop", 3, move |g| {
+        g.add_boxed_system(Box::new(LoopIterationSystem {
+            counter: Arc::clone(&counter_clone),
+        }));
+    });
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "predicate-free loop needs no entry seed: {result:?}"
+    );
+    assert_eq!(
+        *counter.lock().unwrap(),
+        3,
+        "loop should run its fixed iteration count"
+    );
+}
+
+/// Unit is the absence of data flow, so a `Predicate<()>` receives implicit
+/// unit and can terminate a loop without a caller-seeded output.
+#[tokio::test]
+async fn unit_predicate_loop_runs_with_empty_context() {
+    let flag = Arc::new(Mutex::new(false));
+    let mut graph = Graph::new();
+    graph.add_loop::<(), _, _>(
+        "unit_loop",
+        |()| true,
+        |body| {
+            body.add_boxed_system(Box::new(FlagSystem {
+                flag: Arc::clone(&flag),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let mut ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    assert!(
+        executor.validate_resources(&graph, &ctx, None).is_ok(),
+        "unit never requires a stored output during pre-flight"
+    );
+    let result = executor.execute(&graph, &mut ctx, None, None).await;
+
+    assert!(
+        result.is_ok(),
+        "implicit unit satisfies the predicate: {result:?}"
+    );
+    assert!(
+        !*flag.lock().unwrap(),
+        "a true unit predicate terminates before the loop body runs"
+    );
+}
+
+/// A parallel node's branches all run and their outputs merge back into the
+/// parent context, including outputs produced across a nested scope boundary.
+/// The entry check must preserve that nested production when crediting the
+/// parallel node as a possible source for a downstream loop.
+#[tokio::test]
+async fn loop_entry_input_produced_by_scoped_parallel_branch_succeeds() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let mut graph = Graph::new();
+    graph.add_parallel(
+        "fan_out",
+        vec![
+            branch(|g| {
+                let mut inner = Graph::new();
+                inner.add_boxed_system(Box::new(InitialStateSystem));
+                g.add_scope("scoped_init", inner, ContextPolicy::new());
+            }),
+            branch(|g| {
+                g.add_boxed_system(Box::new(SuccessSystem));
+            }),
+        ],
+    );
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "loop_after_parallel",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    // Pre-flight and runtime must agree: the parallel branch's output counts.
+    assert!(
+        executor.validate_resources(&graph, &ctx, hooks).is_ok(),
+        "pre-flight must accept a parallel-produced predicate input"
+    );
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "parallel-produced seed satisfies the loop entry check: {result:?}"
+    );
+    assert_eq!(*counter.lock().unwrap(), 3, "loop should iterate");
+}
+
+/// A scope's outputs merge back into the parent context on exit — even across
+/// a non-shared boundary — so a scope producing the predicate input satisfies
+/// a downstream loop's first termination check.
+#[tokio::test]
+async fn loop_entry_input_produced_by_isolated_scope_merges_back() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(InitialStateSystem));
+
+    let mut graph = Graph::new();
+    graph.add_scope("init", inner, ContextPolicy::new());
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "loop_after_scope",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    assert!(
+        executor.validate_resources(&graph, &ctx, hooks).is_ok(),
+        "pre-flight must accept a scope-produced predicate input"
+    );
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "scope outputs merge back and satisfy the loop entry check: {result:?}"
+    );
+    assert_eq!(*counter.lock().unwrap(), 3, "loop should iterate");
+}
+
+/// A custom executor may raise its recursion limit above the default 64. The
+/// mandatory loop-entry analysis must therefore credit a producer nested more
+/// than 64 scope boundaries deep instead of rejecting the graph before the
+/// producing scope has a chance to run.
+#[tokio::test]
+async fn custom_recursion_limit_credits_deep_scope_producer() {
+    let mut nested = Graph::new();
+    nested.add_boxed_system(Box::new(InitialStateSystem));
+    for _ in 0..65 {
+        let mut outer = Graph::new();
+        outer.add_scope("deep_init", nested, ContextPolicy::shared());
+        nested = outer;
+    }
+
+    let counter = Arc::new(Mutex::new(0usize));
+    let mut graph = Graph::new();
+    graph.add_scope("deep_init_root", nested, ContextPolicy::shared());
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "loop_after_deep_scope",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new().with_max_recursion_depth(128);
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    assert!(
+        executor.validate_resources(&graph, &ctx, hooks).is_ok(),
+        "pre-flight must honor the custom recursion limit and credit the deep producer"
+    );
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "the deep producer should satisfy the downstream loop: {result:?}"
+    );
+    assert_eq!(*counter.lock().unwrap(), 3, "loop should iterate");
+}
+
+/// A decision branch producing the predicate input through a nested scope
+/// passes the entry check (crediting is optimistic — the branch *may* run) and
+/// executes fine when the producing branch is actually taken.
+#[tokio::test]
+async fn loop_entry_input_produced_by_taken_scoped_decision_branch_succeeds() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(DecisionSystem { take_true: true }));
+    graph.add_conditional_branch::<DecisionOutput, _, _, _>(
+        "maybe_init",
+        |decision| decision.take_true,
+        |g| {
+            let mut inner = Graph::new();
+            inner.add_boxed_system(Box::new(InitialStateSystem));
+            g.add_scope("scoped_init", inner, ContextPolicy::new());
+        },
+        |g| {
+            g.add_boxed_system(Box::new(SuccessSystem));
+        },
+    );
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "loop_after_decision",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    assert!(
+        graph
+            .signature()
+            .requires_outputs()
+            .iter()
+            .any(|access| access.type_name.contains("LoopState")),
+        "composition remains pessimistic because the decision branch is conditional"
+    );
+    assert!(
+        executor.validate_resources(&graph, &ctx, hooks).is_ok(),
+        "pre-flight optimistically credits the scoped decision branch"
+    );
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "a taken branch's output satisfies the loop's first check: {result:?}"
+    );
+    assert_eq!(*counter.lock().unwrap(), 3, "loop should iterate");
+}
+
+/// The entry check is a fail-fast courtesy, never the guarantee: an input
+/// produced only conditionally passes it (crediting is optimistic), and if
+/// the producing branch is *not* taken, the failure is the mid-run
+/// [`PredicateError::OutputNotFound`] at the loop — exactly as documented on
+/// [`ExecutionError::LoopPredicateInputMissingOnEntry`]. This is the
+/// untaken-branch twin of
+/// `loop_entry_input_produced_by_taken_scoped_decision_branch_succeeds`;
+/// without it,
+/// a regression to pessimistic crediting (rejecting this graph at run start)
+/// would go uncaught.
+#[tokio::test]
+async fn loop_entry_input_from_untaken_decision_branch_defers_to_mid_run_error() {
+    let flag = Arc::new(Mutex::new(false));
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(DecisionSystem { take_true: false }));
+    graph.add_conditional_branch::<DecisionOutput, _, _, _>(
+        "maybe_init",
+        |decision| decision.take_true,
+        |g| {
+            g.add_boxed_system(Box::new(InitialStateSystem));
+        },
+        |g| {
+            g.add_boxed_system(Box::new(FlagSystem {
+                flag: Arc::clone(&flag),
+            }));
+        },
+    );
+    graph.add_loop::<LoopState, _, _>(
+        "loop_after_decision",
+        |state| state.iteration >= 3,
+        |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::new(Mutex::new(0)),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    // Both static surfaces accept the composition: the producing branch *may*
+    // run, so pre-flight and the run-start entry check must not reject it.
+    assert!(
+        executor.validate_resources(&graph, &ctx, hooks).is_ok(),
+        "pre-flight credits the conditionally producing branch"
+    );
+
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    match result {
+        Err(ExecutionError::PredicateError(PredicateError::OutputNotFound { type_name })) => {
+            assert!(
+                type_name.contains("LoopState"),
+                "the mid-run error names the missing type: {type_name}"
+            );
+        }
+        other => panic!("expected the mid-run OutputNotFound at the loop, got: {other:?}"),
+    }
+    assert!(
+        *flag.lock().unwrap(),
+        "the untaken-branch path executed — the failure was mid-run, not at run start"
+    );
+}
+
+/// A switch case may contain a dynamic boundary. The dynamic slot's contract
+/// is the known interface at validation time, so its `produces` set must remain
+/// visible when the case is credited as a possible producer.
+#[tokio::test]
+async fn loop_entry_input_produced_by_dynamic_in_taken_switch_case_succeeds() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let mut candidate = Graph::new();
+    candidate.add_boxed_system(Box::new(InitialStateSystem));
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(SwitchKeySystem { key: "seed" }));
+    graph.add_switch::<SwitchOutput, _, _, _>(
+        "maybe_init",
+        |output| output.key,
+        [(
+            "seed",
+            branch(|g| {
+                g.add_dynamic(
+                    "dynamic_init",
+                    |_ctx| "only",
+                    [("only", candidate)],
+                    DynamicSlot::new(
+                        GraphSignature::new().produce::<LoopState>(),
+                        ContextPolicy::new(),
+                    ),
+                );
+            }),
+        )],
+        Some(branch(|g| {
+            g.add_boxed_system(Box::new(SuccessSystem));
+        })),
+    );
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "loop_after_switch",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    assert!(
+        executor.validate_resources(&graph, &ctx, hooks).is_ok(),
+        "pre-flight credits the dynamic contract inside the switch case"
+    );
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "the selected dynamic candidate supplies the loop seed: {result:?}"
+    );
+    assert_eq!(*counter.lock().unwrap(), 3, "loop should iterate");
+}
+
+/// The default switch branch participates in the same optimistic production
+/// analysis as named cases, including outputs merged from a nested scope.
+#[tokio::test]
+async fn loop_entry_input_produced_by_scoped_switch_default_succeeds() {
+    let counter = Arc::new(Mutex::new(0usize));
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(SwitchKeySystem { key: "unknown" }));
+    graph.add_switch::<SwitchOutput, _, _, _>(
+        "default_init",
+        |output| output.key,
+        [(
+            "other",
+            branch(|g| {
+                g.add_boxed_system(Box::new(SuccessSystem));
+            }),
+        )],
+        Some(branch(|g| {
+            let mut inner = Graph::new();
+            inner.add_boxed_system(Box::new(InitialStateSystem));
+            g.add_scope("default_scope", inner, ContextPolicy::new());
+        })),
+    );
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "loop_after_default",
+        |state| state.iteration >= 3,
+        move |g| {
+            g.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let executor = GraphExecutor::new();
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    assert!(
+        executor.validate_resources(&graph, &ctx, hooks).is_ok(),
+        "pre-flight credits the scoped default branch"
+    );
+    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
+
+    assert!(
+        result.is_ok(),
+        "the selected default scope supplies the loop seed: {result:?}"
+    );
+    assert_eq!(*counter.lock().unwrap(), 3, "loop should iterate");
+}
+
+// Note on provenance: outputs are the work products of systems. Hook and
+// middleware code is not a sanctioned writer of the output channel, so no
+// test here demonstrates seeding a loop's predicate input from them — the
+// supported sources are production by an earlier system (in this graph or an
+// enclosing shared chain) and a caller pre-seed via
+// `SystemContext::insert_output`.
+
+/// The entry check routes through the normal failure path, so `OnGraphFailure`
+/// hooks observe it like any other execution error.
+#[tokio::test]
+async fn loop_entry_failure_fires_on_graph_failure_hook() {
+    let mut graph = Graph::new();
+    graph.add_loop::<LoopState, _, _>(
+        "unseeded_loop",
+        |state| state.iteration >= 3,
+        |g| {
+            g.add_boxed_system(Box::new(InitialStateSystem));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let failed = Arc::new(Mutex::new(false));
+    let failed_clone = Arc::clone(&failed);
+    let hooks = HooksAPI::new();
+    hooks
+        .register_observer::<OnGraphFailure, _>("record_failure", move |event: &GraphEvent| {
+            if matches!(event, GraphEvent::GraphFailure { .. }) {
+                *failed_clone.lock().unwrap() = true;
+            }
+        })
+        .expect("hook registration should succeed");
+
+    let mut ctx = SystemContext::new();
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, Some(&hooks), None)
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ExecutionError::LoopPredicateInputMissingOnEntry { .. })
+        ),
+        "unseeded loop-first graph fails the entry check: {result:?}"
+    );
+    assert!(
+        *failed.lock().unwrap(),
+        "OnGraphFailure must fire for the entry-check error"
+    );
+}
+
+/// Predicate input for the hook-provider mismatch test: implements
+/// `LocalResource` so it can be registered with a provider hook.
+#[derive(Clone, Debug)]
+struct GateState {
+    done: bool,
+}
+impl LocalResource for GateState {}
+
+async fn advance_gate() -> GateState {
+    GateState { done: true }
+}
+
+/// A provider hook inserts a *resource* (`ctx.insert`), not an output — it
+/// cannot satisfy a termination predicate, which reads the output channel.
+/// The entry check must therefore still fail, upfront.
+#[tokio::test]
+async fn hook_provided_resource_does_not_satisfy_loop_entry() {
+    let mut graph = Graph::new();
+    graph.add_loop::<GateState, _, _>(
+        "gated_loop",
+        |state| state.done,
+        |g| {
+            g.add_system(advance_gate);
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let hooks = HooksAPI::new();
+    hooks
+        .register_provider::<OnGraphStart, GateState, _>("provide_gate_state", |_event| {
+            Some(GateState { done: true })
+        })
+        .expect("hook registration should succeed");
+
+    let mut ctx = SystemContext::new();
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, Some(&hooks), None)
+        .await;
+
+    match result {
+        Err(ExecutionError::LoopPredicateInputMissingOnEntry {
+            name, output_type, ..
+        }) => {
+            assert_eq!(name, "gated_loop", "error names the loop");
+            assert!(
+                output_type.contains("GateState"),
+                "error names the missing type: {output_type}"
+            );
+        }
+        other => panic!("expected LoopPredicateInputMissingOnEntry, got: {other:?}"),
+    }
+}
+
+/// Loops inside branch interiors execute conditionally and are not
+/// entry-checked: a genuinely missing predicate input there surfaces as the
+/// older mid-run predicate error when the branch actually runs.
+#[tokio::test]
+async fn branch_interior_loop_missing_input_fails_mid_run() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(DecisionSystem { take_true: true }));
+    graph.add_conditional_branch::<DecisionOutput, _, _, _>(
+        "route",
+        |decision| decision.take_true,
+        |g| {
+            g.add_loop::<LoopState, _, _>(
+                "interior_loop",
+                |state| state.iteration >= 3,
+                |body| {
+                    body.add_boxed_system(Box::new(LoopIterationSystem {
+                        counter: Arc::new(Mutex::new(0)),
+                    }));
+                },
+            );
+        },
+        |g| {
+            g.add_boxed_system(Box::new(SuccessSystem));
+        },
+    );
+
+    assert_graph_valid(&graph);
+    let mut ctx = SystemContext::new();
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ExecutionError::PredicateError(
+                PredicateError::OutputNotFound { .. }
+            ))
+        ),
+        "a branch-interior loop keeps the mid-run predicate error: {result:?}"
     );
 }
 
@@ -1056,7 +1983,7 @@ async fn scope_fork_missing_resource_hard_errors() {
     struct Forkable {
         value: i32,
     }
-    impl polaris_system::resource::LocalResource for Forkable {}
+    impl LocalResource for Forkable {}
     impl polaris_system::resource::ForkStrategy for Forkable {
         fn fork(&self) -> Self {
             Self { value: self.value }

@@ -25,6 +25,7 @@
 //! ```
 
 use polaris::models::ModelsPlugin;
+use polaris::plugins::InspectionPlugin;
 use polaris::shell::ShellPlugin;
 use polaris::system::plugin::{Plugin, PluginAccess, PluginId, Version};
 use polaris::tools::ToolsPlugin;
@@ -58,6 +59,7 @@ fn entries() -> Vec<Entry> {
         entry(&ModelsPlugin),
         entry(&ToolsPlugin),
         entry(&ShellPlugin::with_working_dir("/tmp")),
+        entry(&InspectionPlugin::default()),
     ]
 }
 

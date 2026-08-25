@@ -541,6 +541,7 @@ These plugins satisfy the standard and can be copied as a starting point:
 - [`SessionsPlugin`](crate::sessions::SessionsPlugin) — full plugin: registers an API, has dependencies, uses `default_dependencies()`.
 - [`HttpPlugin`](crate::sessions::HttpPlugin) *(feature `sessions-http`)* — extender: provides no resources or APIs of its own, contributes routes to [`HttpRouter`](crate::app::HttpRouter) and uses the **Extends** section.
 - [`AnthropicPlugin`](crate::models::AnthropicPlugin) *(feature `anthropic`)* — feature-gated extender: contributes a provider to [`ModelRegistry`](crate::models::ModelRegistry).
+- [`InspectionPlugin`](crate::plugins::InspectionPlugin) — middleware registrant: wraps every graph run via [`MiddlewareAPI`](crate::graph::MiddlewareAPI) and uses the **Middleware Registered** section.
 
 ### Why this matters
 

@@ -296,12 +296,33 @@ impl GraphExecutor {
     ///   and `OnSystemStart` are considered available.
     /// - **Outputs** (`Out<T>`): Validated along sequential (linear) edges.
     ///   Each system's declared output dependencies are checked against the set
-    ///   of outputs produced by preceding systems in the linear chain. Non-system
-    ///   nodes (Decision, Switch, Loop, Parallel) contribute all output types
-    ///   reachable from their subgraphs. Hook-provided types are also considered
-    ///   available. Scope nodes are skipped (outputs flow differently across
-    ///   scope boundaries). Conditional, switch, and parallel branches are not
-    ///   individually validated because their execution is dynamic.
+    ///   of outputs produced by preceding nodes in the linear chain plus outputs
+    ///   already present in the context (callers may seed via
+    ///   [`SystemContext::insert_output`]), as is each loop's termination
+    ///   predicate input (evaluated before the first iteration, so the loop
+    ///   body cannot satisfy it). Non-system nodes credit what they may
+    ///   deposit: Decision, Switch, Loop, and Parallel contribute all output
+    ///   types reachable from their subgraphs; Scope and Dynamic nodes
+    ///   contribute what may merge back across their boundary. Shared-boundary
+    ///   embedded graphs (scope graphs, inline dynamic candidates) are
+    ///   validated recursively against the outputs available at their chain
+    ///   position; non-shared ones against an empty output set (outputs never
+    ///   cross a non-shared boundary inward). Conditional, switch, and
+    ///   parallel branch interiors — including any embedded graphs inside
+    ///   them — are not individually validated because their execution is
+    ///   dynamic.
+    ///
+    /// Hook-provided resource types do not satisfy any output dependency:
+    /// provider hooks insert resources, while systems, predicates, and dynamic
+    /// contracts read the output channel. Outputs are the work products of
+    /// systems — hook and middleware code is not a sanctioned writer of that
+    /// channel. Imperative writes made from there anyway are invisible to this
+    /// static pass; the executor's run-start check
+    /// ([`ExecutionError::LoopPredicateInputMissingOnEntry`]) probes the live
+    /// context and may incidentally observe them, but compositions must not
+    /// rely on that.
+    ///
+    /// [`SystemContext::insert_output`]: polaris_system::param::SystemContext::insert_output
     ///
     /// # Returns
     ///
@@ -347,6 +368,7 @@ impl GraphExecutor {
             .unwrap_or_default();
 
         self.validate_graph_resources(graph, ctx, &hook_provided, &mut errors, 0);
+        self.validate_output_reachability(graph, Some(ctx), HashSet::new(), &mut errors, 0);
 
         if errors.is_empty() {
             Ok(())
@@ -357,6 +379,13 @@ impl GraphExecutor {
 
     /// Recursively validates resource availability for all systems in a graph,
     /// including systems inside scope nodes.
+    ///
+    /// This walk covers *resources* (`Res<T>` / `ResMut<T>`, boundary
+    /// crossings, dynamic contract `requires`) for every node in the graph,
+    /// branch interiors included. Output reachability is validated separately
+    /// by [`validate_output_reachability`](Self::validate_output_reachability),
+    /// which recurses along the sequential chain so embedded graphs are
+    /// checked against the outputs available at their chain position.
     ///
     /// For scope nodes, validation walks the [`ContextPolicy`] and constructs
     /// the same view the inner graph will see at execution time:
@@ -493,8 +522,6 @@ impl GraphExecutor {
                 _ => {}
             }
         }
-
-        self.validate_output_reachability(graph, hook_provided, errors);
     }
 
     /// Checks that registry-backed dynamic nodes can resolve their registry from
@@ -646,25 +673,62 @@ impl GraphExecutor {
         }
     }
 
-    /// Validates that `Out<T>` parameters declared by systems have a matching
-    /// output produced by a predecessor system along the linear (sequential) chain.
+    /// Validates that `Out<T>` reads along the linear (sequential) chain — a
+    /// system's declared output dependencies and each loop's termination
+    /// predicate input — can be satisfied when their node is reached.
     ///
-    /// Walks from the graph's entry node following only sequential edges, building
-    /// a set of output `TypeId`s produced so far. For each system node, every
-    /// declared output dependency (`access.outputs`) must appear in the produced
-    /// set or the hook-provided set. Non-system nodes (Decision, Switch, Loop,
-    /// Parallel) contribute all output types reachable from their subgraphs, since
-    /// at least one execution path through those nodes might produce them. Scope
-    /// nodes are skipped because outputs flow differently across scope boundaries.
+    /// Walks from the graph's entry node following only sequential edges,
+    /// building a set of output `TypeId`s that may have been deposited so far,
+    /// starting from `seed` (the outputs available where this graph starts).
+    /// Every read must appear in that set or among the outputs already present
+    /// in `ctx` (callers may seed via `SystemContext::insert_output`). Provider
+    /// hooks insert resources, not outputs, so their declared types never
+    /// satisfy an output read.
+    /// A loop's own input is checked *before* its body is credited: the
+    /// predicate is evaluated before the first iteration.
+    ///
+    /// Crediting is optimistic — "could any execution deposit this type?" —
+    /// mirroring the executor's run-start loop check
+    /// ([`Graph::unguaranteed_loop_predicate_inputs`]): Decision, Switch,
+    /// Loop, and Parallel contribute every output type reachable from their
+    /// subgraphs; Scope contributes what its inner graph may merge back
+    /// (outputs cross the boundary outward on exit regardless of policy);
+    /// Dynamic contributes its contract's `produces`.
+    ///
+    /// Embedded graphs recurse at their chain position: a shared scope graph
+    /// or inline dynamic candidate is validated against the outputs available
+    /// where it will actually run (`produced_outputs` at that node plus the
+    /// same `ctx`), a non-shared one against an empty output set and no
+    /// context outputs — outputs never cross a non-shared boundary inward.
+    /// Embedded graphs inside branch interiors are not output-validated
+    /// (branches execute dynamically); a genuinely missing read there
+    /// surfaces as a mid-run error.
+    ///
+    /// `ctx` is `None` when validating below a non-shared boundary, where the
+    /// caller's context outputs are unreachable. `depth` mirrors
+    /// [`validate_graph_resources`](Self::validate_graph_resources), which
+    /// recurses over a superset of these embedded graphs and reports
+    /// [`ResourceValidationError::ValidationDepthExceeded`] for over-deep
+    /// nesting — this walk just stops.
     fn validate_output_reachability(
         &self,
         graph: &Graph,
-        hook_provided: &HashSet<TypeId>,
+        ctx: Option<&SystemContext<'_>>,
+        seed: HashSet<TypeId>,
         errors: &mut Vec<ResourceValidationError>,
+        depth: usize,
     ) {
+        if depth > self.max_recursion_depth {
+            // `validate_graph_resources` already recorded
+            // `ValidationDepthExceeded` for this nesting.
+            return;
+        }
+
         let chain = self.build_linear_chain(graph);
 
-        let mut produced_outputs: HashSet<TypeId> = HashSet::new();
+        let mut produced_outputs: HashSet<TypeId> = seed;
+        let in_ctx =
+            |type_id: TypeId| ctx.is_some_and(|ctx| ctx.contains_output_by_type_id(type_id));
 
         for node_id in &chain {
             let Some(node) = graph.get_node(node_id.clone()) else {
@@ -676,7 +740,7 @@ impl GraphExecutor {
                     let access = sys.system.access();
                     for out_access in &access.outputs {
                         if !produced_outputs.contains(&out_access.type_id)
-                            && !hook_provided.contains(&out_access.type_id)
+                            && !in_ctx(out_access.type_id)
                         {
                             errors.push(ResourceValidationError::MissingOutput {
                                 node: sys.id.clone(),
@@ -690,39 +754,73 @@ impl GraphExecutor {
                 }
                 Node::Decision(dec) => {
                     for branch in [&dec.true_branch, &dec.false_branch].into_iter().flatten() {
-                        for (type_id, _) in graph.collect_branch_output_types(branch) {
-                            produced_outputs.insert(type_id);
-                        }
+                        graph.may_produce_output_types_from(branch, &mut produced_outputs);
                     }
                 }
                 Node::Switch(sw) => {
                     for (_, target) in &sw.cases {
-                        for (type_id, _) in graph.collect_branch_output_types(target) {
-                            produced_outputs.insert(type_id);
-                        }
+                        graph.may_produce_output_types_from(target, &mut produced_outputs);
                     }
                     if let Some(default) = &sw.default {
-                        for (type_id, _) in graph.collect_branch_output_types(default) {
-                            produced_outputs.insert(type_id);
-                        }
+                        graph.may_produce_output_types_from(default, &mut produced_outputs);
                     }
                 }
                 Node::Loop(lp) => {
-                    if let Some(body) = &lp.body_entry {
-                        for (type_id, _) in graph.collect_branch_output_types(body) {
-                            produced_outputs.insert(type_id);
+                    // The termination predicate is evaluated *before* the
+                    // first iteration, so its input must exist when the loop
+                    // is reached — the body outputs credited below can never
+                    // satisfy the first check. Context-present outputs count
+                    // (callers may seed via `SystemContext::insert_output`);
+                    // hook-provided types do not — provider hooks insert
+                    // resources, and the predicate reads the output channel.
+                    if let Some(termination) = &lp.termination {
+                        let input = termination.input_type_id();
+                        if input != TypeId::of::<()>()
+                            && !produced_outputs.contains(&input)
+                            && !in_ctx(input)
+                        {
+                            errors.push(ResourceValidationError::MissingOutput {
+                                node: lp.id.clone(),
+                                system_name: lp.name,
+                                output_type: termination.input_type_name(),
+                                type_id: input,
+                            });
                         }
+                    }
+                    if let Some(body) = &lp.body_entry {
+                        graph.may_produce_output_types_from(body, &mut produced_outputs);
                     }
                 }
                 Node::Parallel(par) => {
                     for branch in &par.branches {
-                        for (type_id, _) in graph.collect_branch_output_types(branch) {
-                            produced_outputs.insert(type_id);
-                        }
+                        graph.may_produce_output_types_from(branch, &mut produced_outputs);
                     }
                 }
-                // A scope's inner outputs are opaque across its boundary.
-                Node::Scope(_) => {}
+                // A scope's inner graph runs at this chain position: validate
+                // it against the outputs available here (shared boundary) or
+                // against none (non-shared — outputs never cross inward), and
+                // credit what it may merge back, since scope outputs cross the
+                // boundary outward on exit regardless of policy.
+                Node::Scope(scope) => {
+                    if scope.context_policy.is_shared() {
+                        self.validate_output_reachability(
+                            &scope.graph,
+                            ctx,
+                            produced_outputs.clone(),
+                            errors,
+                            depth + 1,
+                        );
+                    } else {
+                        self.validate_output_reachability(
+                            &scope.graph,
+                            None,
+                            HashSet::new(),
+                            errors,
+                            depth + 1,
+                        );
+                    }
+                    scope.graph.may_produce_output_types(&mut produced_outputs);
+                }
                 // A dynamic node's contract is its interface. Its
                 // `requires_outputs` are free outputs the parent must supply to
                 // the selected candidate — but free outputs never cross a
@@ -730,15 +828,17 @@ impl GraphExecutor {
                 // outputs and never walk the parent chain for them). So a
                 // non-shared policy with a nonempty `requires_outputs` is
                 // statically unsatisfiable, and a shared policy must have each
-                // required output produced upstream (or hook-provided). Its
-                // `produces` name exactly the outputs it merges back, so
-                // downstream `Out<T>` reads can rely on them.
+                // required output deposited upstream or seeded in the context.
+                // Its `produces` name exactly the outputs it merges back, so
+                // downstream `Out<T>` reads can rely on them. Inline candidates
+                // recurse like scope graphs, at this chain position.
                 Node::Dynamic(dynamic) => {
                     let outputs = dynamic.contract().requires_outputs();
-                    if dynamic.context_policy.is_shared() {
+                    let shared = dynamic.context_policy.is_shared();
+                    if shared {
                         for access in outputs {
                             if !produced_outputs.contains(&access.type_id)
-                                && !hook_provided.contains(&access.type_id)
+                                && !in_ctx(access.type_id)
                             {
                                 errors.push(
                                     ResourceValidationError::DynamicContractMissingOutput {
@@ -754,6 +854,27 @@ impl GraphExecutor {
                             node: dynamic.id.clone(),
                             node_name: dynamic.name,
                         });
+                    }
+                    if let CandidateSource::Inline(candidates) = &dynamic.source {
+                        for (_key, candidate) in candidates {
+                            if shared {
+                                self.validate_output_reachability(
+                                    candidate.as_ref(),
+                                    ctx,
+                                    produced_outputs.clone(),
+                                    errors,
+                                    depth + 1,
+                                );
+                            } else {
+                                self.validate_output_reachability(
+                                    candidate.as_ref(),
+                                    None,
+                                    HashSet::new(),
+                                    errors,
+                                    depth + 1,
+                                );
+                            }
+                        }
                     }
                     for access in dynamic.contract().produces() {
                         produced_outputs.insert(access.type_id);
@@ -851,6 +972,10 @@ impl GraphExecutor {
     /// Returns an error if:
     /// - The graph has no entry point
     /// - A referenced node is not found
+    /// - A main-chain loop's termination predicate input can neither be
+    ///   produced earlier on the chain nor is present in the context at
+    ///   execution start ([`ExecutionError::LoopPredicateInputMissingOnEntry`],
+    ///   detected before any node runs)
     /// - A system execution fails
     /// - A predicate evaluation fails
     /// - A loop exceeds its maximum iterations
@@ -945,7 +1070,13 @@ impl GraphExecutor {
         // Graph timeout takes precedence; executor timeout is the fallback.
         let effective_timeout = graph.max_duration.or(self.max_duration);
 
-        let result = if let Some(max) = effective_timeout {
+        // Fail fast if a main-chain loop's first termination check cannot be
+        // satisfied. Runs at the last moment before the first node so the
+        // probe reflects the context's true contents, and routes through the
+        // normal failure path below so `OnGraphFailure` still fires.
+        let result = if let Err(entry_err) = Self::check_loop_entry_inputs(graph, ctx) {
+            Err(entry_err)
+        } else if let Some(max) = effective_timeout {
             match tokio::time::timeout(
                 max,
                 self.execute_from(graph, ctx, entry, 0, hooks, middleware, &run_ctx),
@@ -998,6 +1129,47 @@ impl GraphExecutor {
                 Err(err)
             }
         }
+    }
+
+    /// Fails fast when a main-chain loop's termination predicate input can
+    /// neither be produced earlier on the sequential chain nor is present in
+    /// `ctx`.
+    ///
+    /// The termination predicate is evaluated *before* the first iteration,
+    /// so this must hold when the loop is reached. Chain production is
+    /// checked statically with *optimistic* crediting
+    /// ([`Graph::unguaranteed_loop_predicate_inputs`]): any node kind whose
+    /// outputs may land before the loop counts — a preceding system, a
+    /// decision/switch/loop/parallel subgraph, a scope (outputs merge back on
+    /// exit), or a dynamic node's contract `produces`. The remainder are
+    /// checked against the live context at the boundary, honoring what is
+    /// actually there: outputs deposited by systems earlier in an enclosing
+    /// shared chain, or a caller pre-seed
+    /// (`SystemContext::insert_output`). Outputs are the work products of
+    /// systems — hook and middleware code is not a sanctioned writer of the
+    /// output channel, and no analysis credits it. Optimism means a conditionally
+    /// produced input (e.g. only one decision branch deposits it) passes here
+    /// and, if genuinely absent, still fails at the loop with the mid-run
+    /// [`PredicateError::OutputNotFound`](crate::predicate::PredicateError::OutputNotFound);
+    /// this check never rejects a composition the runtime would execute.
+    /// Called at every graph-execution boundary (top level and embedded
+    /// scope/dynamic graphs) before any node runs, turning the common
+    /// unsatisfiable cases into an upfront error naming the loop and the
+    /// missing type.
+    pub(crate) fn check_loop_entry_inputs(
+        graph: &Graph,
+        ctx: &SystemContext<'_>,
+    ) -> Result<(), ExecutionError> {
+        for unguaranteed in graph.unguaranteed_loop_predicate_inputs().iter() {
+            if !ctx.contains_output_by_type_id(unguaranteed.input_type_id) {
+                return Err(ExecutionError::LoopPredicateInputMissingOnEntry {
+                    node: unguaranteed.node.clone(),
+                    name: unguaranteed.name,
+                    output_type: unguaranteed.input_type_name,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Helper to invoke a hook if the [`HooksAPI`] is present.

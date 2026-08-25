@@ -7,7 +7,7 @@
 //!
 //! The predicate system follows the same type erasure pattern as systems:
 //!
-//! - [`Predicate<T, F>`] - Typed predicate that reads `Out<T>`
+//! - [`Predicate<T, F>`] - Typed predicate that reads `Out<T>` (`()` is implicit)
 //! - [`ErasedPredicate`] - Object-safe trait for type-erased storage
 //! - [`BoxedPredicate`] - Type alias for boxed predicates
 //!
@@ -34,7 +34,7 @@
 
 use polaris_system::param::SystemContext;
 use polaris_system::resource::Output;
-use std::any::{TypeId, type_name};
+use std::any::{Any, TypeId, type_name};
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -180,7 +180,9 @@ pub type BoxedDiscriminator = Box<dyn ErasedDiscriminator>;
 /// A typed predicate that evaluates a condition on a previous system output.
 ///
 /// `Predicate` wraps a closure that takes `&T` and returns `bool`,
-/// where `T` is an output type from a previous system.
+/// where `T` is an output type from a previous system. `Predicate<(), F>` is
+/// the unit exception: because `()` represents no data flow and is never
+/// stored as an output, the closure receives an implicit `&()`.
 ///
 /// # Type Parameters
 ///
@@ -225,6 +227,13 @@ where
     F: Fn(&T) -> bool + Send + Sync + 'static,
 {
     fn evaluate(&self, ctx: &SystemContext<'_>) -> Result<bool, PredicateError> {
+        // `()` is the absence of data flow, so unit predicates are constant
+        // control-flow closures rather than reads from the output channel.
+        // The safe `Any` downcast succeeds only when `T` is exactly `()`.
+        let unit = ();
+        if let Some(input) = (&unit as &dyn Any).downcast_ref::<T>() {
+            return Ok((self.func)(input));
+        }
         let output = ctx
             .get_output::<T>()
             .map_err(|_| PredicateError::OutputNotFound {
@@ -253,7 +262,9 @@ impl<T, F> fmt::Debug for Predicate<T, F> {
 /// A typed discriminator that returns a case key based on a previous system output.
 ///
 /// `Discriminator` wraps a closure that takes `&T` and returns `&'static str`,
-/// where `T` is an output type from a previous system.
+/// where `T` is an output type from a previous system. For
+/// `Discriminator<(), F>`, the closure receives an implicit `&()` because unit
+/// represents no data flow and is never stored as an output.
 ///
 /// # Type Parameters
 ///
@@ -298,6 +309,12 @@ where
     F: Fn(&T) -> &'static str + Send + Sync + 'static,
 {
     fn discriminate(&self, ctx: &SystemContext<'_>) -> Result<&'static str, PredicateError> {
+        // Keep unit discriminators consistent with unit predicates: `()` is
+        // implicit and never needs to be deposited as a system output.
+        let unit = ();
+        if let Some(input) = (&unit as &dyn Any).downcast_ref::<T>() {
+            return Ok((self.func)(input));
+        }
         let output = ctx
             .get_output::<T>()
             .map_err(|_| PredicateError::OutputNotFound {
@@ -371,6 +388,17 @@ mod tests {
     }
 
     #[test]
+    fn unit_predicate_uses_implicit_unit_input() {
+        let pred = Predicate::<(), _>::new(|()| true);
+        let ctx = SystemContext::new();
+
+        assert!(
+            pred.evaluate(&ctx).expect("unit input is always available"),
+            "the predicate closure receives implicit unit without a context output"
+        );
+    }
+
+    #[test]
     fn boxed_predicate() {
         let pred: BoxedPredicate = Box::new(Predicate::<TestOutput, _>::new(|o| o.done));
 
@@ -422,6 +450,18 @@ mod tests {
 
         let result = disc.discriminate(&ctx);
         assert!(matches!(result, Err(PredicateError::OutputNotFound { .. })));
+    }
+
+    #[test]
+    fn unit_discriminator_uses_implicit_unit_input() {
+        let disc = Discriminator::<(), _>::new(|()| "default");
+        let ctx = SystemContext::new();
+
+        assert_eq!(
+            disc.discriminate(&ctx)
+                .expect("unit input is always available"),
+            "default"
+        );
     }
 
     #[test]

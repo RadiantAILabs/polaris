@@ -709,7 +709,13 @@ impl ParallelNode {
 ///
 /// Loop nodes implement iterative execution patterns, repeating the
 /// loop body until a termination predicate returns true or max iterations
-/// is reached.
+/// is reached. The predicate is evaluated *before* each iteration — including
+/// the first, before the body has ever run — so its input must be produced
+/// earlier in the graph (normally by a preceding init system — outputs are
+/// the work products of systems) or pre-seeded by the caller via
+/// [`SystemContext::insert_output`](polaris_system::param::SystemContext::insert_output)
+/// before executing; otherwise execution fails at run start with
+/// [`ExecutionError::LoopPredicateInputMissingOnEntry`](crate::executor::ExecutionError::LoopPredicateInputMissingOnEntry).
 ///
 /// # Examples
 ///
@@ -720,10 +726,14 @@ impl ParallelNode {
 ///
 /// struct LoopState { done: bool }
 ///
+/// async fn init() -> LoopState { LoopState { done: false } }
+///
 /// async fn iterate() -> LoopState { LoopState { done: false } }
 ///
-/// // With a termination predicate
+/// // With a termination predicate; `init` produces the state the first
+/// // termination check reads.
 /// let mut graph = Graph::new();
+/// graph.add_system(init);
 /// graph.add_loop::<LoopState, _, _>(
 ///     "work_loop",
 ///     |state| state.done,

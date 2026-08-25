@@ -41,7 +41,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.0"
-          components: rustfmt, clippy
+          # rust-src lets rustc render sysroot source snippets in diagnostics;
+          # without it the trybuild *.stderr snapshots (which embed $RUST
+          # snippets) regenerate differently on CI and trip the drift guard.
+          components: rustfmt, clippy, rust-src
 
       - uses: Swatinem/rust-cache@v2
 
@@ -55,6 +58,16 @@ jobs:
 
       - name: Run tests
         run: cargo make test
+
+      - name: Verify trybuild snapshots are committed
+        # `cargo make test` runs trybuild with TRYBUILD=overwrite, regenerating
+        # the tracked *.stderr snapshots in place. A diff (or an untracked
+        # snapshot from a new case) means a compile-test diagnostic changed
+        # without its snapshot being committed — the drift guard that makes
+        # diagnostic text and spans CI-enforced, not just the fail direction.
+        run: |
+          git add --intent-to-add -- '*.stderr'
+          git diff --exit-code -- '*.stderr'
 
       - name: Check examples
         run: cargo check --manifest-path examples/Cargo.toml

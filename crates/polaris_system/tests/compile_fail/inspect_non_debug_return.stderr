@@ -1,0 +1,19 @@
+error[E0277]: `NotDebug` doesn't implement `Debug`
+  --> tests/compile_fail/inspect_non_debug_return.rs:12:34
+   |
+11 | #[system(inspect(return))]
+   | -------------------------- required by a bound introduced by this call
+12 | async fn produces_non_debug() -> NotDebug {
+   |                                  ^^^^^^^^ the trait `Debug` is not implemented for `NotDebug`
+   |
+   = note: add `#[derive(Debug)]` to `NotDebug` or manually `impl Debug for NotDebug`
+note: required by a bound in `inspect_value`
+  --> src/param/inspect.rs
+   |
+   | pub fn inspect_value<T: Debug + ?Sized>(value: &T) -> Inspection {
+   |                         ^^^^^ required by this bound in `inspect_value`
+help: consider annotating `NotDebug` with `#[derive(Debug)]`
+   |
+ 7 + #[derive(Debug)]
+ 8 | struct NotDebug {
+   |

@@ -7,6 +7,7 @@
 //! - [`ServerInfoPlugin`] - Server metadata and runtime information
 //! - [`TimePlugin`] - Time utilities with mockable clock for testing
 //! - [`TracingPlugin`] - Tracing subscriber, console logging, and instrumentation
+//! - [`InspectionPlugin`] - Runtime policy and listener registry for parameter inspection
 //! - I/O abstractions ([`IOProvider`], [`UserIO`]) for agent communication
 //! - [`persistence::PersistencePlugin`] - Persistence registry for storable resources
 //! - [`DefaultPlugins`] - Convenient bundle of all infrastructure plugins
@@ -70,6 +71,7 @@
 // Self-reference ensuring `#[derive(Storable)]` macro-generated code can use `polaris_core_plugins::` paths within this crate.
 extern crate self as polaris_core_plugins;
 
+mod inspection;
 mod io;
 #[cfg(feature = "otel")]
 mod otel_plugin;
@@ -77,10 +79,16 @@ pub mod persistence;
 mod server_info;
 #[cfg(feature = "otel")]
 mod span_processor_registry;
+#[cfg(test)]
+mod test_support;
 mod time;
 mod tracing_plugin;
 
 // Re-export plugins
+pub use inspection::{
+    INSPECTION_TRACING_LISTENER, InspectionAPI, InspectionListenerName, InspectionPlugin,
+    InspectionPolicy, InspectionSinkRegistry, RedactionRules, TracingInspectionSink,
+};
 pub use server_info::ServerInfoPlugin;
 pub use time::{Clock, ClockProvider, Stopwatch, TimePlugin};
 pub use tracing_plugin::{FmtConfig, TracingConfig, TracingFormat, TracingLayers, TracingPlugin};
@@ -120,6 +128,7 @@ use tracing::Level;
 /// - [`ServerInfoPlugin`] - Server metadata
 /// - [`TimePlugin`] - Time utilities
 /// - [`TracingPlugin`] - Console logging with fmt output and instrumentation
+/// - [`InspectionPlugin`] - Parameter-value recording, off until enabled via [`InspectionAPI`]
 ///
 /// # Example
 ///
@@ -235,6 +244,7 @@ impl PluginGroup for DefaultPlugins {
             .add(ServerInfoPlugin)
             .add(TimePlugin::default())
             .add(tracing)
+            .add(InspectionPlugin::default())
     }
 }
 
@@ -278,7 +288,18 @@ mod tests {
     #[test]
     fn default_plugins_builds() {
         let builder = DefaultPlugins::new().build();
-        assert_eq!(builder.len(), 3);
+        assert_eq!(builder.len(), 4);
+
+        // `disable::<P>()` removes by plugin id, so each length drop proves
+        // that exact plugin's membership.
+        let builder = builder.disable::<ServerInfoPlugin>();
+        assert_eq!(builder.len(), 3, "ServerInfoPlugin must be a member");
+        let builder = builder.disable::<TimePlugin>();
+        assert_eq!(builder.len(), 2, "TimePlugin must be a member");
+        let builder = builder.disable::<TracingPlugin>();
+        assert_eq!(builder.len(), 1, "TracingPlugin must be a member");
+        let builder = builder.disable::<InspectionPlugin>();
+        assert!(builder.is_empty(), "InspectionPlugin must be a member");
     }
 
     #[test]
@@ -292,7 +313,7 @@ mod tests {
                     .span_events(true),
             )
             .build();
-        assert_eq!(builder.len(), 3);
+        assert_eq!(builder.len(), 4);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+error: unexpected tokens after `inspect(..)`
+  --> tests/compile_fail/inspect_trailing_tokens.rs:16:27
+   |
+16 | #[system(inspect(counter) garbage)]
+   |                           ^^^^^^^
+
+warning: unused import: `polaris_system::param::Res`
+ --> tests/compile_fail/inspect_trailing_tokens.rs:5:5
+  |
+5 | use polaris_system::param::Res;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

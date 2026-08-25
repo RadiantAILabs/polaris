@@ -1,0 +1,33 @@
+error: struct is not supported in `trait`s or `impl`s
+ --> tests/compile_fail/self_param.rs:6:5
+  |
+6 |     #[system]
+  |     ^^^^^^^^^
+  |
+  = help: consider moving the struct out to a nearby module scope
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: implementation is not supported in `trait`s or `impl`s
+ --> tests/compile_fail/self_param.rs:6:5
+  |
+6 |     #[system]
+  |     ^^^^^^^^^
+  |
+  = help: consider moving the implementation out to a nearby module scope
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0425]: cannot find type `SystemWithSelfSystem` in this scope
+ --> tests/compile_fail/self_param.rs:6:5
+  |
+6 |     #[system]
+  |     ^^^^^^^^^ not found in this scope
+  |
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0425]: cannot find value `SystemWithSelfSystem` in this scope
+ --> tests/compile_fail/self_param.rs:6:5
+  |
+6 |     #[system]
+  |     ^^^^^^^^^ not found in this scope
+  |
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)

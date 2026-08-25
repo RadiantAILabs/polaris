@@ -1,0 +1,19 @@
+warning: unused import: `polaris_system::server::Server`
+ --> tests/compile_fail/plugin_provides_non_contract.rs:7:5
+  |
+7 | use polaris_system::server::Server;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0277]: the trait bound `NotACapability: Contract` is not satisfied
+  --> tests/compile_fail/plugin_provides_non_contract.rs:13:65
+   |
+13 | #[plugin(id = "test::bad_provider", version = "0.1.0", provides(NotACapability))]
+   |                                                                 ^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Contract` is not implemented for `NotACapability`
+  --> tests/compile_fail/plugin_provides_non_contract.rs:9:1
+   |
+ 9 | struct NotACapability;
+   | ^^^^^^^^^^^^^^^^^^^^^

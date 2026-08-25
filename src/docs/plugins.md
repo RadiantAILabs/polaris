@@ -61,6 +61,7 @@ application. Most ship via [`polaris_ai::plugins`](crate::plugins).
 | [`ServerInfoPlugin`](crate::plugins::ServerInfoPlugin) | Server identity, version, and runtime metadata as a global [`ServerInfo`](crate::plugins::ServerInfo) resource. |
 | [`TimePlugin`](crate::plugins::TimePlugin) | Wall-clock time via the [`Clock`](crate::plugins::Clock) resource; mockable in tests with `MockClock`. |
 | [`TracingPlugin`](crate::plugins::TracingPlugin) | Console / structured tracing subscriber, graph and system instrumentation hooks, and the [`TracingLayers`](crate::plugins::TracingLayers) for plugins that need to push their own subscriber layer. |
+| [`InspectionPlugin`](crate::plugins::InspectionPlugin) | Delivery for `#[system(inspect(..))]` parameter captures: the [`InspectionAPI`](crate::plugins::InspectionAPI) runtime switch (off by default) with [`RedactionRules`](crate::plugins::RedactionRules) and checked typed-listener toggles, the [`InspectionSinkRegistry`](crate::plugins::InspectionSinkRegistry) listener sign-up sheet, and the shipped [`TracingInspectionSink`](crate::plugins::TracingInspectionSink) that emits records onto the per-step tracing span. |
 | [`PersistencePlugin`](crate::plugins::PersistencePlugin) | The [`PersistenceAPI`](crate::plugins::PersistenceAPI) — a registry of `Storable` resource serializers used by sessions and other state-bearing plugins. |
 | [`OpenTelemetryPlugin`](crate::plugins::OpenTelemetryPlugin) *(feature `otel`)* | Adds an OTLP export layer to the tracing subscriber for distributed tracing backends. |
 | [`DevToolsPlugin`](crate::graph::DevToolsPlugin) | Graph-level developer tooling: per-node [`SystemInfo`](crate::graph::SystemInfo) records, execution event tracing, and graph introspection. Lives in [`polaris_ai::graph`](crate::graph). |
@@ -130,6 +131,18 @@ Graph, model, and tool tracing are always on — [`TracingPlugin`](crate::plugin
 unconditionally registers graph middleware via [`crate::graph::MiddlewareAPI`] and
 decorates both the global [`crate::models::ModelRegistry`] and [`crate::tools::ToolRegistry`].
 With no subscriber attached the spans have no observable cost.
+
+Parameter *values* are a separate, off-by-default axis:
+[`InspectionPlugin`](crate::plugins::InspectionPlugin) (in
+[`DefaultPlugins`](crate::plugins::DefaultPlugins)) delivers
+`#[system(inspect(..))]` captures to registered listeners once
+[`InspectionAPI`](crate::plugins::InspectionAPI) enables recording, and its
+shipped tracing listener lands them on the same per-step spans. The same API
+withholds covered values as `Redacted` (never formatted) via
+[`RedactionRules`](crate::plugins::RedactionRules), and discovers and toggles
+listeners registered under typed [`InspectionListenerName`](crate::plugins::InspectionListenerName)
+identities — including the shipped one under
+[`INSPECTION_TRACING_LISTENER`](crate::plugins::INSPECTION_TRACING_LISTENER) — at run time.
 
 | Feature | Public item to look for | Existing surface it changes | Runtime/API surface |
 |---------|--------------------------|----------------------------|---------------------|

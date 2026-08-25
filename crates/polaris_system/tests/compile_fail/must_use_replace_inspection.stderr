@@ -1,0 +1,16 @@
+error: unused return value of `SystemContext::<'parent>::replace_inspection` that must be used
+  --> tests/compile_fail/must_use_replace_inspection.rs:22:5
+   |
+22 |     ctx.replace_inspection(Arc::new(Discard));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the displaced sink belongs to whoever installed it, and dropping it silently cuts that owner off — bind it to `_` to record that losing it is intended
+note: the lint level is defined here
+  --> tests/compile_fail/must_use_replace_inspection.rs:8:9
+   |
+ 8 | #![deny(unused_must_use)]
+   |         ^^^^^^^^^^^^^^^
+help: use `let _ = ...` to ignore the resulting value
+   |
+22 |     let _ = ctx.replace_inspection(Arc::new(Discard));
+   |     +++++++

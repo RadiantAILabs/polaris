@@ -394,6 +394,18 @@ impl Resources {
     /// If a resource of this type already exists, it is replaced and the
     /// old value is returned.
     ///
+    /// `None` also comes back in the pathological case where the occupying
+    /// entry was stored under `T`'s type ID but holds a different type — a
+    /// violation of the [`insert_boxed`](Self::insert_boxed) contract, in which
+    /// case the displaced value is dropped rather than returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when the displaced entry holds a type other than
+    /// `T`, reporting the contract violation at the write instead of leaving it
+    /// to be inferred from a `None` that means something else. The check is a
+    /// `debug_assert!`: release builds drop the value and return `None`.
+    ///
     /// # Example
     ///
     /// ```
@@ -413,9 +425,15 @@ impl Resources {
         let id = ResourceId::of::<T>();
         let entry = ResourceEntry::new(resource);
 
-        self.storage
-            .insert(id, entry)
-            .and_then(|old| old.into_inner().downcast::<T>().ok().map(|boxed| *boxed))
+        let displaced = self.storage.insert(id, entry)?.into_inner().downcast::<T>();
+        debug_assert!(
+            displaced.is_ok(),
+            "resource slot for `{}` held a different type — an earlier \
+             `insert_boxed` violated its type-correctness contract, and the \
+             displaced value is dropped rather than returned",
+            type_name::<T>()
+        );
+        displaced.ok().map(|boxed| *boxed)
     }
 
     /// Inserts a type-erased resource into the container.
@@ -423,15 +441,24 @@ impl Resources {
     /// This is used internally by factories that create resources dynamically.
     /// The `type_id` must match the type of the boxed resource.
     ///
+    /// If a resource with this type ID already exists, it is replaced and the
+    /// displaced value is returned still boxed.
+    ///
     /// # Correctness
     ///
     /// The caller must ensure that `type_id` corresponds to the type stored
     /// in `resource`. Mismatches will cause panics when the resource is
     /// accessed via `get::<T>()`.
-    pub fn insert_boxed(&mut self, type_id: TypeId, resource: Box<dyn Any + Send + Sync>) {
+    pub fn insert_boxed(
+        &mut self,
+        type_id: TypeId,
+        resource: Box<dyn Any + Send + Sync>,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
         let id = ResourceId(type_id);
         let entry = ResourceEntry::new_boxed(resource);
-        self.storage.insert(id, entry);
+        self.storage
+            .insert(id, entry)
+            .map(ResourceEntry::into_inner)
     }
 
     /// Inserts a type-erased resource together with the factory that produced it.
@@ -440,10 +467,14 @@ impl Resources {
     /// at a scope boundary can re-invoke it to produce a clean child-scope instance
     /// without separate Server→executor plumbing.
     ///
-    /// If a resource of this type already exists, it is replaced. Any
-    /// previously registered clone function on the entry is dropped — register
-    /// a new one with [`Resources::register_clone_fn`] after re-inserting if
-    /// needed.
+    /// If a resource of this type already exists, it is replaced and the
+    /// displaced value is returned still boxed. The displaced entry's factory
+    /// and its clone function are dropped, and neither is recoverable from the
+    /// return. Capture the factory *before* writing if you need it back —
+    /// [`factory_fn_by_type_id`](Self::factory_fn_by_type_id) hands out a clone
+    /// of the one still in force. The clone function has no reader at all, and
+    /// [`register_clone_fn`](Self::register_clone_fn) is generic over a concrete
+    /// `T`, so only a caller that knows the erased type can restore that half.
     ///
     /// # Correctness
     ///
@@ -471,10 +502,12 @@ impl Resources {
         type_id: TypeId,
         resource: Box<dyn Any + Send + Sync>,
         factory_fn: ResourceFactory,
-    ) {
+    ) -> Option<Box<dyn Any + Send + Sync>> {
         let id = ResourceId(type_id);
         let entry = ResourceEntry::new_boxed_with_factory(resource, factory_fn);
-        self.storage.insert(id, entry);
+        self.storage
+            .insert(id, entry)
+            .map(ResourceEntry::into_inner)
     }
 
     /// Returns the factory function associated with a resource entry, if any.
@@ -905,12 +938,70 @@ mod tests {
         // Insert via type-erased method
         let type_id = TypeId::of::<Counter>();
         let boxed: Box<dyn Any + Send + Sync> = Box::new(Counter { value: 99 });
-        resources.insert_boxed(type_id, boxed);
+        assert!(resources.insert_boxed(type_id, boxed).is_none());
 
         // Should be retrievable via normal get
         assert!(resources.contains::<Counter>());
         let counter = resources.get::<Counter>().unwrap();
         assert_eq!(counter.value, 99);
+    }
+
+    #[test]
+    fn insert_boxed_returns_displaced_resource() {
+        let mut resources = Resources::new();
+        let type_id = TypeId::of::<Counter>();
+
+        resources.insert(Counter { value: 1 });
+
+        let boxed: Box<dyn Any + Send + Sync> = Box::new(Counter { value: 2 });
+        let displaced = resources
+            .insert_boxed(type_id, boxed)
+            .expect("replacing an occupied slot returns its previous occupant");
+        assert_eq!(displaced.downcast::<Counter>().unwrap().value, 1);
+
+        assert_eq!(resources.get::<Counter>().unwrap().value, 2);
+        assert_eq!(resources.len(), 1);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn insert_drops_a_mismatched_occupant_and_reports_nothing_displaced() {
+        let mut resources = mismatched_occupant();
+
+        // The typed write cannot downcast the occupant, so it drops it and
+        // returns `None` — a `None` that does not mean "nothing was displaced".
+        assert!(
+            resources.insert(Counter { value: 7 }).is_none(),
+            "a mismatched occupant is dropped rather than returned"
+        );
+
+        assert_eq!(resources.get::<Counter>().unwrap().value, 7);
+        assert_eq!(resources.len(), 1);
+    }
+
+    /// Builds the one state where `insert` returns a `None` that does not mean
+    /// "nothing was displaced": a slot keyed by `Counter`'s type ID holding a
+    /// `Name`. Only reachable by violating `insert_boxed`'s type-correctness
+    /// contract, which is why the typed write asserts on it in debug builds.
+    fn mismatched_occupant() -> Resources {
+        let mut resources = Resources::new();
+        let boxed: Box<dyn Any + Send + Sync> = Box::new(Name("wrong type".to_string()));
+        assert!(
+            resources
+                .insert_boxed(TypeId::of::<Counter>(), boxed)
+                .is_none()
+        );
+        resources
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "resource slot for")]
+    fn insert_asserts_in_debug_when_the_occupant_is_a_different_type() {
+        // The contract violation is loud rather than inferable from the return:
+        // without this, the only signal is a `None` indistinguishable from
+        // "the slot was empty".
+        let _ = mismatched_occupant().insert(Counter { value: 7 });
     }
 
     #[test]
@@ -1166,7 +1257,19 @@ mod tests {
         );
 
         let factory = ResourceFactory::new(|| Box::new(Cloneable { value: 2 }));
-        resources.insert_boxed_with_factory(TypeId::of::<Cloneable>(), factory.produce(), factory);
+        let displaced = resources.insert_boxed_with_factory(
+            TypeId::of::<Cloneable>(),
+            factory.produce(),
+            factory,
+        );
+        assert_eq!(
+            displaced
+                .expect("replacing an occupied slot returns its previous occupant")
+                .downcast::<Cloneable>()
+                .unwrap()
+                .value,
+            1
+        );
 
         assert!(
             resources

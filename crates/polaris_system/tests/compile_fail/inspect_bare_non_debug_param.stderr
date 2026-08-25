@@ -1,0 +1,20 @@
+error[E0277]: `NotDebug` doesn't implement `Debug`
+  --> tests/compile_fail/inspect_bare_non_debug_param.rs:24:45
+   |
+23 | #[system(inspect)]
+   | ------------------ required by a bound introduced by this call
+24 | async fn inspect_all(fine: Res<Renderable>, broken: Res<NotDebug>) {
+   |                                             ^^^^^^^^^^^ the trait `Debug` is not implemented for `NotDebug`
+   |
+   = note: add `#[derive(Debug)]` to `NotDebug` or manually `impl Debug for NotDebug`
+help: the trait `InspectParam` is implemented for `polaris_system::param::Res<'_, T>`
+  --> src/param/inspect.rs
+   |
+   | impl<T: Resource + Debug> InspectParam for Res<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `polaris_system::param::Res<'_, NotDebug>` to implement `InspectParam`
+help: consider annotating `NotDebug` with `#[derive(Debug)]`
+   |
+17 + #[derive(Debug)]
+18 | struct NotDebug {
+   |

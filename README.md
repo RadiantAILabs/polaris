@@ -33,6 +33,7 @@ struct ReActAgent;
 
 impl Agent for ReActAgent {
     fn build(&self, graph: &mut Graph) {
+        // Produces the initial ReactState the loop's termination check reads.
         graph.add_system(init);
 
         graph.add_loop::<ReactState, _, _>(

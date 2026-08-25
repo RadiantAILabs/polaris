@@ -1,0 +1,5 @@
+error: unsupported attribute on a `#[system]` function: the macro replaces the function with generated items, so only `doc` (forwarded to the generated struct), `cfg`/`cfg_attr` (forwarded to every generated item), and lint attributes (forwarded to the generated `run` method) are supported
+ --> tests/compile_fail/system_unsupported_attribute.rs:8:1
+  |
+8 | #[inline]
+  | ^^^^^^^^^

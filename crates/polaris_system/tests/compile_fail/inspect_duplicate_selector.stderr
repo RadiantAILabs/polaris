@@ -1,0 +1,13 @@
+error: duplicate parameter `counter` in `inspect(..)`
+  --> tests/compile_fail/inspect_duplicate_selector.rs:15:27
+   |
+15 | #[system(inspect(counter, counter))]
+   |                           ^^^^^^^
+
+warning: unused import: `polaris_system::param::Res`
+ --> tests/compile_fail/inspect_duplicate_selector.rs:4:5
+  |
+4 | use polaris_system::param::Res;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

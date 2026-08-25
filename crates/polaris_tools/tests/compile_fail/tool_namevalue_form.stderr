@@ -1,0 +1,5 @@
+error: #[tool] takes options in `#[tool(strict = false)]` form, not `#[tool = ...]`
+ --> tests/compile_fail/tool_namevalue_form.rs:7:5
+  |
+7 |     #[tool = false]
+  |     ^^^^^^^^^^^^^^^

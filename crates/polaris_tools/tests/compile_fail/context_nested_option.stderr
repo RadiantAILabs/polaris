@@ -1,0 +1,5 @@
+error: #[context] parameter cannot be `Option<Option<T>>`; use `Option<T>` for an optional context value
+  --> tests/compile_fail/context_nested_option.rs:10:25
+   |
+10 |     #[context] session: Option<Option<SessionId>>,
+   |                         ^^^^^^

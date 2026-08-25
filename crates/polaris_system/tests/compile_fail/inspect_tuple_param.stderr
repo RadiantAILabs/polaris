@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `(polaris_system::param::Res<'_, Counter>, polaris_system::param::Res<'_, Gauge>): InspectParam` is not satisfied
+  --> tests/compile_fail/inspect_tuple_param.rs:24:22
+   |
+23 | #[system(inspect(pair))]
+   | ------------------------ required by a bound introduced by this call
+24 | async fn tuple_param(pair: (Res<'_, Counter>, Res<'_, Gauge>)) {
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `InspectParam` is not implemented for `(polaris_system::param::Res<'_, Counter>, polaris_system::param::Res<'_, Gauge>)`
+   |
+   = help: the following other types implement trait `InspectParam`:
+             Option<polaris_system::param::Out<'_, T>>
+             polaris_system::param::ErrOut<'_, T>
+             polaris_system::param::Out<'_, T>
+             polaris_system::param::Res<'_, T>
+             polaris_system::param::ResMut<'_, T>

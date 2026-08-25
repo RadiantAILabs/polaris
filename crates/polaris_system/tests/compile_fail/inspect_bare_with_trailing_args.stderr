@@ -1,0 +1,13 @@
+error: bare `inspect` cannot be combined with other arguments; it already selects every parameter
+  --> tests/compile_fail/inspect_bare_with_trailing_args.rs:16:10
+   |
+16 | #[system(inspect, counter)]
+   |          ^^^^^^^
+
+warning: unused import: `polaris_system::param::Res`
+ --> tests/compile_fail/inspect_bare_with_trailing_args.rs:5:5
+  |
+5 | use polaris_system::param::Res;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
