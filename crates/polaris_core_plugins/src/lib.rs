@@ -87,7 +87,8 @@ mod tracing_plugin;
 // Re-export plugins
 pub use inspection::{
     INSPECTION_TRACING_LISTENER, InspectionAPI, InspectionListenerName, InspectionPlugin,
-    InspectionPolicy, InspectionSinkRegistry, RedactionRules, TracingInspectionSink,
+    InspectionPolicy, InspectionSinkRegistry, InspectionSpecError, RedactionRules,
+    TracingInspectionSink,
 };
 pub use server_info::ServerInfoPlugin;
 pub use time::{Clock, ClockProvider, Stopwatch, TimePlugin};

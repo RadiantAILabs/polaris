@@ -27,6 +27,7 @@
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
@@ -555,6 +556,233 @@ fn strip_type_paths(name: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spec parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Why an inspection spec string was rejected.
+///
+/// Produced by the [`FromStr`] impls on [`InspectionPolicy`] and
+/// [`RedactionRules`]. Parsing rejects loudly instead of narrowing to a guess,
+/// because each control's silent failure mode is the one it exists to prevent:
+/// a policy typo that quietly matched no system would be a debugging trap, and
+/// a redaction typo that quietly withheld nothing would leak exactly the
+/// values the rule was written to withhold.
+///
+/// Marked `#[non_exhaustive]`: the grammars may grow, so downstream matches
+/// must include a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InspectionSpecError {
+    /// A policy spec was punctuation only (for example `","`), naming no
+    /// systems. Spell "record nothing" as `off` (or an empty spec) instead.
+    EmptyPolicy,
+    /// A policy entry is not spelled like a `#[system]` function name.
+    ///
+    /// The usual cause is a forgotten comma: `"plan act"` arrives as one
+    /// entry. A name that matched no system would merely record nothing, but
+    /// that silence is indistinguishable from "the system never ran" — so the
+    /// spelling is checked where it can be, at the parse.
+    ///
+    /// The variant carries its own `#[non_exhaustive]` on top of the enum's:
+    /// that seals the payload, not just the variant set, so a field (say, an
+    /// entry offset) can be added without a breaking release.
+    #[non_exhaustive]
+    MalformedSystem {
+        /// The offending entry, verbatim.
+        entry: String,
+    },
+    /// A redaction entry was not `param:<binding>` or `type:<Type>`.
+    ///
+    /// The kind prefix is mandatory: a bare name would have to be guessed at,
+    /// and a guessed-wrong rule (or a misspelled kind silently ignored) is a
+    /// withholding control that withholds nothing.
+    ///
+    /// `#[non_exhaustive]` on the variant seals the payload — see
+    /// [`MalformedSystem`](Self::MalformedSystem).
+    #[non_exhaustive]
+    MalformedRedaction {
+        /// The offending entry, verbatim.
+        entry: String,
+    },
+}
+
+impl std::fmt::Display for InspectionSpecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPolicy => f.write_str(
+                "policy spec names no systems; use `off`, `all`, \
+                 or a comma-separated list of `#[system]` function names",
+            ),
+            Self::MalformedSystem { entry } => write!(
+                f,
+                "malformed system name `{entry}`: expected a bare `#[system]` \
+                 function name (did you forget a comma?)"
+            ),
+            Self::MalformedRedaction { entry } => write!(
+                f,
+                "malformed redaction `{entry}`: expected `param:<binding>` or \
+                 `type:<Type>` (a container spelling like `Vec<Token>` is not \
+                 accepted here — name the inner type, which covers every \
+                 container it appears in)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InspectionSpecError {}
+
+/// Whether `name` is spelled like one Rust identifier.
+fn is_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+/// Whether `name` is spelled like a bare or `::`-qualified identifier.
+fn is_path_ident(name: &str) -> bool {
+    !name.is_empty() && name.split("::").all(is_ident)
+}
+
+/// Parses a policy spec: `off` (or an empty string), `all`, or a
+/// comma-separated list of `#[system]` function names.
+///
+/// This is the same policy the typed constructors build, in a form that can
+/// live in an environment variable or an admin request — see
+/// [`InspectionPlugin::with_policy_from_env`]. Keywords are matched
+/// ASCII-case-insensitively and take precedence when the spec is exactly one
+/// of them; system names are case-sensitive identifiers, entries are trimmed,
+/// and empty entries (a trailing comma) are ignored.
+///
+/// # Errors
+///
+/// [`InspectionSpecError::MalformedSystem`] for an entry not spelled like an
+/// identifier — rejected rather than carried as a name that would silently
+/// match nothing — and [`InspectionSpecError::EmptyPolicy`] for a spec that is
+/// punctuation only, naming no systems.
+///
+/// # Example
+///
+/// ```
+/// use polaris_core_plugins::InspectionPolicy;
+///
+/// let policy: InspectionPolicy = "plan,act".parse().expect("two system names");
+/// assert!(policy.allows("plan"));
+/// assert!(!policy.allows("observe"));
+///
+/// assert_eq!("off".parse(), Ok(InspectionPolicy::Off));
+/// assert_eq!("ALL".parse(), Ok(InspectionPolicy::All));
+///
+/// // A forgotten comma is an error, not a name that matches nothing.
+/// assert!("plan act".parse::<InspectionPolicy>().is_err());
+/// ```
+impl FromStr for InspectionPolicy {
+    type Err = InspectionSpecError;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let spec = spec.trim();
+        if spec.is_empty() || spec.eq_ignore_ascii_case("off") {
+            return Ok(Self::Off);
+        }
+        if spec.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
+        }
+        let mut names = Vec::new();
+        for entry in spec.split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            if !is_ident(entry) {
+                return Err(InspectionSpecError::MalformedSystem {
+                    entry: entry.to_owned(),
+                });
+            }
+            names.push(entry);
+        }
+        if names.is_empty() {
+            return Err(InspectionSpecError::EmptyPolicy);
+        }
+        Ok(Self::systems(names))
+    }
+}
+
+/// Parses a redaction spec: comma-separated `param:<binding>` and
+/// `type:<Type>` entries. An empty string is a valid spec with no rules.
+///
+/// This is the same rule set the typed builders compose, in a form that can
+/// live in an environment variable — see
+/// [`InspectionPlugin::with_redactions_from_env`]. Entries and the two halves
+/// around the `:` are trimmed. Type names may be `::`-qualified
+/// (`type:credentials::ApiCredentials`) and are path-stripped exactly as
+/// [`redact_type`](RedactionRules::redact_type) strips them.
+///
+/// # Errors
+///
+/// [`InspectionSpecError::MalformedRedaction`] for any entry that is not
+/// `param:<binding>` or `type:<Type>` — a bare name, a misspelled kind, or a
+/// *container* spelling (`type:Vec<Token>`): commas inside generics are
+/// indistinguishable from entry separators, and the typed API's own guidance
+/// is to name the inner type, which covers every container it appears in. A
+/// rule that genuinely must name a container spelling whole goes through
+/// [`redact_type`](RedactionRules::redact_type).
+///
+/// # Example
+///
+/// ```
+/// use polaris_core_plugins::RedactionRules;
+///
+/// let rules: RedactionRules = "param:token, type:ApiCredentials"
+///     .parse()
+///     .expect("one binding rule, one type rule");
+/// assert!(rules.covers_param("token"));
+/// assert!(rules.covers_type("Option<ApiCredentials>"));
+///
+/// // A misspelled kind is an error, not a rule that withholds nothing.
+/// assert!("parm:token".parse::<RedactionRules>().is_err());
+/// ```
+impl FromStr for RedactionRules {
+    type Err = InspectionSpecError;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let mut rules = Self::new();
+        for entry in spec.split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            let malformed = || InspectionSpecError::MalformedRedaction {
+                entry: entry.to_owned(),
+            };
+            let (kind, name) = entry.split_once(':').ok_or_else(malformed)?;
+            let name = name.trim();
+            rules = match kind.trim() {
+                "param" if is_ident(name) => rules.redact_param(name),
+                "type" if is_path_ident(name) => rules.redact_type(name),
+                _ => return Err(malformed()),
+            };
+        }
+        Ok(rules)
+    }
+}
+
+/// Reads `var`, distinguishing "unset" (`None`) from unusable.
+///
+/// # Panics
+///
+/// Panics if the variable is set but not valid Unicode: a spec that cannot
+/// even be read must fail the boot, for the same reason a spec that cannot be
+/// parsed does.
+fn env_spec(var: &str) -> Option<String> {
+    match std::env::var(var) {
+        Ok(spec) => Some(spec),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("environment variable {var} is set but is not valid Unicode")
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1492,9 +1720,12 @@ impl InspectionSink for TracingInspectionSink {
 /// Add it when you want `#[system(inspect(..))]` captures to go somewhere.
 /// Recording is **off by default** — the plugin is inert until
 /// [`InspectionAPI::enable`] (or a non-[`Off`](InspectionPolicy::Off) initial
-/// policy via [`with_policy`](Self::with_policy)) admits records, so it is
-/// safe to keep registered everywhere; [`DefaultPlugins`](crate::DefaultPlugins)
-/// includes it.
+/// policy via [`with_policy`](Self::with_policy) or
+/// [`with_policy_from_env`](Self::with_policy_from_env)) admits records, so it
+/// is safe to keep registered everywhere; [`DefaultPlugins`](crate::DefaultPlugins)
+/// includes it. The `_from_env` builders fail closed: an unset variable
+/// changes nothing, and a set-but-malformed spec fails startup rather than
+/// coming up under a posture nobody chose.
 ///
 /// # How the pieces fit
 ///
@@ -1688,9 +1919,112 @@ impl InspectionPlugin {
     ///
     /// The default withholds nothing. Rules apply from the first run onward;
     /// [`InspectionAPI::set_redactions`] changes them at run time.
+    ///
+    /// This **replaces** the configured rules wholesale — including any an
+    /// earlier
+    /// [`with_redactions_from_env`](Self::with_redactions_from_env) call
+    /// added, silently dropping what the environment asked to withhold. Call
+    /// this first and let the environment widen the result.
     #[must_use]
     pub fn with_redactions(mut self, redactions: RedactionRules) -> Self {
         self.initial_redactions = redactions;
+        self
+    }
+
+    /// Sets the starting policy from the environment variable `var`, when set.
+    ///
+    /// The variable holds a policy spec — `off`, `all`, or a comma-separated
+    /// list of `#[system]` function names (the [`FromStr`] grammar on
+    /// [`InspectionPolicy`]) — so one binary carries different inspection
+    /// postures per deployment without a rebuild. The variable's *name* is the
+    /// caller's: the framework reads whichever variable the application
+    /// chooses and prescribes none of its own.
+    ///
+    /// An unset variable changes nothing: the policy stays whatever it already
+    /// was, which is [`Off`](InspectionPolicy::Off) unless
+    /// [`with_policy`](Self::with_policy) set it earlier — a deployment that
+    /// says nothing records nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the variable is set but not valid Unicode or does not parse.
+    /// A server must not come up recording under a posture nobody chose, and
+    /// for this control both silent fallbacks are wrong ways: falling back to
+    /// `Off` silently disables the observability staging asked for, and any
+    /// other guess may record what production meant to keep off.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use polaris_core_plugins::InspectionPlugin;
+    ///
+    /// // prod leaves the variables unset and stays off;
+    /// // staging sets e.g. MYAPP_INSPECT=plan,act
+    /// //               and MYAPP_INSPECT_REDACT=type:ApiCredentials,param:api_key
+    /// let plugin = InspectionPlugin::new()
+    ///     .with_policy_from_env("MYAPP_INSPECT")
+    ///     .with_redactions_from_env("MYAPP_INSPECT_REDACT");
+    /// ```
+    #[must_use]
+    pub fn with_policy_from_env(self, var: &str) -> Self {
+        let spec = env_spec(var);
+        self.policy_from_spec(var, spec)
+    }
+
+    /// The testable half of [`with_policy_from_env`](Self::with_policy_from_env):
+    /// everything after the environment read.
+    fn policy_from_spec(self, var: &str, spec: Option<String>) -> Self {
+        match spec {
+            Some(spec) => self.with_policy(spec.parse().unwrap_or_else(|error| {
+                panic!(
+                    "environment variable {var} holds an invalid inspection policy spec: {error}"
+                )
+            })),
+            None => self,
+        }
+    }
+
+    /// Sets the starting [`RedactionRules`] from the environment variable
+    /// `var`, when set.
+    ///
+    /// The variable holds a redaction spec — comma-separated `param:<binding>`
+    /// and `type:<Type>` entries (the [`FromStr`] grammar on
+    /// [`RedactionRules`]). As with
+    /// [`with_policy_from_env`](Self::with_policy_from_env), the variable's
+    /// name is the caller's, and an unset variable changes nothing. A set
+    /// variable **adds** its rules to whatever
+    /// [`with_redactions`](Self::with_redactions) already configured rather
+    /// than replacing them: the environment can widen withholding but never
+    /// drop a rule the binary baked in — the same one-way composition as the
+    /// runtime [`InspectionAPI::add_redacted_param`] /
+    /// [`add_redacted_type`](InspectionAPI::add_redacted_type) operations, and
+    /// deliberately narrower than [`with_redactions`](Self::with_redactions),
+    /// whose replacement semantics stay available to code.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the variable is set but not valid Unicode or does not parse.
+    /// A withholding rule that fails to parse must not be quietly dropped —
+    /// that would leak exactly the values it was written to withhold.
+    #[must_use]
+    pub fn with_redactions_from_env(self, var: &str) -> Self {
+        let spec = env_spec(var);
+        self.redactions_from_spec(var, spec)
+    }
+
+    /// The testable half of
+    /// [`with_redactions_from_env`](Self::with_redactions_from_env):
+    /// everything after the environment read.
+    fn redactions_from_spec(mut self, var: &str, spec: Option<String>) -> Self {
+        if let Some(spec) = spec {
+            let parsed: RedactionRules = spec.parse().unwrap_or_else(|error| {
+                panic!(
+                    "environment variable {var} holds an invalid inspection redaction spec: {error}"
+                )
+            });
+            self.initial_redactions.params.extend(parsed.params);
+            self.initial_redactions.types.extend(parsed.types);
+        }
         self
     }
 
@@ -3010,6 +3344,170 @@ mod tests {
             other.records().len(),
             2,
             "the other listener must keep receiving across the toggle"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Spec parsing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn policy_spec_keywords_are_case_insensitive_and_empty_means_off() {
+        for spec in ["", "   ", "off", "OFF", " Off "] {
+            assert_eq!(
+                spec.parse(),
+                Ok(InspectionPolicy::Off),
+                "spec {spec:?} must parse as Off"
+            );
+        }
+        for spec in ["all", "ALL", " All "] {
+            assert_eq!(
+                spec.parse(),
+                Ok(InspectionPolicy::All),
+                "spec {spec:?} must parse as All"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_spec_names_narrow_and_tolerate_spacing_and_trailing_commas() {
+        let policy: InspectionPolicy = " plan , act ,".parse().expect("two system names");
+        assert_eq!(policy, InspectionPolicy::systems(["plan", "act"]));
+
+        // A keyword is only a keyword when the spec is exactly that keyword:
+        // inside a list, `all` is an ordinary system name.
+        let policy: InspectionPolicy = "all,plan".parse().expect("a list containing `all`");
+        assert_eq!(policy, InspectionPolicy::systems(["all", "plan"]));
+    }
+
+    #[test]
+    fn policy_spec_rejects_what_would_silently_record_nothing() {
+        assert_eq!(
+            ",".parse::<InspectionPolicy>(),
+            Err(InspectionSpecError::EmptyPolicy),
+            "punctuation-only must not quietly mean Off"
+        );
+        // The classic forgotten comma: one entry spelled like two names.
+        assert_eq!(
+            "plan act".parse::<InspectionPolicy>(),
+            Err(InspectionSpecError::MalformedSystem {
+                entry: "plan act".to_owned()
+            }),
+            "a non-identifier entry must error, not become a name matching no system"
+        );
+        assert!(
+            "plan-9".parse::<InspectionPolicy>().is_err(),
+            "identifier validation must reject punctuation inside a name"
+        );
+    }
+
+    #[test]
+    fn redaction_spec_builds_the_same_rules_as_the_typed_builders() {
+        let rules: RedactionRules = " param : token , type : ApiCredentials "
+            .parse()
+            .expect("one binding rule, one type rule, spacing tolerated");
+        assert_eq!(
+            rules,
+            RedactionRules::new()
+                .redact_param("token")
+                .redact_type("ApiCredentials"),
+            "the spec grammar must be a spelling of the typed builders, not a second rule system"
+        );
+
+        // Path-qualified spellings strip exactly as redact_type strips them.
+        let rules: RedactionRules = "type:credentials::ApiCredentials"
+            .parse()
+            .expect("a path-qualified type rule");
+        assert_eq!(
+            rules,
+            RedactionRules::new().redact_type("credentials::ApiCredentials")
+        );
+        assert!(rules.covers_type("ApiCredentials"));
+
+        let empty: RedactionRules = "".parse().expect("an empty spec is a valid no-rule spec");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn redaction_spec_rejects_every_fail_open_shape() {
+        // Each of these, accepted leniently, would be a withholding rule that
+        // withholds nothing. The parse must refuse them all, verbatim.
+        for entry in [
+            "token",           // no kind prefix: would have to be guessed at
+            "parm:token",      // misspelled kind
+            "param:",          // kind without a name
+            "type:Vec<Token>", // container spelling: ambiguous under comma-splitting
+            "param:a b",       // non-identifier binding name
+        ] {
+            assert_eq!(
+                entry.parse::<RedactionRules>(),
+                Err(InspectionSpecError::MalformedRedaction {
+                    entry: entry.to_owned()
+                }),
+                "entry {entry:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn env_spec_builders_apply_set_variables_and_leave_unset_ones_alone() {
+        // The environment read itself (`env_spec`) is exercised through a
+        // variable that is never set — read-only, so it cannot race the panic
+        // machinery's own environment reads elsewhere in the binary. The
+        // set-variable paths go through the builders' testable halves, which
+        // is everything after that read.
+        let untouched = InspectionPlugin::new()
+            .with_policy(InspectionPolicy::All)
+            .with_policy_from_env("POLARIS_TEST_INSPECTION_NEVER_SET")
+            .with_redactions_from_env("POLARIS_TEST_INSPECTION_NEVER_SET");
+        assert_eq!(
+            untouched.initial_policy,
+            InspectionPolicy::All,
+            "an unset variable must change nothing, not reset to the default"
+        );
+        assert!(untouched.initial_redactions.is_empty());
+
+        let plugin = InspectionPlugin::new()
+            .with_redactions(RedactionRules::new().redact_type("BakedIn"))
+            .policy_from_spec("VAR", Some("plan,act".to_owned()))
+            .redactions_from_spec("VAR", Some("param:token,type:ApiCredentials".to_owned()));
+        assert_eq!(
+            plugin.initial_policy,
+            InspectionPolicy::systems(["plan", "act"])
+        );
+        assert!(plugin.initial_redactions.covers_param("token"));
+        assert!(plugin.initial_redactions.covers_type("ApiCredentials"));
+        assert!(
+            plugin.initial_redactions.covers_type("BakedIn"),
+            "an environment spec adds rules; it must never drop one the binary baked in"
+        );
+    }
+
+    #[test]
+    fn a_malformed_env_spec_fails_the_boot_instead_of_guessing() {
+        let unwound = std::panic::catch_unwind(|| {
+            InspectionPlugin::new().policy_from_spec("MYAPP_INSPECT", Some("plan act".to_owned()))
+        });
+        let message = *unwound
+            .expect_err("a malformed policy spec must panic, not narrow to a guess")
+            .downcast::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            message.contains("MYAPP_INSPECT"),
+            "the panic must name the variable to fix, got: {message}"
+        );
+
+        let unwound = std::panic::catch_unwind(|| {
+            InspectionPlugin::new()
+                .redactions_from_spec("MYAPP_REDACT", Some("parm:token".to_owned()))
+        });
+        let message = *unwound
+            .expect_err("a malformed redaction spec must panic, not withhold nothing")
+            .downcast::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            message.contains("MYAPP_REDACT") && message.contains("parm:token"),
+            "the panic must name the variable and the offending entry, got: {message}"
         );
     }
 }
