@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "6.0.0"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris"
@@ -135,5 +135,5 @@ typegen = ["polaris_internal/typegen"]
 dashboard = ["polaris_internal/dashboard"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "6.0", default-features = false }
+polaris_internal = { path = "crates/polaris_internal", version = "0.6", default-features = false }
 tracing = { version = "0.1.43", default-features = false }

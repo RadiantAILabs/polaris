@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [6.0.0] - 2026-08-25
+## [0.6.0] - 2026-08-25
 
 Closes the loop-entry gap: a loop's termination predicate is evaluated *before* its body has ever run, but signature derivation assumed the opposite (omitting the predicate input from `requires_outputs`) and nothing verified the input existed when the loop was reached — a loop-heading graph validated cleanly and then died mid-run with `PredicateError::OutputNotFound`. The need is now recorded in the derived signature, so the existing contract checks enforce it at every composition boundary, and the executor verifies it against the live context at run start, before any node executes. Separately, parameter inspection becomes usable end to end: the plugin-layer half (runtime policy, listener registry, telemetry export) joins the Layer-1 capture mechanism.
 
