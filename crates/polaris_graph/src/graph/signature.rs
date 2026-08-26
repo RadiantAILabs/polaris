@@ -43,10 +43,13 @@
 //! system earlier on the sequential chain. Outputs produced only inside a
 //! branch (decision / switch / loop / parallel) are never credited, because the
 //! branch may not run, so a downstream read of such an output stays a required
-//! free input. Decision predicates and switch discriminators read an output at
-//! runtime too, so their input types are counted as reads at the node's
-//! position. The derived signature therefore never claims *less* than the
-//! runtime truth — the only direction a soundness interface may err.
+//! free input. Decision predicates, switch discriminators, and loop termination
+//! predicates read an output at runtime too, so their input types are counted
+//! as reads at the node's position — a loop's termination predicate in
+//! particular is evaluated *before* the first iteration, so the loop body's
+//! outputs can never satisfy it. The derived signature therefore never claims
+//! *less* than the runtime truth — the only direction a soundness interface may
+//! err.
 //!
 //! Error and timeout **handler subgraphs** are part of the interface: a handler
 //! runs on the failure path and its outputs merge back like any other, so
@@ -75,6 +78,7 @@ use hashbrown::{HashMap, HashSet};
 use polaris_system::param::{Access, AccessMode};
 use std::any::TypeId;
 use std::fmt;
+use std::sync::{Arc, PoisonError};
 
 /// The aggregate input/output interface of a subgraph.
 ///
@@ -653,6 +657,35 @@ fn mode_rank(mode: AccessMode) -> u8 {
     }
 }
 
+/// A main-chain loop whose termination predicate input no earlier chain node
+/// can deposit, as reported by [`Graph::unguaranteed_loop_predicate_inputs`].
+///
+/// The executor checks each entry against the live context at run start and
+/// fails fast on any input still missing.
+#[derive(Debug, Clone)]
+pub(crate) struct UnguaranteedLoopInput {
+    /// The loop node.
+    pub(crate) node: NodeId,
+    /// The loop node's name.
+    pub(crate) name: &'static str,
+    /// The `TypeId` of the output the termination predicate reads.
+    pub(crate) input_type_id: TypeId,
+    /// The human-readable name of that type (for error messages).
+    pub(crate) input_type_name: &'static str,
+}
+
+/// Memoized [`Graph::unguaranteed_loop_predicate_inputs`] result, stored in
+/// [`Graph::loop_entry_cache`](super::Graph) with the graph shape it was
+/// computed for.
+#[derive(Debug)]
+pub(crate) struct LoopEntryCache {
+    /// `(node_count, edge_count)` at computation time — every builder
+    /// mutation appends nodes or edges, so a mismatch marks the entry stale.
+    shape: (usize, usize),
+    /// The computed analysis, shared so cache hits are refcount bumps.
+    inputs: Arc<[UnguaranteedLoopInput]>,
+}
+
 impl Graph {
     /// Returns the aggregate IO [`GraphSignature`] of the subgraph reachable from
     /// this graph's entry point.
@@ -667,10 +700,12 @@ impl Graph {
     ///   along the sequential chain: a read is free unless a producer of its
     ///   type ran earlier on that chain. Outputs produced only inside a branch
     ///   (decision / switch / loop / parallel) are never credited, so a read of
-    ///   such an output stays free. Decision predicates and switch
-    ///   discriminators count as reads of their input type; handler-subgraph
-    ///   reads are classified against what is guaranteed before the node the
-    ///   handler is attached to.
+    ///   such an output stays free. Decision predicates, switch
+    ///   discriminators, and loop termination predicates count as reads of
+    ///   their input type (a loop's termination predicate is evaluated before
+    ///   the first iteration, so its body never satisfies it);
+    ///   handler-subgraph reads are classified against what is guaranteed
+    ///   before the node the handler is attached to.
     ///
     /// An empty graph has an empty signature. Embedded
     /// [`Scope`](crate::node::Node::Scope) and
@@ -755,24 +790,34 @@ impl Graph {
     ///
     /// Walks the sequential chain from `entry`, accumulating the set of output
     /// types *guaranteed* produced so far. A node's `Out<T>` read — a system
-    /// parameter, a decision predicate's input, or a switch discriminator's
-    /// input — is free unless `T` is already in that set. Branch nodes
-    /// (decision / switch / loop / parallel) never contribute to the produced
-    /// set — their outputs are conditional — so a read of a branch-only output
-    /// stays free. Branch interiors are still inspected for their own free
-    /// reads, classified against the outputs guaranteed before the branch.
+    /// parameter, a decision predicate's input, a switch discriminator's
+    /// input, or a loop termination predicate's input — is free unless `T` is
+    /// already in that set. Branch nodes (decision / switch / loop / parallel)
+    /// never contribute to the produced set — their outputs are conditional —
+    /// so a read of a branch-only output stays free. Branch interiors are
+    /// still inspected for their own free reads, starting with the outputs
+    /// guaranteed before the branch and then crediting systems in that
+    /// branch's own sequential order. Branch-local production never escapes
+    /// back into the parent chain's guaranteed set.
     ///
     /// Error/timeout handler subgraphs are inspected the same way, classified
     /// against what is guaranteed *before* their source node — the source
     /// failed, so its own output is never credited to its handler. `()` is
     /// never free.
     ///
-    /// A loop's termination predicate is deliberately *not* counted: [`Graph::
-    /// validate`](Graph::validate) already requires the loop body to produce
-    /// the predicate's input type
-    /// ([`LoopPredicateOutputNotProduced`](super::ValidationError::LoopPredicateOutputNotProduced)),
-    /// and the body runs before the first termination check, so the read is
-    /// internally satisfied in every graph that validates.
+    /// A loop's termination predicate counts as a read at the loop's own
+    /// position: the executor evaluates it *before* the first iteration
+    /// (`// Check termination predicate first` in `execute_loop`), so the
+    /// loop body's outputs can never satisfy the first check. A loop whose
+    /// predicate input is not *guaranteed* produced earlier on the chain
+    /// therefore surfaces here as a free output the parent must supply.
+    ///
+    /// This derivation is deliberately more pessimistic than the executor's
+    /// run-start loop check ([`Graph::unguaranteed_loop_predicate_inputs`]):
+    /// a signature must never claim *less* than the runtime truth, so only
+    /// guaranteed chain production is credited, while the run-start check
+    /// must never fail a graph the runtime would execute, so it credits
+    /// every *possible* producer.
     fn derive_requires_outputs(&self, entry: &NodeId, unit: TypeId) -> Vec<Access> {
         let seq: HashMap<NodeId, NodeId> = self
             .edges()
@@ -783,61 +828,217 @@ impl Graph {
             })
             .collect();
 
-        let mut produced: HashSet<TypeId> = HashSet::new();
         let mut free: Vec<Access> = Vec::new();
+        // Each branch or handler is its own sequential region. It inherits
+        // what was guaranteed at its entry, then credits producers inside the
+        // region in execution order. Regions do not merge their production
+        // back into their parent because a branch/handler may not run.
+        let mut pending = vec![(entry.clone(), HashSet::new())];
+        let mut analyzed: Vec<(NodeId, HashSet<TypeId>)> = Vec::new();
+
+        while let Some((region_entry, mut produced)) = pending.pop() {
+            // Shared handlers can be reached from multiple sources with
+            // different guaranteed inputs. Analyze each distinct state; if
+            // any state leaves a read unsatisfied it correctly remains free.
+            if analyzed.iter().any(|(seen_entry, seen_produced)| {
+                *seen_entry == region_entry && *seen_produced == produced
+            }) {
+                continue;
+            }
+            analyzed.push((region_entry.clone(), produced.clone()));
+
+            let mut visited: HashSet<NodeId> = HashSet::new();
+            let mut current = Some(region_entry);
+            while let Some(node_id) = current {
+                if !visited.insert(node_id.clone()) {
+                    break;
+                }
+                if let Some(node) = self.get_node(node_id.clone()) {
+                    // The node's own reads (system parameters, predicate /
+                    // discriminator / termination inputs), classified against
+                    // what is guaranteed so far in this region.
+                    Self::collect_node_reads(node, &produced, unit, &mut free);
+
+                    // A handler runs only after its source fails, so it starts
+                    // with the state before that source's output is credited.
+                    for handler in self.handler_entries(&node_id) {
+                        pending.push((handler, produced.clone()));
+                    }
+
+                    match node {
+                        Node::System(sys) => {
+                            let out_id = sys.output_type_id();
+                            if out_id != unit {
+                                produced.insert(out_id);
+                            }
+                        }
+                        // Each control-flow interior starts with the state at
+                        // the branch point and tracks its own sequential
+                        // production. Its outputs remain conditional to the
+                        // parent region and are therefore not merged back.
+                        Node::Decision(_) | Node::Switch(_) | Node::Loop(_) | Node::Parallel(_) => {
+                            for branch_entry in self.branch_entries(node) {
+                                pending.push((branch_entry, produced.clone()));
+                            }
+                        }
+                        // Opaque boundaries — their IO crosses separately.
+                        Node::Scope(_) | Node::Dynamic(_) => {}
+                    }
+                }
+                current = seq.get(&node_id).cloned();
+            }
+        }
+
+        free
+    }
+
+    /// Returns the main-chain loops whose termination predicate input cannot
+    /// be produced by *any* node earlier on the sequential chain.
+    ///
+    /// The executor evaluates a loop's termination predicate *before* the
+    /// first iteration, so the input must already exist when the loop is
+    /// reached: deposited by an earlier chain node, or present in the context
+    /// the graph runs in. This lists the loops for which no earlier chain
+    /// node can deposit the input; the executor checks them against the live
+    /// context at each execution boundary and fails fast on any still missing
+    /// ([`ExecutionError::LoopPredicateInputMissingOnEntry`]).
+    ///
+    /// Crediting is *optimistic*, mirroring the executor's pre-flight
+    /// (`validate_output_reachability`): a preceding system credits its
+    /// output; decision / switch / loop / parallel nodes credit every output
+    /// type reachable in their subgraphs (parallel branches all run and merge
+    /// back; conditional branches *may*); scope and dynamic nodes credit what
+    /// may merge back across their boundary
+    /// ([`Graph::may_produce_output_types`] / the contract's `produces`).
+    /// Optimism is deliberate: this feeds a hard run-start error, so
+    /// under-crediting would reject compositions the runtime executes fine,
+    /// while over-crediting merely defers a genuinely missing input to the
+    /// loop's first predicate evaluation
+    /// ([`PredicateError::OutputNotFound`](crate::predicate::PredicateError::OutputNotFound)).
+    /// The signature's `requires_outputs` derivation is the opposite,
+    /// pessimistic model — see
+    /// [`derive_requires_outputs`](Self::derive_requires_outputs).
+    ///
+    /// Loops inside branch interiors execute conditionally and are not
+    /// listed — a missing input there stays a mid-run predicate error. The
+    /// unit type is skipped, mirroring signature derivation.
+    ///
+    /// The walk is a pure function of the graph structure, and this runs at
+    /// every execution boundary (including per-iteration re-entry of
+    /// boundaries nested in loops), so the result is memoized in
+    /// [`Graph::loop_entry_cache`](super::Graph): re-entries pay only the
+    /// per-entry context probe. Validity is keyed on `(node_count,
+    /// edge_count)` — every builder mutation appends nodes or edges, so a
+    /// shape change forces recomputation.
+    ///
+    /// [`ExecutionError::LoopPredicateInputMissingOnEntry`]: crate::executor::ExecutionError::LoopPredicateInputMissingOnEntry
+    pub(crate) fn unguaranteed_loop_predicate_inputs(&self) -> Arc<[UnguaranteedLoopInput]> {
+        let shape = (self.nodes.len(), self.edges.len());
+        if let Some(cache) = self
+            .loop_entry_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            && cache.shape == shape
+        {
+            return Arc::clone(&cache.inputs);
+        }
+        let inputs: Arc<[UnguaranteedLoopInput]> =
+            self.compute_unguaranteed_loop_predicate_inputs().into();
+        *self
+            .loop_entry_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(LoopEntryCache {
+            shape,
+            inputs: Arc::clone(&inputs),
+        });
+        inputs
+    }
+
+    /// The uncached walk behind
+    /// [`unguaranteed_loop_predicate_inputs`](Self::unguaranteed_loop_predicate_inputs).
+    fn compute_unguaranteed_loop_predicate_inputs(&self) -> Vec<UnguaranteedLoopInput> {
+        // Cheap pre-pass: most boundary graphs contain no loop node at all —
+        // skip building the edge map and walking for them.
+        if !self
+            .nodes()
+            .iter()
+            .any(|node| matches!(node, Node::Loop(_)))
+        {
+            return Vec::new();
+        }
+        let Some(entry) = self.entry() else {
+            return Vec::new();
+        };
+
+        let seq: HashMap<NodeId, NodeId> = self
+            .edges()
+            .iter()
+            .filter_map(|edge| match edge {
+                Edge::Sequential(seq) => Some((seq.from.clone(), seq.to.clone())),
+                _ => None,
+            })
+            .collect();
+
+        let unit = TypeId::of::<()>();
+        let mut produced: HashSet<TypeId> = HashSet::new();
         let mut visited: HashSet<NodeId> = HashSet::new();
-        let mut current = Some(entry.clone());
+        let mut unguaranteed = Vec::new();
+        let mut current = Some(entry);
 
         while let Some(node_id) = current {
             if !visited.insert(node_id.clone()) {
                 break;
             }
             if let Some(node) = self.get_node(node_id.clone()) {
-                // The node's own reads (system parameters, predicate /
-                // discriminator inputs), classified against what is guaranteed
-                // so far.
-                Self::collect_node_reads(node, &produced, unit, &mut free);
-
-                // Handler subgraphs attached to this node run only after it
-                // fails, so inspect them *before* crediting its output.
-                for handler in self.handler_entries(&node_id) {
-                    for inner in self.reachable_nodes_with_handlers(&handler) {
-                        Self::collect_node_reads(inner, &produced, unit, &mut free);
-                    }
-                }
-
                 match node {
                     Node::System(sys) => {
-                        let out_id = sys.output_type_id();
-                        if out_id != unit {
-                            produced.insert(out_id);
+                        produced.insert(sys.output_type_id());
+                    }
+                    Node::Decision(_) | Node::Switch(_) | Node::Parallel(_) => {
+                        for branch in self.branch_entries(node) {
+                            self.may_produce_output_types_from(&branch, &mut produced);
                         }
                     }
-                    // Conditional branches: classify their interior reads
-                    // against what is guaranteed before the branch, but do not
-                    // credit the branch's own outputs.
-                    Node::Decision(_) | Node::Switch(_) | Node::Loop(_) | Node::Parallel(_) => {
-                        for entry in self.branch_entries(node) {
-                            for inner in self.reachable_nodes_with_handlers(&entry) {
-                                Self::collect_node_reads(inner, &produced, unit, &mut free);
+                    Node::Loop(lp) => {
+                        // Check the loop's own input against what precedes it
+                        // *before* crediting its body: the predicate runs
+                        // before the first iteration.
+                        if let Some(termination) = &lp.termination {
+                            let input = termination.input_type_id();
+                            if input != unit && !produced.contains(&input) {
+                                unguaranteed.push(UnguaranteedLoopInput {
+                                    node: lp.id.clone(),
+                                    name: lp.name,
+                                    input_type_id: input,
+                                    input_type_name: termination.input_type_name(),
+                                });
                             }
                         }
+                        for branch in self.branch_entries(node) {
+                            self.may_produce_output_types_from(&branch, &mut produced);
+                        }
                     }
-                    // Opaque boundaries — their IO crosses separately.
-                    Node::Scope(_) | Node::Dynamic(_) => {}
+                    // Scope outputs merge back into the parent context on
+                    // exit regardless of the context policy.
+                    Node::Scope(scope) => scope.graph.may_produce_output_types(&mut produced),
+                    // The contract's `produces` are the outputs every
+                    // admissible candidate merges back.
+                    Node::Dynamic(dynamic) => {
+                        produced.extend(dynamic.contract().produces().iter().map(|a| a.type_id));
+                    }
                 }
             }
             current = seq.get(&node_id).cloned();
         }
-
-        free
+        unguaranteed
     }
 
     /// Pushes each of `node`'s output reads that is neither `()` nor already in
     /// `produced` onto `free`: a system's declared output parameters, a
-    /// decision predicate's input, or a switch discriminator's input. Loop
-    /// termination inputs are skipped — see
-    /// [`derive_requires_outputs`](Self::derive_requires_outputs).
+    /// decision predicate's input, a switch discriminator's input, or a loop
+    /// termination predicate's input (evaluated before the first iteration —
+    /// see [`derive_requires_outputs`](Self::derive_requires_outputs)).
     fn collect_node_reads(
         node: &Node,
         produced: &HashSet<TypeId>,
@@ -873,7 +1074,12 @@ impl Graph {
                     );
                 }
             }
-            Node::Loop(_) | Node::Parallel(_) | Node::Scope(_) | Node::Dynamic(_) => {}
+            Node::Loop(lp) => {
+                if let Some(termination) = &lp.termination {
+                    push_read(termination.input_type_id(), termination.input_type_name());
+                }
+            }
+            Node::Parallel(_) | Node::Scope(_) | Node::Dynamic(_) => {}
         }
     }
 
@@ -1667,12 +1873,11 @@ mod tests {
     }
 
     #[test]
-    fn loop_termination_input_is_not_counted() {
-        // Deliberate: `Graph::validate` requires the loop body to produce the
-        // termination predicate's input type, and the body runs before the
-        // first termination check — the read is internally satisfied in every
-        // graph that validates, so counting it would spuriously require the
-        // loop's internal type from the parent.
+    fn loop_termination_input_is_a_free_read_when_unproduced() {
+        // The termination predicate is evaluated *before* the first
+        // iteration, so the body's `ProduceMid` can never satisfy the first
+        // check — the loop genuinely needs `Mid` supplied on entry, and the
+        // interface must say so.
         let mut graph = Graph::new();
         graph.add_loop::<Mid, _, _>(
             "loop",
@@ -1689,8 +1894,198 @@ mod tests {
             .map(|a| a.type_id)
             .collect();
         assert!(
+            free.contains(&TypeId::of::<Mid>()),
+            "the termination predicate's input is a runtime read on entry: {free:?}"
+        );
+    }
+
+    #[test]
+    fn loop_termination_input_produced_upstream_is_not_free() {
+        let mut graph = Graph::new();
+        graph.add_boxed_system(Box::new(ProduceMid));
+        graph.add_loop::<Mid, _, _>(
+            "loop",
+            |_mid| true,
+            |g| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            },
+        );
+
+        let free: Vec<TypeId> = graph
+            .signature()
+            .requires_outputs()
+            .iter()
+            .map(|a| a.type_id)
+            .collect();
+        assert!(
             !free.contains(&TypeId::of::<Mid>()),
-            "a validated loop's termination input is body-satisfied: {free:?}"
+            "a termination input guaranteed upstream is internally satisfied: {free:?}"
+        );
+    }
+
+    #[test]
+    fn loop_termination_input_produced_by_parallel_stays_free_in_signature() {
+        // Signature derivation is pessimistic: branch/parallel production is
+        // never credited, so the interface still advertises `Mid` as a free
+        // read — claiming *more* than the runtime truth, the only direction a
+        // soundness interface may err. The executor's run-start entry check
+        // uses the opposite, optimistic model
+        // (`unguaranteed_loop_predicate_inputs`), so this graph executes
+        // without a parent-supplied seed.
+        let mut graph = Graph::new();
+        graph.add_parallel(
+            "fan_out",
+            vec![Box::new(|g: &mut Graph| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            }) as Box<dyn FnOnce(&mut Graph)>],
+        );
+        graph.add_loop::<Mid, _, _>(
+            "loop",
+            |_mid| true,
+            |g| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            },
+        );
+
+        let free: Vec<TypeId> = graph
+            .signature()
+            .requires_outputs()
+            .iter()
+            .map(|a| a.type_id)
+            .collect();
+        assert!(
+            free.contains(&TypeId::of::<Mid>()),
+            "parallel production is not guaranteed to the signature: {free:?}"
+        );
+        assert!(
+            graph.unguaranteed_loop_predicate_inputs().is_empty(),
+            "the entry check credits parallel production"
+        );
+    }
+
+    #[test]
+    fn dynamic_contract_produces_credits_downstream_loop_entry() {
+        // A dynamic node's contract `produces` names exactly what every
+        // admissible candidate merges back, so a downstream main-chain loop
+        // reading that type is credited by the entry check.
+        use crate::node::{ContextPolicy, DynamicSlot};
+
+        let mut candidate = Graph::new();
+        candidate.add_boxed_system(Box::new(ProduceMid));
+
+        let mut graph = Graph::new();
+        graph.add_dynamic(
+            "route",
+            |_ctx| "only",
+            [("only", candidate)],
+            DynamicSlot::new(
+                GraphSignature::new().produce::<Mid>(),
+                ContextPolicy::shared(),
+            ),
+        );
+        graph.add_loop::<Mid, _, _>(
+            "loop",
+            |_mid| true,
+            |g| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            },
+        );
+
+        assert!(
+            graph.unguaranteed_loop_predicate_inputs().is_empty(),
+            "the entry check credits the dynamic contract's produces"
+        );
+    }
+
+    #[test]
+    fn loop_body_outputs_credit_downstream_loop_after_own_check() {
+        // A loop's body outputs are credited *after* its own predicate input
+        // is checked: the first loop still needs `Seed` on entry, but its
+        // body's `Mid` satisfies the second loop downstream.
+        let mut graph = Graph::new();
+        graph.add_loop::<Seed, _, _>(
+            "first",
+            |_seed| true,
+            |g| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            },
+        );
+        graph.add_loop::<Mid, _, _>(
+            "second",
+            |_mid| true,
+            |g| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            },
+        );
+
+        let unguaranteed = graph.unguaranteed_loop_predicate_inputs();
+        assert_eq!(
+            unguaranteed.len(),
+            1,
+            "only the first loop's input is unguaranteed: {unguaranteed:?}"
+        );
+        assert_eq!(unguaranteed[0].name, "first", "the entry names the loop");
+        assert_eq!(
+            unguaranteed[0].input_type_id,
+            TypeId::of::<Seed>(),
+            "the entry names the missing input type"
+        );
+    }
+
+    #[test]
+    fn unit_predicate_input_is_skipped_by_entry_check() {
+        // `()` is never data flow, mirroring signature derivation: a loop
+        // whose predicate reads `()` is not entry-checked.
+        let mut graph = Graph::new();
+        graph.add_loop::<(), _, _>(
+            "unit_loop",
+            |_unit| true,
+            |g| {
+                g.add_boxed_system(Box::new(SideEffect));
+            },
+        );
+
+        assert!(
+            graph.unguaranteed_loop_predicate_inputs().is_empty(),
+            "a unit predicate input is never entry-checked"
+        );
+    }
+
+    #[test]
+    fn unguaranteed_loop_inputs_are_memoized_until_the_graph_changes() {
+        // Same shape → the memoized analysis is reused (pointer-equal Arc);
+        // a builder mutation changes the shape and forces recomputation.
+        let mut graph = Graph::new();
+        graph.add_loop::<Mid, _, _>(
+            "loop",
+            |_mid| true,
+            |g| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            },
+        );
+
+        let first = graph.unguaranteed_loop_predicate_inputs();
+        let second = graph.unguaranteed_loop_predicate_inputs();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged graph reuses the cached analysis"
+        );
+        assert_eq!(first.len(), 1, "the loop's input is unguaranteed");
+
+        // Appending another unseeded loop invalidates the cache: the fresh
+        // walk reports both.
+        graph.add_loop::<Seed, _, _>(
+            "appended",
+            |_seed| true,
+            |g| {
+                g.add_boxed_system(Box::new(ProduceMid));
+            },
+        );
+        let third = graph.unguaranteed_loop_predicate_inputs();
+        assert_eq!(
+            third.len(),
+            2,
+            "a builder mutation forces recomputation: {third:?}"
         );
     }
 
@@ -1712,6 +2107,9 @@ mod tests {
                 }),
             ),
             (
+                // The loop's own termination input (`Final`) also surfaces as
+                // free — covered by `loop_termination_input_is_a_free_read_
+                // when_unproduced`; here we assert the interior read.
                 "loop",
                 Box::new(|g: &mut Graph| {
                     g.add_loop::<Final, _, _>(
@@ -1750,6 +2148,156 @@ mod tests {
                 "{label}: interior read of an unproduced output must stay free: {free:?}"
             );
         }
+    }
+
+    #[test]
+    fn branch_local_producers_satisfy_later_loop_inputs() {
+        // Every execution region must respect its own sequential order. The
+        // producer is conditional from the parent's perspective, so it must
+        // not satisfy a read *after* the control-flow node; within the same
+        // branch/body/handler, however, it is guaranteed to run before the
+        // nested loop and therefore satisfies that loop's first check.
+        let cases: [(&str, Box<dyn FnOnce(&mut Graph)>); 5] = [
+            (
+                "decision",
+                Box::new(|graph| {
+                    graph.add_conditional_branch::<Seed, _, _, _>(
+                        "branch",
+                        |_seed| true,
+                        |branch| {
+                            branch.add_boxed_system(Box::new(ProduceMid));
+                            branch.add_loop::<Mid, _, _>(
+                                "nested_loop",
+                                |_mid| true,
+                                |body| {
+                                    body.add_boxed_system(Box::new(ProduceMid));
+                                },
+                            );
+                        },
+                        |branch| {
+                            branch.add_boxed_system(Box::new(SideEffect));
+                        },
+                    );
+                }),
+            ),
+            (
+                "switch",
+                Box::new(|graph| {
+                    let case: fn(&mut Graph) = |branch| {
+                        branch.add_boxed_system(Box::new(ProduceMid));
+                        branch.add_loop::<Mid, _, _>(
+                            "nested_loop",
+                            |_mid| true,
+                            |body| {
+                                body.add_boxed_system(Box::new(ProduceMid));
+                            },
+                        );
+                    };
+                    graph.add_switch::<Seed, _, _, _>(
+                        "switch",
+                        |_seed| "case",
+                        [("case", case)],
+                        None,
+                    );
+                }),
+            ),
+            (
+                "loop body",
+                Box::new(|graph| {
+                    graph.add_loop::<Seed, _, _>(
+                        "outer_loop",
+                        |_seed| true,
+                        |outer_body| {
+                            outer_body.add_boxed_system(Box::new(ProduceMid));
+                            outer_body.add_loop::<Mid, _, _>(
+                                "nested_loop",
+                                |_mid| true,
+                                |inner_body| {
+                                    inner_body.add_boxed_system(Box::new(ProduceMid));
+                                },
+                            );
+                            outer_body.add_boxed_system(Box::new(ProduceSeed));
+                        },
+                    );
+                }),
+            ),
+            (
+                "parallel branch",
+                Box::new(|graph| {
+                    graph.add_parallel(
+                        "parallel",
+                        [|branch: &mut Graph| {
+                            branch.add_boxed_system(Box::new(ProduceMid));
+                            branch.add_loop::<Mid, _, _>(
+                                "nested_loop",
+                                |_mid| true,
+                                |body| {
+                                    body.add_boxed_system(Box::new(ProduceMid));
+                                },
+                            );
+                        }],
+                    );
+                }),
+            ),
+            (
+                "error handler",
+                Box::new(|graph| {
+                    graph.add_boxed_system(Box::new(FallibleFinal));
+                    graph.add_error_handler(|handler| {
+                        handler.add_boxed_system(Box::new(ProduceMid));
+                        handler.add_loop::<Mid, _, _>(
+                            "nested_loop",
+                            |_mid| true,
+                            |body| {
+                                body.add_boxed_system(Box::new(ProduceMid));
+                            },
+                        );
+                    });
+                }),
+            ),
+        ];
+
+        for (label, build) in cases {
+            let mut graph = Graph::new();
+            build(&mut graph);
+            let free: Vec<TypeId> = graph
+                .signature()
+                .requires_outputs()
+                .iter()
+                .map(|access| access.type_id)
+                .collect();
+            assert!(
+                !free.contains(&TypeId::of::<Mid>()),
+                "{label}: the branch-local producer runs before the nested loop: {free:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_local_read_before_producer_stays_required() {
+        let mut graph = Graph::new();
+        graph.add_conditional_branch::<Seed, _, _, _>(
+            "branch",
+            |_seed| true,
+            |branch| {
+                branch.add_boxed_system(Box::new(ReadsMid));
+                branch.add_boxed_system(Box::new(ProduceMid));
+            },
+            |branch| {
+                branch.add_boxed_system(Box::new(SideEffect));
+            },
+        );
+
+        let free: Vec<TypeId> = graph
+            .signature()
+            .requires_outputs()
+            .iter()
+            .map(|access| access.type_id)
+            .collect();
+        assert!(
+            free.contains(&TypeId::of::<Mid>()),
+            "a later branch-local producer cannot satisfy an earlier read: {free:?}"
+        );
     }
 
     // ── Opacity, cycles, unit, over-declaration ─────────────────────────────

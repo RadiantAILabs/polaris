@@ -13,17 +13,18 @@ mod test_utils;
 
 use polaris_graph::CaughtError;
 use polaris_graph::executor::{GraphExecutor, ResourceValidationError};
-use polaris_graph::graph::{Graph, ValidationError, ValidationWarning};
+use polaris_graph::graph::{Graph, GraphSignature, ValidationError, ValidationWarning};
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::hooks::schedule::OnGraphStart;
-use polaris_graph::node::{ContextPolicy, NodeId};
+use polaris_graph::node::{ContextPolicy, DynamicSlot, NodeId};
 use polaris_system::param::{
     Access, AccessMode, ERROR_CONTEXT, ErrOut, SystemAccess, SystemContext, SystemParam,
 };
 use polaris_system::resource::LocalResource;
 use polaris_system::system::{BoxFuture, System, SystemError};
 use std::any::TypeId;
-use test_utils::{ReadConfigSystem, SuccessSystem, TestConfig, WriteConfigSystem};
+use std::sync::Arc;
+use test_utils::{ReadConfigSystem, SuccessSystem, TestConfig, WriteConfigSystem, branch};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Systems
@@ -1168,12 +1169,12 @@ fn validate_output_reachability_fails_for_missing_output() {
     );
 }
 
-/// A resource type used for testing hook-provided outputs.
+/// A hook-provided resource used to prove resources do not satisfy outputs.
 #[derive(Clone)]
-struct HookProvidedOutput;
-impl LocalResource for HookProvidedOutput {}
+struct HookProvidedResource;
+impl LocalResource for HookProvidedResource {}
 
-/// System that declares an `Out<HookProvidedOutput>` dependency.
+/// System that declares an `Out<HookProvidedResource>` dependency.
 struct ConsumesHookOutput;
 
 impl System for ConsumesHookOutput {
@@ -1193,8 +1194,8 @@ impl System for ConsumesHookOutput {
     fn access(&self) -> SystemAccess {
         let mut access = SystemAccess::default();
         access.outputs.push(Access {
-            type_id: TypeId::of::<HookProvidedOutput>(),
-            type_name: std::any::type_name::<HookProvidedOutput>(),
+            type_id: TypeId::of::<HookProvidedResource>(),
+            type_name: std::any::type_name::<HookProvidedResource>(),
             mode: AccessMode::Write,
             is_global: false,
         });
@@ -1203,14 +1204,411 @@ impl System for ConsumesHookOutput {
 }
 
 #[test]
-fn validate_output_reachability_hook_provided_outputs_pass() {
+fn validate_output_reachability_rejects_hook_provided_resource_as_output() {
     let mut graph = Graph::new();
     graph.add_boxed_system(Box::new(ConsumesHookOutput));
 
     let hooks = HooksAPI::new();
     hooks
-        .register_provider::<OnGraphStart, HookProvidedOutput, _>("provide_hook_output", |_event| {
-            Some(HookProvidedOutput)
+        .register_provider::<OnGraphStart, HookProvidedResource, _>(
+            "provide_hook_resource",
+            |_event| Some(HookProvidedResource),
+        )
+        .expect("hook registration should succeed");
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let errors = executor
+        .validate_resources(&graph, &ctx, Some(&hooks))
+        .expect_err("a hook-provided resource cannot satisfy an output read");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingOutput {
+                system_name: "consumes_hook_output",
+                output_type,
+                ..
+            } if output_type.contains("HookProvidedResource")
+        )),
+        "expected MissingOutput for the system read, got: {errors:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Output Reachability: Loop Termination Predicate Input
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// State read by an entry loop's termination predicate in the tests below.
+#[derive(Debug)]
+struct EntryLoopState {
+    done: bool,
+}
+
+async fn produce_entry_loop_state() -> EntryLoopState {
+    EntryLoopState { done: true }
+}
+
+/// The termination predicate is evaluated before the first iteration, so a
+/// loop heading the chain — with nothing producing its predicate input and
+/// nothing seeded in the context — must fail the pre-flight.
+#[test]
+fn validate_output_reachability_flags_unseeded_loop_predicate_input() {
+    let mut graph = Graph::new();
+    graph.add_loop::<EntryLoopState, _, _>(
+        "entry_loop",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_err(),
+        "unseeded loop predicate input should fail pre-flight"
+    );
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingOutput {
+                system_name: "entry_loop",
+                output_type,
+                ..
+            } if output_type.contains("EntryLoopState")
+        )),
+        "expected MissingOutput for the loop's predicate input, got: {errors:?}"
+    );
+}
+
+/// Outputs already present in the context count: callers may seed the first
+/// predicate value via `SystemContext::insert_output`.
+#[test]
+fn validate_output_reachability_accepts_seeded_loop_predicate_input() {
+    let mut graph = Graph::new();
+    graph.add_loop::<EntryLoopState, _, _>(
+        "entry_loop",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let mut ctx = SystemContext::new();
+    ctx.insert_output(EntryLoopState { done: false });
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "context-seeded loop predicate input should pass pre-flight, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+/// A producer earlier on the sequential chain guarantees the predicate input.
+#[test]
+fn validate_output_reachability_accepts_chain_produced_loop_predicate_input() {
+    let mut graph = Graph::new();
+    graph.add_system(produce_entry_loop_state);
+    graph.add_loop::<EntryLoopState, _, _>(
+        "primed_loop",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "chain-produced loop predicate input should pass pre-flight, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+/// Crediting is not limited to system nodes: a preceding parallel node's
+/// branches all run and their outputs merge back, so a parallel-produced
+/// predicate input passes pre-flight (as it does at runtime).
+#[test]
+fn validate_accepts_parallel_produced_loop_predicate_input() {
+    let mut graph = Graph::new();
+    graph.add_parallel(
+        "fan_out",
+        vec![branch(|g| {
+            g.add_system(produce_entry_loop_state);
+        })],
+    );
+    graph.add_loop::<EntryLoopState, _, _>(
+        "loop_after_parallel",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "parallel-produced loop predicate input should pass pre-flight, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+/// A scope's outputs merge back into the parent context on exit — even across
+/// a non-shared boundary — so a scope-produced predicate input passes
+/// pre-flight (as it does at runtime).
+#[test]
+fn validate_accepts_scope_produced_loop_predicate_input() {
+    let mut inner = Graph::new();
+    inner.add_system(produce_entry_loop_state);
+
+    let mut graph = Graph::new();
+    graph.add_scope("init", inner, ContextPolicy::new());
+    graph.add_loop::<EntryLoopState, _, _>(
+        "loop_after_scope",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "scope-produced loop predicate input should pass pre-flight, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+/// A shared scope's inner graph is validated against the outputs available at
+/// its chain position: an outer producer before the scope satisfies the inner
+/// loop's predicate input, exactly as it does at runtime (the shared boundary
+/// keeps the same context).
+#[test]
+fn validate_accepts_outer_produced_input_for_shared_scope_inner_loop() {
+    let mut inner = Graph::new();
+    inner.add_loop::<EntryLoopState, _, _>(
+        "inner_loop",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let mut graph = Graph::new();
+    graph.add_system(produce_entry_loop_state);
+    graph.add_scope("episode", inner, ContextPolicy::shared());
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "outer-produced input crosses a shared boundary in pre-flight, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+/// Outputs never cross a non-shared boundary inward: an outer producer cannot
+/// satisfy an isolated scope's inner loop, and pre-flight reports it (the
+/// runtime fails fast at the boundary with
+/// `LoopPredicateInputMissingOnEntry`).
+#[test]
+fn validate_flags_isolated_scope_inner_loop_missing_input() {
+    let mut inner = Graph::new();
+    inner.add_loop::<EntryLoopState, _, _>(
+        "inner_loop",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let mut graph = Graph::new();
+    graph.add_system(produce_entry_loop_state);
+    graph.add_scope("episode", inner, ContextPolicy::new());
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_err(),
+        "an isolated inner loop's unproduced input should fail pre-flight"
+    );
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingOutput {
+                system_name: "inner_loop",
+                output_type,
+                ..
+            } if output_type.contains("EntryLoopState")
+        )),
+        "expected MissingOutput for the isolated inner loop, got: {errors:?}"
+    );
+}
+
+/// Builds a loop-heading candidate reading `EntryLoopState` and the slot
+/// contract it satisfies (the parent supplies the seed, the body's outputs
+/// merge back).
+fn loop_heading_candidate_and_contract() -> (Graph, GraphSignature) {
+    let mut candidate = Graph::new();
+    candidate.add_loop::<EntryLoopState, _, _>(
+        "refine",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+    let contract = GraphSignature::new()
+        .require_output::<EntryLoopState>()
+        .produce::<EntryLoopState>();
+    (candidate, contract)
+}
+
+/// A shared inline dynamic candidate is validated against the outputs
+/// available at the dynamic node's chain position: an outer producer before
+/// the node satisfies both the contract's `requires_outputs` and the
+/// candidate's inner loop.
+#[test]
+fn validate_accepts_outer_produced_input_for_shared_inline_dynamic() {
+    let (candidate, contract) = loop_heading_candidate_and_contract();
+
+    let mut graph = Graph::new();
+    graph.add_system(produce_entry_loop_state);
+    graph.add_dynamic(
+        "route",
+        |_ctx| Arc::from("episode"),
+        [("episode", candidate)],
+        DynamicSlot::new(contract, ContextPolicy::shared()),
+    );
+
+    let ctx = SystemContext::new();
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "outer-produced input reaches a shared inline candidate in pre-flight, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+/// A caller-seeded output (`SystemContext::insert_output`) satisfies a shared
+/// dynamic contract's `requires_outputs` in pre-flight, matching the runtime,
+/// where the selected candidate reads the seed from the shared context.
+#[test]
+fn validate_accepts_caller_seeded_shared_dynamic_contract_output() {
+    let (candidate, contract) = loop_heading_candidate_and_contract();
+
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "route",
+        |_ctx| Arc::from("episode"),
+        [("episode", candidate)],
+        DynamicSlot::new(contract, ContextPolicy::shared()),
+    );
+
+    let mut ctx = SystemContext::new();
+    ctx.insert_output(EntryLoopState { done: false });
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_ok(),
+        "caller-seeded contract output should pass pre-flight, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
+/// Outputs never cross a non-shared boundary inward: a caller-seeded output
+/// cannot satisfy an isolated inline candidate's inner loop, and pre-flight
+/// recurses into the candidate against an empty output set and no context —
+/// mirroring the runtime, which fails fast at the boundary with
+/// `LoopPredicateInputMissingOnEntry`.
+#[test]
+fn validate_flags_isolated_inline_dynamic_candidate_inner_loop() {
+    let mut candidate = Graph::new();
+    candidate.add_loop::<EntryLoopState, _, _>(
+        "isolated_refine",
+        |state| state.done,
+        |g| {
+            g.add_system(produce_entry_loop_state);
+        },
+    );
+
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "route",
+        |_ctx| Arc::from("episode"),
+        [("episode", candidate)],
+        DynamicSlot::new(
+            GraphSignature::new().produce::<EntryLoopState>(),
+            ContextPolicy::new(),
+        ),
+    );
+
+    let mut ctx = SystemContext::new();
+    ctx.insert_output(EntryLoopState { done: false });
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
+        result.is_err(),
+        "an isolated candidate's inner loop must fail pre-flight even with a caller-seeded output"
+    );
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingOutput {
+                system_name: "isolated_refine",
+                output_type,
+                ..
+            } if output_type.contains("EntryLoopState")
+        )),
+        "expected MissingOutput for the isolated candidate's inner loop, got: {errors:?}"
+    );
+}
+
+async fn produce_hook_output() -> HookProvidedResource {
+    HookProvidedResource
+}
+
+/// A provider hook inserts a *resource* (`ctx.insert`), not an output, so it
+/// cannot satisfy a loop's termination predicate — pre-flight must not credit
+/// it (the runtime entry check fails on the same graph).
+#[test]
+fn validate_flags_hook_provided_resource_for_loop_predicate_input() {
+    let mut graph = Graph::new();
+    graph.add_loop::<HookProvidedResource, _, _>(
+        "gated",
+        |_state| true,
+        |g| {
+            g.add_system(produce_hook_output);
+        },
+    );
+
+    let hooks = HooksAPI::new();
+    hooks
+        .register_provider::<OnGraphStart, HookProvidedResource, _>("provide_gate", |_event| {
+            Some(HookProvidedResource)
         })
         .expect("hook registration should succeed");
 
@@ -1219,8 +1617,38 @@ fn validate_output_reachability_hook_provided_outputs_pass() {
     let result = executor.validate_resources(&graph, &ctx, Some(&hooks));
 
     assert!(
+        result.is_err(),
+        "a hook-provided resource must not satisfy a loop predicate input"
+    );
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::MissingOutput {
+                system_name: "gated",
+                output_type,
+                ..
+            } if output_type.contains("HookProvidedResource")
+        )),
+        "expected MissingOutput for the loop's predicate input, got: {errors:?}"
+    );
+}
+
+/// A caller-seeded output satisfies a system's `Out<T>` read in pre-flight,
+/// matching the runtime, where `Out<T>` resolves from the context's outputs.
+#[test]
+fn validate_accepts_caller_seeded_output_for_system_read() {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(ConsumesStringOutput));
+
+    let mut ctx = SystemContext::new();
+    ctx.insert_output(String::from("seeded"));
+    let executor = GraphExecutor::new();
+    let result = executor.validate_resources(&graph, &ctx, None);
+
+    assert!(
         result.is_ok(),
-        "hook-provided output should pass validation, got: {:?}",
+        "caller-seeded output should satisfy a system's Out<T> read, got: {:?}",
         result.unwrap_err()
     );
 }

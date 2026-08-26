@@ -1,0 +1,13 @@
+error: #[tool] methods in a #[toolset] must take `&self` as the first parameter
+ --> tests/compile_fail/toolset_method_no_self.rs:9:11
+  |
+9 |     async fn bad_method(name: String) -> Result<String, ToolError> {
+  |           ^^
+
+warning: unused imports: `ToolError` and `tool`
+ --> tests/compile_fail/toolset_method_no_self.rs:1:21
+  |
+1 | use polaris_tools::{tool, toolset, ToolError};
+  |                     ^^^^           ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

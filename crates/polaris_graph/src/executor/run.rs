@@ -624,6 +624,9 @@ impl GraphExecutor {
 
             let execute_body = async {
                 if policy.is_shared() {
+                    // Same context, so parent-produced or caller-seeded
+                    // outputs satisfy an inner loop's first termination check.
+                    Self::check_loop_entry_inputs(graph, ctx)?;
                     return self
                         .execute_from(graph, ctx, entry, depth + 1, hooks, middleware, run_ctx)
                         .await;
@@ -638,6 +641,11 @@ impl GraphExecutor {
                 // from one the policy is hiding.
                 let mut child = ctx.child_filtered(policy.parent_filter_arc());
                 Self::populate_child_locals(policy, name, ctx, &mut child)?;
+                // Outputs never cross a non-shared boundary, so an inner
+                // loop's first termination check can only be satisfied by
+                // production earlier on the inner chain — the child context
+                // starts with no outputs, and this check reflects that.
+                Self::check_loop_entry_inputs(graph, &child)?;
                 let inner_count = self
                     .execute_from(
                         graph,

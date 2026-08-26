@@ -7,12 +7,14 @@
 
 ## Reference
 
+- [**Guide**](./reference/guide.md) — "How do I X?" — which plugins, APIs, and resources to combine for a given goal
 - [**Systems**](./reference/system.md) — Systems, parameters, and the `#[system]` macro
 - [**Execution Context**](./reference/context.md) — SystemContext lifecycle, hierarchy, resource resolution, graph context flow
 - [**Graphs**](./reference/graph.md) — Graph execution, control flow, error handling, hooks, middleware
 - [**Agents**](./reference/agents.md) — Agent trait and pattern implementations
 - [**Plugins**](./reference/plugins.md) — Plugin system and compositional architecture
 - [**APIs**](./reference/api.md) — Capability registration for shared behaviours across plugins
+- [**Resources**](./reference/resources.md) — Global and local resources, scoping, and the documentation standard
 - [**Sessions**](./reference/sessions.md) — SessionsAPI, turn execution, checkpoints, persistence
 - [**HTTP Integration**](./reference/http.md) — HTTP handlers, deferred router construction, HttpIOProvider, route registration
 - [**Scheduling**](./reference/scheduling.md) — Server lifecycle, tick scheduling, plugin update ordering

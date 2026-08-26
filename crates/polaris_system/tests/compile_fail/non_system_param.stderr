@@ -1,0 +1,34 @@
+error[E0277]: the trait bound `String: SystemParam` is not satisfied
+ --> tests/compile_fail/non_system_param.rs:5:23
+  |
+5 | async fn bad_param(x: String) -> i32 {
+  |                       ^^^^^^ the trait `SystemParam` is not implemented for `String`
+  |
+  = help: the following other types implement trait `SystemParam`:
+            ()
+            (P0, P1)
+            (P0, P1, P2)
+            (P0, P1, P2, P3)
+            (P0, P1, P2, P3, P4)
+            (P0, P1, P2, P3, P4, P5)
+            (P0, P1, P2, P3, P4, P5, P6)
+            (P0, P1, P2, P3, P4, P5, P6, P7)
+          and $N others
+
+error[E0277]: the trait bound `String: SystemParam` is not satisfied
+ --> tests/compile_fail/non_system_param.rs:4:1
+  |
+4 | #[system]
+  | ^^^^^^^^^ the trait `SystemParam` is not implemented for `String`
+  |
+  = help: the following other types implement trait `SystemParam`:
+            ()
+            (P0, P1)
+            (P0, P1, P2)
+            (P0, P1, P2, P3)
+            (P0, P1, P2, P3, P4)
+            (P0, P1, P2, P3, P4, P5)
+            (P0, P1, P2, P3, P4, P5, P6)
+            (P0, P1, P2, P3, P4, P5, P6, P7)
+          and $N others
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)

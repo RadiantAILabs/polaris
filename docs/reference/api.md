@@ -60,13 +60,27 @@ Reach for `expect_api` instead of `api().cloned()` whenever a `ready()` capture 
 Interior mutability is the *mechanism* an API uses to accept contributions after
 insertion. The *policy* — who is allowed to contribute, and when — is the
 property downstream consumers actually need to know. Every API falls into one
-of three buckets:
+of four buckets:
 
 | Policy | Who may mutate | Mechanism | Examples |
 |--------|----------------|-----------|----------|
 | **Open extension** | Any plugin during `build()` (and sometimes `ready()`) | `RwLock`-guarded collection that accepts entries | [`HttpRouter`](crate::app::HttpRouter), [`MiddlewareAPI`](crate::graph::MiddlewareAPI), [`PersistenceAPI`](crate::plugins::PersistenceAPI) |
 | **Provider-scoped** | Only the providing plugin | `Arc`-wrapped inner state, public methods read-only | [`SessionsAPI`](crate::sessions::SessionsAPI) (session/turn writes go through the plugin's own systems; its capability-contract registry is a documented consumer-writable exception) |
+| **Shared switch** | Any holder, at run time — writes are global and replace rather than accumulate | `RwLock`-guarded settings struct with setters | [`InspectionAPI`](crate::plugins::InspectionAPI) |
 | **Single-replace** | Replaced wholesale by a successor `insert_api` call, not contributed to | No interior mutability needed | Configuration-style APIs |
+
+**Shared switch** is the operator-control shape: the API exists so something
+outside the providing plugin — a dashboard panel, an admin route, a test — can
+change runtime behavior, so its whole mutating surface is deliberately
+consumer-facing. It is not open extension, because writes replace instead of
+accumulating, and consumers must be told to treat the handle as one shared
+switch rather than a per-consumer view. An API in this bucket also has to say
+which of its axes *cannot* safely be last-writer-wins, and offer an accumulating
+alternative there that never runs caller code while holding the API lock:
+[`InspectionAPI::add_redacted_param`](crate::plugins::InspectionAPI::add_redacted_param)
+and [`InspectionAPI::add_redacted_type`](crate::plugins::InspectionAPI::add_redacted_type)
+are those bounded operations, because a withholding rule silently replaced is
+a leak, not a lost preference.
 
 State the API's policy in its rustdoc — that's the question consumers have, not
 which lock type it uses. The [Documentation Standard](#documentation-standard)
@@ -300,7 +314,7 @@ every PR.
 | **Provided by** | The plugin that calls `insert_api` for this type during its `build()`. If no plugin registers it by default — the API is consumer-supplied — say so explicitly. |
 | **Surface** | Markdown table with columns `Method \| Description`. One line per `pub` method. This is what consumers read to know what they can do; if a method takes a closure or a builder, surface that in the Description column rather than expecting consumers to read the signature. |
 | **Lifecycle** | When each method may be called: `build()` only, `ready()` only, `build()` + `ready()`, or runtime. State the consequence of calling outside the window (panic, no-op, late-but-OK). |
-| **Composition rule** | One of: **Open extension** (any plugin may contribute), **Provider-scoped** (only the providing plugin mutates), or **Single-replace** (subsequent `insert_api` replaces). See [Composition Policy](#composition-policy). |
+| **Composition rule** | One of: **Open extension** (any plugin may contribute), **Provider-scoped** (only the providing plugin mutates), **Shared switch** (any holder writes at run time, last-writer-wins), or **Single-replace** (subsequent `insert_api` replaces). See [Composition Policy](#composition-policy). |
 | **Example consumers** | Inline list of 1–3 concrete plugins in this workspace that consume this API, with what they contribute. Not exhaustive — a couple of representative examples is enough. The catalog and grep cover completeness. |
 | **Example** | Rustdoc code block (`no_run` acceptable) showing both the provider's `insert_api` call **and** a consumer's `server.api::<T>()` access in one snippet. Two halves of one example, not two examples. |
 
@@ -311,6 +325,7 @@ These APIs satisfy the standard and can be copied as a starting point:
 - [`HttpRouter`](crate::app::HttpRouter) — open-extension API: any plugin contributes routes.
 - [`PersistenceAPI`](crate::plugins::PersistenceAPI) — open-extension API: any plugin registers serializers.
 - [`SessionsAPI`](crate::sessions::SessionsAPI) — provider-scoped: the API exposes operations (create session, run turn), but writes flow through `SessionsPlugin`'s own machinery. Its capability-contract registry is the deliberate exception — an open-extension point any plugin may write via `register_contract` after `ready()` — and its rustdoc `# Composition` section says so, which is exactly the standard's point.
+- [`InspectionAPI`](crate::plugins::InspectionAPI) — shared switch: every mutating method is consumer-facing on purpose (an operator flips recording at run time), so the rustdoc states the last-writer-wins semantics outright and names the one axis that must compose instead — redactions, via the bounded `add_redacted_param` / `add_redacted_type` operations. Copy it when an API's *whole* point is letting someone outside the provider change runtime behavior.
 
 ## Summary
 

@@ -77,6 +77,8 @@ tracing_subscriber::fmt()
 
 For structured observability in production, prefer registering your own observer hooks on the specific schedules you care about (e.g., `OnSystemError` → metrics counter, `OnGraphComplete` → histogram).
 
+For **value-level** visibility — what a system actually received or returned, not just when it ran — see [System — Parameter Inspection](./system.md#parameter-inspection): `#[system(inspect(..))]` selects parameters at compile time, and `InspectionPlugin` delivers the records — its `InspectionAPI` flips recording on at run time (off by default; safe to leave registered in production), any plugin can sign up a listener via `Extends<InspectionSinkRegistry>`, and the shipped tracing listener lands records on the per-step spans, complementing the structural `SystemInfo` and event tracing here.
+
 ## Key Files
 
 | File | Purpose |
@@ -86,4 +88,5 @@ For structured observability in production, prefer registering your own observer
 | `polaris_graph/src/hooks/schedule.rs` | `AllGraphSchedules`, `OnSystemStart`, etc. |
 | `polaris_core_plugins/src/tracing_plugin/mod.rs` | `TracingPlugin`, `TracingLayers`, `TracingConfig` |
 | `polaris_core_plugins/src/tracing_plugin/instrument/` | Graph, LLM, tool, and GenAI-content span instrumentation |
+| `polaris_core_plugins/src/inspection.rs` | `InspectionPlugin`, `InspectionAPI`, `InspectionSinkRegistry` — parameter-value recording |
 | `polaris_models/src/llm/provider.rs` | `LlmProvider::pricing()`, `ModelPricing` |

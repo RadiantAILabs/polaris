@@ -1,0 +1,13 @@
+error: parameter names beginning with `__polaris` are reserved for identifiers the `#[system]` macro generates
+  --> tests/compile_fail/param_named_generated_prefix.rs:18:26
+   |
+18 | async fn reserved_prefix(__polaris_sink: Res<Counter>) {
+   |                          ^^^^^^^^^^^^^^
+
+warning: unused import: `polaris_system::param::Res`
+ --> tests/compile_fail/param_named_generated_prefix.rs:6:5
+  |
+6 | use polaris_system::param::Res;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

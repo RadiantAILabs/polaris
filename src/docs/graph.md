@@ -88,15 +88,20 @@ graph.add_parallel("execute_tools", vec![
 ]);
 ```
 
-**Loop:**
+**Loop** (the termination predicate is evaluated *before* each iteration,
+including the first — so its input must be produced before the loop, normally
+by an init system; a caller driving the graph directly may instead pre-seed
+the context before executing):
 
 ```no_run
 # use polaris_ai::graph::Graph;
 # struct LoopState { is_done: bool }
+# async fn init_state() -> LoopState { LoopState { is_done: false } }
 # async fn reason() -> LoopState { LoopState { is_done: true } }
 # async fn act() {}
 # async fn observe() {}
 # let mut graph = Graph::new();
+graph.add_system(init_state); // the first termination check reads this
 graph.add_loop::<LoopState, _, _>(
     "react_loop",
     |state| state.is_done,
@@ -235,7 +240,29 @@ mw.register_system("timer", |info: SystemInfo, ctx, next| {
 `graph.validate()` checks structural validity (entry point, edge
 connectivity, predicate/branch presence). `executor.validate_resources()`
 checks that all `Res<T>`, `ResMut<T>`, and `Out<T>` parameters can be
-satisfied before execution.
+satisfied before execution. Independently, the executor always verifies at
+run start that every main-chain loop's termination predicate input is
+produced before the loop or already present in the context, failing fast
+with `LoopPredicateInputMissingOnEntry` otherwise.
+
+Conditional production is phase-specific. Composition signatures are
+pessimistic: a decision or switch branch is not guaranteed to run, so its
+outputs cannot erase a declared requirement. Pre-flight and run-start checks
+are optimistic: they credit every branch that might run, preserving outputs
+from nested scopes, parallel branches, and dynamic contracts. After a branch
+is selected, execution observes the live output channel exactly and returns a
+typed missing-output error if the selected path did not produce the value.
+
+Every such check follows the layer's verification-phase rules. Checks run
+at one of five phases -- Rust compile time, graph validate time,
+composition time (signature matching), run start, execution time -- and
+each phase may reject only on facts no later phase could change: validate
+time sees only the fragment's own structure, signature derivation is
+pessimistic (interfaces never under-claim), run-start checks are
+optimistic (they reject only what cannot succeed on any path), and
+execution-time failures are typed and routed, never panics. The full rules
+live in the repository's `docs/reference/graph.md` under "Verification
+Phases".
 
 # Related
 

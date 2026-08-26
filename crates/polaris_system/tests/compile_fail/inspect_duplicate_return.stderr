@@ -1,0 +1,5 @@
+error: duplicate `return` in `inspect(..)`
+ --> tests/compile_fail/inspect_duplicate_return.rs:6:26
+  |
+6 | #[system(inspect(return, return))]
+  |                          ^^^^^^

@@ -44,6 +44,20 @@ and do not need the macro.
 
 See [Data flow patterns](crate#data-flow-patterns) for a decision guide.
 
+Parameter *values* can be captured for observability with
+`#[system(inspect(a, b))]`. A type opts in by deriving `Debug` — there is
+nothing to implement, so it works on resource types from crates you do not own.
+Selection is compile-time; whether capture is live is a separate runtime
+choice, made through
+[`InspectionPlugin`](crate::plugins::InspectionPlugin)'s policy switch
+([`InspectionAPI`](crate::plugins::InspectionAPI), off by default) — or by
+installing an
+[`InspectionSink`](crate::system::param::inspect::InspectionSink) on the
+context directly when the plugin is absent. Values render through the type's
+own `Debug`, so a hand-written masking impl is honored — do not select a
+parameter whose derived `Debug` would expose credentials. See
+[`param::inspect`](crate::system::param::inspect).
+
 # `SystemContext`
 
 [`SystemContext`](crate::system::param::SystemContext) is the execution context flowing
@@ -65,6 +79,14 @@ Server (globals: Config, ToolRegistry, ModelRegistry)
 
 `ResMut<T>` skips the hierarchy entirely and only accesses the current
 context. `T` must implement `LocalResource`.
+
+**Writes return what they displaced.** `insert`, `insert_resource`,
+`insert_output`, their type-erased forms, and `replace_inspection` all hand back the
+value they overwrote, so clobbering another writer's value is observable rather
+than silent. The scope is the context written to: shadowing a parent's resource
+displaces nothing and returns `None`. The full rules, including how to chain a
+second inspection sink onto one already installed, live in the repository's
+`docs/reference/context.md` under "Writes Return What They Displaced".
 
 # Resources
 

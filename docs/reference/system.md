@@ -32,6 +32,10 @@ As all state flows through parameters, a system has no hidden dependencies, whic
 
 The macro generates two items: a struct that implements the `System` trait, and a factory function that returns an instance of that struct.
 
+The macro validates the signature at expansion and rejects, with an error at the offending token: non-`async` functions; generic functions and `where` clauses (the generated struct carries no generics, so they would be silently discarded); parameter patterns that are not simple identifiers; a parameter named `ctx` (it collides with the context binding the generated body uses); and parameter names under the reserved `__polaris` prefix (they collide with generated locals).
+
+Attributes written on the function are forwarded rather than silently discarded: doc comments land on the generated struct, `cfg`/`cfg_attr` gate every generated item, and lint attributes (`allow`, `expect`, `warn`, `deny`, `forbid`) scope the generated `run` method, which contains the function body. Any other attribute — another attribute macro, `#[inline]` — has no meaningful target after expansion and is rejected at that attribute. The rejection applies to attributes left for `#[system]` itself to handle: another attribute macro still composes when written *above* `#[system]`, since attribute macros expand outside-in and it transforms the original function before `#[system]` sees it.
+
 ### Fallible Systems
 
 Systems that may fail can return `Result<T, SystemError>`. The macro detects this pattern and extracts `T` as the system's output type. On success, `T` is stored in the context for downstream `Out<T>` access. On error, the `SystemError` propagates to the executor, which routes to an error edge or halts the graph.
@@ -219,6 +223,54 @@ async fn plan(memory: Res<Memory>, llm: Res<LLM>) -> PlannerOutput {
     // ...
 }
 ```
+
+### Parameter Inspection
+
+Parameter *values* can be captured for observability. Selection is per system and per parameter, via the macro:
+
+```rust
+#[system(inspect(memory, upstream, return))]
+async fn plan(
+    config: Res<Config>,          // not captured
+    mut memory: ResMut<Memory>,   // captured
+    upstream: Out<Draft>,         // captured
+) -> Plan {
+    // ...
+}
+```
+
+A type becomes renderable by deriving `Debug` — there is nothing to implement, so this works on resource types from crates you do not own. Naming a parameter whose type is not `Debug` is a compile error **at that parameter**, not a silent omission. Bare `#[system(inspect)]` selects every parameter, which requires all of them to be `Debug` — but not the return value, which is not a parameter and must be named explicitly (`inspect(.., return)`). `return` selects the system's own return value: for a fallible system (one whose return type is spelled literally `Result<T, SystemError>` — fallibility detection is syntactic) the recorded value is the extracted success value and a failure records nothing, while a `Result` with any other error type is an ordinary output value, so its `Err` arm is recorded like any other value.
+
+Parameters selected with `inspect(..)` are captured at `Phase::Before`, meaning "this value went in" — those records survive a later fetch failure or a body failure. Only the `return` record implies the system succeeded; a sink must not infer success from the presence of parameter records.
+
+Capture happens at parameter resolution, inside the generated body. That is the only point where a parameter is still statically typed, so there is no downcast and no reflection: a value whose `ResMut` borrow is held is still readable, because the capture *is* that borrow rather than a competing one.
+
+Two axes are deliberately separate:
+
+| Axis | Decided by | Effect |
+|------|-----------|--------|
+| **Capturability** | `#[system(inspect(..))]` at compile time | Which parameters *can* be recorded; where the `Debug` bound lands |
+| **Activation** | `InspectionPolicy` at run time, via `InspectionAPI` (or raw `SystemContext::replace_inspection()` without the plugin) | Whether capture is live, without a rebuild |
+
+An un-annotated system emits no capture at all and imposes no bound on its parameters. With no sink installed, an annotated system pays a single `Option` check and never formats a value; a sink receives the value as a closure, so declining a record costs no formatting either. Child contexts inherit the sink, so installing it once at the root covers every scope, branch, and loop iteration beneath it. A sink runs synchronously on the system's execution path: it must not block, and a panic it raises fails the system being observed — only panics inside the value's `Debug` impl are absorbed.
+
+One sink is installed at a time, so a second `replace_inspection()` replaces the first. The replaced sink is *returned* rather than dropped silently, and `inspection_arc()` hands back an owned `Arc` (unlike `inspection()`, which is a borrow). Together those let a plugin chain onto a sink a caller already installed instead of cutting it off. Chaining is not idempotent — re-applying it to a context that already carries the wrapper grows the chain a link at a time — so a consumer that may run more than once against the same context must guard on sink identity. A chained sink also does not inherit the wrapped sink's policy — it renders values the other sink would have withheld — and a panic in one branch starves the branches behind it. Both argue for delivering to a single installed sink that fans out flatly over wrapping sinks around one another; the framework bounds none of it, so the guard is the caller's. See [Execution Context — Chaining onto an Installed Sink](./context.md#chaining-onto-an-installed-sink).
+
+Rendering treats the `Debug` impl as untrusted code: formatting **stops** at a byte cap rather than materializing the full value (a multi-megabyte history costs at most the cap), and a `Debug` impl that panics is absorbed at the render boundary and recorded as `Opaque` — a buggy formatter cannot fail the system it observes. Records carry the inner resource type (`Memory`, not `ResMut<'_, Memory>`) as declared at the parameter, so they group by resource across wrapper and lifetime spellings — but not across path spellings: `Res<Deep>` and `Res<nested::Deep>` record different names for the same resource.
+
+Captured values render through the type's **own** `Debug` impl, so the standard redaction idiom composes: a hand-written `Debug` that masks a secret field is honored by the capture path (note the flip side: a derived `Debug` escapes string contents via `escape_debug` where a hand-written one need not, so a hand-written impl can put raw control characters into the *rendering* — the shipped tracing listener then escapes the whole rendering again when it emits it, so neither can forge log structure there, but a listener that writes the rendering verbatim gets no such protection). Three gates guard sensitive data: selection (do not name a parameter in `inspect(..)` whose derived `Debug` would expose credentials); the runtime policy, which is off by default — enabling it exposes selected renderings to every registered listener; and, in the plugin layer, runtime `RedactionRules` — a covered value is delivered as `Redacted` without its `Debug` ever running, so the value never reaches a `String`. Rule matching is deliberately generous, because a withholding control that under-matches leaks: `redact_param` matches the binding name exactly, while `redact_type` strips paths on both sides *and* descends into the recorded spelling, so one rule on `ApiCredentials` covers `credentials::ApiCredentials`, `Option<ApiCredentials>`, `Vec<ApiCredentials>`, and `Box<dyn ApiCredentials>` alike — whitespace between two identifiers is preserved rather than dropped precisely so the last of those cannot glue into `dynApiCredentials` and escape the rule. Name the sensitive type itself rather than a container spelling; a rule that names a container matches that spelling whole and so would miss the same container nested one level deeper. A type **alias** records the alias, which no rule on the underlying name can see — mask in the type's own `Debug` impl when a value must never render anywhere.
+
+Layer 1 supplies only this mechanism — the `Inspection` rendering, the `InspectionSink` trait, and the capture. Recording policy, listener registration, and export to telemetry live in the plugin layer: `InspectionPlugin` (`polaris_core_plugins`) installs a fan-out sink on every graph run, gates delivery through the runtime `InspectionPolicy` (off by default; on, or narrowed to named systems, via `InspectionAPI`), withholds `RedactionRules`-covered values (set at build with `InspectionPlugin::with_redactions`, added at run time with the bounded `InspectionAPI::add_redacted_param` / `add_redacted_type` operations so two holders cannot un-redact one another), lets any plugin sign up a listener through `Extends<InspectionSinkRegistry>` (optionally under a static `InspectionListenerName`, so `InspectionAPI` can discover and switch it off and on at run time), and ships a tracing listener registered under the name `INSPECTION_TRACING_LISTENER` that lands records on the per-step span. Unknown toggles return `None` without allocating registry state. The framework stores no records — listeners bring their own storage.
+
+Both starting settings can come from the deployment environment: `InspectionPlugin::with_policy_from_env` and `with_redactions_from_env` read a spec from an environment variable the *application* names — the framework prescribes no variable of its own — so one binary carries different inspection postures per deployment (staging records `plan,act`; production, saying nothing, stays off). The route fails closed: an unset variable changes nothing and the default policy is `Off`, while a set-but-malformed spec fails startup rather than coming up under a posture nobody chose — a policy fallback would either disable the observability staging asked for or record what production meant to keep off, and a quietly dropped redaction rule would leak exactly the values it was written to withhold. An environment redaction spec **adds** rules to those baked in and can never drop one, mirroring the one-way composition of the runtime `add_redacted_param` / `add_redacted_type` operations. The specs are the `FromStr` grammars on `InspectionPolicy` (`off`, `all`, or comma-separated `#[system]` function names) and `RedactionRules` (comma-separated `param:<binding>` / `type:<Type>` entries; container spellings like `Vec<Token>` are rejected — name the inner type), so the same strings work anywhere a string arrives: `api.set_policy(spec.parse()?)` gives an admin surface the identical grammar. Parsing rejects loudly instead of guessing — a forgotten comma or a misspelled kind prefix is an `InspectionSpecError`, not a rule that silently matches nothing.
+
+The two activation routes do not compose: the plugin installs its fan-out at the start of every graph run, so it replaces a sink placed on the context by `replace_inspection()` rather than chaining onto it. Pick one — register a listener, or drop the plugin and keep the manual sink. The first run that displaces a *foreign* sink logs a warning on the `polaris::inspection` target (the plugin recognizes its own fan-out by identity, so a context reused across turns is not reported as a displacement), which is also the target the plugin's records use and the spelling of the shipped listener's typed identity. `RUST_LOG="info,polaris::inspection=off"` suppresses rendered values without turning recording off for other listeners, and because the listener consults the filter before rendering, a filtered-out target means the value is never formatted for it at all; `InspectionAPI::disable_listener(INSPECTION_TRACING_LISTENER)` stops the shipped listener the same way with no environment change.
+
+Two properties of the exported event are worth knowing when reading it back. The value is emitted through `Debug`, so it arrives quoted and escaped and a rendering containing newlines cannot forge extra log structure. And a separate `polaris.inspection.rendering` field says which `Inspection` variant produced it (`text`, `redacted`, `opaque`, `unrenderable`) — key alerting on that rather than on the text, because a value whose `Debug` writes the literal `<redacted>` is otherwise indistinguishable from the sentinel.
+
+Enabling is **process-wide**. The policy has no session, run, or tenant axis and one fan-out serves every concurrent run, so turning recording on to chase one session records every other session executing at the same time and ships all of it to every listener. Narrow with `enable_only`, put `RedactionRules` in place before enabling rather than after, and keep the window short.
+
+Two limitations are worth stating plainly: a hand-written `impl System` gets no capture, since the mechanism lives in the macro; and `ResMut` records the value going *in*, not the mutated result.
 
 ## ContextFactory
 

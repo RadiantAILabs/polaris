@@ -1,0 +1,13 @@
+error: no parameter named `nonexistent` in this system
+  --> tests/compile_fail/inspect_unknown_param.rs:15:18
+   |
+15 | #[system(inspect(nonexistent))]
+   |                  ^^^^^^^^^^^
+
+warning: unused import: `polaris_system::param::Res`
+ --> tests/compile_fail/inspect_unknown_param.rs:4:5
+  |
+4 | use polaris_system::param::Res;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

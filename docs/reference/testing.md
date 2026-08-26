@@ -50,6 +50,7 @@ A plugin's contract is registration: after its lifecycle methods run, the expect
 Macro correctness is a compile-time property. Invalid inputs must produce helpful diagnostics.
 
 - Use `trybuild` with `compile_fail` tests and `.stderr` snapshots.
+- Snapshots are committed. `cargo make test` runs trybuild with `TRYBUILD=overwrite`, regenerating them in place — review the diff and commit intentional diagnostic changes alongside the change that caused them. CI fails on uncommitted snapshot drift, so the diagnostic text and spans are guarded, not just the fail/pass direction.
 - Valid inputs must produce the expected trait implementations.
 - Each error path the macro can take should have a corresponding `compile_fail` case.
 

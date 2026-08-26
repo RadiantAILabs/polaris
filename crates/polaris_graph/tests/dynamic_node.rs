@@ -19,6 +19,7 @@ use polaris_graph::registry::{RegistryError, SubgraphRegistry};
 use polaris_system::param::{AccessMode, SystemAccess, SystemContext};
 use polaris_system::resource::{ForkStrategy, LocalResource};
 use polaris_system::system::{BoxFuture, System, SystemError};
+use std::any::TypeId;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,10 +50,9 @@ struct Choice {
 }
 impl LocalResource for Choice {}
 
-/// A hook-provided output type used to prove Dynamic contract validation credits
-/// output providers registered on graph/system start schedules.
-struct HookProvidedOutput;
-impl LocalResource for HookProvidedOutput {}
+/// A hook-provided resource used to prove it cannot satisfy output contracts.
+struct HookProvidedResource;
+impl LocalResource for HookProvidedResource {}
 
 /// A candidate system: reads [`Base`], records and returns `base.n * factor`.
 struct Multiply {
@@ -579,6 +579,186 @@ fn registry_rejects_structurally_invalid_candidate() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Loop-heading candidates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Seed type read by a loop-heading candidate's termination predicate.
+#[derive(Debug)]
+struct Progress {
+    round: usize,
+}
+
+async fn seed_progress() -> Progress {
+    Progress { round: 0 }
+}
+
+async fn advance_progress() -> Progress {
+    Progress { round: 1 }
+}
+
+async fn choose_progress_branch() -> bool {
+    true
+}
+
+/// A candidate whose first node is a loop: its termination predicate reads
+/// `Progress` *before* the first iteration, so the derived signature requires
+/// `Out<Progress>` from the parent.
+fn loop_heading_candidate() -> Graph {
+    let mut graph = Graph::new();
+    graph.add_loop::<Progress, _, _>(
+        "refine",
+        |progress| progress.round >= 1,
+        |g| {
+            g.add_system(advance_progress);
+        },
+    );
+    graph
+}
+
+/// The slot contract a loop-heading candidate genuinely satisfies: the parent
+/// supplies the seed (`require_output`), and the body's outputs merge back.
+fn loop_contract() -> GraphSignature {
+    GraphSignature::new()
+        .require_output::<Progress>()
+        .produce::<Progress>()
+}
+
+/// A candidate whose selected branch seeds its own loop before the first
+/// predicate check. The seed is conditional to the parent graph but
+/// guaranteed within the selected branch's sequential chain.
+fn branch_seeded_loop_candidate() -> Graph {
+    let mut graph = Graph::new();
+    graph.add_system(choose_progress_branch);
+    graph.add_conditional_branch::<bool, _, _, _>(
+        "choose_loop",
+        |take_loop| *take_loop,
+        |branch| {
+            branch.add_system(seed_progress);
+            branch.add_loop::<Progress, _, _>(
+                "refine",
+                |progress| progress.round >= 1,
+                |body| {
+                    body.add_system(advance_progress);
+                },
+            );
+        },
+        |branch| {
+            branch.add_system(advance_progress);
+        },
+    );
+    graph
+}
+
+fn branch_seeded_loop_contract() -> GraphSignature {
+    GraphSignature::new()
+        .produce::<bool>()
+        .produce::<Progress>()
+}
+
+#[test]
+fn registry_accepts_loop_heading_candidate_when_contract_supplies_seed() {
+    let mut registry = SubgraphRegistry::new(loop_contract());
+    registry
+        .register("episode", loop_heading_candidate())
+        .expect("candidate whose seed the contract supplies should register");
+    assert!(registry.contains("episode"));
+}
+
+#[test]
+fn registry_rejects_loop_heading_candidate_when_contract_lacks_seed() {
+    // Without `require_output::<Progress>()` the contract omits the seed the
+    // candidate's first termination check needs — the signature diff catches
+    // the mismatch at admission instead of a runtime predicate failure.
+    let mut registry = SubgraphRegistry::new(GraphSignature::new().produce::<Progress>());
+    let err = registry
+        .register("episode", loop_heading_candidate())
+        .unwrap_err();
+
+    match &err {
+        RegistryError::Incompatible { diff, .. } => {
+            let extra = diff.extra_requires_outputs();
+            assert_eq!(
+                extra.len(),
+                1,
+                "diff should name exactly the unmet seed, got: {diff:?}"
+            );
+            assert!(
+                extra[0].type_name.contains("Progress"),
+                "diff names the seed type the contract lacks, got: {}",
+                extra[0].type_name
+            );
+        }
+        other => panic!("expected Incompatible, got: {other:?}"),
+    }
+    assert!(!registry.contains("episode"));
+}
+
+#[tokio::test]
+async fn registry_loop_heading_candidate_runs_with_parent_seed() {
+    let mut graph = Graph::new();
+    graph.add_system(seed_progress);
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("episode"),
+        DynamicSlot::new(loop_contract(), ContextPolicy::shared()),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut registry = SubgraphRegistry::new(loop_contract());
+    registry
+        .register("episode", loop_heading_candidate())
+        .unwrap();
+
+    let mut ctx = SystemContext::new().with(registry);
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("parent-seeded loop-heading candidate should run");
+
+    // Seed (round 0) fails the first termination check, the body advances to
+    // round 1, and the second check terminates the loop.
+    assert_eq!(result.output::<Progress>().map(|p| p.round), Some(1));
+}
+
+#[tokio::test]
+async fn registry_accepts_and_runs_branch_local_seeded_loop_without_parent_seed() {
+    let candidate = branch_seeded_loop_candidate();
+    assert!(
+        candidate
+            .signature()
+            .requires_outputs()
+            .iter()
+            .all(|access| access.type_id != TypeId::of::<Progress>()),
+        "a producer earlier in the selected branch satisfies its nested loop"
+    );
+
+    let contract = branch_seeded_loop_contract();
+    let mut registry = SubgraphRegistry::new(contract.clone());
+    registry
+        .register("episode", candidate)
+        .expect("a self-seeded nested loop should satisfy the slot contract");
+
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("episode"),
+        DynamicSlot::new(contract, ContextPolicy::shared()),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new().with(registry);
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the candidate supplies its own loop seed");
+
+    assert_eq!(
+        result.output::<Progress>().map(|progress| progress.round),
+        Some(1)
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Validation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1024,21 +1204,21 @@ fn validate_resources_accepts_required_output_produced_upstream() {
 }
 
 #[test]
-fn validate_resources_accepts_dynamic_required_output_from_hook_provider() {
-    // Dynamic `requires_outputs` is satisfied by the same hook-provided output
-    // set that ordinary `Out<T>` validation consults.
+fn validate_resources_rejects_hook_resource_for_dynamic_required_output() {
+    // Provider hooks insert resources, while `requires_outputs` describes the
+    // separate output channel. Matching type IDs cannot bridge that boundary.
     let mut graph = Graph::new();
     graph.add_dynamic_registry(
         "route",
         |_ctx| Arc::from("slot"),
         DynamicSlot::new(
-            GraphSignature::new().require_output::<HookProvidedOutput>(),
+            GraphSignature::new().require_output::<HookProvidedResource>(),
             ContextPolicy::shared(),
         ),
     );
 
     let ctx = SystemContext::new().with(SubgraphRegistry::new(
-        GraphSignature::new().require_output::<HookProvidedOutput>(),
+        GraphSignature::new().require_output::<HookProvidedResource>(),
     ));
     assert!(
         GraphExecutor::new()
@@ -1049,17 +1229,25 @@ fn validate_resources_accepts_dynamic_required_output_from_hook_provider() {
 
     let hooks = HooksAPI::new();
     hooks
-        .register_provider::<OnGraphStart, HookProvidedOutput, _>(
-            "provide_dynamic_output",
-            |_event| Some(HookProvidedOutput),
+        .register_provider::<OnGraphStart, HookProvidedResource, _>(
+            "provide_dynamic_resource",
+            |_event| Some(HookProvidedResource),
         )
         .expect("hook registration should succeed");
 
+    let errors = GraphExecutor::new()
+        .validate_resources(&graph, &ctx, Some(&hooks))
+        .expect_err("a hook-provided resource cannot satisfy a dynamic output contract");
     assert!(
-        GraphExecutor::new()
-            .validate_resources(&graph, &ctx, Some(&hooks))
-            .is_ok(),
-        "hook-provided output should satisfy the dynamic slot's required output"
+        errors.iter().any(|err| matches!(
+            err,
+            ResourceValidationError::DynamicContractMissingOutput {
+                node_name: "route",
+                output,
+                ..
+            } if output.contains("HookProvidedResource")
+        )),
+        "expected DynamicContractMissingOutput, got: {errors:?}"
     );
 }
 

@@ -1,0 +1,13 @@
+error: #[tool] methods must take `&self`, not `&mut self`; toolset wraps self in Arc which only provides shared references
+ --> tests/compile_fail/toolset_method_mut_self.rs:9:25
+  |
+9 |     async fn bad_method(&mut self, name: String) -> Result<String, ToolError> {
+  |                         ^^^^^^^^^
+
+warning: unused imports: `ToolError` and `tool`
+ --> tests/compile_fail/toolset_method_mut_self.rs:1:21
+  |
+1 | use polaris_tools::{tool, toolset, ToolError};
+  |                     ^^^^           ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

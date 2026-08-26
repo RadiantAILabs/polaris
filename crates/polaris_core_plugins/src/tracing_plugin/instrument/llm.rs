@@ -448,6 +448,7 @@ impl StreamOutputAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::set_default_and_rebuild;
     use parking_lot::Mutex;
     use polaris_models::llm::{StopReason, Usage};
     use std::collections::{HashMap, VecDeque};
@@ -538,6 +539,12 @@ mod tests {
 
     /// Runs `f` with a `CaptureLayer` installed as the default subscriber and
     /// returns the captured span fields.
+    ///
+    /// Installs through [`set_default_and_rebuild`] rather than
+    /// [`tracing::subscriber::with_default`]: these spans are opened by other
+    /// tests in this binary that install no subscriber, and the first such hit
+    /// caches the callsite's interest as `never` process-wide. Rebuilding after
+    /// the install re-evaluates it against this subscriber.
     fn capture_span_fields<F>(f: F) -> HashMap<String, String>
     where
         F: FnOnce(),
@@ -546,7 +553,10 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(CaptureLayer {
             fields: StdArc::clone(&fields),
         });
-        tracing::subscriber::with_default(subscriber, f);
+        {
+            let _guard = set_default_and_rebuild(subscriber);
+            f();
+        }
         let guard = fields.lock();
         guard.clone()
     }

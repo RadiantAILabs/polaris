@@ -1,0 +1,6 @@
+error: system functions cannot have a `where` clause; the generated system struct is not generic
+  --> tests/compile_fail/where_clause_system.rs:9:1
+   |
+ 9 | / where
+10 | |     i32: Copy,
+   | |______________^

@@ -1,0 +1,5 @@
+error: unsupported #[tool] option; expected `strict = <bool>`
+ --> tests/compile_fail/tool_unknown_option.rs:3:8
+  |
+3 | #[tool(unknown = true)]
+  |        ^^^^^^^

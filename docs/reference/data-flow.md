@@ -24,7 +24,7 @@ Polaris systems declare their dependencies as typed parameters, and the framewor
 
 A system's return type is inserted into the context's output store under its concrete type. The *next* system declaring `Out<T>` reads it by type. This is the primary data pipeline within a graph.
 
-- **Lifetime:** current scope only. Parallel branches see only their own parent's outputs; loops overwrite each iteration.
+- **Lifetime:** current scope only. Unlike `Res<T>`, outputs never walk the parent chain: a parallel branch starts with an *empty* output store, so it cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a local resource on the parent context: update the resource before the fork with `ResMut<T>`, then read it in each branch with `Res<T>`. Branch outputs merge back into the parent only after all branches complete successfully, in declaration order. At run time, two branches producing the same `T` collapse to the last one. Loops overwrite each iteration.
 - **Resolution:** by `TypeId`. Two systems that return the same `T` in a linear chain mean the second overwrites the first.
 - **Use when:** the value is produced by one step and consumed by the next.
 
@@ -86,7 +86,7 @@ async fn add_issue(prev: Out<IssueList>) -> IssueList {
 }
 ```
 
-In a loop, each iteration's output replaces the previous one, but the systems read/write cost grows linearly. This is also broken when the accumulator spans parallel branches (each branch sees only its parent's output).
+In a loop, each iteration's output replaces the previous one, but the systems read/write cost grows linearly. This is also broken when the accumulator spans parallel branches: each branch starts with an empty output store, so it cannot read the accumulator at all, and same-type branch outputs collapse to the last branch at merge time. Keep the accumulator as a local resource on the parent context so systems before the fork can update it with `ResMut<IssueList>` and branches can read it through the parent chain with `Res<IssueList>`.
 
 **Fix:** `ResMut<IssueList>` is correct for accumulated state. Outputs are for point-to-point handoff, not shared buffers.
 

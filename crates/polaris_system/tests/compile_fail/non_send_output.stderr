@@ -1,0 +1,27 @@
+error[E0277]: `Rc<String>` cannot be shared between threads safely
+ --> tests/compile_fail/non_send_output.rs:5:31
+  |
+5 | async fn non_send_system() -> Rc<String> {
+  |                               ^^^^^^^^^^ `Rc<String>` cannot be shared between threads safely
+  |
+  = help: the trait `Sync` is not implemented for `Rc<String>`
+  = note: required for `<NonSendSystemSystem as polaris_system::system::System>::Output` to implement `polaris_system::resource::Output`
+note: required by a bound in `polaris_system::system::System::Output`
+ --> src/system/mod.rs
+  |
+  |     type Output: Output;
+  |                  ^^^^^^ required by this bound in `System::Output`
+
+error[E0277]: `Rc<String>` cannot be sent between threads safely
+ --> tests/compile_fail/non_send_output.rs:5:31
+  |
+5 | async fn non_send_system() -> Rc<String> {
+  |                               ^^^^^^^^^^ `Rc<String>` cannot be sent between threads safely
+  |
+  = help: the trait `Send` is not implemented for `Rc<String>`
+  = note: required for `<NonSendSystemSystem as polaris_system::system::System>::Output` to implement `polaris_system::resource::Output`
+note: required by a bound in `polaris_system::system::System::Output`
+ --> src/system/mod.rs
+  |
+  |     type Output: Output;
+  |                  ^^^^^^ required by this bound in `System::Output`

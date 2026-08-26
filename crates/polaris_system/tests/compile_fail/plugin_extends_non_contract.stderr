@@ -1,0 +1,35 @@
+error[E0277]: the trait bound `NotACapability: Contract` is not satisfied
+  --> tests/compile_fail/plugin_extends_non_contract.rs:12:1
+   |
+12 | #[plugin(id = "test::bad_extender", version = "0.1.0")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Contract` is not implemented for `NotACapability`
+  --> tests/compile_fail/plugin_extends_non_contract.rs:8:1
+   |
+ 8 | struct NotACapability;
+   | ^^^^^^^^^^^^^^^^^^^^^
+help: the trait `BuildParam` is implemented for `Extends<'_, T>`
+  --> src/plugin/build_param.rs
+   |
+   | impl<T: Resource + Contract> BuildParam for Extends<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `Extends<'_, NotACapability>` to implement `BuildParam`
+   = note: this error originates in the attribute macro `plugin` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `NotACapability: Contract` is not satisfied
+  --> tests/compile_fail/plugin_extends_non_contract.rs:14:27
+   |
+14 |     fn build(&self, _cap: Extends<NotACapability>) {}
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Contract` is not implemented for `NotACapability`
+  --> tests/compile_fail/plugin_extends_non_contract.rs:8:1
+   |
+ 8 | struct NotACapability;
+   | ^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `Extends`
+  --> src/plugin/build_param.rs
+   |
+   | pub struct Extends<'w, T: Resource + Contract> {
+   |                                      ^^^^^^^^ required by this bound in `Extends`

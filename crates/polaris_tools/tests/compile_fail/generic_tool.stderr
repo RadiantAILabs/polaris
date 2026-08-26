@@ -1,0 +1,13 @@
+error: #[tool] does not support generic parameters
+ --> tests/compile_fail/generic_tool.rs:5:22
+  |
+5 | async fn generic_tool<T: ToString>(name: T) -> Result<String, ToolError> {
+  |                      ^^^^^^^^^^^^^
+
+warning: unused import: `ToolError`
+ --> tests/compile_fail/generic_tool.rs:1:27
+  |
+1 | use polaris_tools::{tool, ToolError};
+  |                           ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

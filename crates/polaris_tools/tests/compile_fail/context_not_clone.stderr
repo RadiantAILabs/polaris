@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `NotClone: Clone` is not satisfied
+ --> tests/compile_fail/context_not_clone.rs:6:1
+  |
+6 | #[tool]
+  | ^^^^^^^ the trait `Clone` is not implemented for `NotClone`
+  |
+note: required by a bound in `Option::<&T>::cloned`
+ --> $RUST/core/src/option.rs
+  |
+  |     pub fn cloned(self) -> Option<T>
+  |            ------ required by a bound in this associated function
+  |     where
+  |         T: Clone,
+  |            ^^^^^ required by this bound in `Option::<&T>::cloned`
+  = note: this error originates in the attribute macro `tool` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `NotClone` with `#[derive(Clone)]`
+  |
+4 + #[derive(Clone)]
+5 | struct NotClone(String);
+  |

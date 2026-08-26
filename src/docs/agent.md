@@ -62,14 +62,18 @@ pub trait Agent: Send + Sync + 'static {
 # struct LlmResponse;
 # impl LlmResponse { fn has_tool_calls(&self) -> bool { false } }
 # async fn receive_user_input() {}
+# async fn init_loop() -> ReactState { ReactState { is_complete: false } }
 # async fn act() -> LlmResponse { LlmResponse }
-# async fn execute_tools() {}
-# async fn finalize() {}
+# async fn execute_tools() -> ReactState { ReactState { is_complete: false } }
+# async fn finalize() -> ReactState { ReactState { is_complete: true } }
 struct ReActAgent;
 
 impl Agent for ReActAgent {
     fn build(&self, graph: &mut Graph) {
         graph.add_system(receive_user_input);
+        // Produces the ReactState the loop's first termination check reads:
+        // the predicate runs before the body, so the input must exist on entry.
+        graph.add_system(init_loop);
         graph.add_loop::<ReactState, _, _>(
             "react_loop",
             |state| state.is_complete,

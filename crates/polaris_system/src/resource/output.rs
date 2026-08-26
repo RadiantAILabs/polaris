@@ -114,19 +114,39 @@ impl Outputs {
     /// Inserts a system output.
     ///
     /// Called by the executor after a system returns a value.
-    /// If an output of this type already exists, it is replaced.
+    /// If an output of this type already exists, it is replaced and returned.
+    ///
+    /// The displaced value is returned as `Some(T)`. `None` also comes back in
+    /// the pathological case where the occupying entry was stored under this
+    /// type ID but holds a different type — a violation of the
+    /// [`insert_boxed`](Self::insert_boxed) contract, in which case the
+    /// displaced value is dropped rather than returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when the displaced entry holds a type other than
+    /// `T`, reporting the contract violation at the write instead of leaving it
+    /// to be inferred from a `None` that means something else. The check is a
+    /// `debug_assert!`: release builds drop the value and return `None`.
     pub fn insert<T: Output>(&mut self, value: T) -> Option<T> {
         let id = OutputId::of::<T>();
         let entry = OutputEntry::new(value);
         self.last_type_id = Some(id);
 
-        self.storage.insert(id, entry).and_then(|old| {
-            old.data
-                .into_inner()
-                .downcast::<T>()
-                .ok()
-                .map(|boxed| *boxed)
-        })
+        let displaced = self
+            .storage
+            .insert(id, entry)?
+            .data
+            .into_inner()
+            .downcast::<T>();
+        debug_assert!(
+            displaced.is_ok(),
+            "output slot for `{}` held a different type — an earlier \
+             `insert_boxed` violated its type-correctness contract, and the \
+             displaced value is dropped rather than returned",
+            type_name::<T>()
+        );
+        displaced.ok().map(|boxed| *boxed)
     }
 
     /// Inserts a type-erased system output.
@@ -135,14 +155,21 @@ impl Outputs {
     /// is not known at compile time. The `type_id` must match the correct type
     /// of the boxed value.
     ///
-    /// If an output with this type ID already exists, it is replaced.
-    pub fn insert_boxed(&mut self, type_id: TypeId, value: Box<dyn Any + Send + Sync>) {
+    /// If an output with this type ID already exists, it is replaced and the
+    /// displaced value is returned still boxed.
+    pub fn insert_boxed(
+        &mut self,
+        type_id: TypeId,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
         let id = OutputId(type_id);
         let entry = OutputEntry {
             data: RwLock::new(value),
         };
         self.last_type_id = Some(id);
-        self.storage.insert(id, entry);
+        self.storage
+            .insert(id, entry)
+            .map(|old| old.data.into_inner())
     }
 
     /// Returns `true` if an output of type `T` exists.
@@ -218,6 +245,12 @@ impl Outputs {
     /// Consumes `other`, moving all entries into `self`.
     /// If both containers have an output of the same type, the entry
     /// from `other` overwrites the one in `self`.
+    ///
+    /// This is the one write that is deliberately *not* observable: unlike the
+    /// [`insert`](Self::insert) family, a bulk merge reports nothing about what
+    /// it displaced. Merging is the parallel-branch join, where overwriting is
+    /// the defined outcome of the join rather than an accident worth signalling,
+    /// and a per-type report would have no single caller to return it to.
     pub fn merge_from(&mut self, other: Outputs) {
         if let Some(id) = other.last_type_id {
             self.last_type_id = Some(id);
@@ -294,6 +327,55 @@ mod tests {
         assert_eq!(result.action, "second");
     }
 
+    /// Builds the one state where `insert` returns a `None` that does not mean
+    /// "nothing was displaced": a slot keyed by `ReasoningResult`'s type ID
+    /// holding a `ToolResult`. Only reachable by violating `insert_boxed`'s
+    /// type-correctness contract, which is why the typed write asserts on it in
+    /// debug builds. Mirrors `Resources::insert`, which documents and enforces
+    /// the same rule.
+    fn mismatched_occupant() -> Outputs {
+        let mut outputs = Outputs::new();
+        let boxed: Box<dyn Any + Send + Sync> = Box::new(ToolResult { value: 7 });
+        assert!(
+            outputs
+                .insert_boxed(TypeId::of::<ReasoningResult>(), boxed)
+                .is_none()
+        );
+        outputs
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn insert_drops_a_mismatched_occupant_and_reports_nothing_displaced() {
+        let mut outputs = mismatched_occupant();
+
+        // The typed write cannot downcast the occupant, so it drops it and
+        // returns `None` — a `None` that does not mean "nothing was displaced".
+        assert!(
+            outputs
+                .insert(ReasoningResult {
+                    action: "replacement".into(),
+                })
+                .is_none(),
+            "a mismatched occupant is dropped rather than returned"
+        );
+
+        assert_eq!(
+            outputs.get::<ReasoningResult>().unwrap().action,
+            "replacement"
+        );
+        assert_eq!(outputs.len(), 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "output slot for")]
+    fn insert_asserts_in_debug_when_the_occupant_is_a_different_type() {
+        let _ = mismatched_occupant().insert(ReasoningResult {
+            action: "replacement".into(),
+        });
+    }
+
     #[test]
     fn multiple_output_types() {
         let mut outputs = Outputs::new();
@@ -363,7 +445,7 @@ mod tests {
         let boxed: Box<dyn Any + Send + Sync> = Box::new(ReasoningResult {
             action: "boxed".into(),
         });
-        outputs.insert_boxed(type_id, boxed);
+        assert!(outputs.insert_boxed(type_id, boxed).is_none());
 
         // Should be retrievable via normal get
         assert!(outputs.contains::<ReasoningResult>());
@@ -420,7 +502,13 @@ mod tests {
         let boxed: Box<dyn Any + Send + Sync> = Box::new(ReasoningResult {
             action: "second".into(),
         });
-        outputs.insert_boxed(type_id, boxed);
+        let displaced = outputs
+            .insert_boxed(type_id, boxed)
+            .expect("replacing an occupied slot returns its previous occupant");
+        assert_eq!(
+            displaced.downcast::<ReasoningResult>().unwrap().action,
+            "first"
+        );
 
         // Should have the new value
         let result = outputs.get::<ReasoningResult>().unwrap();

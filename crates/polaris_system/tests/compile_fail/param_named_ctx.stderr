@@ -1,0 +1,13 @@
+error: parameter name `ctx` collides with the context binding the generated system body uses; rename the parameter
+  --> tests/compile_fail/param_named_ctx.rs:18:26
+   |
+18 | async fn shadows_context(ctx: Res<Counter>) {
+   |                          ^^^
+
+warning: unused import: `polaris_system::param::Res`
+ --> tests/compile_fail/param_named_ctx.rs:6:5
+  |
+6 | use polaris_system::param::Res;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

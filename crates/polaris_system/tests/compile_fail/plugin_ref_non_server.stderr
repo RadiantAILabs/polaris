@@ -1,0 +1,36 @@
+error[E0277]: the trait bound `&Config: BuildParam` is not satisfied
+  --> tests/compile_fail/plugin_ref_non_server.rs:15:27
+   |
+15 |     fn build(&self, _cfg: &Config) {}
+   |                           ^^^^^^^ the trait `BuildParam` is not implemented for `&Config`
+   |
+help: the following other types implement trait `BuildParam`
+  --> src/plugin/build_param.rs
+   |
+   | impl<T: Resource + Contract> BuildParam for Requires<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Requires<'_, T>`
+...
+   | impl<T: Resource + Contract> BuildParam for Extends<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Extends<'_, T>`
+...
+   | impl<T: Resource + Contract> BuildParam for Optional<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Optional<'_, T>`
+
+error[E0277]: the trait bound `&Config: BuildParam` is not satisfied
+  --> tests/compile_fail/plugin_ref_non_server.rs:13:1
+   |
+13 | #[plugin(id = "test::bad_plugin", version = "0.1.0")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `BuildParam` is not implemented for `&Config`
+   |
+help: the following other types implement trait `BuildParam`
+  --> src/plugin/build_param.rs
+   |
+   | impl<T: Resource + Contract> BuildParam for Requires<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Requires<'_, T>`
+...
+   | impl<T: Resource + Contract> BuildParam for Extends<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Extends<'_, T>`
+...
+   | impl<T: Resource + Contract> BuildParam for Optional<'_, T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Optional<'_, T>`
+   = note: this error originates in the attribute macro `plugin` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -25,7 +25,36 @@ The first node added becomes the graph's entry point. Each subsequent call to th
 
 Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches; loop nodes have a body and termination condition or iteration limit; and dynamic nodes have a non-empty, key-unique inline candidate set whose every candidate is structurally valid, flat (no nested `Scope`/`Dynamic` boundary), and signature-compatible with the slot contract. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body and warning about conflicting output types in parallel branches.
 
-A separate runtime validation pass, `executor.validate_resources()`, checks that all `Res<T>`, `ResMut<T>`, and `Out<T>` parameters can be satisfied before execution begins. Output reachability is validated along the linear (sequential) chain — each system's `Out<T>` dependencies are checked against outputs produced by preceding systems. Non-system nodes contribute all output types reachable from their subgraphs. See [Execution Context — Resource Validation](context.md#resource-validation) for details.
+A separate runtime validation pass, `executor.validate_resources()`, checks that all `Res<T>`, `ResMut<T>`, and `Out<T>` parameters can be satisfied before execution begins. Output reachability is validated along the linear (sequential) chain — each system's `Out<T>` dependencies are checked against outputs produced by preceding systems, as is each loop's termination predicate input (evaluated before the first iteration, so the loop body cannot satisfy it). Non-system nodes contribute all output types reachable from their subgraphs. See [Execution Context — Resource Validation](context.md#resource-validation) for details. Independently of this opt-in pass, the executor always verifies loop predicate inputs at run start — see [Loop](#loop).
+
+Both passes are instances of the phase rules that govern every check in this layer, defined next.
+
+## Verification Phases
+
+Layer 2 recognizes five verification phases. Knowledge grows monotonically across them — types, then structure, then interfaces, then the live context, then the paths actually taken. Every check the graph layer performs belongs to exactly one phase and is bound by the rules below; a check that cannot satisfy its phase's rules must move to a later phase.
+
+| Phase | When | Knowledge available |
+|-------|------|---------------------|
+| **1 — Rust compile time** | `cargo build` | Types, ownership, trait bounds |
+| **2 — Graph validate time** | `graph.validate()`, plus errors raised eagerly by builder calls | The graph's own structure — nothing outside it |
+| **3 — Composition time** | Signature matching: `validate()` for inline dynamic candidates, `SubgraphRegistry::register` for registry candidates (see [Dynamic](#dynamic)) | Both fragments' interfaces (`GraphSignature`) |
+| **4 — Run start** | `execute()` before the first node — after `OnGraphStart` hooks and graph-execution middleware run — and again at each embedded scope/dynamic boundary | Full graph plus live context contents; **not** path choices |
+| **5 — Execution time** | Node dispatch onward | Everything, exactly |
+
+### Phase Rules
+
+These rules are binding on every current and future Layer 2 check:
+
+1. **No false positives, at any phase.** A check MUST NOT reject a graph that could still execute successfully given facts a later phase would reveal. A rejection is legitimate only when failure is certain on every possible path.
+2. **Catch at the earliest sound phase.** Every invariant MUST be enforced at the earliest phase where Rule 1 holds for it, and MUST NOT be deferred to a later one. Prefer phase 1 whenever the invariant is expressible in the type system.
+3. **Validate time sees only the fragment.** A phase-2 check MUST depend only on the graph's own structure — never on context contents, hooks, or the embedding graph. A graph is a fragment that can be embedded anywhere, so an environment-dependent rejection here violates Rule 1 by construction.
+4. **Interfaces never under-claim.** Signature derivation MUST be pessimistic: a requirement may be omitted from `requires_outputs` only when production is guaranteed on every path. Over-claiming is sound (a composability tax, to be narrowed over time); under-claiming admits candidates that fail at runtime and is forbidden.
+5. **Run start rejects only impossibility.** A phase-4 check MUST be optimistic: it may reject only what cannot succeed on *any* path, crediting every possible producer and everything already in the context. It is a fail-fast courtesy, never the guarantee — the authoritative check remains at execution time. The loop entry check ([Loop](#loop)) is the model instance.
+6. **A check MUST NOT borrow another phase's crediting model.** Pessimistic interface analysis (phase 3) and optimistic run-start analysis (phase 4) answer different questions — "what does this fragment need from its surroundings?" versus "can this run possibly satisfy this need?" — and are documented as a deliberate split in `signature.rs`. Applying the pessimistic model at phase 4 falsely rejects runnable graphs; applying the optimistic model at phase 3 under-claims interfaces. Both violate the rules above.
+7. **An advisory pass MUST NOT contradict the mandatory check it predicts.** Whatever an opt-in pass admits, the corresponding mandatory check MUST also admit. Concretely: `validate_resources` is phase-4 analysis performed ahead of time and credits no more than the mandatory run-start entry check does, so pre-flight success is never followed by a run-start refusal from the same analysis.
+8. **Execution-time failures MUST be typed and routed, never panics.** Anticipated failures route through the graph's own error flow ([Error Handling](#error-handling)); infrastructure failures propagate as typed `ExecutionError` values through the normal failure path, firing `OnGraphFailure`, and leave the process running.
+
+To place a new check, ask what it needs to know. If the answer includes "who embeds this graph," it belongs no earlier than phase 3. If it includes "what the caller seeded," no earlier than phase 4. If it includes "which branch was taken," it belongs at phase 5, expressed as a typed error.
 
 ## Adding System Nodes
 
@@ -111,9 +140,11 @@ graph
 
 ### Parallel Execution
 
-A parallel node forks execution across multiple subgraphs. Each branch receives its own child context. Branches run concurrently — if any branch fails, the remaining branches are cancelled and the error propagates.
+A parallel node forks execution across multiple subgraphs. Each branch receives its own child context and runs concurrently. If any branch fails, the remaining branches are cancelled, the error propagates, and no branch outputs reach the parent. The child context inherits resource reads through the parent chain but starts with an **empty output store**, so a branch cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a resource on the parent context and read them in each branch with `Res<T>`.
 
-The parallel node is both the entry and exit point. Once all branches complete and their outputs are merged, execution continues from the parallel node's outgoing sequential edge.
+The parallel node is both the entry and exit point. Once all branches complete successfully, every branch's outputs are merged in declaration order and execution continues from the parallel node's outgoing sequential edge. This includes outputs produced behind a nested scope boundary, outputs declared by a nested dynamic node's contract, and outputs from a handler path. At run time, two or more branches producing the same output type collapse to the last one.
+
+`validate()` reports `ValidationWarning::ConflictingParallelOutputs`, not an error, when it finds the same type from reachable `System` nodes in multiple branches. This check does not cover outputs hidden behind a nested scope, a dynamic node's contract, or a handler path. Validation also does not catch a branch `Out<T>` read that appears satisfied only by an output above the parallel node: signature derivation credits the parent chain to the branch region, but the branch's empty output store makes the read fail at run time with `ParamError::OutputNotFound`.
 
 ```rust
 graph
@@ -127,25 +158,37 @@ graph
 
 ### Loop
 
-A loop node repeats its body subgraph until a termination predicate returns true or an iteration limit is reached. The termination predicate is evaluated before each iteration. The context persists across iterations, so outputs from iteration N are available to iteration N+1.
+A loop node repeats its body subgraph until a termination predicate returns true or an iteration limit is reached. The termination predicate is evaluated before each iteration — including the *first*, which happens before the body has ever run. The context persists across iterations, so outputs from iteration N are available to iteration N+1.
+
+Because the first check precedes the body, the predicate's input type must already exist when the loop is reached: either an earlier node in the graph produces it, or a caller driving the graph directly pre-seeds it into the context with `SystemContext::insert_output` before executing. Earlier production may come from a preceding system, a parallel fan-out, a scope whose outputs merge back, or a dynamic node's contract `produces`. These sources still count when nested inside a control-flow branch. Outputs are the work products of systems: only system execution (and its merge-back across boundaries) is a sanctioned writer of the output channel — hooks and middleware receive context access for resources and observability, and writing outputs from them is unsupported.
+
+How conditional production is credited depends on the verification phase:
+
+- **Composition signatures are pessimistic.** A decision or switch branch has not been selected, so branch production is not guaranteed and cannot remove the predicate input from `requires_outputs`. A subgraph that begins with a loop therefore advertises the seed, and slot contracts must supply it (see [Dynamic](#dynamic)).
+- **Pre-flight and run-start checks are optimistic.** Before path selection, they credit every branch that could produce the input — including production behind nested scopes, dynamic contracts, loop bodies, and parallel branches. They may reject only when no path can produce the input and the live context lacks it.
+- **Execution is exact.** Once a decision or switch has selected a branch, a genuinely absent input surfaces as `PredicateError::OutputNotFound` when the loop is reached. Loops inside branch interiors likewise remain execution-time checks.
+
+If no earlier node can possibly produce the input and the context lacks it, the executor fails before running the first node with `ExecutionError::LoopPredicateInputMissingOnEntry`, naming the loop and missing type. The run-start check is a fail-fast courtesy, not the guarantee.
 
 ```rust
-graph.add_loop::<LoopState, _, _>(
-    "react_loop",
-    |state| state.is_done || state.iterations >= 10,
-    |g| {
-        g.add_system(reason)
-         .add_system(act)
-         .add_system(observe);
-    },
-);
+graph
+    .add_system(init_state) // produces LoopState: the first predicate check reads it
+    .add_loop::<LoopState, _, _>(
+        "react_loop",
+        |state| state.is_done || state.iterations >= 10,
+        |g| {
+            g.add_system(reason)
+             .add_system(act)
+             .add_system(observe);
+        },
+    );
 ```
 
 For loops that should run a fixed number of times without a predicate, `add_loop_n` accepts only an iteration count.
 
 ### Scope
 
-A scope node executes an embedded graph with a configurable context boundary. A `ContextPolicy` is constructed upfront and passed to `add_scope`; it determines which resources cross from parent to child and how each one crosses.
+A scope node executes an embedded graph with a configurable context boundary. A `ContextPolicy` is constructed upfront and passed to `add_scope`; it determines which resources cross from parent to child and how each one crosses. It does not filter outputs flowing back to the parent.
 
 Two constructors anchor the surface:
 
@@ -187,7 +230,7 @@ graph.add_scope("scope", inner_graph, policy);
 
 At runtime the executor branches on the policy: `shared()` reuses the parent context; every other policy creates a child via `ctx.child_filtered(...)` so chain-reads only expose explicitly-shared types. A `share` verb (including `share_rest()`) widens that filter; pure-isolation policies (only `forward` / `fork` / `forward_fresh`) use an empty `AllowOnly` filter — the child still sees globals through the retained parent reference, but no parent local is readable. The reference is kept (rather than dropped) so a blocked read can report `ResourceOutOfScope` naming the verb that would expose it.
 
-After the inner graph completes, child outputs are merged back into the parent context. See [Execution Context — Context Flow](context.md#context-flow-through-graph-execution) for details.
+After the inner graph completes, child outputs are merged back into the parent context regardless of policy. With `shared()` they were written into that context directly; every non-shared policy merges the child's output channel on exit. The policy controls resource ingress, not output egress. See [Execution Context — Context Flow](context.md#context-flow-through-graph-execution) for details.
 
 ### Dynamic
 
@@ -523,6 +566,7 @@ Both errors and timeouts count as failed attempts. After all retries are exhaust
 | `PredicateError(PredicateError)` | Predicate evaluation failed |
 | `MaxIterationsExceeded { node, max }` | Loop exceeded iteration limit |
 | `NoTerminationCondition(NodeId)` | Loop has neither predicate nor `max_iterations` |
+| `LoopPredicateInputMissingOnEntry { node, name, output_type }` | Main-chain loop's termination predicate input is neither producible by any earlier node nor present in the context at run start (see [Loop](#loop)) |
 | `Timeout { node, timeout }` | System execution exceeded timeout |
 | `GraphTimeout { elapsed, max }` | Total graph execution exceeded `max_duration` |
 | `RecursionLimitExceeded { depth, max }` | Nested control flow too deep (default: 64) |

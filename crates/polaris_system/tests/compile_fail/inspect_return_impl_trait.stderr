@@ -1,0 +1,16 @@
+error[E0658]: `impl Trait` in associated types is unstable
+ --> tests/compile_fail/inspect_return_impl_trait.rs:8:29
+  |
+8 | async fn opaque_return() -> impl std::fmt::Debug {
+  |                             ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: see issue #63063 <https://github.com/rust-lang/rust/issues/63063> for more information
+
+error[E0562]: `impl Trait` is not allowed in the type of variable bindings
+ --> tests/compile_fail/inspect_return_impl_trait.rs:8:29
+  |
+8 | async fn opaque_return() -> impl std::fmt::Debug {
+  |                             ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `impl Trait` is only allowed in arguments and return types of functions and methods
+  = note: see issue #63065 <https://github.com/rust-lang/rust/issues/63065> for more information

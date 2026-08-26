@@ -11,8 +11,10 @@ use crate::edge::{Edge, EdgeId, SequentialEdge};
 use crate::node::{Node, NodeId, SystemNode, remap_node_id};
 pub use builder::SystemNodeBuilder;
 use hashbrown::{HashMap, HashSet};
+use signature::LoopEntryCache;
 pub use signature::{GraphSignature, RenderedSignature, SignatureDiff};
 use std::any::TypeId;
+use std::sync::RwLock;
 use std::time::Duration;
 pub use validation::{MergeError, ValidationError, ValidationResult, ValidationWarning};
 
@@ -62,6 +64,16 @@ pub struct Graph {
     /// If exceeded, returns [`ExecutionError::GraphTimeout`](crate::executor::ExecutionError::GraphTimeout).
     /// This takes precedence over the executor's own `max_duration`.
     pub(crate) max_duration: Option<Duration>,
+    /// Memoized [`unguaranteed_loop_predicate_inputs`](Graph::unguaranteed_loop_predicate_inputs)
+    /// result, so per-iteration re-entry of an embedded boundary probes only
+    /// the live context instead of re-walking the graph.
+    ///
+    /// Validity is keyed on `(node_count, edge_count)` inside the cache:
+    /// every builder mutation appends nodes or edges (in-place node edits
+    /// don't exist), so a shape change marks the entry stale and it is
+    /// recomputed. [`duplicate`](Graph::duplicate) starts the clone with an
+    /// empty cache because node IDs are remapped.
+    pub(crate) loop_entry_cache: RwLock<Option<LoopEntryCache>>,
 }
 
 impl Graph {
@@ -331,6 +343,9 @@ impl Graph {
                 .as_ref()
                 .map(|id| remap_node_id(&node_map, id)),
             max_duration: self.max_duration,
+            // The memoized loop-entry analysis names the *original* node IDs;
+            // the clone recomputes against its own.
+            loop_entry_cache: RwLock::new(None),
         }
     }
 
@@ -527,6 +542,229 @@ impl Graph {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Appends every output `TypeId` this graph *may* merge back into the
+    /// context it runs against, starting at the graph entry.
+    ///
+    /// This is the *optimistic* production set — "could any execution deposit
+    /// this type?" — used to credit a node's contribution in analyses that
+    /// must never reject a graph the runtime would execute (the run-start loop
+    /// check, output-reachability validation). It is the opposite direction
+    /// from [`Graph::signature`]'s pessimistic `requires_outputs` derivation,
+    /// which credits only *guaranteed* production. Dynamic candidates are
+    /// represented by their contract, never recursed into. Scope graphs are
+    /// traversed iteratively, so arbitrarily deep graphs do not consume the
+    /// call stack and the analysis never needs to under-credit production at
+    /// an artificial depth cap. The executor's configured recursion limit
+    /// remains the authority on whether a particular nesting can execute.
+    pub(crate) fn may_produce_output_types(&self, acc: &mut HashSet<TypeId>) {
+        let Some(entry) = self.entry() else {
+            return;
+        };
+        self.may_produce_output_types_from(&entry, acc);
+    }
+
+    /// Appends every output `TypeId` the subgraph rooted at `entry` *may*
+    /// merge back into its surrounding context.
+    ///
+    /// Unlike [`collect_branch_output_types`](Self::collect_branch_output_types),
+    /// this is an optimistic production walk: it follows error and timeout
+    /// handlers, descends through [`Scope`](Node::Scope) graphs, and credits a
+    /// [`Dynamic`](Node::Dynamic) node's contract `produces`. Use it when a
+    /// check must not reject a graph if any execution path could produce the
+    /// output. It deliberately does not replace happy-path or guaranteed-output
+    /// analyses.
+    pub(crate) fn may_produce_output_types_from(&self, entry: &NodeId, acc: &mut HashSet<TypeId>) {
+        let mut graphs = vec![(self, entry.clone())];
+        while let Some((graph, graph_entry)) = graphs.pop() {
+            for node in graph.reachable_nodes_with_handlers(&graph_entry) {
+                match node {
+                    Node::System(sys) => {
+                        acc.insert(sys.output_type_id());
+                    }
+                    Node::Scope(scope) => {
+                        if let Some(scope_entry) = scope.graph.entry() {
+                            graphs.push((&scope.graph, scope_entry));
+                        }
+                    }
+                    Node::Dynamic(dynamic) => {
+                        acc.extend(dynamic.contract().produces().iter().map(|a| a.type_id));
+                    }
+                    Node::Decision(_) | Node::Switch(_) | Node::Loop(_) | Node::Parallel(_) => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod production_walk_tests {
+    use super::*;
+    use crate::node::{ContextPolicy, DynamicSlot};
+
+    async fn out_i32() -> i32 {
+        1
+    }
+    async fn out_string() -> String {
+        "x".to_string()
+    }
+    async fn out_bool() -> bool {
+        true
+    }
+    async fn out_u8() -> u8 {
+        1
+    }
+
+    /// Wraps an `i32` producer in `depth` nested scopes.
+    fn deep_nest(depth: usize) -> Graph {
+        let mut nested = Graph::new();
+        nested.add_system(out_i32);
+        for _ in 0..depth {
+            let mut outer = Graph::new();
+            outer.add_scope("nest", nested, ContextPolicy::new());
+            nested = outer;
+        }
+        nested
+    }
+
+    #[test]
+    fn handler_subgraph_outputs_are_credited() {
+        // Handler outputs merge back on the failure path, so the optimistic
+        // set includes them alongside the main-chain output.
+        let mut graph = Graph::new();
+        graph.add_system(out_i32);
+        let src = graph.last_node().expect("producer was added");
+        graph.add_error_handler_for(src, |g| {
+            g.add_system(out_string);
+        });
+
+        let mut acc = HashSet::new();
+        graph.may_produce_output_types(&mut acc);
+
+        assert!(
+            acc.contains(&TypeId::of::<i32>()),
+            "the main-chain output is credited"
+        );
+        assert!(
+            acc.contains(&TypeId::of::<String>()),
+            "the handler subgraph's output is credited"
+        );
+    }
+
+    #[test]
+    fn nested_scope_outputs_are_credited_recursively() {
+        let mut inner = Graph::new();
+        inner.add_system(out_string);
+        let mut mid = Graph::new();
+        mid.add_scope("inner", inner, ContextPolicy::new());
+        let mut graph = Graph::new();
+        graph.add_scope("mid", mid, ContextPolicy::new());
+
+        let mut acc = HashSet::new();
+        graph.may_produce_output_types(&mut acc);
+
+        assert!(
+            acc.contains(&TypeId::of::<String>()),
+            "outputs two scope levels down are credited"
+        );
+    }
+
+    #[test]
+    fn dynamic_nodes_credit_their_contract_not_their_candidates() {
+        // The contract's `produces` is the dynamic node's interface; the walk
+        // never recurses into candidates. A candidate output absent from the
+        // contract is therefore not credited.
+        let mut candidate = Graph::new();
+        candidate.add_system(out_i32);
+
+        let mut graph = Graph::new();
+        graph.add_dynamic(
+            "route",
+            |_ctx| "only",
+            [("only", candidate)],
+            DynamicSlot::new(
+                GraphSignature::new().produce::<String>(),
+                ContextPolicy::shared(),
+            ),
+        );
+
+        let mut acc = HashSet::new();
+        graph.may_produce_output_types(&mut acc);
+
+        assert!(
+            acc.contains(&TypeId::of::<String>()),
+            "the contract's produces are credited"
+        );
+        assert!(
+            !acc.contains(&TypeId::of::<i32>()),
+            "candidate internals are represented by the contract, never recursed into"
+        );
+    }
+
+    #[test]
+    fn branch_root_walk_preserves_boundaries_and_handler_outputs() {
+        // Start below a prefix node to exercise the branch-root entry point.
+        // The nested scope contributes both its normal output and a possible
+        // handler output; the following dynamic node contributes only its
+        // declared contract.
+        let mut inner = Graph::new();
+        inner.add_system(out_i32);
+        let source = inner.last_node().expect("inner producer was added");
+        inner.add_error_handler_for(source, |g| {
+            g.add_system(out_string);
+        });
+
+        let mut candidate = Graph::new();
+        candidate.add_system(out_bool);
+
+        let mut graph = Graph::new();
+        graph.add_system(out_u8);
+        graph.add_scope("branch_scope", inner, ContextPolicy::new());
+        let branch_entry = graph.last_node().expect("scope was added");
+        graph.add_dynamic(
+            "branch_dynamic",
+            |_ctx| "only",
+            [("only", candidate)],
+            DynamicSlot::new(
+                GraphSignature::new().produce::<bool>(),
+                ContextPolicy::shared(),
+            ),
+        );
+
+        let mut acc = HashSet::new();
+        graph.may_produce_output_types_from(&branch_entry, &mut acc);
+
+        assert!(
+            acc.contains(&TypeId::of::<i32>()),
+            "scope output is credited"
+        );
+        assert!(
+            acc.contains(&TypeId::of::<String>()),
+            "nested handler output is credited"
+        );
+        assert!(
+            acc.contains(&TypeId::of::<bool>()),
+            "dynamic contract output is credited"
+        );
+        assert!(
+            !acc.contains(&TypeId::of::<u8>()),
+            "nodes preceding the branch root are excluded"
+        );
+    }
+
+    #[test]
+    fn production_walk_credits_outputs_beyond_the_default_executor_depth() {
+        // The analysis is iterative and independent of any particular
+        // executor configuration. A custom executor may legitimately raise
+        // its recursion limit above the default 64, so production beyond that
+        // depth must remain visible to the mandatory run-start check.
+        let mut acc = HashSet::new();
+        deep_nest(65).may_produce_output_types(&mut acc);
+        assert!(
+            acc.contains(&TypeId::of::<i32>()),
+            "a deeply nested producer is credited without recursive analysis"
+        );
     }
 }
 

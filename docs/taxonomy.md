@@ -39,6 +39,8 @@ These primitives define *how agents are structured*. They are fixed building blo
 
 **Scope.** Layer 2 owns the `Graph` structure and builder API, node types (system, decision, switch, parallel, loop, scope, dynamic), edge types (sequential, conditional, parallel, loop-back, error, timeout), control flow primitives (`Predicate`, `Discriminator`), the `GraphExecutor`, the hook system (`HooksAPI`, `GraphEvent`, schedule markers), the middleware system (`MiddlewareAPI`, targets, `Next`), the `Agent` trait, and concrete API definitions for agent orchestration. It does not contain specific agent implementations, tool or LLM abstractions, memory backends, or I/O mechanisms.
 
+**Verification phases.** Every check Layer 2 performs is assigned to one of five phases — Rust compile time, graph validate time, composition time (signature matching), run start, execution time — and is bound by the phase rules in [graph.md — Verification Phases](./reference/graph.md#verification-phases). The rules are binding on new checks: no false positives at any phase, enforcement at the earliest sound phase, and no phase may borrow another phase's crediting model.
+
 See [graph.md](./reference/graph.md) for graph construction, execution, hooks, and middleware, and [agents.md](./reference/agents.md) for the agent trait.
 
 ## Layer 3: Plugin-Provided Abstractions

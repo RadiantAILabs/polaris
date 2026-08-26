@@ -1,0 +1,24 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/return_type_mismatch.rs:31:5
+   |
+31 | /     CounterOutput {
+32 | |         value: counter.count,
+33 | |     }
+   | |_____^ expected `i32`, found `CounterOutput`
+   |
+note: return type inferred to be `i32` here
+  --> tests/compile_fail/return_type_mismatch.rs:29:16
+   |
+29 |         return 42i32;
+   |                ^^^^^
+
+error[E0271]: expected `{async block@$DIR/tests/compile_fail/return_type_mismatch.rs:26:1: 26:10}` to be a future that resolves to `Result<CounterOutput, SystemError>`, but it resolves to `Result<i32, _>`
+  --> tests/compile_fail/return_type_mismatch.rs:26:1
+   |
+26 | #[system]
+   | ^^^^^^^^^ expected `Result<CounterOutput, SystemError>`, found `Result<i32, _>`
+   |
+   = note: expected enum `Result<CounterOutput, SystemError>`
+              found enum `Result<i32, _>`
+   = note: required for the cast from `Pin<Box<{async block@$DIR/tests/compile_fail/return_type_mismatch.rs:26:1: 26:10}>>` to `Pin<Box<(dyn Future<Output = Result<CounterOutput, SystemError>> + Send + 'a)>>`
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)

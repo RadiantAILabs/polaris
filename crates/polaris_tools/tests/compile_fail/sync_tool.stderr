@@ -1,0 +1,13 @@
+error: #[tool] requires an async function
+ --> tests/compile_fail/sync_tool.rs:5:1
+  |
+5 | fn sync_tool(name: String) -> Result<String, ToolError> {
+  | ^^
+
+warning: unused import: `ToolError`
+ --> tests/compile_fail/sync_tool.rs:1:27
+  |
+1 | use polaris_tools::{tool, ToolError};
+  |                           ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

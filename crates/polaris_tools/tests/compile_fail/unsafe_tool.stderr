@@ -1,0 +1,13 @@
+error: #[tool] cannot be applied to unsafe functions
+ --> tests/compile_fail/unsafe_tool.rs:5:7
+  |
+5 | async unsafe fn unsafe_tool(name: String) -> Result<String, ToolError> {
+  |       ^^^^^^
+
+warning: unused import: `ToolError`
+ --> tests/compile_fail/unsafe_tool.rs:1:27
+  |
+1 | use polaris_tools::{tool, ToolError};
+  |                           ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
