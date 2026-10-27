@@ -141,7 +141,8 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let model_id = "anthropic/claude-sonnet-4-6";
+    let model_id = std::env::var("POLARIS_MODEL")
+        .unwrap_or_else(|_| "anthropic/claude-sonnet-5-5".to_owned());
 
     // Build the agent registry for the info endpoint.
     // In a real app, this would be dynamic based on registered agents and their configs.
@@ -184,7 +185,7 @@ async fn main() {
     let agent_type = AgentTypeId::from_name(ReActAgent::NAME);
     sessions
         .create_session_with(server.create_context(), &session_id, &agent_type, |ctx| {
-            ctx.insert(AgentConfig::new(model_id));
+            ctx.insert(AgentConfig::new(model_id.clone()));
         })
         .unwrap();
 

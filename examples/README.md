@@ -14,7 +14,7 @@ Interactive REPL demonstrating the ReAct (Reasoning + Acting) pattern. See [agen
 
 ### Running
 
-Use Rust 1.97.0 or newer. Set `ANTHROPIC_API_KEY` in your environment (or a local `.env` file). This revision configures `anthropic/claude-sonnet-4-6` in `src/bin/cli.rs`; there is no `--model` option.
+Use Rust 1.97.0 or newer. Set `ANTHROPIC_API_KEY` in your environment (or a local `.env` file). The CLI and HTTP examples default to `anthropic/claude-sonnet-5-5`. Set `POLARIS_MODEL` to another Anthropic model identifier to override it, for example `POLARIS_MODEL=anthropic/claude-opus-5-5`. These examples register the Anthropic provider; selecting another provider also requires registering its plugin and credentials. See [Anthropic’s current model IDs](https://platform.claude.com/docs/en/models/overview). There is no `--model` option.
 
 Run the following commands from the repository root. Create the working directory first:
 

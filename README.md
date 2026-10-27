@@ -65,7 +65,7 @@ See [`examples`](examples/README.md) for a full implementation of a file assista
 
 Start with the [first working graph](https://radiantlabs.dev/docs/getting-started/your-first-agent/) or [interactive file assistant](https://radiantlabs.dev/docs/examples/react-cli/). The first graph needs no model credentials.
 
-The current main branch is **0.6.0** and requires **Rust 1.97.0+** (Edition 2024). To use the revision covered by the website examples:
+The current main branch is **0.6.0** and requires **Rust 1.97.0+** (Edition 2024). The example below pins Polaris to the exact public Git commit tested with these guides, so later framework changes do not break your first run. This pin controls the framework version, not which model you can use:
 
 ```toml
 [dependencies]
