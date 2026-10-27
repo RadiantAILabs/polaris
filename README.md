@@ -63,12 +63,19 @@ See [`examples`](examples/README.md) for a full implementation of a file assista
 
 ## Getting Started
 
+Start with the [first working graph](https://radiantlabs.dev/docs/getting-started/your-first-agent/) or [interactive file assistant](https://radiantlabs.dev/docs/examples/react-cli/). The first graph needs no model credentials.
+
+The current main branch is **0.6.0** and requires **Rust 1.97.0+** (Edition 2024). To use the revision covered by the website examples:
+
 ```toml
 [dependencies]
-polaris-ai = "0.4.1"
+polaris-ai = { git = "https://github.com/RadiantAILabs/polaris", rev = "5ff84646db63589d58bf87956976d749b8c754de" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Requires **Rust 1.97+** (Edition 2024). Run `cargo make test` for the full test suite.
+Import the crate as `polaris_ai`. Enable the `anthropic`, `openai` or `bedrock` feature for the provider you use, then register its plugin. Await `server.finish().await?` to complete plugin startup.
+
+For a crates.io release, use `cargo add polaris-ai` and follow the [API documentation for that release](https://docs.rs/polaris-ai). Published releases may differ from Git main; check their Rust requirements separately. Framework contributors can run `cargo make test` for the full suite.
 
 ## Documentation
 
