@@ -14,22 +14,30 @@ Interactive REPL demonstrating the ReAct (Reasoning + Acting) pattern. See [agen
 
 ### Running
 
-Run the following commands from the `examples/` directory:
+Use Rust 1.97.0 or newer. Set `ANTHROPIC_API_KEY` in your environment (or a local `.env` file). The CLI and HTTP examples default to `anthropic/claude-sonnet-5-5`. Set `POLARIS_MODEL` to another Anthropic model identifier to override it, for example `POLARIS_MODEL=anthropic/claude-opus-5-5`. These examples register the Anthropic provider; selecting another provider also requires registering its plugin and credentials. See [Anthropic’s current model IDs](https://platform.claude.com/docs/en/models/overview). There is no `--model` option.
+
+Run the following commands from the repository root. Create the working directory first:
 
 ```bash
-cargo run -p examples --bin cli -- <working_dir> [--session <id>] [--otel <endpoint>] [--capture-content]
+mkdir -p sandbox
+```
+
+Enable `polaris/anthropic` explicitly: the example imports this provider, but does not enable it by default.
+
+```bash
+cargo run -p examples --features polaris/anthropic --bin cli -- <working_dir> [--session <id>] [--otel <endpoint>] [--capture-content]
 
 # Example
-cargo run -p examples --bin cli -- ./sandbox
-cargo run -p examples --bin cli -- ./sandbox --session my-session
+cargo run -p examples --features polaris/anthropic --bin cli -- ./sandbox
+cargo run -p examples --features polaris/anthropic --bin cli -- ./sandbox --session my-session
 
 # With OpenTelemetry trace export
-cargo run -p examples --bin cli -- ./sandbox --otel http://localhost:4318/v1/traces
+cargo run -p examples --features polaris/anthropic,otel --bin cli -- ./sandbox --otel http://localhost:4318/v1/traces
 ```
 
 ### OpenTelemetry Tracing
 
-The `--otel <endpoint>` flag enables OpenTelemetry trace export. All LLM calls, tool executions, and graph node transitions are exported as spans.
+Enable the `otel` Cargo feature as shown below; the `--otel <endpoint>` flag then configures the export endpoint. The flag alone cannot enable tracing in a binary compiled without the feature. All LLM calls, tool executions, and graph node transitions are exported as spans.
 
 [Arize Phoenix](https://github.com/Arize-ai/phoenix) is an open-source observability tool that works well for local development:
 
@@ -41,10 +49,10 @@ pip install arize-phoenix
 phoenix serve
 
 # Run the CLI with tracing pointed at Phoenix
-cargo run -p examples --bin cli -- ./sandbox --otel "http://localhost:6006/v1/traces"
+cargo run -p examples --features polaris/anthropic,otel --bin cli -- ./sandbox --otel "http://localhost:6006/v1/traces"
 
 # Include full LLM request/response and tool call content in spans
-cargo run -p examples --bin cli -- ./sandbox --otel "http://localhost:6006/v1/traces" --capture-content
+cargo run -p examples --features polaris/anthropic,otel --bin cli -- ./sandbox --otel "http://localhost:6006/v1/traces" --capture-content
 ```
 
 Then open `http://localhost:6006` to view traces.
@@ -79,11 +87,11 @@ Serves the same ReAct agent over HTTP using `polaris_app`. Demonstrates `AppPlug
 ### Running
 
 ```bash
-cargo run -p examples --bin http -- <working_dir> [--port <port>]
+cargo run -p examples --features polaris/anthropic --bin http -- <working_dir> [--port <port>]
 
 # Example
-cargo run -p examples --bin http -- ./sandbox
-cargo run -p examples --bin http -- ./sandbox --port 8080
+cargo run -p examples --features polaris/anthropic --bin http -- ./sandbox
+cargo run -p examples --features polaris/anthropic --bin http -- ./sandbox --port 8080
 ```
 
 ### Endpoints
