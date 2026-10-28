@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-28
+
 ### Added
 
 - **Per-request output token limits: `LlmRequest::max_output_tokens` and `LlmRequestBuilder::max_output_tokens`** (`polaris_models`) — callers can cap one response before it is generated. The limit is a `NonZeroU32`, so a limit of 0 cannot be set and a serialized request carrying `"max_output_tokens": 0` fails to deserialize. Anthropic and Bedrock enforce their registration-wide ceiling, so a request can lower it but not raise it; OpenAI sends the request value as given. An unset limit preserves each provider's existing behavior. See [Model Providers — Output token limits](docs/reference/model-providers.md#output-token-limits).

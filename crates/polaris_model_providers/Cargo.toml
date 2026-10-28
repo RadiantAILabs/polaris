@@ -38,8 +38,8 @@ bedrock = [
 dashboard = ["polaris_models/dashboard"]
 
 [dependencies]
-polaris_models = { path = "../polaris_models", version = "0.6" }
-polaris_system = { path = "../polaris_system", version = "0.6" }
+polaris_models = { path = "../polaris_models", version = "0.7" }
+polaris_system = { path = "../polaris_system", version = "0.7" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.13.1", features = ["json", "stream", "blocking"] }

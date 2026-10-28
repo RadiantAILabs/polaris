@@ -15,7 +15,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.6" }
+polaris_system = { path = "../polaris_system", version = "0.7" }
 tokio = { version = "1", features = ["time"] }
 tokio-util = { version = "0.7", default-features = false }
 futures = "0.3"
