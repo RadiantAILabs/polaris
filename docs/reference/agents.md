@@ -46,6 +46,11 @@ pub trait Agent: Send + Sync + 'static {
 
 See [graph.md](./graph.md) for further details on building graphs.
 
+An agent whose `build` should accept a caller-supplied system — a configurable
+stage rather than a fixed one — takes it as a `TypedSystem<O>` parameter rather
+than a system-and-marker generic pair. See
+[System — Typed Erasure for Composition](./system.md#typed-erasure-for-composition).
+
 ## Setup
 
 `setup` receives `&self` and `&mut SystemContext`, so implementations can read configuration from the agent instance, from the context (injected by the caller's `init` closure), or both. The sessions layer calls `setup` automatically at two points:

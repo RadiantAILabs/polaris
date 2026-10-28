@@ -12,9 +12,7 @@
 //! v1 of the dashboard surface and keeps memory bounded under a busy agent
 //! type that emits one transition per turn.
 
-use crate::http::models::{
-    BucketGranularity, SessionUptimeBucket, SessionUptimeResponse, UptimeStatus,
-};
+use crate::models::{BucketGranularity, SessionUptimeBucket, SessionUptimeResponse, UptimeStatus};
 use crate::store::SessionId;
 use chrono::{DateTime, Duration, Utc};
 use hashbrown::HashMap;

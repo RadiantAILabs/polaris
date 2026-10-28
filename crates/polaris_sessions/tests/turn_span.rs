@@ -2,12 +2,14 @@
 //!
 //! `process_turn` stamps the `invoke_agent` semantics onto the turn
 //! span (agent identity, `otel.name`/`otel.kind`) and, when execution fails,
-//! records `otel.status_code` and a derived `error.type`. These tests install
-//! a thread-local capturing subscriber, drive one real turn, and assert on the
+//! records `otel.status_code` and a derived `error.type`; an interrupted turn
+//! records `error.type` but no error status. These tests install a
+//! thread-local capturing subscriber, drive one real turn, and assert on the
 //! attributes the span actually carries.
 
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::PersistencePlugin;
+use polaris_graph::cancel::RunCancellation;
 use polaris_graph::executor::ExecutionError;
 use polaris_graph::graph::Graph;
 use polaris_sessions::store::memory::InMemoryStore;
@@ -71,6 +73,40 @@ impl Agent for FailingAgent {
 
     fn name(&self) -> &'static str {
         "FailingAgent"
+    }
+}
+
+/// Tells the test the turn has entered its parking node, so the interrupt is
+/// raised against a turn that is genuinely in flight.
+#[derive(Clone, Default)]
+struct ParkGate {
+    entered: Arc<tokio::sync::Notify>,
+}
+impl LocalResource for ParkGate {}
+
+/// Parks until the run is interrupted, then returns normally.
+#[system]
+async fn park_until_interrupted(gate: Res<ParkGate>, cancel: Res<RunCancellation>) {
+    gate.entered.notify_one();
+    cancel.cancelled().await;
+}
+
+/// Gives the executor a node boundary at which to observe the interrupt: a
+/// graph that ends on the parking node finishes successfully when it returns.
+#[system]
+async fn after_park(_gate: Res<ParkGate>) {}
+
+struct ParkingAgent;
+
+impl Agent for ParkingAgent {
+    fn build(&self, graph: &mut Graph) {
+        graph
+            .add_system(park_until_interrupted)
+            .add_system(after_park);
+    }
+
+    fn name(&self) -> &'static str {
+        "ParkingAgent"
     }
 }
 
@@ -454,9 +490,8 @@ async fn turn_span_records_error_status_on_failure() {
 
     // `FailingAgent`'s `Res<MissingInput>` cannot resolve, so the turn fails with
     // `ExecutionError::SystemError`, whose `Debug` discriminant is what the span
-    // records. Assert that literal directly — deriving the expected value from
-    // `exec_err` (as an earlier revision did) merely re-runs the production code
-    // path and proves nothing.
+    // records. Assert that literal directly: deriving the expected value from
+    // `exec_err` would re-run the production code path and prove nothing.
     assert!(
         matches!(exec_err, ExecutionError::SystemError(_)),
         "missing Res<MissingInput> should surface as ExecutionError::SystemError, got {exec_err:?}"
@@ -469,5 +504,61 @@ async fn turn_span_records_error_status_on_failure() {
     assert_eq!(
         get(&fields, "gen_ai.agent.name").as_deref(),
         Some("FailingAgent")
+    );
+}
+
+/// An interrupted turn is a user exercising control, not a failure: the span
+/// leaves `otel.status_code` unset, and `error.type` still names the outcome.
+#[tokio::test(flavor = "current_thread")]
+async fn turn_span_marks_an_interrupted_turn_without_an_error_status() {
+    let fields: Fields = Arc::new(Mutex::new(HashMap::new()));
+    let subscriber = Registry::default().with(TurnSpanCapture {
+        fields: Arc::clone(&fields),
+    });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = server_with(ParkingAgent).await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    let id = SessionId::new();
+    let gate = ParkGate::default();
+    sessions
+        .create_session_with(
+            server.create_context(),
+            &id,
+            &AgentTypeId::from_name("ParkingAgent"),
+            {
+                let gate = gate.clone();
+                move |ctx| {
+                    ctx.insert(gate);
+                }
+            },
+        )
+        .unwrap();
+
+    let turn = tokio::spawn({
+        let sessions = sessions.clone();
+        let id = id.clone();
+        async move { sessions.process_turn(&id).await }
+    });
+    gate.entered.notified().await;
+    assert!(
+        sessions.interrupt_turn(&id).unwrap(),
+        "the turn was in flight"
+    );
+    let outcome = turn.await.unwrap();
+    assert!(
+        matches!(outcome, Err(SessionError::Interrupted { .. })),
+        "expected SessionError::Interrupted, got {outcome:?}"
+    );
+
+    assert_eq!(
+        get(&fields, "otel.status_code"),
+        None,
+        "a user's interrupt is not an error status"
+    );
+    assert_eq!(get(&fields, "error.type").as_deref(), Some("Interrupted"));
+    assert_eq!(
+        get(&fields, "gen_ai.agent.name").as_deref(),
+        Some("ParkingAgent")
     );
 }

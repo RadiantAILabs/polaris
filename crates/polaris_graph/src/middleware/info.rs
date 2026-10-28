@@ -5,7 +5,7 @@
 //! middleware handlers registered via [`MiddlewareAPI::register_system`](super::MiddlewareAPI::register_system).
 
 use crate::NodeId;
-use crate::node::ContextMode;
+use crate::node::{ContextMode, NodeName};
 
 /// Metadata passed to [`GraphExecution`](super::GraphExecution) middleware.
 #[derive(Debug, Clone)]
@@ -21,8 +21,10 @@ pub struct GraphInfo {
 pub struct SystemInfo {
     /// The node ID of the executing system.
     pub node_id: NodeId,
-    /// The system's name.
-    pub node_name: &'static str,
+    /// The system node's runtime display name. Defaults to the system's
+    /// static function name; overridden per-node with
+    /// [`SystemNodeBuilder::named`](crate::graph::SystemNodeBuilder::named).
+    pub node_name: NodeName,
 }
 
 /// Metadata passed to [`Loop`](super::Loop) middleware.
@@ -31,7 +33,7 @@ pub struct LoopInfo {
     /// The node ID of the loop node.
     pub node_id: NodeId,
     /// The loop's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
     /// The maximum iterations allowed.
     pub max_iterations: usize,
 }
@@ -42,7 +44,7 @@ pub struct ParallelInfo {
     /// The node ID of the parallel node.
     pub node_id: NodeId,
     /// The parallel node's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
     /// Number of branches.
     pub branch_count: usize,
 }
@@ -53,7 +55,7 @@ pub struct DecisionInfo {
     /// The node ID of the decision node.
     pub node_id: NodeId,
     /// The decision node's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
 }
 
 /// Metadata passed to [`Switch`](super::Switch) middleware.
@@ -62,7 +64,7 @@ pub struct SwitchInfo {
     /// The node ID of the switch node.
     pub node_id: NodeId,
     /// The switch node's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
     /// Number of cases in the switch.
     pub case_count: usize,
     /// Whether a default case exists.
@@ -75,7 +77,7 @@ pub struct LoopIterationInfo {
     /// The node ID of the loop node.
     pub node_id: NodeId,
     /// The loop's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
     /// Current iteration (0-indexed).
     pub iteration: usize,
     /// Maximum iterations allowed.
@@ -88,7 +90,7 @@ pub struct ParallelBranchInfo {
     /// The node ID of the parallel node.
     pub node_id: NodeId,
     /// The parallel node's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
     /// Index of this branch (0-indexed).
     pub branch_index: usize,
     /// Total number of branches.
@@ -101,7 +103,7 @@ pub struct ScopeInfo {
     /// The node ID of the scope node.
     pub node_id: NodeId,
     /// The scope node's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
     /// High-level context-boundary classification — `Shared`, `Inherit`, or
     /// `Isolated`. See [`ContextMode`] and
     /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
@@ -116,7 +118,7 @@ pub struct DynamicInfo {
     /// The node ID of the dynamic node.
     pub node_id: NodeId,
     /// The dynamic node's name.
-    pub node_name: &'static str,
+    pub node_name: NodeName,
     /// High-level context-boundary classification — `Shared`, `Inherit`, or
     /// `Isolated`. See [`ContextMode`] and
     /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).

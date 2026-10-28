@@ -20,7 +20,7 @@ use polaris_graph::node::{ContextMode, ContextPolicy, NodeId};
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::Schedule;
 use polaris_system::system;
-use polaris_system::system::SystemError;
+use polaris_system::system::{SystemError, erase};
 use std::sync::{Arc, Mutex};
 use test_utils::{
     DecisionOutput, DecisionSystem, FailingSystem, SuccessSystem, SwitchKeySystem, SwitchOutput,
@@ -166,8 +166,8 @@ async fn single_system_lifecycle() {
 
     assert_event_sequence!(log, [
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1, .. },
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "success_system", .. } if *node_id == system_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "success_system", duration, .. } if *node_id == system_id && !duration.is_zero(),
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == system_id && *node_name == "success_system",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == system_id && !duration.is_zero() && *node_name == "success_system",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 1, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -182,8 +182,8 @@ async fn failing_system_lifecycle() {
 
     assert_event_sequence!(log, [
         "OnGraphStart"    => GraphEvent::GraphStart { node_count: 1, .. },
-        "OnSystemStart"   => GraphEvent::SystemStart { node_id, node_name: "failing_system", .. } if *node_id == failing_id,
-        "OnSystemError"   => GraphEvent::SystemError { node_id, node_name: "failing_system", error, .. } if *node_id == failing_id && error.contains("intentional failure"),
+        "OnSystemStart"   => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == failing_id && *node_name == "failing_system",
+        "OnSystemError"   => GraphEvent::SystemError { node_id, node_name, error, .. } if *node_id == failing_id && error.contains("intentional failure") && *node_name == "failing_system",
         "OnGraphFailure"  => GraphEvent::GraphFailure { error, .. } if matches!(error, ExecutionError::SystemError(_)),
     ]);
 }
@@ -208,10 +208,59 @@ async fn sequential_systems() {
 
     assert_event_sequence!(log, [
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "sys_a", .. } if *node_id == sys_a_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "sys_a", duration, .. } if *node_id == sys_a_id && !duration.is_zero(),
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "sys_b", .. } if *node_id == sys_b_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "sys_b", duration, .. } if *node_id == sys_b_id && !duration.is_zero(),
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == sys_a_id && *node_name == "sys_a",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == sys_a_id && !duration.is_zero() && *node_name == "sys_a",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == sys_b_id && *node_name == "sys_b",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == sys_b_id && !duration.is_zero() && *node_name == "sys_b",
+        "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 2, duration, .. } if !duration.is_zero(),
+    ]);
+}
+
+#[tokio::test]
+async fn runtime_named_system_reports_custom_name_in_hooks() {
+    #[system]
+    async fn plain_system() -> i32 {
+        1
+    }
+
+    let mut graph = Graph::new();
+    let named_id = graph.system(plain_system).named("custom_name").id();
+    let _plain_id = graph.system(plain_system).id();
+
+    let (result, log) = execute_with_hooks(&graph).await;
+    assert!(result.is_ok());
+
+    assert_event_sequence!(log, [
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == named_id && *node_name == "custom_name",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, .. } if *node_id == named_id && *node_name == "custom_name",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_name, .. } if *node_name == "plain_system",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_name, .. } if *node_name == "plain_system",
+        "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 2, duration, .. } if !duration.is_zero(),
+    ]);
+}
+
+#[tokio::test]
+async fn two_copies_of_same_system_distinguished_by_runtime_name() {
+    #[system]
+    async fn shared_system() -> i32 {
+        1
+    }
+
+    let mut graph = Graph::new();
+    let first_id = graph.system(shared_system).named("first_copy").id();
+    let second_id = graph.system(shared_system).named("second_copy").id();
+    assert_ne!(first_id, second_id);
+
+    let (result, log) = execute_with_hooks(&graph).await;
+    assert!(result.is_ok());
+
+    assert_event_sequence!(log, [
+        "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == first_id && *node_name == "first_copy",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, .. } if *node_id == first_id && *node_name == "first_copy",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == second_id && *node_name == "second_copy",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, .. } if *node_id == second_id && *node_name == "second_copy",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 2, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -231,10 +280,10 @@ async fn error_handler_recovery() {
 
     assert_event_sequence!(log, [
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "failing_system", .. } if *node_id == failing_id,
-        "OnSystemError"     => GraphEvent::SystemError { node_id, node_name: "failing_system", error, .. } if *node_id == failing_id && error.contains("intentional failure"),
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "success_system", .. } if *node_id == handler_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "success_system", duration, .. } if *node_id == handler_id && !duration.is_zero(),
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == failing_id && *node_name == "failing_system",
+        "OnSystemError"     => GraphEvent::SystemError { node_id, node_name, error, .. } if *node_id == failing_id && error.contains("intentional failure") && *node_name == "failing_system",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == handler_id && *node_name == "success_system",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == handler_id && !duration.is_zero() && *node_name == "success_system",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 2, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -262,16 +311,16 @@ async fn decision_hooks() {
 
     assert_event_sequence!(log, [
         "OnGraphStart"        => GraphEvent::GraphStart { node_count: 4, .. },
-        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name: "decision_system", .. } if *node_id == decision_sys_id,
-        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name: "decision_system", duration, .. } if *node_id == decision_sys_id && !duration.is_zero(),
-        "OnDecisionStart"     => GraphEvent::DecisionStart { node_id, node_name: "test_decision", .. } if *node_id == decision_id,
-        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name: "success_system", .. } if *node_id == true_branch_id,
-        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name: "success_system", duration, .. } if *node_id == true_branch_id && !duration.is_zero(),
+        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == decision_sys_id && *node_name == "decision_system",
+        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == decision_sys_id && !duration.is_zero() && *node_name == "decision_system",
+        "OnDecisionStart"     => GraphEvent::DecisionStart { node_id, node_name, .. } if *node_id == decision_id && *node_name == "test_decision",
+        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == true_branch_id && *node_name == "success_system",
+        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == true_branch_id && !duration.is_zero() && *node_name == "success_system",
         "OnDecisionComplete"  => GraphEvent::DecisionComplete {
             node_id,
-            node_name: "test_decision",
+            node_name,
             selected_branch: "true", ..
-        } if *node_id == decision_id,
+        } if *node_id == decision_id && *node_name == "test_decision",
         "OnGraphComplete"     => GraphEvent::GraphComplete { nodes_executed: 3, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -298,25 +347,25 @@ async fn loop_hooks() {
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
         "OnLoopStart"       => GraphEvent::LoopStart {
             node_id,
-            node_name: "test_loop",
+            node_name,
             max_iterations: 3, ..
-        } if *node_id == loop_id,
-        "OnLoopIteration"   => GraphEvent::LoopIteration { node_id, node_name: "test_loop", iteration: 0, .. } if *node_id == loop_id,
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "loop_body", .. } if *node_id == body_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "loop_body", duration, .. } if *node_id == body_id && !duration.is_zero(),
-        "OnLoopIteration"   => GraphEvent::LoopIteration { node_id, node_name: "test_loop", iteration: 1, .. } if *node_id == loop_id,
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "loop_body", .. } if *node_id == body_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "loop_body", duration, .. } if *node_id == body_id && !duration.is_zero(),
-        "OnLoopIteration"   => GraphEvent::LoopIteration { node_id, node_name: "test_loop", iteration: 2, .. } if *node_id == loop_id,
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "loop_body", .. } if *node_id == body_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "loop_body", duration, .. } if *node_id == body_id && !duration.is_zero(),
+        } if *node_id == loop_id && *node_name == "test_loop",
+        "OnLoopIteration"   => GraphEvent::LoopIteration { node_id, node_name, iteration: 0, .. } if *node_id == loop_id && *node_name == "test_loop",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == body_id && *node_name == "loop_body",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == body_id && !duration.is_zero() && *node_name == "loop_body",
+        "OnLoopIteration"   => GraphEvent::LoopIteration { node_id, node_name, iteration: 1, .. } if *node_id == loop_id && *node_name == "test_loop",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == body_id && *node_name == "loop_body",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == body_id && !duration.is_zero() && *node_name == "loop_body",
+        "OnLoopIteration"   => GraphEvent::LoopIteration { node_id, node_name, iteration: 2, .. } if *node_id == loop_id && *node_name == "test_loop",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == body_id && *node_name == "loop_body",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == body_id && !duration.is_zero() && *node_name == "loop_body",
         "OnLoopEnd"         => GraphEvent::LoopEnd {
             node_id,
-            node_name: "test_loop",
+            node_name,
             iterations: 3,
             nodes_executed: 3,
             duration, ..
-        } if *node_id == loop_id && !duration.is_zero(),
+        } if *node_id == loop_id && !duration.is_zero() && *node_name == "test_loop",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 4, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -357,20 +406,20 @@ async fn parallel_hooks() {
         "OnGraphStart"        => GraphEvent::GraphStart { node_count: 3, .. },
         "OnParallelStart"     => GraphEvent::ParallelStart {
             node_id,
-            node_name: "test_parallel",
+            node_name,
             branch_count: 2, ..
-        } if *node_id == parallel_id,
-        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name: "branch_a", .. } if *node_id == branch_a_id,
-        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name: "branch_a", duration, .. } if *node_id == branch_a_id && !duration.is_zero(),
-        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name: "branch_b", .. } if *node_id == branch_b_id,
-        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name: "branch_b", duration, .. } if *node_id == branch_b_id && !duration.is_zero(),
+        } if *node_id == parallel_id && *node_name == "test_parallel",
+        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == branch_a_id && *node_name == "branch_a",
+        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == branch_a_id && !duration.is_zero() && *node_name == "branch_a",
+        "OnSystemStart"       => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == branch_b_id && *node_name == "branch_b",
+        "OnSystemComplete"    => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == branch_b_id && !duration.is_zero() && *node_name == "branch_b",
         "OnParallelComplete"  => GraphEvent::ParallelComplete {
             node_id,
-            node_name: "test_parallel",
+            node_name,
             branch_count: 2,
             total_nodes_executed: 2,
             duration, ..
-        } if *node_id == parallel_id && !duration.is_zero(),
+        } if *node_id == parallel_id && !duration.is_zero() && *node_name == "test_parallel",
         "OnGraphComplete"     => GraphEvent::GraphComplete { nodes_executed: 3, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -407,22 +456,22 @@ async fn switch_hooks() {
 
     assert_event_sequence!(log, [
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 4, .. },
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "switch_key_system", .. } if *node_id == switch_sys_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "switch_key_system", duration, .. } if *node_id == switch_sys_id && !duration.is_zero(),
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == switch_sys_id && *node_name == "switch_key_system",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == switch_sys_id && !duration.is_zero() && *node_name == "switch_key_system",
         "OnSwitchStart"     => GraphEvent::SwitchStart {
             node_id,
-            node_name: "test_switch",
+            node_name,
             case_count: 2,
             has_default: false, ..
-        } if *node_id == switch_id,
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "success_system", .. } if *node_id == alpha_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "success_system", duration, .. } if *node_id == alpha_id && !duration.is_zero(),
+        } if *node_id == switch_id && *node_name == "test_switch",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == alpha_id && *node_name == "success_system",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == alpha_id && !duration.is_zero() && *node_name == "success_system",
         "OnSwitchComplete"  => GraphEvent::SwitchComplete {
             node_id,
-            node_name: "test_switch",
-            selected_case: "alpha",
+            node_name,
+            selected_case,
             used_default: false, ..
-        } if *node_id == switch_id,
+        } if *node_id == switch_id && *node_name == "test_switch" && *selected_case == "alpha",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 3, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -450,12 +499,58 @@ async fn marker_fires_for_marked_system() {
     // Built-in hooks fire before markers at each lifecycle point.
     assert_event_sequence!(log, [
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1, .. },
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "success_fn", ..} if *node_id == sys_id,
-        "MarkerA"           => GraphEvent::SystemStart { node_id, node_name: "success_fn", .. } if *node_id == sys_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "success_fn", duration, .. } if *node_id == sys_id && !duration.is_zero(),
-        "MarkerA"           => GraphEvent::SystemComplete { node_id, node_name: "success_fn", duration, .. } if *node_id == sys_id && !duration.is_zero(),
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, ..} if *node_id == sys_id && *node_name == "success_fn",
+        "MarkerA"           => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == sys_id && *node_name == "success_fn",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == sys_id && !duration.is_zero() && *node_name == "success_fn",
+        "MarkerA"           => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == sys_id && !duration.is_zero() && *node_name == "success_fn",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 1, duration, .. } if !duration.is_zero(),
     ]);
+}
+
+#[tokio::test]
+async fn typed_erased_path_matches_tuple_schedule_emissions() {
+    #[system]
+    async fn success_fn() -> i32 {
+        42
+    }
+
+    let mut direct = Graph::new();
+    direct.add_system((MarkerA, success_fn));
+
+    let mut erased = Graph::new();
+    erased
+        .system_boxed(erase(success_fn))
+        .with_schedules(MarkerA)
+        .done();
+
+    assert_eq!(direct.signature(), erased.signature());
+
+    let (direct_result, direct_log) = execute_with_custom_hooks(&direct, |hooks, log| {
+        register_recording_hooks!(hooks, log, MarkerA => "MarkerA");
+    })
+    .await;
+    let (erased_result, erased_log) = execute_with_custom_hooks(&erased, |hooks, log| {
+        register_recording_hooks!(hooks, log, MarkerA => "MarkerA");
+    })
+    .await;
+
+    assert!(direct_result.is_ok());
+    assert!(erased_result.is_ok());
+
+    let direct_schedules: Vec<String> = direct_log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|record| record.schedule_name.clone())
+        .collect();
+    let erased_schedules: Vec<String> = erased_log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|record| record.schedule_name.clone())
+        .collect();
+
+    assert_eq!(direct_schedules, erased_schedules);
 }
 
 #[tokio::test]
@@ -480,12 +575,12 @@ async fn unmarked_system_does_not_fire_markers() {
     // MarkerA only fires for the second (marked) system, not the first.
     assert_event_sequence!(log, [
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 2, .. },
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "success_system", .. } if *node_id == unmarked_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "success_system", duration, .. } if *node_id == unmarked_id && !duration.is_zero(),
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "success_fn", .. } if *node_id == marked_id,
-        "MarkerA"           => GraphEvent::SystemStart { node_id, node_name: "success_fn", .. } if *node_id == marked_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "success_fn", duration, .. } if *node_id == marked_id && !duration.is_zero(),
-        "MarkerA"           => GraphEvent::SystemComplete { node_id, node_name: "success_fn", duration, .. } if *node_id == marked_id && !duration.is_zero(),
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == unmarked_id && *node_name == "success_system",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == unmarked_id && !duration.is_zero() && *node_name == "success_system",
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == marked_id && *node_name == "success_fn",
+        "MarkerA"           => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == marked_id && *node_name == "success_fn",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == marked_id && !duration.is_zero() && *node_name == "success_fn",
+        "MarkerA"           => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == marked_id && !duration.is_zero() && *node_name == "success_fn",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 2, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -509,12 +604,12 @@ async fn multiple_markers_all_fire() {
     // Both markers fire in schedule order (A before B) at each lifecycle point.
     assert_event_sequence!(log, [
         "OnGraphStart"      => GraphEvent::GraphStart { node_count: 1, .. },
-        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name: "success_fn", .. } if *node_id == sys_id,
-        "MarkerA"           => GraphEvent::SystemStart { node_id, node_name: "success_fn", .. } if *node_id == sys_id,
-        "MarkerB"           => GraphEvent::SystemStart { node_id, node_name: "success_fn", .. } if *node_id == sys_id,
-        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name: "success_fn", duration, .. } if *node_id == sys_id && !duration.is_zero(),
-        "MarkerA"           => GraphEvent::SystemComplete { node_id, node_name: "success_fn", duration, .. } if *node_id == sys_id && !duration.is_zero(),
-        "MarkerB"           => GraphEvent::SystemComplete { node_id, node_name: "success_fn", duration, .. } if *node_id == sys_id && !duration.is_zero(),
+        "OnSystemStart"     => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == sys_id && *node_name == "success_fn",
+        "MarkerA"           => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == sys_id && *node_name == "success_fn",
+        "MarkerB"           => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == sys_id && *node_name == "success_fn",
+        "OnSystemComplete"  => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == sys_id && !duration.is_zero() && *node_name == "success_fn",
+        "MarkerA"           => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == sys_id && !duration.is_zero() && *node_name == "success_fn",
+        "MarkerB"           => GraphEvent::SystemComplete { node_id, node_name, duration, .. } if *node_id == sys_id && !duration.is_zero() && *node_name == "success_fn",
         "OnGraphComplete"   => GraphEvent::GraphComplete { nodes_executed: 1, duration, .. } if !duration.is_zero(),
     ]);
 }
@@ -537,10 +632,10 @@ async fn marker_fires_on_system_error() {
 
     assert_event_sequence!(log, [
         "OnGraphStart"    => GraphEvent::GraphStart { node_count: 1, .. },
-        "OnSystemStart"   => GraphEvent::SystemStart { node_id, node_name: "error_fn", .. } if *node_id == failing_id,
-        "MarkerA"         => GraphEvent::SystemStart { node_id, node_name: "error_fn", .. } if *node_id == failing_id,
-        "OnSystemError"   => GraphEvent::SystemError { node_id, node_name: "error_fn", error, .. } if *node_id == failing_id && error.contains("intentional failure"),
-        "MarkerA"         => GraphEvent::SystemError { node_id, node_name: "error_fn", error, .. } if *node_id == failing_id && error.contains("intentional failure"),
+        "OnSystemStart"   => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == failing_id && *node_name == "error_fn",
+        "MarkerA"         => GraphEvent::SystemStart { node_id, node_name, .. } if *node_id == failing_id && *node_name == "error_fn",
+        "OnSystemError"   => GraphEvent::SystemError { node_id, node_name, error, .. } if *node_id == failing_id && error.contains("intentional failure") && *node_name == "error_fn",
+        "MarkerA"         => GraphEvent::SystemError { node_id, node_name, error, .. } if *node_id == failing_id && error.contains("intentional failure") && *node_name == "error_fn",
         "OnGraphFailure"  => GraphEvent::GraphFailure { error, .. } if matches!(error, ExecutionError::SystemError(_)),
     ]);
 }

@@ -303,8 +303,7 @@ documentation alone — without reading source.
 
 The catalog drift guard at `tests/api_catalog.rs` enforces that every exported
 API appears in the [API Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/apis/);
-documentation-standard conformance itself is checked by `/review-docs` on
-every PR.
+documentation-standard conformance itself is checked in code review.
 
 ### Required Sections
 

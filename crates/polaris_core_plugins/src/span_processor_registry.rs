@@ -90,10 +90,15 @@ impl SpanProcessorRegistry {
     /// at [`cleanup()`](crate::OpenTelemetryPlugin) is not guaranteed to reach
     /// it — late pushes may silently drop their buffered spans on exit.
     ///
-    /// Contributed processors must be **non-blocking**: every callback runs
-    /// synchronously inside the fan-out while it holds an internal lock, so a
-    /// processor that blocks in `on_end`/`force_flush`/`shutdown_with_timeout`
-    /// stalls span export for everyone.
+    /// A contributed processor's hot-path callbacks (`on_start` and `on_end`)
+    /// must be **non-blocking** because the fan-out invokes them synchronously
+    /// while holding its internal lock. Lifecycle callbacks are different:
+    /// [`SpanProcessor::force_flush`] and
+    /// [`SpanProcessor::shutdown_with_timeout`] are synchronous by contract and
+    /// may wait for buffered export work to finish. They also run under the
+    /// fan-out lock, so callers should invoke provider shutdown only after
+    /// span-producing work is quiescent, and processors must honor their
+    /// configured or supplied timeout.
     pub fn push(&mut self, processor: impl SpanProcessor + 'static) {
         let mut boxed: Box<dyn SpanProcessor + 'static> = Box::new(processor);
         let mut shared = self.state.lock();

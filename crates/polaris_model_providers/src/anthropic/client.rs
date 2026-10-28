@@ -33,6 +33,21 @@ impl AnthropicClient {
         &self.base_url
     }
 
+    /// Overrides the base URL, so tests can point the client at a local
+    /// server instead of the real Anthropic API.
+    ///
+    /// Also stops the client from using proxies named in the environment: a
+    /// loopback request sent through `HTTP_PROXY` never reaches the test server.
+    #[cfg(test)]
+    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self.client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a client without proxies should build");
+        self
+    }
+
     /// Builds common headers for the Anthropic API.
     fn build_headers(&self, request: &CreateMessageRequest) -> Result<HeaderMap, GenerationError> {
         let mut headers = HeaderMap::new();
@@ -326,6 +341,133 @@ where
     }
 }
 
+/// A local HTTP server for tests that need to see the request a client sends.
+///
+/// Shared by the client and plugin tests so both read the whole request and
+/// neither can wait on the network forever.
+#[cfg(test)]
+pub(crate) mod loopback {
+    use core::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+
+    /// How long a test waits on the server or the client before it fails.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Runs `future`, failing the test if it takes longer than [`TIMEOUT`].
+    pub(crate) async fn within<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(TIMEOUT, future)
+            .await
+            .expect("timed out waiting on the loopback server")
+    }
+
+    /// A complete HTTP response with a JSON body.
+    pub(crate) fn json_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A complete HTTP response whose body is a server-sent event stream.
+    pub(crate) fn sse_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        )
+    }
+
+    /// Serves one canned response per connection, in order, and records the
+    /// body of each request it receives.
+    pub(crate) struct Server {
+        base_url: String,
+        task: JoinHandle<Vec<String>>,
+    }
+
+    impl Server {
+        /// Binds a local port and starts serving `responses`, one per connection.
+        pub(crate) async fn start(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("should bind a local port");
+            let addr = listener.local_addr().expect("listener should have an addr");
+
+            let task = tokio::spawn(async move {
+                let mut bodies = Vec::new();
+                for response in responses {
+                    let (mut socket, _) =
+                        listener.accept().await.expect("should accept a connection");
+                    bodies.push(read_request_body(&mut socket).await);
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("should write the canned response");
+                    socket.shutdown().await.expect("should close the socket");
+                }
+                bodies
+            });
+
+            Self {
+                base_url: format!("http://{addr}"),
+                task,
+            }
+        }
+
+        /// The URL to point the client under test at.
+        pub(crate) fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        /// Waits for every canned response to be served and returns the body
+        /// of each request received, in order.
+        pub(crate) async fn request_bodies(self) -> Vec<String> {
+            within(self.task)
+                .await
+                .expect("mock server task should not panic")
+        }
+    }
+
+    /// Reads one request: the headers, then exactly `Content-Length` body bytes.
+    async fn read_request_body(socket: &mut TcpStream) -> String {
+        let mut received = Vec::new();
+        let body_start = loop {
+            if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+            read_more(socket, &mut received).await;
+        };
+
+        let headers =
+            core::str::from_utf8(&received[..body_start]).expect("headers should be UTF-8");
+        let content_length: usize = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+            .expect("the request should carry a Content-Length header")
+            .1
+            .trim()
+            .parse()
+            .expect("Content-Length should be a number");
+
+        while received.len() < body_start + content_length {
+            read_more(socket, &mut received).await;
+        }
+        String::from_utf8(received[body_start..body_start + content_length].to_vec())
+            .expect("body should be UTF-8")
+    }
+
+    /// Appends the next chunk from `socket` to `received`.
+    async fn read_more(socket: &mut TcpStream, received: &mut Vec<u8>) {
+        let mut chunk = [0u8; 4096];
+        let read = socket
+            .read(&mut chunk)
+            .await
+            .expect("should read the request");
+        assert!(read > 0, "the client closed the connection mid-request");
+        received.extend_from_slice(&chunk[..read]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +680,66 @@ mod tests {
             events[0].is_ok(),
             "should not error on split multibyte UTF-8"
         );
+    }
+
+    // ── create_message: an over-ceiling max_tokens is passed through, not clamped ──
+
+    /// `create_message` sends whatever `max_tokens` it is given — including a
+    /// value above any model's ceiling — and surfaces the upstream's own `400`
+    /// as [`GenerationError::Provider`] carrying the upstream message, rather
+    /// than guessing at a ceiling and clamping client-side.
+    #[tokio::test]
+    async fn over_ceiling_max_tokens_surfaces_as_provider_error() {
+        use super::super::types::{ContentBlockParam, MessageParam, Role};
+        use loopback::{Server, json_response, within};
+
+        let upstream_message = "max_tokens: 10000000 > 64000, which is the maximum allowed \
+            number of output tokens for claude-sonnet-4-6";
+        let body = format!(
+            r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{upstream_message}"}}}}"#
+        );
+        let server = Server::start(vec![json_response("400 Bad Request", &body)]).await;
+
+        let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+        let request = CreateMessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 10_000_000,
+            messages: vec![MessageParam {
+                role: Role::User,
+                content: vec![ContentBlockParam::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            stop_sequences: None,
+            output_format: None,
+            stream: None,
+        };
+
+        let result = within(client.create_message(&request)).await;
+        let bodies = server.request_bodies().await;
+
+        assert_eq!(bodies.len(), 1, "exactly one request should be sent");
+        assert!(
+            bodies[0].contains(r#""max_tokens":10000000"#),
+            "the over-ceiling value should reach the wire unclamped: {}",
+            bodies[0]
+        );
+        match result {
+            Err(GenerationError::Provider {
+                status, message, ..
+            }) => {
+                assert_eq!(status, Some(400));
+                assert!(
+                    message.contains(upstream_message),
+                    "error message should carry the upstream body verbatim: {message}"
+                );
+            }
+            other => panic!("expected GenerationError::Provider, got {other:?}"),
+        }
     }
 }

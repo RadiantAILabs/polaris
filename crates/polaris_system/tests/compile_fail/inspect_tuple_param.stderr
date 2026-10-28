@@ -8,6 +8,7 @@ error[E0277]: the trait bound `(polaris_system::param::Res<'_, Counter>, polaris
    |
    = help: the following other types implement trait `InspectParam`:
              Option<polaris_system::param::Out<'_, T>>
+             polaris_system::OutAll<'_, T>
              polaris_system::param::ErrOut<'_, T>
              polaris_system::param::Out<'_, T>
              polaris_system::param::Res<'_, T>

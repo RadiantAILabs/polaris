@@ -2,9 +2,57 @@
 //!
 //! Provides [`ShellTools`], a [`Toolset`](polaris_tools::Toolset) that exposes
 //! [`ShellExecutor`] functionality as tools for LLM agents.
+//!
+//! # Observing an invocation
+//!
+//! ```no_run
+//! use polaris_shell::{ChannelSink, ShellCancel, ShellEvent, ShellSinkHandle};
+//! use polaris_tools::{ToolContext, ToolError, ToolRegistry};
+//! use serde_json::{Value, json};
+//! use std::num::NonZeroUsize;
+//!
+//! async fn run_observed(
+//!     registry: &ToolRegistry,
+//!     stop_receiver: tokio::sync::watch::Receiver<bool>,
+//!     mut on_event: impl FnMut(ShellEvent),
+//! ) -> Result<Value, ToolError> {
+//!     let (sink, mut events) = ChannelSink::new(NonZeroUsize::new(32).unwrap());
+//!     let context = ToolContext::new()
+//!         .with(ShellSinkHandle::new(sink))
+//!         .with(ShellCancel::from_watch(stop_receiver));
+//!     let arguments = json!({"command": "cargo test"});
+//!     let execution = registry.execute_with("run_command", &arguments, &context);
+//!     tokio::pin!(execution);
+//!     let mut events_open = true;
+//!     loop {
+//!         tokio::select! {
+//!             result = &mut execution => {
+//!                 let response = result?; // Propagate permission and execution errors.
+//!                 if response["status"] == "confirmation_required" {
+//!                     // Return the prompt to the host for approval; no run started.
+//!                     return Ok(response);
+//!                 }
+//!                 // Completion published Finished; drain any remaining events.
+//!                 while let Some(event) = events.recv().await {
+//!                     on_event(event);
+//!                 }
+//!                 return Ok(response);
+//!             }
+//!             event = events.recv(), if events_open => {
+//!                 if let Some(event) = event {
+//!                     on_event(event);
+//!                 } else {
+//!                     events_open = false;
+//!                 }
+//!             }
+//!         }
+//!     }
+//! }
+//! ```
 
 use crate::error::ShellError;
 use crate::executor::{ExecutionResult, ShellExecutor, ShellRequest, ShellResponse};
+use crate::process::{ShellCancel, ShellSinkHandle};
 use polaris_tools::ToolError;
 use polaris_tools::toolset;
 use serde::Serialize;
@@ -58,6 +106,15 @@ impl ShellTools {
     ///
     /// The command is interpreted by the system shell (`sh -c`), supporting
     /// pipes, redirects, and globbing.
+    ///
+    /// `cancel` and `sink` are `#[context]` parameters: they are supplied by
+    /// the host through [`ToolContext`](polaris_tools::ToolContext) and
+    /// [`ToolRegistry::execute_with`](polaris_tools::ToolRegistry::execute_with),
+    /// and never appear in the LLM-facing JSON schema. A host driving a
+    /// cancellable run should build a [`ShellCancel`] from its own
+    /// cancellation signal and put it in the context to stop the child while
+    /// keeping the invocation future alive. Dropping that future also requests
+    /// a stop through the foreground process handle.
     #[tool]
     async fn run_command(
         &self,
@@ -69,6 +126,12 @@ impl ShellTools {
         /// Timeout in seconds. Defaults to the configured default (30s).
         #[default(None::<u64>)]
         timeout_secs: Option<u64>,
+        /// Optional externally owned cancellation observer.
+        #[context]
+        cancel: Option<ShellCancel>,
+        /// Optional destination for incremental process events.
+        #[context]
+        sink: Option<ShellSinkHandle>,
     ) -> Result<ShellToolResponse, ToolError> {
         let mut request = ShellRequest::new(&command);
 
@@ -78,6 +141,14 @@ impl ShellTools {
 
         if let Some(secs) = timeout_secs {
             request = request.with_timeout(secs);
+        }
+
+        if let Some(cancel) = cancel {
+            request = request.with_cancel(cancel);
+        }
+
+        if let Some(sink) = sink {
+            request = request.with_sink(sink);
         }
 
         let response =

@@ -66,7 +66,7 @@ for info in sessions.agent_type_infos() {
 }
 ```
 
-Matching uses `GraphSignature::satisfies` — **subsumption**, not the exact-set `compatible_with` used for `Dynamic` slot substitution (see [Graph — Dynamic](./graph.md#dynamic)). An agent's extra `requires` are presumed environment-provided by its registrant's setup (conservative derivation reports self-inserted resources as required), and extra `produces` merge back harmlessly; only a free-output read the slot never sanctioned disqualifies. The residual risk is deliberate: an agent whose extra requires nothing actually provides still advertises the contract and fails loudly on first turn — the same honor-system boundary as declared access generally.
+Matching uses `GraphSignature::satisfies` — **subsumption**, not either of the relations a `Dynamic` slot substitutes candidates under (`compatible_with` / `substitutable_for`; see [Graph — Dynamic](./graph.md#dynamic)), whose `requires` axis runs the other way because their environment is a parent graph rather than the registrant. An agent's extra `requires` are presumed environment-provided by its registrant's setup (conservative derivation reports self-inserted resources as required), and extra `produces` merge back (inertly only where the driver's graph produces no colliding type — merge-back keeps each producer's entry, but a same-typed output becomes the newest one, so a plain `Out<T>` read in the driver sees it; see [Graph — Dynamic](./graph.md#extra-outputs-stop-at-the-dynamic-boundary) for how a slot boundary drops such extras instead); only a free-output read the slot never sanctioned disqualifies. The residual risk is deliberate: an agent whose extra requires nothing actually provides still advertises the contract and fails loudly on first turn — the same honor-system boundary as declared access generally.
 
 Behavioral notes:
 
@@ -145,11 +145,61 @@ When any `process_turn` variant is called:
 
 1. **Lock context** — `tokio::sync::Mutex` guards the `SystemContext`
 2. **Inject SessionInfo** — session ID and turn number inserted into context
-3. **Call setup closure** — caller injects per-turn resources (e.g., `UserIO`)
-4. **Execute graph** — `GraphExecutor::execute()` runs the agent's graph with hooks and middleware
-5. **Auto-checkpoint** — if enabled, context is serialized (in-memory, does not block result)
-6. **Increment turn number** — atomic counter advanced
-7. **Return** `ExecutionResult` — `{ nodes_executed, duration, final_output }`
+3. **Inject the turn's cancellation token** — a fresh `RunCancellation`, inserted *before* the setup closure so a caller may deliberately override it
+4. **Call setup closure** — caller injects per-turn resources (e.g., `UserIO`)
+5. **Execute graph** — `GraphExecutor::execute()` runs the agent's graph with hooks and middleware
+6. **Auto-checkpoint** — if enabled, the context is captured into the session's retained checkpoint set. This runs synchronously while the turn still holds the context lock, so its serialization cost adds to the turn's latency; a failed capture is warned, never returned. The retained set reaches the store only through `save_session`. Also taken after an interrupted turn; a failed turn is not captured (see [Auto-Checkpoint](#auto-checkpoint))
+7. **Increment turn number** — atomic counter advanced
+8. **Return** `ExecutionResult` — `{ nodes_executed, duration, final_output }`
+
+### Interrupting a turn
+
+`interrupt_turn` raises the signal for whatever turn the session is currently running. It is **synchronous and never touches the context lock** — a turn holds that lock for its entire duration, so a method that waited for it could not stop the thing holding it.
+
+It does take two short internal locks, one on the session registry and one on the turn's cancellation slot, so it is **not safe to call from a raw OS signal handler**: a signal that arrives while the interrupted thread holds one of them would deadlock. Call it from an ordinary task, a UI callback, or an HTTP handler. To stop a turn on `SIGINT`, let the runtime deliver the signal to a task and call `interrupt_turn` from there:
+
+```rust
+// A task that waits for Ctrl-C, then raises the signal for the running turn.
+// The turn itself runs on another task, so there is something to interrupt.
+tokio::spawn({
+    let sessions = sessions.clone();
+    let session_id = session_id.clone();
+    async move {
+        tokio::signal::ctrl_c().await.ok();
+        // Ok(true): a turn was in flight. Ok(false): the session was idle.
+        let _ = sessions.interrupt_turn(&session_id);
+    }
+});
+```
+
+The whole contract a caller may rely on:
+
+- `Ok(true)` means **a turn was in flight**, nothing finer. The session cannot distinguish a turn that is working from one parked waiting for user input; both hold the slot.
+- A raise while the session is idle returns `Ok(false)` and is **not** latched into the next turn. A stray interrupt must not kill the next request.
+- An unknown session returns `SessionError::SessionNotFound`.
+- Escalation — "a second press quits" — belongs to the host and its own timer. A second call during the same turn also returns `Ok(true)`.
+
+How promptly the turn ends is the agent's business: the executor stops at the next node boundary, and a system that reads `Res<RunCancellation>` can return sooner. See [Graph — Cancellation](graph.md#cancellation).
+
+#### What an interrupted turn records
+
+| | Completed | Failed | **Interrupted** |
+|---|---|---|---|
+| Turn history status | `Completed` | `Failed` | `Interrupted` |
+| Lifecycle | `Idle` | `Idle` | `Idle` |
+| `otel.status_code` | unset | `ERROR` | unset — a user's interrupt is not an error |
+| `error.type` | unset | variant name | `"Interrupted"` |
+| `turn_number` | advances | stays | **advances** |
+| Auto-checkpoint | attempted | not taken | **attempted** |
+| Return | `Ok(ExecutionResult)` | `Err(SessionError::Execution(..))` | `Err(SessionError::Interrupted { .. })` |
+
+The number advances because `(session_id, turn_number)` is the run's identity and two runs must never share it — reusing the number would also shadow the interrupted turn's own history entry. The checkpoint is attempted because the state after an interrupted run is consistent by construction: every system either completed or returned by its own choice, so it is a legitimate rollback target, and the next turn builds on it either way. It is *attempted* rather than guaranteed: auto-checkpoint may be disabled, and `CheckpointRetention` may refuse the capture for capacity. Either way the refusal is warned, not fatal, so the interrupt contract holds; `checkpoints().current` says whether a point was actually retained.
+
+The asymmetry with the `Failed` path — which still neither advances nor checkpoints — is deliberate and unchanged here.
+
+`SessionError::Interrupted` is the **one** representation of the outcome. `SessionError::Execution(ExecutionError::Interrupted { .. })` is never constructed, on any of the three turn entry points, so a consumer matches one shape rather than two.
+
+Over HTTP the outcome maps to the `turn_interrupted` error code with status `409`, on both the JSON turn response and the SSE terminal `event: error`. No endpoint *raises* the signal: the SSE handler's documented no-abort-on-client-disconnect behaviour is unchanged.
 
 ## Recipes
 
@@ -260,16 +310,72 @@ Use `scoped_session` when you need multi-step control (multiple turns, context i
 
 ## Checkpointing and Rollback
 
-Checkpoints are in-memory snapshots of session resource state at a specific turn.
+A checkpoint is a snapshot of a session's serialized resource state at a turn boundary. Checkpoints are **durable**: the retained set rides `SessionData` through whatever `SessionStore` the host configured, so `save_session` writes them and `resume_session` brings them back. They are also **bounded** — see [Retention](#checkpoint-retention) — because a set that grew without limit would be rewritten in full on every save.
+
+Two surfaces exist. The older one identifies a snapshot by its turn number; the newer one, on the `SessionCheckpoints` handle, identifies it by a stable `CheckpointId`. Prefer the handle for anything that resumes execution after rewinding — a turn number is a display label, two snapshots can share one, and rollback resolves to whichever was captured first.
 
 ### Auto-Checkpoint
 
-Enabled by default. After every successful turn, the context is serialized and stored as a checkpoint. Failures are logged but never propagate.
+Enabled by default. A checkpoint is captured at session creation, at resume, and after every completed or interrupted turn; a failed turn is not captured. Failures — including a retention refusal — are warned, never propagated, so an automatic checkpoint never fails a user's turn.
 
 ```rust
 // Disable auto-checkpoint
 SessionsPlugin::new(store).without_auto_checkpoint();
 ```
+
+### The checkpoint handle
+
+```rust
+use polaris_sessions::checkpoint::{CheckpointOrigin, CheckpointStatus};
+
+let checkpoints = sessions.checkpoints();
+
+// Capture, and hold the point across a user decision.
+let point = checkpoints.capture(&session_id, CheckpointOrigin::Manual).await?;
+let pin = checkpoints.pin(&session_id, point.id)?;
+
+// Rewind. The state being left is captured first, so it stays recoverable.
+let outcome = checkpoints.restore(&session_id, point.id).await?;
+assert_eq!(outcome.resume_turn, point.resume_turn);
+```
+
+`CheckpointMeta` stores `resume_turn` — the turn the session runs **next** if restored here — separately from the display `turn` label. That is what makes an automatic capture resume as correctly as a manual one. `parent` and `revision` record branch structure, so "is this point on the current history path" is a field read rather than a numeric turn comparison, and `restore` re-parents onto a new revision instead of discarding newer points.
+
+| Method | Description |
+|--------|-------------|
+| `capture` | Captures the current state. Refuses a read-only session. |
+| `list` | Every retained point, oldest first, with metadata. |
+| `current` / `revision` | Where the session is positioned, and on which history revision. |
+| `restore` | Rewinds to a point, reporting what it restored, what it could not, and what it carried over. |
+| `restore_exact` | Refuses rather than restoring partially; the context is untouched on refusal. |
+| `status` | `Retained`, `OffHistory`, `Evicted` or `Unknown` for one id. |
+| `retention` / `usage` | The configured bounds, and what this session is spending against them. |
+| `pin` | Holds a point against eviction until the returned `CheckpointPin` drops. Dropping a pin is an atomic decrement: it does not wait on checkpoint encoding, eviction or the session registry. A pin does not prevent deleting the session. |
+
+`restore` does **not** re-run `Agent::setup`; like `rollback` it leaves non-persisted resources alone and names them in `RestoreOutcome::carried_over`. Call `setup_session` afterwards if they need rebuilding.
+
+#### Recovering from a failed restore
+
+If a resource fails to load partway through `restore`, the context holds a mix of old and new state and the session is marked incoherent. Until a restore succeeds, `process_turn` and every capture (`capture`, the older `checkpoint`, and automatic ones) return `SessionError::RestoreFailed`. So does `save_session`, which checks before it serializes anything, so the last coherent session in the store is not overwritten. Recover by restoring a retained point.
+
+The retry reuses the pre-restore snapshot from the failed attempt instead of capturing the mixed context. It therefore needs no free slot, even when the session is full at its checkpoint count or byte bound.
+
+### Checkpoint retention
+
+Retention is injected policy, not a constant at a call site:
+
+```rust
+use polaris_sessions::checkpoint::CheckpointRetention;
+
+SessionsPlugin::new(store)
+    .with_checkpoint_retention(CheckpointRetention::new(Some(32), Some(8 * 1024 * 1024)));
+```
+
+Both bounds are per session. The defaults — 64 checkpoints and 16 MiB — are initial product choices, not measured performance claims. Enforcement runs at one place: a capture evicts the oldest unpinned point that is off the current history path, then the oldest unpinned point on it, and **refuses** with `SessionError::CheckpointCapacity` when nothing is evictable. It never drops a point silently. A consumer discovers the bounds with `retention()` and `usage()` rather than restating them.
+
+A capture never evicts the session's current point, either endpoint of a restore that has not finished, or a point held by a `CheckpointPin`. `restore` has one exception. It first protects its target, then captures the state being left. If nothing else can be evicted, that pre-restore snapshot replaces the previous current point, which then reports `Evicted`. This is what lets you restore the oldest point of a session that is full at two points and still keep both the target and the snapshot. An explicit pin always wins: if the previous current point is pinned, the capture is refused with `SessionError::CheckpointCapacity` and the context is left untouched.
+
+An evicted point leaves a two-field tombstone, so `status` reports `Evicted` — distinct from `Unknown` — and keeps doing so after a restart. Old tombstones compact into a floor marker rather than accumulating.
 
 ### Manual Checkpoint
 
@@ -286,6 +392,8 @@ sessions.rollback(&session_id, target_turn).await?;
 
 Rollback restores the context to the checkpointed state. Checkpoints newer than the target turn are discarded. The turn number is reset to match the checkpoint.
 
+> **Run-identity hazard.** An automatic checkpoint's label is the turn that just *ran*, so `rollback` of one sets the counter back to a number that has already been used and the next turn re-uses the run identity `(session_id, turn_number)` — which the rule above says must never happen. A manual checkpoint reads the already-incremented counter and does not have the problem. The behaviour is documented rather than changed, because changing a shipped method is a separate decision; `checkpoints().restore` resumes at the stored `resume_turn` and has no such hazard.
+
 ## Persistence (Save/Resume)
 
 Sessions can be persisted to a `SessionStore` backend and later resumed.
@@ -301,6 +409,10 @@ sessions.resume_session(&session_id, &agent_type).await?;
 The `SessionStore` trait is implemented by:
 - `InMemoryStore` — in-process HashMap (default, no durability)
 - `FileStore` — filesystem-backed (requires `file-store` feature)
+
+`FileStore` bounds what it writes as well as what it reads. By default a session file may be at most 64 MiB and may hold at most 1024 checkpoints and 1024 tombstones. `save` refuses a session over a bound with `FileStoreError::SaveTooLarge`, `SaveTooManyCheckpoints` or `SaveTooManyTombstones`, before it writes anything, so a stored session can always be resumed and the previous file is unchanged. With `CheckpointRetention::unbounded()` a long-lived session can reach them; raise them with `FileStore::with_load_limits(FileStoreLimits::new(..))`.
+
+`save_session` returns `SessionError::RestoreFailed` while a failed restore has left the context incoherent, and writes nothing. See [Recovering from a failed restore](#recovering-from-a-failed-restore).
 
 Serialization uses `ResourceSerializer` instances registered via `PersistencePlugin`.
 
@@ -335,7 +447,7 @@ Each session holds:
 | `executor` | `GraphExecutor` | Per-session executor config |
 | `agent_type` | `AgentTypeId` | Registered agent identifier |
 | `turn_number` | `AtomicU32` | Current turn counter |
-| `checkpoints` | `parking_lot::Mutex<Vec<Checkpoint>>` | In-memory checkpoint history |
+| `checkpoints` | `parking_lot::Mutex<CheckpointSet>` | Retained checkpoints, their identity counter, removal tombstones and pins. Persisted with the session, and bounded by `CheckpointRetention`. |
 
 ## Error Types
 
@@ -348,6 +460,11 @@ Each session holds:
 | `SessionError::TurnNotFound` | Rollback target doesn't exist |
 | `SessionError::GraphValidation` | Agent graph has structural errors |
 | `SessionError::Execution` | Graph execution failed |
+| `SessionError::Interrupted` | The turn was stopped by `interrupt_turn` — recorded, numbered, a checkpoint attempted (subject to the checkpoint policy), and distinct from a failure |
+| `SessionError::CheckpointNotFound` | No retained checkpoint has that `CheckpointId` — ask `status` whether it was evicted or never existed |
+| `SessionError::RestoreIncomplete` | `restore_exact` found an entry no registered serializer matches; nothing was written |
+| `SessionError::RestoreFailed` | A resource failed to load partway through a restore; the context is unknown, so turns, captures and `save_session` are refused until a restore succeeds (see [Recovering from a failed restore](#recovering-from-a-failed-restore)) |
+| `SessionError::CheckpointCapacity` | The retained set is at a bound and nothing is evictable |
 | `SessionError::Setup` | Agent `setup()` returned error |
 | `SessionError::OutputNotFound` | `run_oneshot` graph completed but didn't produce expected type |
 | `SessionError::ContractNotFound` | Named capability contract not registered |
@@ -365,3 +482,21 @@ Each session holds:
 | `polaris_sessions/src/store/mod.rs` | `SessionStore` trait, `SessionId`, `SessionData` |
 | `polaris_sessions/src/store/memory.rs` | `InMemoryStore` implementation |
 | `polaris_sessions/src/store/file.rs` | `FileStore` implementation |
+
+## History and channel IO without HTTP
+
+`SessionsAPI::turn_history`, `turn`, `record_turn_messages`, and `uptime_buckets`
+are available with default features and with `default-features = false`.
+`Turn`, `TurnStatus`, `TurnSummary`, `BucketGranularity`, and
+`SessionUptimeResponse` are re-exported at the sessions crate root; the full
+value family lives in `polaris_sessions::models`. History retains at most 256
+turns per session, with bounded messages and payload sizes per turn. Callers
+attach captured IO using `record_turn_messages`; executing a turn alone does
+not capture its messages. History is in memory and is not restored from the store.
+
+`polaris_sessions::ChannelIOProvider` provides bounded input/output channels
+for interactive, headless, or HTTP callers. Its historical `HttpIOProvider`
+name remains as a compatibility alias. The `sessions-http` feature gates the
+HTTP router, handlers, and `HttpPlugin`, including their axum/app dependencies.
+Existing `http::models` and `http::HttpIOProvider` imports remain compatible
+when that feature is enabled.

@@ -6,15 +6,17 @@
 
 #![cfg(feature = "sessions-http")]
 
-use polaris_agent::Agent;
+use polaris_agent::{Agent, SetupError};
 use polaris_app::{AppConfig, AppPlugin};
 use polaris_core_plugins::persistence::PersistencePlugin;
 use polaris_core_plugins::{IOContent, IOMessage, UserIO};
+use polaris_graph::cancel::RunCancellation;
 use polaris_graph::graph::Graph;
 use polaris_sessions::http::HttpPlugin;
-use polaris_sessions::store::memory::InMemoryStore;
+use polaris_sessions::store::{SessionId, memory::InMemoryStore};
 use polaris_sessions::{SessionsAPI, SessionsPlugin};
-use polaris_system::param::Res;
+use polaris_system::param::{Res, SystemContext};
+use polaris_system::resource::LocalResource;
 use polaris_system::server::Server;
 use polaris_system::system;
 use polaris_system::system::SystemError;
@@ -141,6 +143,78 @@ impl Agent for BurstAgent {
     }
 }
 
+/// Rendezvous fired once the interruptible turn has parked on the cancellation
+/// signal.
+///
+/// Sessions in this file are created over HTTP, so there is no setup closure to
+/// inject through — the signal rides the agent value instead and reaches the
+/// context through [`Agent::setup`]. Not a `static`: `Notify::notify_one`
+/// stores a permit, so one process-global would let a second test using
+/// `InterruptibleAgent` consume the permit this one is waiting for.
+#[derive(Clone)]
+struct ParkSignal(Arc<tokio::sync::Notify>);
+
+impl ParkSignal {
+    fn new() -> Self {
+        Self(Arc::new(tokio::sync::Notify::new()))
+    }
+
+    /// Resolves once a turn of this test's session has parked.
+    async fn parked(&self) {
+        self.0.notified().await;
+    }
+}
+
+impl LocalResource for ParkSignal {}
+
+/// Emits one message, then parks until the run is interrupted.
+#[system]
+async fn park_until_interrupted(
+    io: Res<UserIO>,
+    cancel: Res<RunCancellation>,
+    parked: Res<ParkSignal>,
+) {
+    let _ = io.receive().await.expect("should receive a message");
+    io.send(IOMessage::system_text("parked"))
+        .await
+        .expect("should send the parked marker");
+    parked.0.notify_one();
+    cancel.cancelled().await;
+}
+
+/// Must never run: the boundary check declines it once the signal is raised.
+#[system]
+async fn after_the_stop(io: Res<UserIO>) {
+    io.send(IOMessage::system_text("must-not-appear"))
+        .await
+        .expect("should send");
+}
+
+struct InterruptibleAgent {
+    parked: ParkSignal,
+}
+
+impl Agent for InterruptibleAgent {
+    fn build(&self, graph: &mut Graph) {
+        // Two nodes: a run that reaches its terminal node *completes* even if
+        // the signal was raised, so the stop needs a node left to decline.
+        graph
+            .add_system(park_until_interrupted)
+            .add_system(after_the_stop);
+    }
+
+    fn name(&self) -> &'static str {
+        "InterruptibleAgent"
+    }
+
+    /// Hands every session built from this agent the rendezvous the test that
+    /// registered it is waiting on.
+    fn setup(&self, ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
+        ctx.insert(self.parked.clone());
+        Ok(())
+    }
+}
+
 /// Binds to an ephemeral port and returns the listener with its port.
 async fn bind_ephemeral() -> (tokio::net::TcpListener, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -173,6 +247,15 @@ async fn wait_for_server(port: u16) {
 
 /// Builds a test server with the full HTTP stack.
 async fn test_server(listener: tokio::net::TcpListener, port: u16) -> Server {
+    test_server_with_park(listener, port).await.0
+}
+
+/// As [`test_server`], plus the rendezvous this server's `InterruptibleAgent`
+/// fires when one of its turns parks.
+async fn test_server_with_park(
+    listener: tokio::net::TcpListener,
+    port: u16,
+) -> (Server, ParkSignal) {
     let mut server = Server::new();
     server
         .add_plugins(PersistencePlugin)
@@ -190,8 +273,14 @@ async fn test_server(listener: tokio::net::TcpListener, port: u16) -> Server {
     sessions.register_agent(FailingAgent).unwrap();
     sessions.register_agent(EmitThenFailAgent).unwrap();
     sessions.register_agent(BurstAgent).unwrap();
+    let parked = ParkSignal::new();
+    sessions
+        .register_agent(InterruptibleAgent {
+            parked: parked.clone(),
+        })
+        .unwrap();
 
-    server
+    (server, parked)
 }
 
 /// Creates a session via the REST API and returns the session ID.
@@ -344,7 +433,7 @@ async fn stream_turn_bounds_retained_history_without_truncating_sse() {
     assert_eq!(frames.last().unwrap().event, "done");
 
     let sessions = server.api::<SessionsAPI>().unwrap();
-    let session_id = polaris_sessions::store::SessionId::from_string(session_id);
+    let session_id = SessionId::from_string(session_id);
     let summary = sessions.turn_history(&session_id, true).unwrap().remove(0);
     assert_eq!(summary.io_message_count, 300);
     assert_eq!(summary.messages.unwrap().len(), 256);
@@ -389,9 +478,10 @@ async fn stream_turn_busy() {
     // Start a blocking turn via the API directly, keeping input_tx alive
     // so the BlockingAgent's second receive() blocks indefinitely.
     let sessions = server.api::<SessionsAPI>().unwrap().clone();
-    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+    let sid = SessionId::from_string(session_id_str.clone());
 
-    let (provider, input_tx, mut output_rx) = polaris_sessions::http::HttpIOProvider::new(32, 32);
+    let (provider, input_tx, mut output_rx) =
+        polaris_sessions::http::ChannelIOProvider::new(32, 32);
     let provider = Arc::new(provider);
     input_tx.send(IOMessage::user_text("block")).await.unwrap();
     // Do NOT drop input_tx — keep channel alive so BlockingAgent blocks.
@@ -481,12 +571,13 @@ async fn stream_turn_busy_does_not_clobber_recorded_messages() {
 
     let session_id_str = create_session(port, "BlockingAgent").await;
     let sessions = server.api::<SessionsAPI>().unwrap().clone();
-    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+    let sid = SessionId::from_string(session_id_str.clone());
 
     // Hold the session lock with a blocking turn (turn 0). While it is in
     // flight the turn counter stays at 0, so the racing streaming request
     // below captures `turn_before == 0` — the same turn we seed.
-    let (provider, input_tx, mut output_rx) = polaris_sessions::http::HttpIOProvider::new(32, 32);
+    let (provider, input_tx, mut output_rx) =
+        polaris_sessions::http::ChannelIOProvider::new(32, 32);
     let provider = Arc::new(provider);
     input_tx.send(IOMessage::user_text("block")).await.unwrap();
 
@@ -584,12 +675,13 @@ async fn turn_busy_does_not_clobber_recorded_messages() {
 
     let session_id_str = create_session(port, "BlockingAgent").await;
     let sessions = server.api::<SessionsAPI>().unwrap().clone();
-    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+    let sid = SessionId::from_string(session_id_str.clone());
 
     // Hold the session lock with a blocking turn (turn 0). While it is in
     // flight the turn counter stays at 0, so the racing request below reads
     // `turn_before == 0` — the same turn we seed.
-    let (provider, input_tx, mut output_rx) = polaris_sessions::http::HttpIOProvider::new(32, 32);
+    let (provider, input_tx, mut output_rx) =
+        polaris_sessions::http::ChannelIOProvider::new(32, 32);
     let provider = Arc::new(provider);
     input_tx.send(IOMessage::user_text("block")).await.unwrap();
 
@@ -721,7 +813,7 @@ async fn stream_turn_failed_after_emitting_records_partial_messages() {
 
     let session_id_str = create_session(port, "EmitThenFailAgent").await;
     let sessions = server.api::<SessionsAPI>().unwrap().clone();
-    let sid = polaris_sessions::store::SessionId::from_string(session_id_str.clone());
+    let sid = SessionId::from_string(session_id_str.clone());
 
     let resp = reqwest::Client::new()
         .post(format!(
@@ -757,6 +849,91 @@ async fn stream_turn_failed_after_emitting_records_partial_messages() {
         texts.iter().any(|t| t == "partial output before failure"),
         "a failed-but-executed turn must record the IO emitted before failure, got: {texts:?}"
     );
+
+    server.cleanup().await;
+}
+
+/// An interrupted turn reaches the client as the `turn_interrupted` code
+/// rather than falling through to `internal_error`, on both the streaming
+/// terminal event and the non-streaming response.
+#[tokio::test]
+async fn stream_turn_interrupted_emits_turn_interrupted_error_event() {
+    let (listener, port) = bind_ephemeral().await;
+    let (mut server, parked) = test_server_with_park(listener, port).await;
+    wait_for_server(port).await;
+
+    let session_id = create_session(port, "InterruptibleAgent").await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+
+    let stream_session = session_id.clone();
+    let stream = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/v1/sessions/{stream_session}/turns/stream"
+            ))
+            .json(&serde_json::json!({ "message": "hello" }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    });
+
+    parked.parked().await;
+    let was_running = sessions
+        .interrupt_turn(&SessionId::from_string(session_id.clone()))
+        .expect("the session exists");
+    assert!(was_running, "a turn was in flight");
+
+    let body = stream.await.unwrap();
+    let frames = parse_sse_frames(&body);
+    let error_frame = frames
+        .iter()
+        .find(|frame| frame.event == "error")
+        .unwrap_or_else(|| panic!("expected an 'error' SSE event, got frames: {frames:?}"));
+    let error_json: serde_json::Value = serde_json::from_str(&error_frame.data)
+        .unwrap_or_else(|json_err| panic!("error frame must be valid JSON ({json_err})"));
+    assert_eq!(
+        error_json["code"], "turn_interrupted",
+        "an interrupt is not an internal error; clients must be able to tell them apart"
+    );
+    // The messages emitted before the stop are still delivered.
+    assert!(
+        frames.iter().any(|frame| frame.data.contains("parked")),
+        "output produced before the interrupt still reaches the client: {frames:?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.data.contains("must-not-appear")),
+        "the node after the stop must never start: {frames:?}"
+    );
+
+    // The same mapping on the non-streaming endpoint, which also exercises the
+    // status code.
+    let second_session = session_id.clone();
+    let non_streaming = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/v1/sessions/{second_session}/turns"
+            ))
+            .json(&serde_json::json!({ "message": "hello again" }))
+            .send()
+            .await
+            .unwrap()
+    });
+    parked.parked().await;
+    assert!(
+        sessions
+            .interrupt_turn(&SessionId::from_string(session_id))
+            .unwrap()
+    );
+
+    let resp = non_streaming.await.unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "turn_interrupted");
 
     server.cleanup().await;
 }

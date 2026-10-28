@@ -11,13 +11,15 @@
 //!
 //! Every candidate is checked at insertion time: it must pass its own
 //! [`validate`](crate::Graph::validate) **and** carry a
-//! [signature](crate::Graph::signature) [compatible](GraphSignature::compatible_with)
-//! with the registry contract. A candidate added mid-session is therefore held
-//! to the same interface the parent graph was validated against — selection
-//! never runs an unchecked graph.
+//! [signature](crate::Graph::signature) the registry's [`MatchingMode`] relation
+//! admits against the registry contract, including guaranteed production of
+//! every contract output. A candidate added mid-session is
+//! therefore held to the same interface the parent graph was validated against
+//! — selection never runs an unchecked graph.
 
-use crate::graph::{Graph, GraphSignature, SignatureDiff, ValidationError};
+use crate::graph::{Graph, GraphSignature, MatchingMode, SignatureDiff, ValidationError};
 use hashbrown::HashMap;
+use polaris_system::param::Access;
 use polaris_system::resource::LocalResource;
 use std::fmt;
 use std::sync::Arc;
@@ -31,6 +33,9 @@ use std::sync::Arc;
 /// time (for which the inline candidate set is simpler; see **Alternatives**).
 /// Every candidate is held to the registry's [`GraphSignature`] contract, so
 /// whatever the slot runs is always shape-compatible with the parent graph.
+/// How strictly it is held is selectable — see
+/// [`with_matching`](Self::with_matching), which also carries why the
+/// registry, not the node, is the admission point on this path.
 ///
 /// # Scope
 ///
@@ -145,6 +150,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct SubgraphRegistry {
     contract: GraphSignature,
+    matching: MatchingMode,
     graphs: HashMap<Arc<str>, Arc<Graph>>,
     max_candidates: Option<usize>,
 }
@@ -153,14 +159,67 @@ impl LocalResource for SubgraphRegistry {}
 
 impl SubgraphRegistry {
     /// Creates an empty, unbounded registry whose candidates must satisfy
-    /// `contract`.
+    /// `contract` under [`MatchingMode::Exact`].
     #[must_use]
     pub fn new(contract: GraphSignature) -> Self {
         Self {
             contract,
+            matching: MatchingMode::default(),
             graphs: HashMap::new(),
             max_candidates: None,
         }
+    }
+
+    /// Sets the relation [`register`](Self::register) admits candidates under.
+    ///
+    /// Mirrors [`DynamicSlot::with_matching`](crate::node::DynamicSlot::with_matching):
+    /// a registry is the admission point for its own candidates, so a slot that
+    /// opts into [`MatchingMode::Substitutable`] wants the registry feeding it to
+    /// do the same. The default is [`MatchingMode::Exact`].
+    ///
+    /// # The registry is the only gate on this path
+    ///
+    /// The registry's relation and the node's are independent knobs, and on a
+    /// registry-backed node **the registry's is the one that decides**: it
+    /// admits at `register()`, and the executor re-checks only that the
+    /// registry's *contract* is this node's ([`DynamicContractMismatch`]),
+    /// never the mode. So
+    /// [`DynamicSlot::with_matching`](crate::node::DynamicSlot::with_matching)
+    /// gates nothing here, and a divergence is silent in both directions: a
+    /// stricter registry registers fewer candidates than its slot would have
+    /// taken, and a laxer one runs candidates the slot's own mode would have
+    /// refused. Set them together.
+    ///
+    /// Neither direction is *unsound* — both modes admit only sound
+    /// substitutes for the shared contract, so no candidate reads an input the
+    /// parent does not supply. What a laxer registry can cost a slot that
+    /// asked for [`MatchingMode::Exact`] is the shadowing property described
+    /// on [`MatchingMode::Substitutable`]: a registry candidate producing an
+    /// extra output type merges it back over a same-typed parent output. That
+    /// case is past `validate()`, so no warning covers it — which is the
+    /// concrete reason to mirror the mode rather than leave it to chance.
+    ///
+    /// [`DynamicContractMismatch`]: crate::executor::ExecutionError::DynamicContractMismatch
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::{GraphSignature, MatchingMode, SubgraphRegistry};
+    ///
+    /// let registry = SubgraphRegistry::new(GraphSignature::new().produce::<i32>())
+    ///     .with_matching(MatchingMode::Substitutable);
+    /// assert_eq!(registry.matching(), MatchingMode::Substitutable);
+    /// ```
+    #[must_use]
+    pub fn with_matching(mut self, matching: MatchingMode) -> Self {
+        self.matching = matching;
+        self
+    }
+
+    /// The relation [`register`](Self::register) admits candidates under.
+    #[must_use]
+    pub fn matching(&self) -> MatchingMode {
+        self.matching
     }
 
     /// Caps the registry at `max` candidates.
@@ -199,10 +258,15 @@ impl SubgraphRegistry {
     ///   key (replacement is always allowed).
     /// - [`RegistryError::Invalid`] if the graph fails its own structural
     ///   validation.
-    /// - [`RegistryError::NestedCandidate`] if the graph nests a scope or dynamic
-    ///   node that flat signature derivation cannot see across.
-    /// - [`RegistryError::Incompatible`] if the graph's signature does not match
-    ///   the registry contract.
+    /// - [`RegistryError::NestedCandidate`] if the graph nests an undeclared
+    ///   scope that flat signature derivation cannot see across (a scope with a
+    ///   declared contract or a dynamic node is admissible — see
+    ///   [`Graph::add_scope_with_contract`](crate::Graph::add_scope_with_contract)).
+    /// - [`RegistryError::Incompatible`] if the graph's signature is not
+    ///   admitted against the registry contract by the registry's
+    ///   [`matching`](Self::with_matching) relation.
+    /// - [`RegistryError::MissingGuaranteedOutputs`] if the graph produces a
+    ///   contract output on only some successful paths.
     pub fn register(&mut self, id: impl Into<Arc<str>>, graph: Graph) -> Result<(), RegistryError> {
         let id = id.into();
 
@@ -224,19 +288,28 @@ impl SubgraphRegistry {
             });
         }
 
-        // A candidate nesting a scope or dynamic node presents a signature that
+        // A candidate nesting an undeclared scope presents a signature that
         // hides the IO crossing that boundary, so it cannot be soundly checked
-        // against the contract — refuse it rather than trust an opaque signature.
+        // against the contract — refuse it rather than trust an opaque
+        // signature. Declared scopes and dynamic nodes expose contracts in the
+        // signature (and are validated above), so they do not disqualify.
         if graph.contains_nested_boundary() {
             return Err(RegistryError::NestedCandidate { id });
         }
 
-        let diff = graph.signature().diff(&self.contract);
+        let signature = graph.signature();
+        let diff = self.matching.diff(&signature, &self.contract);
         if !diff.is_empty() {
             return Err(RegistryError::Incompatible {
                 id,
                 diff: Box::new(diff),
+                matching: self.matching,
             });
+        }
+
+        let missing = signature.missing_guaranteed_produces(&self.contract);
+        if !missing.is_empty() {
+            return Err(RegistryError::MissingGuaranteedOutputs { id, missing });
         }
 
         self.graphs.insert(id, Arc::new(graph));
@@ -301,18 +374,33 @@ pub enum RegistryError {
         /// The validation errors reported by [`Graph::validate`].
         errors: Vec<ValidationError>,
     },
-    /// The candidate's signature is not compatible with the registry contract.
+    /// The candidate's signature is not admitted against the registry contract
+    /// by the registry's [`MatchingMode`] relation.
     Incompatible {
         /// The key the candidate was being registered under.
         id: Arc<str>,
         /// Which signature axes diverge, and in which direction. Boxed to keep
         /// [`RegistryError`] small on the common success path.
         diff: Box<SignatureDiff>,
+        /// The relation the candidate was checked under. The `diff` reports
+        /// only the directions *this* relation forbids, so without the mode a
+        /// reader cannot tell a permitted divergence from an absent one.
+        matching: MatchingMode,
     },
-    /// The candidate nests a [`Scope`](crate::node::Node::Scope) or
-    /// [`Dynamic`](crate::node::Node::Dynamic) node that flat signature
+    /// The candidate may produce a contract output but does not guarantee it
+    /// on every successful path.
+    MissingGuaranteedOutputs {
+        /// The key the candidate was being registered under.
+        id: Arc<str>,
+        /// Contract output entries the candidate does not guarantee.
+        missing: Vec<Access>,
+    },
+    /// The candidate nests an undeclared [`Scope`](crate::node::Node::Scope)
+    /// or [`Dynamic`](crate::node::Node::Dynamic) node that flat signature
     /// derivation cannot see across, so it cannot be soundly checked against the
-    /// registry contract.
+    /// registry contract. A scope carrying a declared contract
+    /// ([`Graph::add_scope_with_contract`](crate::Graph::add_scope_with_contract))
+    /// does not disqualify a candidate.
     NestedCandidate {
         /// The key the candidate was being registered under.
         id: Arc<str>,
@@ -346,13 +434,26 @@ impl fmt::Display for RegistryError {
                     rest.len()
                 ),
             },
-            RegistryError::Incompatible { id, diff } => write!(
+            RegistryError::Incompatible { id, diff, matching } => write!(
                 f,
-                "candidate '{id}' is not compatible with the registry contract ({diff})"
+                "candidate '{id}' is not admitted against the registry contract under {matching} matching ({diff})"
             ),
+            RegistryError::MissingGuaranteedOutputs { id, missing } => {
+                write!(
+                    f,
+                    "candidate '{id}' does not guarantee registry contract output(s): "
+                )?;
+                for (index, access) in missing.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "Out<{}>", access.type_name)?;
+                }
+                Ok(())
+            }
             RegistryError::NestedCandidate { id } => write!(
                 f,
-                "candidate '{id}' nests a scope or dynamic node; signature derivation does not yet see across nested context boundaries — flatten the candidate (recursive signatures are planned)"
+                "candidate '{id}' nests an undeclared scope; signature derivation does not see across that boundary — declare a contract on the nested scope (add_scope_with_contract) or flatten the candidate"
             ),
             RegistryError::Full { id, max } => write!(
                 f,
@@ -369,6 +470,7 @@ impl std::error::Error for RegistryError {
                 .first()
                 .map(|err| err as &(dyn std::error::Error + 'static)),
             RegistryError::Incompatible { .. }
+            | RegistryError::MissingGuaranteedOutputs { .. }
             | RegistryError::NestedCandidate { .. }
             | RegistryError::Full { .. } => None,
         }
@@ -431,6 +533,21 @@ mod tests {
         }
         fn access(&self) -> SystemAccess {
             SystemAccess::new()
+        }
+    }
+
+    /// Completes without producing a data-flow output.
+    struct Noop;
+    impl System for Noop {
+        type Output = ();
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a SystemContext<'_>,
+        ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn name(&self) -> &'static str {
+            "noop"
         }
     }
 
@@ -545,6 +662,36 @@ mod tests {
             }
             other => panic!("expected Incompatible, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn register_rejects_a_contract_output_a_branch_can_skip() {
+        let mut candidate = Graph::new();
+        candidate.add_conditional_branch::<i32, _, _, _>(
+            "route",
+            |_value| true,
+            |graph| {
+                graph.add_boxed_system(Box::new(Produce));
+            },
+            |graph| {
+                graph.add_boxed_system(Box::new(Noop));
+            },
+        );
+        let contract = GraphSignature::new()
+            .require_output::<i32>()
+            .produce::<i32>();
+        let mut registry = SubgraphRegistry::new(contract);
+
+        let err = registry.register("conditional", candidate).unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::MissingGuaranteedOutputs { ref missing, .. }
+                if missing.iter().any(|access| access.type_name == std::any::type_name::<i32>())
+        ));
+        assert!(
+            err.to_string().contains("Out<i32>"),
+            "the typed error names the missing contract output: {err}"
+        );
     }
 
     #[test]

@@ -1,19 +1,20 @@
 //! Builder API for constructing graphs.
 
-use super::{Graph, MergeError};
+use super::{Graph, GraphSignature, MergeError};
 use crate::edge::{Edge, ErrorEdge, TimeoutEdge};
 use crate::executor::CaughtError;
 use crate::node::{
     CandidateSource, ContextPolicy, DecisionNode, DynamicNode, DynamicSlot, IntoSystemNode,
-    LoopNode, Node, NodeId, ParallelNode, RetryPolicy, ScopeNode, SwitchNode, SystemNode,
+    LoopNode, Node, NodeId, NodeName, ParallelNode, RetryPolicy, ScopeNode, SwitchNode, SystemNode,
 };
-use crate::predicate::Predicate;
+use crate::predicate::{BoxedDiscriminator, BoxedPredicate, Discriminator, Predicate};
 use crate::registry::SubgraphRegistry;
 use crate::selector::{BoxedSelector, Selector};
 use hashbrown::HashSet;
 use polaris_system::param::{ERROR_CONTEXT, SystemAccess, SystemContext};
+use polaris_system::plugin::{IntoScheduleIds, ScheduleId};
 use polaris_system::resource::Output;
-use polaris_system::system::{BoxFuture, BoxedSystem, System, SystemError};
+use polaris_system::system::{BoxFuture, IntoBoxedSystem, System, SystemError};
 use std::any::TypeId;
 use std::sync::Arc;
 use std::time::Duration;
@@ -236,15 +237,22 @@ impl Graph {
         }
     }
 
-    /// Adds a boxed system node directly.
+    /// Adds a boxed or typed-erased system node directly.
     ///
-    /// This is useful for adding custom `System` implementations
-    /// that don't go through `IntoSystem`.
+    /// Accepts [`BoxedSystem`](polaris_system::system::BoxedSystem), boxed
+    /// custom [`System`] implementations, and
+    /// [`TypedSystem<O>`](polaris_system::system::TypedSystem) handles produced
+    /// by [`erase`](polaris_system::system::erase).
+    ///
+    /// Prefer this over [`system_boxed`](Self::system_boxed) when a composition
+    /// helper needs the `NodeId` to wire edges itself — for example reading
+    /// [`TypedSystem::is_fallible`](polaris_system::system::TypedSystem::is_fallible)
+    /// and attaching an error handler for the returned node.
     ///
     /// # Returns
     ///
     /// The node ID of the newly added system node.
-    pub fn add_boxed_system(&mut self, system: BoxedSystem) -> NodeId {
+    pub fn add_boxed_system(&mut self, system: impl IntoBoxedSystem) -> NodeId {
         let node = Node::System(SystemNode::new_boxed(system));
         let id = node.id();
 
@@ -263,14 +271,13 @@ impl Graph {
         id
     }
 
-    /// Adds a boxed system node and returns a builder for configuring
-    /// error/timeout handlers.
+    /// Adds a boxed or typed-erased system node and returns its builder.
     ///
-    /// This is useful for adding custom `System` implementations
-    /// that don't go through `IntoSystem`,
-    ///
-    /// This is the builder equivalent of [`add_boxed_system`](Self::add_boxed_system),
-    /// useful for custom `System` implementations that don't go through `IntoSystem`.
+    /// This is the builder equivalent of
+    /// [`add_boxed_system`](Self::add_boxed_system), useful for boxed custom
+    /// [`System`] implementations and typed-erased composition stages. The returned
+    /// builder can attach schedules, error and timeout handlers, execution
+    /// timeouts, and retry policies.
     ///
     /// # Example
     ///
@@ -287,7 +294,31 @@ impl Graph {
     ///     .done()
     ///     .add_system(next_step);
     /// ```
-    pub fn system_boxed(&mut self, system: BoxedSystem) -> SystemNodeBuilder<'_> {
+    ///
+    /// A composition helper receives its stage as a
+    /// [`TypedSystem<O>`](polaris_system::system::TypedSystem) — naming the
+    /// output it requires without a system or marker type parameter — and
+    /// attaches its own hook schedule here, since a handle cannot use the
+    /// `(schedule, system)` tuple form:
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_system::plugin::Schedule;
+    /// # use polaris_system::system::{TypedSystem, erase};
+    /// # async fn predict() -> i32 { 7 }
+    /// struct OnStage;
+    /// impl Schedule for OnStage {}
+    ///
+    /// fn add_stage(graph: &mut Graph, stage: TypedSystem<i32>) {
+    ///     graph.system_boxed(stage)
+    ///         .with_schedules(OnStage)
+    ///         .done();
+    /// }
+    ///
+    /// let mut graph = Graph::new();
+    /// add_stage(&mut graph, erase(predict));
+    /// ```
+    pub fn system_boxed(&mut self, system: impl IntoBoxedSystem) -> SystemNodeBuilder<'_> {
         let node_id = self.add_boxed_system(system);
         SystemNodeBuilder {
             graph: self,
@@ -330,6 +361,49 @@ impl Graph {
         F: FnOnce(&mut Graph),
     {
         f(self);
+        self
+    }
+
+    /// Binds `reader`'s `Out<T>` (or `Option<Out<T>>`) read of `T` to
+    /// `producer`'s entries, instead of the newest write of `T` from any
+    /// producer.
+    ///
+    /// The primitive behind [`SystemNodeBuilder::read_from`], which is the
+    /// more ergonomic call for the common case of wiring a system's read to a
+    /// producer that already exists. Call this directly instead when the
+    /// producer's id is not yet available at the point the reader is added —
+    /// notably a loop's backward wire, where the producer
+    /// is added *after* the reader in the same body, since the reader reads
+    /// its *previous* iteration's value:
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_system::param::Out;
+    /// # #[derive(Clone, Copy)] struct Counter(u32);
+    /// # async fn seed() -> Counter { Counter(0) }
+    /// # #[polaris_system::system]
+    /// # async fn remember(previous: Option<Out<Counter>>) -> i32 { previous.map_or(-1, |c| c.0 as i32) }
+    /// # #[polaris_system::system]
+    /// # async fn advance(counter: Out<Counter>) -> Counter { Counter(counter.0 + 1) }
+    /// let mut graph = Graph::new();
+    /// graph.add_system(seed);
+    /// graph.add_loop_n("loop", 3, |g| {
+    ///     let remember_id = g.system(remember).id();
+    ///     let advance_id = g.system(advance).id();
+    ///     g.read_from::<Counter>(remember_id, advance_id);
+    /// });
+    /// assert!(graph.validate().is_ok());
+    /// ```
+    ///
+    /// A second `read_from::<T>` call for the same `reader` and `T` replaces
+    /// the earlier binding.
+    pub fn read_from<T: Output>(&mut self, reader: NodeId, producer: NodeId) -> &mut Self {
+        self.output_wiring.bind(
+            reader,
+            TypeId::of::<T>(),
+            producer,
+            std::any::type_name::<T>(),
+        );
         self
     }
 
@@ -408,8 +482,7 @@ impl Graph {
             );
         }
 
-        self.nodes.extend(other.nodes);
-        self.edges.extend(other.edges);
+        self.absorb(other);
         self.last_node = Some(other_exit);
 
         Ok(self)
@@ -453,7 +526,7 @@ impl Graph {
     /// ```
     pub fn add_conditional_branch<T, P, F1, F2>(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         predicate: P,
         true_path: F1,
         false_path: F2,
@@ -464,8 +537,48 @@ impl Graph {
         F1: FnOnce(&mut Graph),
         F2: FnOnce(&mut Graph),
     {
-        let boxed_predicate = Box::new(Predicate::<T, P>::new(predicate));
-        let mut decision = DecisionNode::with_predicate(name, boxed_predicate);
+        let boxed_predicate: BoxedPredicate = Predicate::<T, P>::new(predicate).into();
+        self.add_conditional_branch_boxed(name, boxed_predicate, true_path, false_path)
+    }
+
+    /// Adds a decision node for binary branching with an already-boxed predicate.
+    ///
+    /// The type-erased counterpart of
+    /// [`add_conditional_branch`](Self::add_conditional_branch) — build the
+    /// [`BoxedPredicate`] with [`BoxedPredicate::new`] when the input type is
+    /// only known at runtime (for example, assembling a graph from a JSON
+    /// plan over a registry of pre-registered predicates), without naming the
+    /// input type at the call site.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::predicate::BoxedPredicate;
+    /// # struct ReasoningResult { needs_tool: bool }
+    /// # async fn use_tool() -> i32 { 1 }
+    /// # async fn respond() -> i32 { 2 }
+    /// # let mut graph = Graph::new();
+    /// let predicate = BoxedPredicate::new::<ReasoningResult>(|result| result.needs_tool);
+    /// graph.add_conditional_branch_boxed(
+    ///     "needs_tool",
+    ///     predicate,
+    ///     |g| { g.add_system(use_tool); },
+    ///     |g| { g.add_system(respond); },
+    /// );
+    /// ```
+    pub fn add_conditional_branch_boxed<F1, F2>(
+        &mut self,
+        name: impl Into<NodeName>,
+        predicate: BoxedPredicate,
+        true_path: F1,
+        false_path: F2,
+    ) -> &mut Self
+    where
+        F1: FnOnce(&mut Graph),
+        F2: FnOnce(&mut Graph),
+    {
+        let mut decision = DecisionNode::with_predicate(name, predicate);
         let decision_id = decision.id.clone();
 
         // Connect to previous node if exists
@@ -482,7 +595,7 @@ impl Graph {
         let mut true_graph = Graph::new();
         true_path(&mut true_graph);
 
-        if let Some(entry) = true_graph.entry {
+        if let Some(entry) = true_graph.entry.take() {
             decision.true_branch = Some(entry);
         }
 
@@ -490,7 +603,7 @@ impl Graph {
         let mut false_graph = Graph::new();
         false_path(&mut false_graph);
 
-        if let Some(entry) = false_graph.entry {
+        if let Some(entry) = false_graph.entry.take() {
             decision.false_branch = Some(entry);
         }
 
@@ -498,10 +611,8 @@ impl Graph {
         self.nodes.push(Node::Decision(decision));
 
         // Merge branch graphs into main graph
-        self.nodes.extend(true_graph.nodes);
-        self.edges.extend(true_graph.edges);
-        self.nodes.extend(false_graph.nodes);
-        self.edges.extend(false_graph.edges);
+        self.absorb(true_graph);
+        self.absorb(false_graph);
 
         // Decision node becomes the last node (branches may rejoin later)
         self.last_node = Some(decision_id);
@@ -511,11 +622,18 @@ impl Graph {
 
     /// Adds a parallel execution node.
     ///
+    /// Every branch runs and merges its outputs back in branch order, so what
+    /// the branches jointly guarantee is credited to the chain after this node
+    /// — a fan-out may seed a downstream `Out<T>` read or loop without the
+    /// parent supplying it. A branch cannot be satisfied by a sibling, and
+    /// production behind a handler edge inside a branch is not credited. See
+    /// [Graph — Parallel Execution](../../docs/reference/graph.md#parallel-execution).
+    ///
     /// # Arguments
     ///
     /// * `name` - Human-readable name for the parallel node.
     /// * `branches` - Builder functions for each parallel branch.
-    pub fn add_parallel<I, F>(&mut self, name: &'static str, branches: I) -> &mut Self
+    pub fn add_parallel<I, F>(&mut self, name: impl Into<NodeName>, branches: I) -> &mut Self
     where
         I: IntoIterator<Item = F>,
         F: FnOnce(&mut Graph),
@@ -538,13 +656,12 @@ impl Graph {
             let mut branch_graph = Graph::new();
             branch_fn(&mut branch_graph);
 
-            if let Some(entry) = branch_graph.entry {
+            if let Some(entry) = branch_graph.entry.take() {
                 parallel.branches.push(entry);
             }
 
             // Merge branch graph
-            self.nodes.extend(branch_graph.nodes);
-            self.edges.extend(branch_graph.edges);
+            self.absorb(branch_graph);
         }
 
         // Add parallel node (it serves as both entry and exit)
@@ -572,7 +689,11 @@ impl Graph {
     /// lacks it, the executor fails at run start with
     /// [`ExecutionError::LoopPredicateInputMissingOnEntry`](crate::executor::ExecutionError::LoopPredicateInputMissingOnEntry).
     /// The derived [`Graph::signature`] lists the input in `requires_outputs`
-    /// unless a preceding system is guaranteed to produce it.
+    /// unless production is *guaranteed* earlier on the chain — by a preceding
+    /// system, a parallel node (every branch runs and merges back), or a scope
+    /// (inner outputs merge back on exit). A decision or switch case, a loop
+    /// body, and a dynamic candidate guarantee nothing, so a seed produced
+    /// only there is still advertised.
     ///
     /// # Type Parameters
     ///
@@ -608,14 +729,58 @@ impl Graph {
     ///     },
     /// );
     /// ```
-    pub fn add_loop<T, P, F>(&mut self, name: &'static str, termination: P, body: F) -> &mut Self
+    pub fn add_loop<T, P, F>(
+        &mut self,
+        name: impl Into<NodeName>,
+        termination: P,
+        body: F,
+    ) -> &mut Self
     where
         T: Output,
         P: Fn(&T) -> bool + Send + Sync + 'static,
         F: FnOnce(&mut Graph),
     {
-        let boxed_termination = Box::new(Predicate::<T, P>::new(termination));
-        let mut loop_node = LoopNode::with_termination(name, boxed_termination);
+        let boxed_termination: BoxedPredicate = Predicate::<T, P>::new(termination).into();
+        self.add_loop_boxed(name, boxed_termination, body)
+    }
+
+    /// Adds a loop node with an already-boxed termination predicate.
+    ///
+    /// The type-erased counterpart of [`add_loop`](Self::add_loop) — build
+    /// the [`BoxedPredicate`] with [`BoxedPredicate::new`] when the input
+    /// type is only known at runtime, without naming it at the call site.
+    /// The loop-entry check (the predicate's input type must be guaranteed
+    /// before the loop is reached, or the executor fails at run start with
+    /// [`ExecutionError::LoopPredicateInputMissingOnEntry`](crate::executor::ExecutionError::LoopPredicateInputMissingOnEntry))
+    /// still runs, driven by
+    /// [`ErasedPredicate::input_type_id`](crate::predicate::ErasedPredicate::input_type_id)
+    /// on the boxed predicate exactly as it does for the typed [`add_loop`](Self::add_loop).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::predicate::BoxedPredicate;
+    /// # struct LoopState { is_done: bool }
+    /// # async fn init_state() -> LoopState { LoopState { is_done: false } }
+    /// # async fn act() -> i32 { 1 }
+    /// # let mut graph = Graph::new();
+    /// let termination = BoxedPredicate::new::<LoopState>(|state| state.is_done);
+    /// graph.add_system(init_state);
+    /// graph.add_loop_boxed("react_loop", termination, |g| {
+    ///     g.add_system(act);
+    /// });
+    /// ```
+    pub fn add_loop_boxed<F>(
+        &mut self,
+        name: impl Into<NodeName>,
+        termination: BoxedPredicate,
+        body: F,
+    ) -> &mut Self
+    where
+        F: FnOnce(&mut Graph),
+    {
+        let mut loop_node = LoopNode::with_termination(name, termination);
         let loop_id = loop_node.id.clone();
 
         // Connect to previous node if exists
@@ -632,13 +797,12 @@ impl Graph {
         let mut body_graph = Graph::new();
         body(&mut body_graph);
 
-        if let Some(entry) = body_graph.entry {
+        if let Some(entry) = body_graph.entry.take() {
             loop_node.body_entry = Some(entry);
         }
 
         // Merge body graph
-        self.nodes.extend(body_graph.nodes);
-        self.edges.extend(body_graph.edges);
+        self.absorb(body_graph);
 
         // Add loop node
         self.nodes.push(Node::Loop(loop_node));
@@ -670,7 +834,12 @@ impl Graph {
     ///     g.add_system(attempt_operation);
     /// });
     /// ```
-    pub fn add_loop_n<F>(&mut self, name: &'static str, max_iterations: usize, body: F) -> &mut Self
+    pub fn add_loop_n<F>(
+        &mut self,
+        name: impl Into<NodeName>,
+        max_iterations: usize,
+        body: F,
+    ) -> &mut Self
     where
         F: FnOnce(&mut Graph),
     {
@@ -691,13 +860,12 @@ impl Graph {
         let mut body_graph = Graph::new();
         body(&mut body_graph);
 
-        if let Some(entry) = body_graph.entry {
+        if let Some(entry) = body_graph.entry.take() {
             loop_node.body_entry = Some(entry);
         }
 
         // Merge body graph
-        self.nodes.extend(body_graph.nodes);
-        self.edges.extend(body_graph.edges);
+        self.absorb(body_graph);
 
         // Add loop node
         self.nodes.push(Node::Loop(loop_node));
@@ -719,6 +887,13 @@ impl Graph {
     ///
     /// Unlike decision/loop/parallel nodes, the embedded graph's nodes are NOT
     /// merged into the parent graph. The scope node holds the graph as a field.
+    ///
+    /// "Opaque" governs node merging and what the interior *needs*, not what it
+    /// deposits: inner outputs merge back on exit whatever the policy, so the
+    /// interior's guaranteed production is credited to the enclosing chain and
+    /// a scope may seed a downstream `Out<T>` read or loop. Production behind a
+    /// handler edge inside the scope is not credited. See
+    /// [Graph — Scope](../../docs/reference/graph.md#scope).
     ///
     /// # Arguments
     ///
@@ -743,11 +918,90 @@ impl Graph {
     /// ```
     pub fn add_scope(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         graph: Graph,
         policy: ContextPolicy,
     ) -> &mut Self {
-        let scope = ScopeNode::new(name, graph, policy);
+        self.push_scope(ScopeNode::new(name, graph, policy))
+    }
+
+    /// Adds a scope node that carries a declared [`GraphSignature`] contract.
+    ///
+    /// The contract is the interface the scope presents to this graph, and it
+    /// replaces the opaque treatment a plain [`add_scope`](Self::add_scope)
+    /// gets in [`signature`](Graph::signature) derivation: the contract's
+    /// `requires` and `requires_outputs` are classified against what is
+    /// guaranteed upstream and surfaced in this graph's signature otherwise,
+    /// and its `produces` are credited as guaranteed production for downstream
+    /// reads. Because the boundary's IO is fully declared, a graph embedding a
+    /// contract-declared scope is admissible as a
+    /// [`Dynamic`](Node::Dynamic) candidate, where a plain scope is not.
+    ///
+    /// It is also a **sealed** boundary at runtime, not just at validate time:
+    /// on a non-[`shared()`](ContextPolicy::shared) `policy`, only the output
+    /// types named in `produces` merge back when the scope completes — every
+    /// other output the interior wrote, declared or not, is dropped with the
+    /// child context, and a same-typed parent output survives untouched. A
+    /// plain [`add_scope`](Self::add_scope) keeps merging every interior
+    /// output unfiltered, contract or no contract. See
+    /// [`ScopeNode`]'s *Declared contracts* docs for the `shared()` exception,
+    /// where there is no child context to filter.
+    ///
+    /// The declaration cannot drift from the interior:
+    /// [`validate`](Graph::validate) checks the embedded graph's `requires`
+    /// and `requires_outputs` against the contract with the same exact-match
+    /// relation [`SubgraphRegistry`] admission uses, and rejects a contract
+    /// requirement the `policy` blocks from crossing the boundary at runtime.
+    /// `produces` is checked as a **subset** instead: every declared produce
+    /// must be production the interior *guarantees* (crediting an
+    /// unguaranteed one downstream would be unsound), but the interior may
+    /// guarantee more than the contract declares — the extra stays private,
+    /// filtered out by the runtime boundary above rather than reported as
+    /// drift. The checked interface includes eager
+    /// [`forward`](ContextPolicy::forward)/[`fork`](ContextPolicy::fork)
+    /// inputs even if the interior never accesses them: declare a read for a
+    /// crossing-only type, retaining existing interior read/write requirements.
+    /// [`forward_fresh`](ContextPolicy::forward_fresh) is rejected for declared
+    /// scopes because a resource requirement cannot express factory availability.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::{ContextPolicy, Graph, GraphSignature};
+    ///
+    /// async fn gather_info() -> String { String::new() }
+    /// async fn log_progress() -> u32 { 0 } // an internal detail, kept private below
+    ///
+    /// let mut research = Graph::new();
+    /// research.add_system(gather_info).add_system(log_progress);
+    ///
+    /// // The scope advertises its interface instead of erasing it — and the
+    /// // contract need not name everything the interior guarantees: `u32`
+    /// // (produced by `log_progress`) is guaranteed but left undeclared, so
+    /// // it validates as a subset and stays private to the scope at runtime.
+    /// let mut graph = Graph::new();
+    /// graph.add_scope_with_contract(
+    ///     "research",
+    ///     research,
+    ///     ContextPolicy::new(),
+    ///     GraphSignature::new().produce::<String>(),
+    /// );
+    /// assert!(graph.validate().is_ok());
+    /// assert_eq!(graph.signature(), GraphSignature::new().produce::<String>());
+    /// ```
+    pub fn add_scope_with_contract(
+        &mut self,
+        name: impl Into<NodeName>,
+        graph: Graph,
+        policy: ContextPolicy,
+        contract: GraphSignature,
+    ) -> &mut Self {
+        self.push_scope(ScopeNode::new(name, graph, policy).with_contract(contract))
+    }
+
+    /// Shared wiring for the `add_scope*` builders: connects the node to the
+    /// chain and makes it the entry when it is the first node.
+    fn push_scope(&mut self, scope: ScopeNode) -> &mut Self {
         let scope_id = scope.id.clone();
 
         // Connect to previous node if exists
@@ -816,7 +1070,7 @@ impl Graph {
     /// ```
     pub fn add_dynamic<S, R, I, K>(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         selector: S,
         candidates: I,
         slot: DynamicSlot,
@@ -850,6 +1104,14 @@ impl Graph {
     /// whose contract matches the slot's contract into the session context before
     /// running.
     ///
+    /// Because admission happens at the registry, the `slot`'s
+    /// [`MatchingMode`](crate::graph::MatchingMode) is **not** consulted on
+    /// this path — set the relation on the registry with
+    /// [`SubgraphRegistry::with_matching`](crate::registry::SubgraphRegistry::with_matching),
+    /// and mirror it on the slot only to document intent. `validate()` still
+    /// checks this node's *contract* against its surroundings, and the
+    /// executor still refuses a registry whose contract is not this node's.
+    ///
     /// # Example
     ///
     /// ```
@@ -882,7 +1144,7 @@ impl Graph {
     /// ```
     pub fn add_dynamic_registry<S, R>(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         selector: S,
         slot: DynamicSlot,
     ) -> &mut Self
@@ -953,7 +1215,7 @@ impl Graph {
     /// ```
     pub fn add_dynamic_boxed<I, K>(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         selector: BoxedSelector,
         candidates: I,
         slot: DynamicSlot,
@@ -1024,7 +1286,7 @@ impl Graph {
     /// ```
     pub fn add_dynamic_registry_boxed(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         selector: BoxedSelector,
         slot: DynamicSlot,
     ) -> &mut Self {
@@ -1038,7 +1300,7 @@ impl Graph {
     /// wires it into the graph like `add_scope`.
     fn push_dynamic(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         selector: BoxedSelector,
         source: CandidateSource,
         slot: DynamicSlot,
@@ -1075,6 +1337,17 @@ impl Graph {
     /// returns `true`) that does not already have an error edge, pointing to
     /// the handler subgraph's entry.
     ///
+    /// # Ordering
+    ///
+    /// Only nodes without an existing error edge are wired, so this must run
+    /// *after* any node-specific handler
+    /// ([`add_error_handler_for`](Self::add_error_handler_for),
+    /// [`add_error_handler_fn_for`](Self::add_error_handler_fn_for)) meant to
+    /// take priority over it — reversing the order gives that node two error
+    /// routes, which [`Graph::validate`](Self::validate) rejects as
+    /// [`ValidationError::AmbiguousRoute`](crate::graph::ValidationError::AmbiguousRoute)
+    /// (`kind: `[`RouteKind::Error`](crate::graph::RouteKind::Error)).
+    ///
     /// # Arguments
     ///
     /// * `handler` - Builder function that creates the shared error handling subgraph
@@ -1099,7 +1372,7 @@ impl Graph {
         let mut handler_graph = Graph::new();
         handler(&mut handler_graph);
 
-        let Some(handler_entry) = handler_graph.entry else {
+        let Some(handler_entry) = handler_graph.entry.take() else {
             // Empty handler — nothing to wire.
             return self;
         };
@@ -1133,6 +1406,16 @@ impl Graph {
             })
             .collect();
 
+        if targets.is_empty() {
+            // Every fallible node already has a handler — the same "nothing
+            // to wire" case as an empty handler closure above. Dropping the
+            // built-but-unattached subgraph here matters: merging it in
+            // regardless would leave its nodes with no route to them at all,
+            // which `Graph::validate` now reports as
+            // `ValidationError::DisconnectedNodes`.
+            return self;
+        }
+
         // Wire error edges.
         for source in targets {
             let error_edge = Edge::Error(ErrorEdge::new(source, handler_entry.clone()));
@@ -1140,8 +1423,7 @@ impl Graph {
         }
 
         // Merge handler subgraph into main graph.
-        self.nodes.extend(handler_graph.nodes);
-        self.edges.extend(handler_graph.edges);
+        self.absorb(handler_graph);
 
         self
     }
@@ -1152,6 +1434,20 @@ impl Graph {
     /// the error handler node built by `handler` instead of propagating the
     /// error. The handler subgraph is shared — only one copy of the handler
     /// nodes is added to the graph, with an error edge from each source.
+    ///
+    /// # Ordering
+    ///
+    /// Wires an error edge from every source unconditionally — there is no
+    /// check for an existing one. Calling this a second time for a source
+    /// that already has an error edge (from this method, from
+    /// [`add_error_handler_fn_for`](Self::add_error_handler_fn_for), or from
+    /// a blanket [`add_error_handler`](Self::add_error_handler) called
+    /// first) gives that node two error routes:
+    /// [`Graph::validate`](Self::validate) rejects it as
+    /// [`ValidationError::AmbiguousRoute`](crate::graph::ValidationError::AmbiguousRoute)
+    /// (`kind: `[`RouteKind::Error`](crate::graph::RouteKind::Error)). There
+    /// is no override — call this at most once per source node, and before
+    /// any blanket handler meant to skip it.
     ///
     /// # Arguments
     ///
@@ -1197,16 +1493,23 @@ impl Graph {
         handler(&mut handler_graph);
 
         // Get handler entry point
-        if let Some(handler_entry) = handler_graph.entry {
+        if let Some(handler_entry) = handler_graph.entry.take() {
             // Add error edge from each source to handler
+            let mut wired_any = false;
             for source in source_nodes {
                 let error_edge = Edge::Error(ErrorEdge::new(source, handler_entry.clone()));
                 self.edges.push(error_edge);
+                wired_any = true;
             }
 
-            // Merge handler graph into main graph
-            self.nodes.extend(handler_graph.nodes);
-            self.edges.extend(handler_graph.edges);
+            // Merge handler graph into main graph — but only if a source was
+            // actually wired to it. An empty `source_nodes` would otherwise
+            // leave the handler subgraph's nodes with no route to them at
+            // all, which `Graph::validate` now reports as
+            // `ValidationError::DisconnectedNodes`.
+            if wired_any {
+                self.absorb(handler_graph);
+            }
         }
 
         self
@@ -1221,6 +1524,14 @@ impl Graph {
     ///
     /// This is a convenience over [`add_error_handler`](Self::add_error_handler)
     /// for trivial error mapping that doesn't need a full system definition.
+    ///
+    /// # Ordering
+    ///
+    /// Delegates to [`add_error_handler`](Self::add_error_handler), so the
+    /// same ordering rule applies: it must run *after* any node-specific
+    /// handler meant to take priority over it, or that node ends up with two
+    /// error routes and [`Graph::validate`](Self::validate) rejects the
+    /// graph.
     ///
     /// # Example
     ///
@@ -1257,6 +1568,15 @@ impl Graph {
     ///
     /// Like [`add_error_handler_fn`](Self::add_error_handler_fn) but only
     /// wires error edges from the specified source nodes.
+    ///
+    /// # Ordering
+    ///
+    /// Delegates to [`add_error_handler_for`](Self::add_error_handler_for),
+    /// so the same ordering rule applies: it wires unconditionally, so
+    /// calling it a second time for a source that already has an error edge
+    /// gives that node two error routes and
+    /// [`Graph::validate`](Self::validate) rejects the graph. There is no
+    /// override — call this at most once per source node.
     ///
     /// # Example
     ///
@@ -1295,6 +1615,16 @@ impl Graph {
     /// Note: You must also set a timeout on the source node for this handler to
     /// be triggered. Use [`set_timeout`](Self::set_timeout) after adding the system.
     ///
+    /// # Ordering
+    ///
+    /// Wires a timeout edge from every source unconditionally — there is no
+    /// blanket variant and no check for an existing one. Calling this a
+    /// second time for the same source node gives it two timeout routes:
+    /// [`Graph::validate`](Self::validate) rejects it as
+    /// [`ValidationError::AmbiguousRoute`](crate::graph::ValidationError::AmbiguousRoute)
+    /// (`kind: `[`RouteKind::Timeout`](crate::graph::RouteKind::Timeout)).
+    /// There is no override — call this at most once per source node.
+    ///
     /// # Arguments
     ///
     /// * `source_node` - The node ID to attach the timeout handler to
@@ -1324,16 +1654,23 @@ impl Graph {
         handler(&mut handler_graph);
 
         // Get handler entry point
-        if let Some(handler_entry) = handler_graph.entry {
+        if let Some(handler_entry) = handler_graph.entry.take() {
             // Add timeout edge from each source to handler
+            let mut wired_any = false;
             for source in source_nodes {
                 let timeout_edge = Edge::Timeout(TimeoutEdge::new(source, handler_entry.clone()));
                 self.edges.push(timeout_edge);
+                wired_any = true;
             }
 
-            // Merge handler graph into main graph
-            self.nodes.extend(handler_graph.nodes);
-            self.edges.extend(handler_graph.edges);
+            // Merge handler graph into main graph — but only if a source was
+            // actually wired to it. An empty `source_nodes` would otherwise
+            // leave the handler subgraph's nodes with no route to them at
+            // all, which `Graph::validate` now reports as
+            // `ValidationError::DisconnectedNodes`.
+            if wired_any {
+                self.absorb(handler_graph);
+            }
         }
 
         self
@@ -1402,6 +1739,143 @@ impl Graph {
         panic!("set_retry_policy: node {node_id} not found or is not a system node");
     }
 
+    /// Sets how many of a loop's most recent completed iterations remain
+    /// visible to its later iterations.
+    ///
+    /// The default is 1: while an iteration runs, the previous iteration's
+    /// outputs stay readable. A larger value keeps more history available to
+    /// `Out<T>`/`OutAll<T>` reads in subsequent iterations; 0 keeps none, so
+    /// each iteration sees only what it wrote itself plus what existed before
+    /// the loop. Whatever the value, only the last iteration's outputs cross
+    /// the loop boundary when the loop ends. See
+    /// [`set_loop_retention_for_type`](Self::set_loop_retention_for_type) to
+    /// change it for one output type only; 0 means the same there.
+    ///
+    /// Configuration lives in a side table keyed by `node_id` rather than as a
+    /// field on the loop node itself, so `add_loop*`'s existing `&mut Graph`
+    /// chaining return is unchanged — call this after adding the loop, using
+    /// [`last_node`](Graph::last_node) to get its id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node is not a loop node or doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # async fn step() -> i32 { 1 }
+    /// # let mut graph = Graph::new();
+    /// graph.add_loop_n("loop", 5, |g| { g.add_system(step); });
+    /// let loop_id = graph.last_node().expect("the loop was just added");
+    /// graph.set_loop_retention(loop_id, 3);
+    /// ```
+    pub fn set_loop_retention(&mut self, node_id: NodeId, iterations: usize) -> &mut Self {
+        self.assert_is_loop_node("set_loop_retention", &node_id);
+        self.loop_retention.set_default(node_id, iterations);
+        self
+    }
+
+    /// Sets a loop's explicit maximum iteration count.
+    ///
+    /// This limit applies in addition to a loop's termination predicate and
+    /// overrides the executor's default iteration limit. A predicate loop
+    /// whose predicate remains false when it reaches this limit returns
+    /// [`ExecutionError::MaxIterationsExceeded`](crate::executor::ExecutionError::MaxIterationsExceeded).
+    ///
+    /// A limit of zero has the same meaning as it does for
+    /// [`add_loop_n`](Self::add_loop_n): the body does not run. A predicate
+    /// that is already true still ends the loop normally; otherwise the loop
+    /// returns `MaxIterationsExceeded { max: 0 }` before starting its body.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node is not a loop node or doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # async fn initial_state() -> bool { false }
+    /// # async fn step() -> bool { false }
+    /// # let mut graph = Graph::new();
+    /// graph.add_system(initial_state).add_loop::<bool, _, _>(
+    ///     "loop",
+    ///     |done| *done,
+    ///     |body| { body.add_system(step); },
+    /// );
+    /// let loop_id = graph.last_node().expect("the loop was just added");
+    /// graph.set_loop_max_iterations(loop_id, 5);
+    /// ```
+    pub fn set_loop_max_iterations(&mut self, node_id: NodeId, max_iterations: usize) -> &mut Self {
+        self.assert_is_loop_node("set_loop_max_iterations", &node_id);
+        for node in &mut self.nodes {
+            if let Node::Loop(loop_node) = node
+                && loop_node.id == node_id
+            {
+                loop_node.max_iterations = Some(max_iterations);
+                return self;
+            }
+        }
+        unreachable!("loop node was checked before setting its iteration limit");
+    }
+
+    /// Sets a per-type override for how many of a loop's most recent
+    /// completed iterations of `T` a loop keeps visible to its later
+    /// iterations. It wins over [`set_loop_retention`](Self::set_loop_retention)
+    /// for `T` without changing the retention of any other output type.
+    ///
+    /// The value means the same as it does for `set_loop_retention`: 0 keeps
+    /// no earlier iteration's `T` readable, and the last iteration's `T`
+    /// still crosses the loop boundary when the loop ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node is not a loop node or doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # async fn draft() -> String { String::new() }
+    /// # async fn score() -> u32 { 1 }
+    /// # let mut graph = Graph::new();
+    /// graph.add_loop_n("refine", 5, |g| {
+    ///     g.add_system(draft).add_system(score);
+    /// });
+    /// let loop_id = graph.last_node().expect("the loop was just added");
+    /// // Keep three earlier scores readable, but only the current draft.
+    /// graph
+    ///     .set_loop_retention(loop_id.clone(), 3)
+    ///     .set_loop_retention_for_type::<String>(loop_id, 0);
+    /// ```
+    pub fn set_loop_retention_for_type<T: Output>(
+        &mut self,
+        node_id: NodeId,
+        iterations: usize,
+    ) -> &mut Self {
+        self.assert_is_loop_node("set_loop_retention_for_type", &node_id);
+        self.loop_retention
+            .set_for_type(node_id, TypeId::of::<T>(), iterations);
+        self
+    }
+
+    /// Panics with a message naming `caller` if `node_id` is not a loop node
+    /// in this graph — the shared precondition check for the loop retention
+    /// setters, mirroring [`set_timeout`](Self::set_timeout)'s and
+    /// [`set_retry_policy`](Self::set_retry_policy)'s own panics for the
+    /// wrong node kind.
+    fn assert_is_loop_node(&self, caller: &str, node_id: &NodeId) {
+        let is_loop = self
+            .nodes
+            .iter()
+            .any(|node| matches!(node, Node::Loop(loop_node) if loop_node.id == *node_id));
+        assert!(
+            is_loop,
+            "{caller}: node {node_id} not found or is not a loop node"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Switch API
     // ─────────────────────────────────────────────────────────────────────────
@@ -1418,6 +1892,16 @@ impl Graph {
     /// - `D`: The discriminator closure type
     /// - `C`: The case builder type (iterable of key-handler pairs)
     /// - `F`: The default case builder type (optional)
+    ///
+    /// The discriminator must return `&'static str` and case keys must be
+    /// `&'static str`, matching every existing call site's turbofish arity
+    /// unchanged. For a discriminator or case keys known only at runtime
+    /// (e.g. `String`s), build a [`BoxedDiscriminator`] and use
+    /// [`add_switch_boxed`](Self::add_switch_boxed) instead — adding type
+    /// parameters here to generalize over the return/key type would change
+    /// this method's generic arity and break every existing explicit
+    /// turbofish call site, since Rust does not allow a turbofish to supply
+    /// a strict prefix of a function's type parameters.
     ///
     /// # Arguments
     ///
@@ -1447,7 +1931,7 @@ impl Graph {
     /// ```
     pub fn add_switch<T, D, C, F>(
         &mut self,
-        name: &'static str,
+        name: impl Into<NodeName>,
         discriminator: D,
         cases: C,
         default: Option<F>,
@@ -1458,14 +1942,53 @@ impl Graph {
         C: IntoIterator<Item = (&'static str, F)>,
         F: FnOnce(&mut Graph),
     {
-        use crate::predicate::Discriminator;
+        let boxed_discriminator: BoxedDiscriminator =
+            Discriminator::<T, D>::new(discriminator).into();
+        self.add_switch_boxed(name, boxed_discriminator, cases, default)
+    }
 
-        // Create the discriminator
-        let boxed_discriminator: crate::predicate::BoxedDiscriminator =
-            Box::new(Discriminator::<T, D>::new(discriminator));
-
+    /// Adds a switch node for multi-way branching with an already-boxed discriminator.
+    ///
+    /// The type-erased counterpart of [`add_switch`](Self::add_switch) —
+    /// build the [`BoxedDiscriminator`] with [`BoxedDiscriminator::new`] when
+    /// the input type is only known at runtime, without naming it at the
+    /// call site. Case keys accept any `impl Into<NodeName>`, so they can
+    /// come from runtime `String`s as well as `&'static str` literals.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::predicate::BoxedDiscriminator;
+    /// # struct RouterOutput { action: &'static str }
+    /// # async fn use_tool() -> i32 { 1 }
+    /// # async fn respond() -> i32 { 2 }
+    /// # let mut graph = Graph::new();
+    /// let discriminator = BoxedDiscriminator::new::<RouterOutput, _>(|out| out.action);
+    /// graph.add_switch_boxed(
+    ///     "route_action",
+    ///     discriminator,
+    ///     vec![
+    ///         ("tool", Box::new(|g: &mut Graph| { g.add_system(use_tool); }) as Box<dyn FnOnce(&mut Graph)>),
+    ///         ("respond", Box::new(|g: &mut Graph| { g.add_system(respond); }) as Box<dyn FnOnce(&mut Graph)>),
+    ///     ],
+    ///     None,
+    /// );
+    /// ```
+    pub fn add_switch_boxed<C, F, K>(
+        &mut self,
+        name: impl Into<NodeName>,
+        discriminator: BoxedDiscriminator,
+        cases: C,
+        default: Option<F>,
+    ) -> &mut Self
+    where
+        C: IntoIterator<Item = (K, F)>,
+        K: Into<NodeName>,
+        F: FnOnce(&mut Graph),
+    {
         // Create switch node
-        let mut switch_node = SwitchNode::with_discriminator(name, boxed_discriminator);
+        let mut switch_node = SwitchNode::with_discriminator(name, discriminator);
         let switch_id = switch_node.id.clone();
 
         // Build each case subgraph
@@ -1473,12 +1996,11 @@ impl Graph {
             let mut case_graph = Graph::new();
             handler(&mut case_graph);
 
-            if let Some(case_entry) = case_graph.entry {
-                switch_node.cases.push((key, case_entry));
+            if let Some(case_entry) = case_graph.entry.take() {
+                switch_node.cases.push((key.into(), case_entry));
 
                 // Merge case graph into main graph
-                self.nodes.extend(case_graph.nodes);
-                self.edges.extend(case_graph.edges);
+                self.absorb(case_graph);
             }
         }
 
@@ -1487,12 +2009,11 @@ impl Graph {
             let mut default_graph = Graph::new();
             default_handler(&mut default_graph);
 
-            if let Some(default_entry) = default_graph.entry {
+            if let Some(default_entry) = default_graph.entry.take() {
                 switch_node.default = Some(default_entry);
 
                 // Merge default graph into main graph
-                self.nodes.extend(default_graph.nodes);
-                self.edges.extend(default_graph.edges);
+                self.absorb(default_graph);
             }
         }
 
@@ -1514,10 +2035,12 @@ impl Graph {
     }
 }
 
-/// Builder for configuring a system node's error handling, timeout, and retry.
+/// Builder for configuring a system node's schedules, error handling, timeout,
+/// and retry policy.
 ///
-/// Created by [`Graph::system`]. The node is already added to the graph;
-/// this builder attaches decorations (error handlers, timeout, retry policy).
+/// Created by [`Graph::system`] or [`Graph::system_boxed`]. The node is already
+/// added to the graph; this builder attaches decorations (schedules, error
+/// handlers, timeout, retry policy).
 ///
 /// Call [`.done()`](Self::done) to return to `&mut Graph` for continued
 /// fluent chaining, or let the builder drop to release the borrow.
@@ -1531,6 +2054,128 @@ impl<'a> SystemNodeBuilder<'a> {
     #[must_use]
     pub fn id(&self) -> NodeId {
         self.node_id.clone()
+    }
+
+    /// Attaches custom schedules to this system node.
+    ///
+    /// System lifecycle events are re-emitted on these schedules, allowing
+    /// hooks to subscribe to events for this system only. A tuple attaches
+    /// multiple schedules.
+    ///
+    /// Schedules **accumulate**: markers already attached — by an earlier call
+    /// or by the `(schedule, system)` tuple form passed to
+    /// [`Graph::system`](Graph::system) — are preserved, and a marker already
+    /// present is not added twice. This means a composition helper can stamp
+    /// its own role marker onto a caller-supplied stage without discarding the
+    /// caller's observability markers. Attachment order is preserved, with
+    /// newly added markers appended after the existing ones.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this builder's node is no longer a system node in the graph.
+    /// Unreachable through the public API: the builder is only constructed
+    /// immediately after its node is pushed, and it holds `&mut Graph` for its
+    /// whole lifetime.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_system::plugin::Schedule;
+    /// # async fn run_stage() {}
+    /// struct OnStage;
+    /// impl Schedule for OnStage {}
+    ///
+    /// let mut graph = Graph::new();
+    /// graph.system(run_stage)
+    ///     .with_schedules(OnStage)
+    ///     .done();
+    /// ```
+    ///
+    /// Accumulating onto a tuple-attached marker keeps both:
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::node::Node;
+    /// # use polaris_system::plugin::{Schedule, ScheduleId};
+    /// # async fn run_stage() {}
+    /// struct OnAudit;
+    /// impl Schedule for OnAudit {}
+    /// struct OnStage;
+    /// impl Schedule for OnStage {}
+    ///
+    /// let mut graph = Graph::new();
+    /// graph.system((OnAudit, run_stage)).with_schedules(OnStage).done();
+    ///
+    /// let Node::System(node) = &graph.nodes()[0] else { unreachable!() };
+    /// assert_eq!(
+    ///     node.schedules,
+    ///     [ScheduleId::of::<OnAudit>(), ScheduleId::of::<OnStage>()],
+    /// );
+    /// ```
+    pub fn with_schedules(self, schedules: impl IntoScheduleIds) -> Self {
+        fn schedule_ids_for<Sch: IntoScheduleIds>(_: &Sch) -> Vec<ScheduleId> {
+            Sch::schedule_ids()
+        }
+
+        let added = schedule_ids_for(&schedules);
+        let system = self
+            .graph
+            .nodes
+            .iter_mut()
+            .find_map(|node| match node {
+                Node::System(system) if system.id == self.node_id => Some(system),
+                _ => None,
+            })
+            .expect("SystemNodeBuilder always refers to an existing system node");
+        system.push_schedules(added);
+        self
+    }
+
+    /// Sets the node's runtime display name.
+    ///
+    /// Defaults to the system's static function name (`S::name()` /
+    /// [`ErasedSystem::name`](polaris_system::system::ErasedSystem::name)). Setting a
+    /// runtime name is useful when the same system is added to a graph more
+    /// than once and the copies need to be told apart in hook events,
+    /// middleware [`SystemInfo`](crate::middleware::info::SystemInfo), and
+    /// devtools [`SystemInfo`](crate::dev::SystemInfo). Works for both the
+    /// typed ([`Graph::system`](Graph::system)) and boxed / typed-erased
+    /// ([`Graph::system_boxed`](Graph::system_boxed)) construction paths,
+    /// since both return this builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this builder's node is no longer a system node in the graph.
+    /// Unreachable through the public API: the builder is only constructed
+    /// immediately after its node is pushed, and it holds `&mut Graph` for its
+    /// whole lifetime.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_graph::node::Node;
+    /// # async fn run_stage() {}
+    /// let mut graph = Graph::new();
+    /// graph.system(run_stage).named("stage_one").done();
+    ///
+    /// let Node::System(node) = &graph.nodes()[0] else { unreachable!() };
+    /// assert_eq!(node.node_name, "stage_one");
+    /// ```
+    pub fn named(self, name: impl Into<NodeName>) -> Self {
+        let name = name.into();
+        let system = self
+            .graph
+            .nodes
+            .iter_mut()
+            .find_map(|node| match node {
+                Node::System(system) if system.id == self.node_id => Some(system),
+                _ => None,
+            })
+            .expect("SystemNodeBuilder always refers to an existing system node");
+        system.node_name = name;
+        self
     }
 
     /// Attaches an error handler to this system node.
@@ -1552,6 +2197,53 @@ impl<'a> SystemNodeBuilder<'a> {
     /// Sets a retry policy on this system node.
     pub fn with_retry(self, policy: RetryPolicy) -> Self {
         self.graph.set_retry_policy(self.node_id.clone(), policy);
+        self
+    }
+
+    /// Binds this system's `Out<T>` (or `Option<Out<T>>`) read of `T` to one
+    /// producer node's entries, instead of the newest write of `T` from any
+    /// producer.
+    ///
+    /// The system itself still declares a plain `Out<T>` — the *graph* picks
+    /// its producer, not the system's own type, so the same system can be
+    /// reused in a graph with a different producer wired in. At run time the
+    /// executor installs this binding only for the duration of this node's
+    /// own `run` call.
+    ///
+    /// A second `read_from::<T>` call on the same node replaces the earlier
+    /// binding for `T` — the same "last call wins" rule as
+    /// [`with_timeout`](Self::with_timeout).
+    ///
+    /// [`Graph::validate`] rejects the wire if `producer` is missing from
+    /// this graph, is not a system node, has a different output type, or is
+    /// not guaranteed to have completed before this node on every path —
+    /// unless both nodes are in the same loop body, in which case the wire
+    /// reads the producer's entry from an earlier iteration (seed the value
+    /// before the loop, or read it as `Option<Out<T>>`, since the first
+    /// iteration has none).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use polaris_graph::Graph;
+    /// # use polaris_system::param::Out;
+    /// # struct Plan { steps: Vec<String> }
+    /// # async fn plan() -> Plan { Plan { steps: vec![] } }
+    /// # #[polaris_system::system]
+    /// # async fn act(plan: Out<Plan>) -> i32 { plan.steps.len() as i32 }
+    /// let mut graph = Graph::new();
+    /// let planner = graph.system(plan).id();
+    /// graph.system(act).read_from::<Plan>(planner);
+    /// ```
+    ///
+    /// A loop's backward wire (reading an earlier iteration) needs the
+    /// producer's id *before* the producer node has
+    /// been added, since the producer runs structurally later in the body
+    /// than the reader that reads its previous value. This builder method
+    /// cannot express that ordering; use [`Graph::read_from`] directly once
+    /// both nodes exist by id instead.
+    pub fn read_from<T: Output>(self, producer: NodeId) -> Self {
+        self.graph.read_from::<T>(self.node_id.clone(), producer);
         self
     }
 

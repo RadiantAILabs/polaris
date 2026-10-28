@@ -26,7 +26,7 @@ The plugin has no dependencies on other Polaris plugins but requires a `HooksAPI
 | Field | Accessor | Description |
 |-------|----------|-------------|
 | `node_id` | `info.node_id()` | `NodeId` of the currently executing graph node |
-| `system_name` | `info.system_name()` | `&'static str` name of the system |
+| `system_name` | `info.system_name()` | `&NodeName` runtime name of the system node |
 
 ```rust
 use polaris_graph::dev::SystemInfo;
@@ -37,7 +37,7 @@ use polaris_system::system;
 async fn traced_step(info: Res<SystemInfo>) -> StepResult {
     tracing::info!(
         node = ?info.node_id(),
-        system = info.system_name(),
+        system = %info.system_name(),
         "running step"
     );
     StepResult::default()

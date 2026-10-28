@@ -38,12 +38,14 @@ test-utils = ["polaris_core_plugins/test-utils"]
 file-store = ["polaris_sessions/file-store"]
 typegen = ["polaris_sessions/typegen"]
 # Enables the dashboard HTTP surface (tools/models snapshots) across `polaris_tools` and `polaris_models`.
-# Pulls axum and `polaris_app` into the graph. `polaris_core_plugins/dashboard` forwards to the same
-# tools/models surface so the umbrella knob stays consistent across every plugin crate.
+# Pulls axum and `polaris_app` into the graph. `polaris_core_plugins/dashboard` and
+# `polaris_model_providers/dashboard` forward to the same tools/models surface so the umbrella knob
+# stays consistent across every plugin crate.
 dashboard = [
     "polaris_tools/dashboard",
     "polaris_models/dashboard",
     "polaris_core_plugins/dashboard",
+    "polaris_model_providers/dashboard",
 ]
 
 [dependencies]

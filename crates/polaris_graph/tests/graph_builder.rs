@@ -240,6 +240,15 @@ fn add_loop_with_iterations() {
     assert!(graph.node_count() >= 2);
 }
 
+#[test]
+#[should_panic(expected = "set_loop_max_iterations: node")]
+fn setting_loop_max_iterations_on_non_loop_panics() {
+    let mut graph = Graph::new();
+    let system_id = graph.add_system_node(test_system);
+
+    graph.set_loop_max_iterations(system_id, 3);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Complex Graphs
 // ─────────────────────────────────────────────────────────────────────────────
@@ -772,6 +781,75 @@ fn add_error_handler_skips_existing_error_edges() {
     assert_eq!(errors_from_b, 1);
 }
 
+/// A handler subgraph the blanket call has nothing to wire — because every
+/// fallible node already has a handler — must not be merged into the graph.
+/// Merging it unconditionally regardless of whether any edge pointed to it
+/// left its nodes with no route to them at all: a real, publicly-reachable
+/// orphan, not a hypothetical one.
+#[test]
+fn add_error_handler_drops_subgraph_when_every_fallible_node_already_has_a_handler() {
+    let mut graph = Graph::new();
+
+    let fallible = graph.add_boxed_system(Box::new(FailingSystem));
+    graph.add_error_handler_for(fallible, |g| {
+        g.add_system(respond);
+    });
+    let node_count_before = graph.node_count();
+
+    graph.add_error_handler(|g| {
+        g.add_system(fallback_system);
+    });
+
+    assert_eq!(
+        graph.node_count(),
+        node_count_before,
+        "a handler subgraph with no target must not be merged into the graph"
+    );
+    assert!(
+        graph.validate().is_ok(),
+        "no target for the blanket handler must not leave an orphaned node"
+    );
+}
+
+/// Same defect, direct call: an empty source list wires zero edges, so the
+/// handler subgraph it built must be dropped rather than merged in unwired.
+#[test]
+fn add_error_handler_for_with_no_sources_does_not_add_an_orphan() {
+    let mut graph = Graph::new();
+    graph.add_system(fallback_system);
+    let node_count_before = graph.node_count();
+
+    graph.add_error_handler_for(std::iter::empty(), |g| {
+        g.add_system(respond);
+    });
+
+    assert_eq!(
+        graph.node_count(),
+        node_count_before,
+        "an empty source list must not merge an unwired handler subgraph"
+    );
+    assert!(graph.validate().is_ok());
+}
+
+/// Same defect, timeout side.
+#[test]
+fn add_timeout_handler_with_no_sources_does_not_add_an_orphan() {
+    let mut graph = Graph::new();
+    graph.add_system(fallback_system);
+    let node_count_before = graph.node_count();
+
+    graph.add_timeout_handler(std::iter::empty(), |g| {
+        g.add_system(respond);
+    });
+
+    assert_eq!(
+        graph.node_count(),
+        node_count_before,
+        "an empty source list must not merge an unwired handler subgraph"
+    );
+    assert!(graph.validate().is_ok());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Closure-based error handler (add_error_handler_fn)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -901,5 +979,250 @@ async fn system_node_builder_on_error_fn_executes() {
     assert!(
         output.unwrap().starts_with("recovered: "),
         "output should contain the recovered message"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SystemNodeBuilder::with_schedules
+// ─────────────────────────────────────────────────────────────────────────────
+
+use polaris_system::plugin::{Schedule, ScheduleId};
+use polaris_system::system::erase;
+
+struct MarkerAudit;
+impl Schedule for MarkerAudit {}
+
+struct MarkerRole;
+impl Schedule for MarkerRole {}
+
+struct MarkerExtra;
+impl Schedule for MarkerExtra {}
+
+/// Reads the schedules attached to the graph's only system node.
+fn only_system_schedules(graph: &Graph) -> Vec<ScheduleId> {
+    let nodes: Vec<_> = graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            Node::System(system) => Some(system),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nodes.len(), 1, "expected exactly one system node");
+    nodes[0].schedules.clone()
+}
+
+#[test]
+fn with_schedules_preserves_tuple_attached_schedules() {
+    let mut graph = Graph::new();
+    graph
+        .system((MarkerAudit, first_step))
+        .with_schedules(MarkerRole)
+        .done();
+
+    assert_eq!(
+        only_system_schedules(&graph),
+        vec![
+            ScheduleId::of::<MarkerAudit>(),
+            ScheduleId::of::<MarkerRole>()
+        ],
+        "a helper stamping its role marker must not discard the author's marker"
+    );
+}
+
+#[test]
+fn with_schedules_accumulates_across_calls() {
+    let mut graph = Graph::new();
+    graph
+        .system(first_step)
+        .with_schedules(MarkerAudit)
+        .with_schedules(MarkerRole)
+        .done();
+
+    assert_eq!(
+        only_system_schedules(&graph),
+        vec![
+            ScheduleId::of::<MarkerAudit>(),
+            ScheduleId::of::<MarkerRole>()
+        ],
+        "successive calls must accumulate, not replace"
+    );
+}
+
+#[test]
+fn with_schedules_ignores_duplicates() {
+    let mut graph = Graph::new();
+    graph
+        .system((MarkerAudit, first_step))
+        .with_schedules((MarkerAudit, MarkerRole))
+        .with_schedules(MarkerRole)
+        .done();
+
+    assert_eq!(
+        only_system_schedules(&graph),
+        vec![
+            ScheduleId::of::<MarkerAudit>(),
+            ScheduleId::of::<MarkerRole>()
+        ],
+        "a marker already attached must not be added twice"
+    );
+}
+
+#[test]
+fn with_schedules_accepts_tuple_on_erased_system() {
+    let mut graph = Graph::new();
+    graph
+        .system_boxed(erase(first_step))
+        .with_schedules((MarkerRole, MarkerExtra))
+        .done();
+
+    assert_eq!(
+        only_system_schedules(&graph),
+        vec![
+            ScheduleId::of::<MarkerRole>(),
+            ScheduleId::of::<MarkerExtra>()
+        ],
+        "the documented tuple form must attach every marker in order"
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Typed erasure of fallible systems
+//
+// A fallible system's `Output` is its success type, so `erase` on
+// `-> Result<T, SystemError>` yields `TypedSystem<T>` — fallibility rides
+// alongside `O` as `is_fallible`. These tests pin that an erased fallible
+// system is handled exactly like a directly added one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Counts the error edges leaving `node`.
+fn error_edges_from(graph: &Graph, node: &polaris_graph::node::NodeId) -> usize {
+    graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge, Edge::Error(_)) && &edge.from() == node)
+        .count()
+}
+
+#[test]
+fn erased_fallible_system_reports_fallibility_to_the_graph() {
+    let mut graph = Graph::new();
+    let fallible = graph.add_boxed_system(erase(|| FailingSystem));
+    let infallible = graph.add_boxed_system(erase(first_step));
+
+    let system_for = |id: &polaris_graph::node::NodeId| {
+        graph
+            .nodes()
+            .iter()
+            .find_map(|node| match node {
+                Node::System(system) if &system.id == id => Some(system),
+                _ => None,
+            })
+            .expect("node should exist")
+    };
+
+    assert!(
+        system_for(&fallible).system.is_fallible(),
+        "an erased fallible system must still declare fallibility"
+    );
+    assert!(
+        !system_for(&infallible).system.is_fallible(),
+        "an erased infallible system must not declare fallibility"
+    );
+}
+
+#[test]
+fn erased_fallible_system_auto_wires_error_edges_like_direct() {
+    // Direct path: a boxed concrete fallible system.
+    let mut direct = Graph::new();
+    let direct_node = direct.add_boxed_system(Box::new(FailingSystem));
+    direct.add_error_handler_fn(|_err: &CaughtError| -> String { "handled".to_string() });
+
+    // Erased path: the same system behind a `TypedSystem<()>`.
+    let mut erased = Graph::new();
+    let erased_node = erased.add_boxed_system(erase(|| FailingSystem));
+    erased.add_error_handler_fn(|_err: &CaughtError| -> String { "handled".to_string() });
+
+    assert_eq!(
+        error_edges_from(&direct, &direct_node),
+        1,
+        "the direct path wires one error edge"
+    );
+    assert_eq!(
+        error_edges_from(&erased, &erased_node),
+        error_edges_from(&direct, &direct_node),
+        "auto-wiring keys off is_fallible, which must survive erasure"
+    );
+    assert_eq!(direct.signature(), erased.signature());
+
+    let result = erased.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn erased_infallible_system_gets_no_error_edge() {
+    let mut graph = Graph::new();
+    let node = graph.add_boxed_system(erase(first_step));
+    graph.add_error_handler_fn(|_err: &CaughtError| -> String { "handled".to_string() });
+
+    assert_eq!(
+        error_edges_from(&graph, &node),
+        0,
+        "an erased infallible system must not be wired to an error handler"
+    );
+}
+
+#[tokio::test]
+async fn erased_fallible_system_recovers_through_its_error_handler() {
+    use polaris_graph::executor::GraphExecutor;
+    use test_utils::create_test_server;
+
+    let mut graph = Graph::new();
+    graph
+        .system_boxed(erase(|| FailingSystem))
+        .on_error_fn(|err: &CaughtError| -> String { format!("recovered: {}", err.message) });
+
+    let server = create_test_server();
+    let hooks = test_utils::get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await
+        .expect("the error handler should recover the erased fallible system");
+
+    let output = result
+        .output::<String>()
+        .expect("the handler's output should be in the result");
+    assert_eq!(
+        output, "recovered: execution error: intentional failure",
+        "the erased system's error must reach the handler intact"
+    );
+}
+
+#[tokio::test]
+async fn erased_infallible_system_output_reaches_the_result() {
+    use polaris_graph::executor::GraphExecutor;
+    use test_utils::create_test_server;
+
+    let mut graph = Graph::new();
+    graph.add_boxed_system(erase(first_step));
+
+    let server = create_test_server();
+    let hooks = test_utils::get_hooks(&server);
+    let mut ctx = server.create_context();
+
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await
+        .expect("execution should succeed");
+
+    assert_eq!(
+        result.output::<i32>(),
+        Some(&1),
+        "an erased system's output must land in the context like any other"
     );
 }

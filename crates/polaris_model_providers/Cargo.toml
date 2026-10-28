@@ -23,23 +23,33 @@ default = ["anthropic"]
 anthropic = []
 openai = ["dep:async-openai"]
 bedrock = [
+    "openai",
     "dep:aws-sdk-bedrockruntime",
     "dep:aws-config",
+    "dep:aws-sigv4",
     "dep:aws-smithy-types",
     "dep:tokio",
     "dep:base64",
+    "dep:futures-util",
 ]
+# Forwards the dashboard variant to polaris_models. With it enabled,
+# `ModelsPlugin` requires `AppPlugin`; the plugin tests use this flag to add
+# `AppPlugin` when the dependency is present.
+dashboard = ["polaris_models/dashboard"]
 
 [dependencies]
 polaris_models = { path = "../polaris_models", version = "0.6" }
 polaris_system = { path = "../polaris_system", version = "0.6" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.13.1", features = ["json", "stream"] }
+reqwest = { version = "0.13.1", features = ["json", "stream", "blocking"] }
 tracing = "0.1"
 futures-core = "0.3"
 bytes = "1"
 simdutf8 = "0.1"
+thiserror = "2.0"
+dirs = "6.0"
+parking_lot = "0.12"
 
 # OpenAI dependencies
 async-openai = { version = "0.33", optional = true, default-features = false, features = [
@@ -53,16 +63,28 @@ aws-sdk-bedrockruntime = { version = "1.124.0", optional = true }
 aws-config = { version = "1.5", features = [
     "behavior-version-latest",
 ], optional = true }
+aws-sigv4 = { version = "1.6", optional = true }
 aws-smithy-types = { version = "1.2", optional = true }
 tokio = { version = "1.43", features = [
     "sync",
     "rt",
     "rt-multi-thread",
+    "time",
 ], optional = true }
 base64 = { version = "0.22", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.43", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+] }
 futures-util = "0.3"
 schemars = "1.2"
 dotenvy = "0.15"
+# Used by the plugin tests under `--all-features`: with `dashboard` enabled,
+# `ModelsPlugin` requires `AppPlugin`.
+polaris_app = { path = "../polaris_app", default-features = false }

@@ -69,7 +69,7 @@
 use std::fmt::{self, Debug, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use super::{ErrOut, ErrorContext, Out, Res, ResMut};
+use super::{ErrOut, ErrorContext, Out, OutAll, OutAllEntry, Res, ResMut};
 use crate::resource::{LocalResource, Output, Resource};
 
 /// Default byte ceiling applied by [`Inspection::debug`].
@@ -294,6 +294,8 @@ pub enum ParamKind {
     ResMut,
     /// An [`Out<T>`] parameter.
     Out,
+    /// An [`OutAll<T>`] parameter.
+    OutAll,
     /// An [`ErrOut<T>`] parameter.
     ErrOut,
     /// The system's own return value, which is not a parameter.
@@ -435,7 +437,7 @@ pub trait InspectionSink: Send + Sync {
 
 /// A system parameter that can render the value it resolved to.
 ///
-/// Implemented by this crate for [`Res`], [`ResMut`], [`Out`] and [`ErrOut`]
+/// Implemented by this crate for [`Res`], [`ResMut`], [`Out`], [`OutAll`] and [`ErrOut`]
 /// whenever the wrapped type is [`Debug`]. These are blanket impls over
 /// Polaris's *own* wrapper types, which is why opting in needs no trait impl
 /// from the caller and works on types they do not own — the orphan rule never
@@ -469,6 +471,13 @@ impl<T: LocalResource + Debug> InspectParam for ResMut<'_, T> {
 impl<T: Output + Debug> InspectParam for Out<'_, T> {
     fn inspect(this: &Self) -> Inspection {
         Inspection::debug(&**this)
+    }
+}
+
+impl<T: Output + Debug> InspectParam for OutAll<'_, T> {
+    fn inspect(this: &Self) -> Inspection {
+        let values: Vec<&T> = this.iter().map(OutAllEntry::value).collect();
+        Inspection::debug(&values)
     }
 }
 

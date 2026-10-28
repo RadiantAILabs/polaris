@@ -3,14 +3,15 @@
 //! Nodes are the vertices in a graph, representing units of computation
 //! or control flow decisions.
 
-use crate::graph::{Graph, GraphSignature};
+use crate::graph::{Graph, GraphSignature, MatchingMode};
 use crate::predicate::{BoxedDiscriminator, BoxedPredicate, ErasedDiscriminator, ErasedPredicate};
 use crate::selector::{BoxedSelector, ErasedSelector};
 use core::any::Any;
 use hashbrown::{HashMap, HashSet};
+use polaris_system::param::{Access, AccessMode};
 use polaris_system::plugin::{IntoScheduleIds, ScheduleId};
 use polaris_system::resource::LocalResource;
-use polaris_system::system::{BoxedSystem, ErasedSystem, IntoSystem};
+use polaris_system::system::{BoxedSystem, ErasedSystem, IntoBoxedSystem, IntoSystem};
 use std::any::TypeId;
 use std::fmt;
 use std::marker::PhantomData;
@@ -86,6 +87,166 @@ impl IntoIterator for NodeId {
 
     fn into_iter(self) -> Self::IntoIter {
         std::iter::once(self)
+    }
+}
+
+/// The display name of a node: a system, loop, switch, scope, dynamic, or
+/// parallel node, or a switch case key / discriminator result.
+///
+/// Backed by `Arc<str>`, so cloning is a reference-count bump. Accepts both
+/// `&'static str` literals (the common case, zero-allocation) and owned
+/// `String`s built at runtime (for example from a JSON plan), via `From` /
+/// `Into<NodeName>` — most call sites take `impl Into<NodeName>` and need no
+/// change at existing literal-argument call sites.
+///
+/// Compares equal to `&str` and `str` directly, and formats via `Display`
+/// exactly like the wrapped string, including width/alignment directives
+/// (`format!("{name:20}")`), so it is a drop-in replacement for `&'static str`
+/// in comparisons and interpolation.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::NodeName;
+///
+/// // From a literal, like existing call sites.
+/// let name: NodeName = "router".into();
+/// assert_eq!(name, "router");
+/// assert_eq!(format!("{name}"), "router");
+///
+/// // From an owned String built at runtime.
+/// let owned = format!("node_{}", 42);
+/// let name: NodeName = owned.into();
+/// assert_eq!(name.as_str(), "node_42");
+/// ```
+#[derive(Clone, Eq, Hash)]
+#[expect(
+    clippy::derived_hash_with_manual_eq,
+    reason = "the manual PartialEq below delegates to the same Arc<str> field as the derived Hash, so they stay consistent"
+)]
+pub struct NodeName(Arc<str>);
+
+impl NodeName {
+    /// Returns the name as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NodeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl fmt::Display for NodeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(&self.0)
+    }
+}
+
+impl std::ops::Deref for NodeName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for NodeName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for NodeName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&'static str> for NodeName {
+    fn from(name: &'static str) -> Self {
+        Self(Arc::from(name))
+    }
+}
+
+impl From<String> for NodeName {
+    fn from(name: String) -> Self {
+        Self(Arc::from(name))
+    }
+}
+
+impl From<Arc<str>> for NodeName {
+    fn from(name: Arc<str>) -> Self {
+        Self(name)
+    }
+}
+
+impl From<std::borrow::Cow<'static, str>> for NodeName {
+    fn from(name: std::borrow::Cow<'static, str>) -> Self {
+        match name {
+            std::borrow::Cow::Borrowed(s) => Self(Arc::from(s)),
+            std::borrow::Cow::Owned(s) => Self(Arc::from(s)),
+        }
+    }
+}
+
+impl PartialEq for NodeName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+/// Orders names by their string contents, consistent with [`PartialEq`] and
+/// [`Hash`], so a `NodeName` can key a `BTreeMap` or be sorted exactly like
+/// the `&'static str` it replaced.
+impl PartialOrd for NodeName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NodeName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialEq<str> for NodeName {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for NodeName {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<NodeName> for str {
+    fn eq(&self, other: &NodeName) -> bool {
+        self == &*other.0
+    }
+}
+
+impl PartialEq<NodeName> for &str {
+    fn eq(&self, other: &NodeName) -> bool {
+        *self == &*other.0
+    }
+}
+
+impl PartialEq<String> for NodeName {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl Default for NodeName {
+    fn default() -> Self {
+        Self(Arc::from(""))
     }
 }
 
@@ -172,15 +333,15 @@ impl Node {
 
     /// Returns the node's name.
     #[must_use]
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> NodeName {
         match self {
-            Node::System(n) => n.name(),
-            Node::Decision(n) => n.name,
-            Node::Switch(n) => n.name,
-            Node::Parallel(n) => n.name,
-            Node::Loop(n) => n.name,
-            Node::Scope(n) => n.name,
-            Node::Dynamic(n) => n.name,
+            Node::System(n) => n.node_name.clone(),
+            Node::Decision(n) => n.name.clone(),
+            Node::Switch(n) => n.name.clone(),
+            Node::Parallel(n) => n.name.clone(),
+            Node::Loop(n) => n.name.clone(),
+            Node::Scope(n) => n.name.clone(),
+            Node::Dynamic(n) => n.name.clone(),
         }
     }
 
@@ -202,56 +363,59 @@ impl Node {
             Node::System(n) => Node::System(SystemNode {
                 id,
                 system: Arc::clone(&n.system),
+                node_name: n.node_name.clone(),
                 timeout: n.timeout,
                 retry_policy: n.retry_policy.clone(),
                 schedules: n.schedules.clone(),
             }),
             Node::Decision(n) => Node::Decision(DecisionNode {
                 id,
-                name: n.name,
+                name: n.name.clone(),
                 predicate: n.predicate.clone(),
                 true_branch: n.true_branch.as_ref().map(|t| remap_node_id(map, t)),
                 false_branch: n.false_branch.as_ref().map(|t| remap_node_id(map, t)),
             }),
             Node::Switch(n) => Node::Switch(SwitchNode {
                 id,
-                name: n.name,
+                name: n.name.clone(),
                 discriminator: n.discriminator.clone(),
                 cases: n
                     .cases
                     .iter()
-                    .map(|(case, target)| (*case, remap_node_id(map, target)))
+                    .map(|(case, target)| (case.clone(), remap_node_id(map, target)))
                     .collect(),
                 default: n.default.as_ref().map(|d| remap_node_id(map, d)),
             }),
             Node::Parallel(n) => Node::Parallel(ParallelNode {
                 id,
-                name: n.name,
+                name: n.name.clone(),
                 branches: n.branches.iter().map(|b| remap_node_id(map, b)).collect(),
             }),
             Node::Loop(n) => Node::Loop(LoopNode {
                 id,
-                name: n.name,
+                name: n.name.clone(),
                 termination: n.termination.clone(),
                 max_iterations: n.max_iterations,
                 body_entry: n.body_entry.as_ref().map(|b| remap_node_id(map, b)),
             }),
             Node::Scope(n) => Node::Scope(ScopeNode {
                 id,
-                name: n.name,
+                name: n.name.clone(),
                 graph: n.graph.duplicate(),
                 context_policy: n.context_policy.clone(),
+                contract: n.contract.clone(),
             }),
             // Selector behavior is immutable and shared via `Arc`; inline
             // candidate topology is owned by this node, so it is duplicated like
             // a scope's embedded graph.
             Node::Dynamic(n) => Node::Dynamic(DynamicNode {
                 id,
-                name: n.name,
+                name: n.name.clone(),
                 selector: Arc::clone(&n.selector),
                 source: n.source.duplicate_owned_graphs(),
                 default: n.default.clone(),
                 contract: n.contract.clone(),
+                matching: n.matching,
                 context_policy: n.context_policy.clone(),
             }),
         }
@@ -413,6 +577,15 @@ pub struct SystemNode {
     /// cheaply when a graph is duplicated via [`Graph::duplicate`] — the clone
     /// gets a fresh [`NodeId`] but reuses the same system code.
     pub system: Arc<dyn ErasedSystem>,
+    /// The node's runtime display name.
+    ///
+    /// Defaults to [`ErasedSystem::name`] (the system's static function name).
+    /// Set a different value with [`SystemNodeBuilder::named`](crate::graph::SystemNodeBuilder::named)
+    /// to distinguish multiple nodes wrapping the same system in hook events,
+    /// middleware [`SystemInfo`](crate::middleware::info::SystemInfo), and
+    /// devtools [`SystemInfo`](crate::dev::SystemInfo). This is independent of
+    /// [`SystemNode::name`], which always returns the static system name.
+    pub node_name: NodeName,
     /// Optional timeout for this system's execution.
     /// If set and exceeded, the executor will follow any timeout edge if present.
     pub timeout: Option<Duration>,
@@ -428,25 +601,42 @@ impl SystemNode {
     /// Creates a new system node from any type implementing [`ErasedSystem`].
     #[must_use]
     pub fn new<S: ErasedSystem>(system: S) -> Self {
+        let node_name = system.name().into();
         Self {
             id: NodeId::new(),
             system: Arc::new(system),
+            node_name,
             timeout: None,
             retry_policy: None,
             schedules: Vec::new(),
         }
     }
 
-    /// Creates a new system node from an already-boxed system.
+    /// Creates a new system node from a boxed or typed-erased system.
     #[must_use]
-    pub fn new_boxed(system: BoxedSystem) -> Self {
+    pub fn new_boxed(system: impl IntoBoxedSystem) -> Self {
+        let system: Arc<dyn ErasedSystem> = Arc::from(system.into_boxed_system());
+        let node_name = system.name().into();
         Self {
             id: NodeId::new(),
-            system: Arc::from(system),
+            system,
+            node_name,
             timeout: None,
             retry_policy: None,
             schedules: Vec::new(),
         }
+    }
+
+    /// Sets the node's runtime display name.
+    ///
+    /// See [`SystemNode::node_name`] for what this affects. Prefer
+    /// [`SystemNodeBuilder::named`](crate::graph::SystemNodeBuilder::named)
+    /// when adding a system node through the [`Graph`] builder API; this
+    /// method is for direct, low-level construction.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<NodeName>) -> Self {
+        self.node_name = name.into();
+        self
     }
 
     /// Sets the timeout for this system node.
@@ -456,11 +646,30 @@ impl SystemNode {
         self
     }
 
-    /// Sets the custom schedules for this system node.
+    /// Attaches custom schedules to this system node.
+    ///
+    /// Schedules accumulate, matching
+    /// [`SystemNodeBuilder::with_schedules`](crate::graph::SystemNodeBuilder::with_schedules):
+    /// markers already attached are preserved, and a marker already present is
+    /// not added twice. Attachment order is preserved, with newly added markers
+    /// appended after the existing ones.
     #[must_use]
     pub fn with_schedules(mut self, schedules: Vec<ScheduleId>) -> Self {
-        self.schedules = schedules;
+        self.push_schedules(schedules);
         self
+    }
+
+    /// Appends `schedules`, skipping any marker already attached.
+    ///
+    /// The one place the accumulate-and-dedup rule is implemented; both
+    /// [`Self::with_schedules`] and `SystemNodeBuilder::with_schedules` go
+    /// through it.
+    pub(crate) fn push_schedules(&mut self, schedules: Vec<ScheduleId>) {
+        for schedule in schedules {
+            if !self.schedules.contains(&schedule) {
+                self.schedules.push(schedule);
+            }
+        }
     }
 
     /// Returns the system's name for debugging and tracing.
@@ -487,6 +696,7 @@ impl fmt::Debug for SystemNode {
         f.debug_struct("SystemNode")
             .field("id", &self.id)
             .field("name", &self.name())
+            .field("node_name", &self.node_name)
             .field("output_type", &self.output_type_name())
             .field("schedules", &self.schedules)
             .finish()
@@ -524,7 +734,7 @@ pub struct DecisionNode {
     /// Unique identifier for this node.
     pub id: NodeId,
     /// Human-readable name for debugging and tracing.
-    pub name: &'static str,
+    pub name: NodeName,
     /// The predicate that determines which branch to take.
     ///
     /// Held behind an [`Arc`] so the immutable predicate is shared cheaply
@@ -539,10 +749,10 @@ pub struct DecisionNode {
 impl DecisionNode {
     /// Creates a new decision node.
     #[must_use]
-    pub fn new(name: &'static str) -> Self {
+    pub fn new(name: impl Into<NodeName>) -> Self {
         Self {
             id: NodeId::new(),
-            name,
+            name: name.into(),
             predicate: None,
             true_branch: None,
             false_branch: None,
@@ -551,11 +761,11 @@ impl DecisionNode {
 
     /// Creates a new decision node with a predicate.
     #[must_use]
-    pub fn with_predicate(name: &'static str, predicate: BoxedPredicate) -> Self {
+    pub fn with_predicate(name: impl Into<NodeName>, predicate: BoxedPredicate) -> Self {
         Self {
             id: NodeId::new(),
-            name,
-            predicate: Some(Arc::from(predicate)),
+            name: name.into(),
+            predicate: Some(Arc::from(predicate.into_inner())),
             true_branch: None,
             false_branch: None,
         }
@@ -609,14 +819,14 @@ pub struct SwitchNode {
     /// Unique identifier for this node.
     pub id: NodeId,
     /// Human-readable name for debugging and tracing.
-    pub name: &'static str,
+    pub name: NodeName,
     /// The discriminator that determines which case to take.
     ///
     /// Held behind an [`Arc`] so the immutable discriminator is shared cheaply
     /// across a [`Graph::duplicate`].
     pub discriminator: Option<Arc<dyn ErasedDiscriminator>>,
     /// Node IDs for each case, keyed by case name.
-    pub cases: Vec<(&'static str, NodeId)>,
+    pub cases: Vec<(NodeName, NodeId)>,
     /// Default case if no match.
     pub default: Option<NodeId>,
 }
@@ -624,10 +834,10 @@ pub struct SwitchNode {
 impl SwitchNode {
     /// Creates a new switch node.
     #[must_use]
-    pub fn new(name: &'static str) -> Self {
+    pub fn new(name: impl Into<NodeName>) -> Self {
         Self {
             id: NodeId::new(),
-            name,
+            name: name.into(),
             discriminator: None,
             cases: Vec::new(),
             default: None,
@@ -636,11 +846,14 @@ impl SwitchNode {
 
     /// Creates a new switch node with a discriminator.
     #[must_use]
-    pub fn with_discriminator(name: &'static str, discriminator: BoxedDiscriminator) -> Self {
+    pub fn with_discriminator(
+        name: impl Into<NodeName>,
+        discriminator: BoxedDiscriminator,
+    ) -> Self {
         Self {
             id: NodeId::new(),
-            name,
-            discriminator: Some(Arc::from(discriminator)),
+            name: name.into(),
+            discriminator: Some(Arc::from(discriminator.into_inner())),
             cases: Vec::new(),
             default: None,
         }
@@ -688,7 +901,7 @@ pub struct ParallelNode {
     /// Unique identifier for this node.
     pub id: NodeId,
     /// Human-readable name for debugging and tracing.
-    pub name: &'static str,
+    pub name: NodeName,
     /// Node IDs for each parallel branch entry point.
     pub branches: Vec<NodeId>,
 }
@@ -696,10 +909,10 @@ pub struct ParallelNode {
 impl ParallelNode {
     /// Creates a new parallel node.
     #[must_use]
-    pub fn new(name: &'static str) -> Self {
+    pub fn new(name: impl Into<NodeName>) -> Self {
         Self {
             id: NodeId::new(),
-            name,
+            name: name.into(),
             branches: Vec::new(),
         }
     }
@@ -757,7 +970,7 @@ pub struct LoopNode {
     /// Unique identifier for this node.
     pub id: NodeId,
     /// Human-readable name for debugging and tracing.
-    pub name: &'static str,
+    pub name: NodeName,
     /// The termination predicate (loop exits when this returns true).
     ///
     /// Held behind an [`Arc`] so the immutable predicate is shared cheaply
@@ -772,10 +985,10 @@ pub struct LoopNode {
 impl LoopNode {
     /// Creates a new loop node.
     #[must_use]
-    pub fn new(name: &'static str) -> Self {
+    pub fn new(name: impl Into<NodeName>) -> Self {
         Self {
             id: NodeId::new(),
-            name,
+            name: name.into(),
             termination: None,
             max_iterations: None,
             body_entry: None,
@@ -784,11 +997,11 @@ impl LoopNode {
 
     /// Creates a new loop node with a termination predicate.
     #[must_use]
-    pub fn with_termination(name: &'static str, termination: BoxedPredicate) -> Self {
+    pub fn with_termination(name: impl Into<NodeName>, termination: BoxedPredicate) -> Self {
         Self {
             id: NodeId::new(),
-            name,
-            termination: Some(Arc::from(termination)),
+            name: name.into(),
+            termination: Some(Arc::from(termination.into_inner())),
             max_iterations: None,
             body_entry: None,
         }
@@ -796,10 +1009,10 @@ impl LoopNode {
 
     /// Creates a new loop node with a maximum iteration count.
     #[must_use]
-    pub fn with_max_iterations(name: &'static str, max_iterations: usize) -> Self {
+    pub fn with_max_iterations(name: impl Into<NodeName>, max_iterations: usize) -> Self {
         Self {
             id: NodeId::new(),
-            name,
+            name: name.into(),
             termination: None,
             max_iterations: Some(max_iterations),
             body_entry: None,
@@ -1127,6 +1340,10 @@ impl ContextPolicy {
 
     /// Instantiate a fresh `T` in the child via the resource's registered factory.
     ///
+    /// Declared scope contracts cannot express factory availability, so
+    /// [`Graph::validate`] rejects this crossing on a scope constructed with
+    /// [`Graph::add_scope_with_contract`]. Plain scopes support it.
+    ///
     /// `T` must have been registered with the server via `register_local(...)`
     /// — the factory is captured on the resource entry and re-invoked at scope
     /// entry. If no factory is registered for `T` anywhere in the parent
@@ -1278,6 +1495,43 @@ impl ContextPolicy {
     pub(crate) fn parent_filter_arc(&self) -> Arc<polaris_system::param::ParentFilter> {
         Arc::clone(&self.cached_parent_filter)
     }
+
+    /// Returns `true` if a declared-contract `requires` entry can be satisfied
+    /// across the boundary this policy describes, assuming the parent context
+    /// holds the resource.
+    ///
+    /// Mirrors how the runtime resolves the interior's parameters:
+    ///
+    /// - A **read** (`Res<T>`) resolves through the parent chain (`shared()`,
+    ///   [`share`](Self::share), un-excluded [`share_rest`](Self::share_rest))
+    ///   or against a child-local copy ([`forward`](Self::forward) /
+    ///   [`fork`](Self::fork) / [`forward_fresh`](Self::forward_fresh)).
+    /// - A **write** (`ResMut<T>`) operates on the current scope only, so
+    ///   across a non-shared boundary it needs a child-local copy — one of the
+    ///   copy verbs. `share` / `share_rest` give chain reads, never a local.
+    ///
+    /// Used by [`Graph::validate`](crate::Graph::validate) to reject a scope
+    /// whose declared contract names a requirement the policy makes
+    /// unsatisfiable at runtime.
+    pub(crate) fn admits_contract_require(&self, access: &Access) -> bool {
+        if self.is_shared() {
+            return true;
+        }
+        match access.mode {
+            AccessMode::Read => {
+                self.crossings.contains_key(&access.type_id)
+                    || (self.share_rest && !self.excludes.contains(&access.type_id))
+            }
+            AccessMode::Write => matches!(
+                self.crossings.get(&access.type_id).map(|c| &c.action),
+                Some(
+                    CrossingAction::Forward(_)
+                        | CrossingAction::Fork(_)
+                        | CrossingAction::ForwardFresh
+                )
+            ),
+        }
+    }
 }
 
 /// A node that executes an embedded graph with a configurable context boundary.
@@ -1293,6 +1547,36 @@ impl ContextPolicy {
 ///
 /// Unlike decision/loop/parallel nodes, the embedded graph's nodes are NOT merged
 /// into the parent. The `ScopeNode` holds the [`Graph`] as a field.
+///
+/// # Declared contracts
+///
+/// A scope may carry an optional **declared** [`GraphSignature`] contract
+/// ([`Graph::add_scope_with_contract`](crate::Graph::add_scope_with_contract)).
+/// The contract is the interface the scope presents to the enclosing graph —
+/// [`Graph::signature`](crate::Graph::signature) propagates it at the scope's
+/// chain position instead of treating the boundary as opaque — and
+/// [`Graph::validate`](crate::Graph::validate) checks the embedded graph
+/// and eager `forward`/`fork` inputs against it. Crossing-only types need a
+/// declared read; existing interior read/write entries are retained.
+/// `forward_fresh` is rejected because [`GraphSignature`] cannot express
+/// factory requirements. Without a contract the scope keeps its opaque
+/// derivation behavior.
+///
+/// The contract is a **real runtime boundary**, not just a validate-time
+/// interface. On a non-[`shared()`](ContextPolicy::shared) policy, only the
+/// output types named in `produces` merge back into the parent when the
+/// scope completes — every other output the interior wrote is dropped along
+/// with the child context that held it, and a parent output of the same type
+/// an undeclared interior output would otherwise have clobbered is left
+/// untouched. `produces` may therefore be a genuine **subset** of what the
+/// interior guarantees — `validate` only requires that every declared
+/// produce actually be guaranteed, not that every guarantee be declared — and
+/// the unnamed rest stays private to the scope rather than leaking upward.
+/// `shared()` is the one exception: it denotes no boundary at all, so the
+/// interior runs directly in the parent's own context, and every output —
+/// declared or not — is visible immediately, with nothing left to filter on
+/// exit. A `shared()` scope's declared `produces` are still a sound credit
+/// (everything named is guaranteed present), just not a privacy boundary.
 ///
 /// # Examples
 ///
@@ -1317,23 +1601,49 @@ pub struct ScopeNode {
     /// Unique identifier for this node.
     pub id: NodeId,
     /// Human-readable name for debugging and tracing.
-    pub name: &'static str,
+    pub name: NodeName,
     /// The embedded graph to execute.
     pub(crate) graph: Graph,
     /// Context sharing policy.
     pub(crate) context_policy: ContextPolicy,
+    /// Optional declared interface, validated against `graph` and propagated
+    /// into the enclosing graph's derived signature.
+    pub(crate) contract: Option<GraphSignature>,
 }
 
 impl ScopeNode {
-    /// Creates a new scope node.
+    /// Creates a new scope node with no declared contract.
     #[must_use]
-    pub fn new(name: &'static str, graph: Graph, context_policy: ContextPolicy) -> Self {
+    pub fn new(name: impl Into<NodeName>, graph: Graph, context_policy: ContextPolicy) -> Self {
         Self {
             id: NodeId::new(),
-            name,
+            name: name.into(),
             graph,
             context_policy,
+            contract: None,
         }
+    }
+
+    /// Declares this scope's [`GraphSignature`] contract (see the type-level
+    /// *Declared contracts* section).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_graph::{ContextPolicy, Graph, GraphSignature, ScopeNode};
+    ///
+    /// async fn answer() -> u32 { 42 }
+    /// let mut inner = Graph::new();
+    /// inner.add_system(answer);
+    /// let contract = GraphSignature::new().produce::<u32>();
+    /// let scope = ScopeNode::new("answer", inner, ContextPolicy::new())
+    ///     .with_contract(contract.clone());
+    /// assert_eq!(scope.contract(), Some(&contract));
+    /// ```
+    #[must_use]
+    pub fn with_contract(mut self, contract: GraphSignature) -> Self {
+        self.contract = Some(contract);
+        self
     }
 
     /// Returns a reference to the embedded graph.
@@ -1346,6 +1656,23 @@ impl ScopeNode {
     #[must_use]
     pub fn context_policy(&self) -> &ContextPolicy {
         &self.context_policy
+    }
+
+    /// Returns the declared contract, if one was set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_graph::{ContextPolicy, Graph, GraphSignature, ScopeNode};
+    ///
+    /// let scope = ScopeNode::new("worker", Graph::new(), ContextPolicy::new());
+    /// assert!(scope.contract().is_none());
+    /// let scope = scope.with_contract(GraphSignature::new());
+    /// assert_eq!(scope.contract(), Some(&GraphSignature::new()));
+    /// ```
+    #[must_use]
+    pub fn contract(&self) -> Option<&GraphSignature> {
+        self.contract.as_ref()
     }
 }
 
@@ -1374,15 +1701,18 @@ pub struct DynamicNode {
     /// Unique identifier for this node.
     pub id: NodeId,
     /// Human-readable name for debugging and tracing.
-    pub name: &'static str,
+    pub name: NodeName,
     /// Chooses the candidate key from the runtime context.
     pub(crate) selector: Arc<dyn ErasedSelector>,
     /// Where the candidate subgraphs come from.
     pub(crate) source: CandidateSource,
     /// Candidate key chosen when the selector's key is absent from the set.
     pub(crate) default: Option<Arc<str>>,
-    /// The slot interface every candidate must be compatible with.
+    /// The slot interface every candidate is admitted against, under
+    /// [`matching`](Self::matching).
     pub(crate) contract: GraphSignature,
+    /// The relation candidates are admitted against the contract under.
+    pub(crate) matching: MatchingMode,
     /// Context sharing policy applied around the selected subgraph.
     pub(crate) context_policy: ContextPolicy,
 }
@@ -1390,9 +1720,10 @@ pub struct DynamicNode {
 impl DynamicNode {
     /// Creates a new dynamic node.
     ///
-    /// The slot's fixed configuration — contract, boundary policy, and optional
-    /// default key — travels as one [`DynamicSlot`] value here too, so the
-    /// low-level constructor has no positional `None` holes either.
+    /// The slot's fixed configuration — contract, matching mode, boundary
+    /// policy, and optional default key — travels as one [`DynamicSlot`] value
+    /// here too, so the low-level constructor has no positional `None` holes
+    /// either.
     ///
     /// This is the low-level primitive: most callers should build a dynamic node
     /// through the [`add_dynamic`](crate::Graph::add_dynamic) family, which wires
@@ -1437,23 +1768,25 @@ impl DynamicNode {
     /// ```
     #[must_use]
     pub fn new(
-        name: &'static str,
+        name: impl Into<NodeName>,
         selector: BoxedSelector,
         source: CandidateSource,
         slot: DynamicSlot,
     ) -> Self {
         let DynamicSlot {
             contract,
+            matching,
             policy,
             default,
         } = slot;
         Self {
             id: NodeId::new(),
-            name,
+            name: name.into(),
             selector: Arc::from(selector),
             source,
             default,
             contract,
+            matching,
             context_policy: policy,
         }
     }
@@ -1462,6 +1795,13 @@ impl DynamicNode {
     #[must_use]
     pub fn contract(&self) -> &GraphSignature {
         &self.contract
+    }
+
+    /// Returns the relation candidates are admitted against the contract
+    /// under.
+    #[must_use]
+    pub fn matching(&self) -> MatchingMode {
+        self.matching
     }
 
     /// Returns the context policy applied around the selected subgraph.
@@ -1486,11 +1826,14 @@ impl DynamicNode {
 /// The fixed interface a [`Dynamic`](Node::Dynamic) node selects candidates
 /// against.
 ///
-/// A slot bundles the three pieces of configuration that stay constant while
+/// A slot bundles the pieces of configuration that stay constant while
 /// candidates are swapped around them:
 ///
-/// - `contract` — the [`GraphSignature`] every candidate must be
-///   [compatible](GraphSignature::compatible_with) with.
+/// - `contract` — the [`GraphSignature`] every candidate is checked against.
+/// - `matching` — the [`MatchingMode`] relation that check uses. Defaults to
+///   [`MatchingMode::Exact`]; [`with_matching`](Self::with_matching) opts into
+///   [`MatchingMode::Substitutable`] for a slot whose candidates deliberately
+///   differ in what they consume.
 /// - `policy` — the [`ContextPolicy`] applied around the selected subgraph.
 /// - `default` — the candidate key run when the selector's key is not present
 ///   in the candidate set (optional).
@@ -1520,20 +1863,85 @@ impl DynamicNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicSlot {
     pub(crate) contract: GraphSignature,
+    pub(crate) matching: MatchingMode,
     pub(crate) policy: ContextPolicy,
     pub(crate) default: Option<Arc<str>>,
 }
 
 impl DynamicSlot {
     /// Creates a slot from its `contract` and boundary `policy`, with no default
-    /// candidate key.
+    /// candidate key and [`MatchingMode::Exact`] candidate matching.
     #[must_use]
     pub fn new(contract: GraphSignature, policy: ContextPolicy) -> Self {
         Self {
             contract,
+            matching: MatchingMode::default(),
             policy,
             default: None,
         }
+    }
+
+    /// Sets the relation candidates are admitted against the contract under.
+    ///
+    /// The default is [`MatchingMode::Exact`] — a candidate must match the
+    /// contract's interface exactly. [`MatchingMode::Substitutable`] relaxes that
+    /// to true substitutability (`requires` and `requires_outputs`
+    /// contravariant, `produces` covariant), so a candidate that deliberately
+    /// consumes *less* than the slot guarantees — the cheap rung of an
+    /// escalation ladder — is admitted. `Exact` implies `Substitutable`, so
+    /// this only ever widens the admissible set.
+    ///
+    /// The mode governs *candidate* admission only. The contract's own
+    /// obligations on the parent are unchanged: whatever it declares in
+    /// `requires` / `requires_outputs` must still be reachable from the
+    /// surroundings, because a candidate consuming the whole declared set stays
+    /// admissible under either mode.
+    ///
+    /// # Applies to inline candidates only
+    ///
+    /// This mode is consulted when the node's candidates are inline — the
+    /// [`add_dynamic`](crate::Graph::add_dynamic) family — where `validate()`
+    /// admits them. A **registry-backed** node
+    /// ([`add_dynamic_registry`](crate::Graph::add_dynamic_registry)) is a
+    /// different admission point: its candidates are checked by
+    /// [`SubgraphRegistry::with_matching`](crate::registry::SubgraphRegistry::with_matching)
+    /// at `register()` time, and the executor re-checks only that the
+    /// registry's *contract* is this node's, never the mode. So on a
+    /// registry-backed slot this setter records intent but gates nothing:
+    /// set the same mode on the registry, or the registry's mode silently
+    /// decides — in either direction. Both modes stay sound for the shared
+    /// contract, so a divergence costs admissions or the shadowing property
+    /// described on [`MatchingMode::Substitutable`], never a dangling read.
+    ///
+    /// # Widening is not free on the output side
+    ///
+    /// [`MatchingMode::Substitutable`] lets a candidate merge back output
+    /// types the contract never named, shadowing a same-typed output the
+    /// parent produced. `validate()` warns where it can see the collision
+    /// ([`DynamicCandidateShadowsOutput`]); see
+    /// [`MatchingMode::Substitutable`] for the full caveat.
+    ///
+    /// [`DynamicCandidateShadowsOutput`]: crate::graph::ValidationWarning::DynamicCandidateShadowsOutput
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_graph::{ContextPolicy, DynamicSlot, GraphSignature, MatchingMode};
+    ///
+    /// struct Transcript;
+    /// struct Verdict;
+    ///
+    /// let slot = DynamicSlot::new(
+    ///     GraphSignature::new().require_read::<Transcript>().produce::<Verdict>(),
+    ///     ContextPolicy::shared(),
+    /// )
+    /// .with_matching(MatchingMode::Substitutable);
+    /// assert_eq!(slot.matching(), MatchingMode::Substitutable);
+    /// ```
+    #[must_use]
+    pub fn with_matching(mut self, matching: MatchingMode) -> Self {
+        self.matching = matching;
+        self
     }
 
     /// Sets the default candidate key — run when the selector's key is not
@@ -1551,6 +1959,13 @@ impl DynamicSlot {
     #[must_use]
     pub fn contract(&self) -> &GraphSignature {
         &self.contract
+    }
+
+    /// Returns the [`MatchingMode`] relation candidates are admitted against the
+    /// contract under.
+    #[must_use]
+    pub fn matching(&self) -> MatchingMode {
+        self.matching
     }
 
     /// Returns the [`ContextPolicy`] applied around the selected subgraph.
@@ -1661,8 +2076,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polaris_system::param::Out;
     use polaris_system::plugin::Schedule;
-    use polaris_system::system::IntoSystem;
+    use polaris_system::system::{IntoSystem, erase};
 
     // Test system functions
     async fn test_system() -> String {
@@ -1671,6 +2087,11 @@ mod tests {
 
     async fn sys_fn() -> i32 {
         42
+    }
+
+    #[polaris_system::system]
+    async fn typed_stage(input: Out<u8>) -> i32 {
+        i32::from(*input)
     }
 
     #[test]
@@ -1708,6 +2129,48 @@ mod tests {
 
         assert_eq!(node.output_type_id(), TypeId::of::<i32>());
         assert!(node.output_type_name().contains("i32"));
+    }
+
+    #[test]
+    fn system_node_default_node_name_matches_static_name() {
+        let node = SystemNode::new(sys_fn.into_system());
+        assert_eq!(node.node_name, node.name());
+        assert_eq!(node.node_name, "sys_fn");
+    }
+
+    #[test]
+    fn system_node_with_name_overrides_node_name_but_not_static_name() {
+        let node = SystemNode::new(sys_fn.into_system()).with_name("custom_label");
+        assert_eq!(node.node_name, "custom_label");
+        // `SystemNode::name()` always reports the system's static function name.
+        assert_eq!(node.name(), "sys_fn");
+    }
+
+    #[test]
+    fn node_name_borrow_str_hashmap_lookup() {
+        let mut map: HashMap<NodeName, i32> = HashMap::new();
+        map.insert(NodeName::from("router"), 1);
+        assert_eq!(map.get("router"), Some(&1));
+        assert_eq!(map.get("missing"), None);
+    }
+
+    #[test]
+    fn node_name_orders_like_its_string() {
+        let mut names = vec![
+            NodeName::from("gamma"),
+            NodeName::from(String::from("alpha")),
+            NodeName::from("beta"),
+        ];
+        names.sort();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+
+        let mut map: std::collections::BTreeMap<NodeName, i32> = std::collections::BTreeMap::new();
+        map.insert(NodeName::from("b"), 2);
+        map.insert(NodeName::from("a"), 1);
+        assert_eq!(
+            map.keys().map(NodeName::as_str).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
     }
 
     #[test]
@@ -1785,6 +2248,55 @@ mod tests {
         assert_eq!(node.schedules.len(), 2);
         assert_eq!(node.schedules[0], ScheduleId::of::<MarkerA>());
         assert_eq!(node.schedules[1], ScheduleId::of::<MarkerB>());
+    }
+
+    #[test]
+    fn system_node_with_schedules_accumulates_and_dedups() {
+        // Matches `SystemNodeBuilder::with_schedules`: successive calls add to
+        // the set rather than replacing it, and a repeat is a no-op.
+        let node = SystemNode::new(sys_fn.into_system())
+            .with_schedules(vec![ScheduleId::of::<MarkerA>()])
+            .with_schedules(vec![
+                ScheduleId::of::<MarkerA>(),
+                ScheduleId::of::<MarkerB>(),
+            ]);
+
+        assert_eq!(
+            node.schedules,
+            vec![ScheduleId::of::<MarkerA>(), ScheduleId::of::<MarkerB>()],
+            "the second call must add MarkerB without duplicating MarkerA"
+        );
+    }
+
+    #[test]
+    fn typed_erased_path_matches_scheduled_system_path() {
+        let mut direct = Graph::new();
+        direct.add_system((MarkerA, typed_stage));
+
+        let mut erased = Graph::new();
+        erased
+            .system_boxed(erase(typed_stage))
+            .with_schedules(MarkerA)
+            .done();
+
+        assert!(direct.validate().is_ok());
+        assert!(erased.validate().is_ok());
+        assert_eq!(direct.signature(), erased.signature());
+
+        let Node::System(direct_node) = &direct.nodes()[0] else {
+            panic!("direct graph should contain a system node");
+        };
+        let Node::System(erased_node) = &erased.nodes()[0] else {
+            panic!("erased graph should contain a system node");
+        };
+
+        assert_eq!(direct_node.schedules, erased_node.schedules);
+        assert_eq!(direct_node.system.access(), erased_node.system.access());
+        assert_eq!(direct_node.output_type_id(), erased_node.output_type_id());
+        assert_eq!(
+            direct_node.output_type_name(),
+            erased_node.output_type_name()
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2024,9 +2536,10 @@ mod tests {
         let inner = Graph::new();
         let scope = ScopeNode {
             id: NodeId::new(),
-            name: "test_scope",
+            name: "test_scope".into(),
             graph: inner,
             context_policy: ContextPolicy::shared(),
+            contract: None,
         };
         let node = Node::Scope(scope);
         assert_eq!(node.name(), "test_scope");

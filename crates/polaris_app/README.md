@@ -48,17 +48,18 @@ impl Plugin for HealthPlugin {
 
 Multiple plugins can register routes independently -- they are all merged before the server starts.
 
-## HttpIOProvider
+## ChannelIOProvider
 
-`HttpIOProvider` lives in `polaris_sessions::http` (its only consumer). It
-bridges HTTP requests to agent `UserIO` via tokio channels:
+`ChannelIOProvider` lives at the `polaris_sessions` crate root and is available
+without the `sessions-http` feature. It bridges caller-owned channels,
+including HTTP requests, to agent `UserIO`:
 
 ```rust
-use polaris_sessions::http::HttpIOProvider;
+use polaris_sessions::ChannelIOProvider;
 use polaris_core_plugins::{IOMessage, UserIO};
 use std::sync::Arc;
 
-let (provider, input_tx, mut output_rx) = HttpIOProvider::new(32, 32);
+let (provider, input_tx, mut output_rx) = ChannelIOProvider::new(32, 32);
 
 // Pre-load user input from HTTP request body
 // input_tx.send(IOMessage::user_text("hello")).await;

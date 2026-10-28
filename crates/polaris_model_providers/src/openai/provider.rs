@@ -1,5 +1,6 @@
 //! `OpenAI` [`LlmProvider`] implementation using the Responses API.
 
+use crate::pricing::PriceStore;
 use crate::schema::normalize_schema_for_strict_mode;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
@@ -25,16 +26,73 @@ use std::collections::{HashMap, VecDeque};
 /// `OpenAI` [`LlmProvider`] implementation using the Responses API.
 pub struct OpenAiProvider {
     client: async_openai::Client<OpenAIConfig>,
+    pricing: PriceStore,
 }
 
 impl OpenAiProvider {
     /// Creates a new provider with the given API key.
+    ///
+    /// Pricing defaults to [`PriceStore::builtin`]: the built-in price table,
+    /// with no network access and no files. Use
+    /// [`with_pricing_store`](Self::with_pricing_store) to opt into live
+    /// prices, for example with [`PriceStore::live`].
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         let config = OpenAIConfig::new().with_api_key(api_key);
         Self {
             client: async_openai::Client::with_config(config),
+            pricing: PriceStore::builtin(),
         }
+    }
+
+    /// Replaces this provider's price store (default: [`PriceStore::builtin`]).
+    ///
+    /// Pass [`PriceStore::live`] to fetch current prices from the web and
+    /// cache them on disk, or build your own store to choose the source,
+    /// cache path, and TTL. A live store fetches and writes files; see
+    /// [`crate::pricing`] for exactly when.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use polaris_model_providers::openai::OpenAiProvider;
+    /// use polaris_model_providers::pricing::PriceStore;
+    ///
+    /// let provider = OpenAiProvider::new("api-key").with_pricing_store(PriceStore::live());
+    /// # let _ = provider;
+    /// ```
+    #[must_use]
+    pub fn with_pricing_store(mut self, pricing: PriceStore) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    /// Adds a per-model pricing override for this provider only, beating
+    /// whatever its price store says for models starting with `prefix`.
+    ///
+    /// Other providers are not affected, even when they share the same
+    /// [`PriceStore`] (see [`PriceStore::with_override`]). Call it after
+    /// [`with_pricing_store`](Self::with_pricing_store), which replaces the
+    /// store together with its overrides.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_model_providers::openai::OpenAiProvider;
+    /// use polaris_models::llm::{LlmProvider, ModelPricing};
+    ///
+    /// let provider = OpenAiProvider::new("api-key")
+    ///     .with_pricing_override("gpt-5.5", ModelPricing::new(4.0, 24.0));
+    /// assert_eq!(provider.pricing("gpt-5.5"), Some(ModelPricing::new(4.0, 24.0)));
+    /// ```
+    #[must_use]
+    pub fn with_pricing_override(
+        mut self,
+        prefix: impl Into<String>,
+        pricing: ModelPricing,
+    ) -> Self {
+        self.pricing = self.pricing.with_override(prefix, pricing);
+        self
     }
 }
 
@@ -82,23 +140,7 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
-        // OpenAI public list prices, USD per million base input / output
-        // tokens. Cached-input rates are intentionally omitted — `Usage`
-        // carries no cache breakdown. `starts_with` tolerates dated id
-        // suffixes. List prices drift; new model ids must be added here.
-        let (input_per_million_usd, output_per_million_usd) = if model.starts_with("gpt-5.5") {
-            (5.0, 30.0)
-        } else if model.starts_with("gpt-5.4-mini") {
-            (0.75, 4.5)
-        } else if model.starts_with("gpt-5.4") {
-            (2.5, 15.0)
-        } else {
-            return None;
-        };
-        Some(ModelPricing::new(
-            input_per_million_usd,
-            output_per_million_usd,
-        ))
+        self.pricing.get(model)
     }
 
     fn endpoint(&self) -> Option<String> {
@@ -111,7 +153,7 @@ impl LlmProvider for OpenAiProvider {
 // Request conversion (Polaris -> OpenAI)
 // ---------------------------------------------------------------------------
 
-fn convert_request(
+pub(crate) fn convert_request(
     model: &str,
     request: &LlmRequest,
 ) -> Result<async_openai::types::responses::CreateResponse, GenerationError> {
@@ -171,6 +213,9 @@ fn convert_request(
     }
     if let Some(text) = text {
         builder.text(text);
+    }
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        builder.max_output_tokens(max_output_tokens.get());
     }
 
     builder.build().map_err(|build_err| {
@@ -404,7 +449,7 @@ fn convert_tool_choice(choice: &ToolChoice) -> ToolChoiceParam {
 // Response conversion (OpenAI -> Polaris)
 // ---------------------------------------------------------------------------
 
-fn convert_response(response: Response) -> Result<LlmResponse, GenerationError> {
+pub(crate) fn convert_response(response: Response) -> Result<LlmResponse, GenerationError> {
     let id = Some(response.id.clone());
     let model = Some(response.model.clone());
 
@@ -934,9 +979,16 @@ mod tests {
         ResponseTextDoneEvent, ResponseUsage, Status,
     };
 
+    /// A store that serves only the built-in table and never touches the
+    /// network or the disk, so pricing tests stay hermetic.
+    fn fallback_only_pricing_store() -> PriceStore {
+        PriceStore::builtin()
+    }
+
     #[test]
     fn pricing_maps_gpt5_families_to_list_prices() {
-        let provider = OpenAiProvider::new("test-key");
+        let provider =
+            OpenAiProvider::new("test-key").with_pricing_store(fallback_only_pricing_store());
         assert_eq!(
             provider.pricing("gpt-5.5"),
             Some(ModelPricing::new(5.0, 30.0))
@@ -965,6 +1017,7 @@ mod tests {
             .with_api_base("https://proxy.example.com/v1");
         let provider = OpenAiProvider {
             client: async_openai::Client::with_config(config),
+            pricing: fallback_only_pricing_store(),
         };
         assert_eq!(
             provider.endpoint(),
@@ -1045,6 +1098,27 @@ mod tests {
     /// `{"type":"function","name":…,"parameters":…,"strict":…}`.
     fn request_json(request: &LlmRequest) -> serde_json::Value {
         serde_json::to_value(convert_request("gpt-5.5", request).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn output_token_limit_is_sent_when_requested() {
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            max_output_tokens: core::num::NonZeroU32::new(512),
+            ..Default::default()
+        };
+
+        assert_eq!(request_json(&request)["max_output_tokens"], 512);
+    }
+
+    #[test]
+    fn unset_output_token_limit_is_omitted() {
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+
+        assert!(request_json(&request).get("max_output_tokens").is_none());
     }
 
     #[test]

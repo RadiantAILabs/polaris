@@ -63,6 +63,12 @@ impl SessionGuard {
     /// Executes a single turn for this session.
     ///
     /// See [`SessionsAPI::process_turn`] for details.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Interrupted`] on interruption or
+    /// [`SessionError::RestoreFailed`] while a failed restore leaves the
+    /// context incoherent. Other errors match the corresponding API method.
     pub async fn process_turn(&self) -> Result<ExecutionResult, SessionError> {
         self.sessions.process_turn(&self.id).await
     }
@@ -70,6 +76,12 @@ impl SessionGuard {
     /// Executes a single turn with a setup closure.
     ///
     /// See [`SessionsAPI::process_turn_with`] for details.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Interrupted`] on interruption or
+    /// [`SessionError::RestoreFailed`] while a failed restore leaves the
+    /// context incoherent. Other errors match the corresponding API method.
     pub async fn process_turn_with(
         &self,
         setup: impl FnOnce(&mut SystemContext<'static>),

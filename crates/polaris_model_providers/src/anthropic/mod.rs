@@ -16,4 +16,4 @@ mod provider;
 mod types;
 
 pub use plugin::AnthropicPlugin;
-pub use provider::AnthropicProvider;
+pub use provider::{AnthropicProvider, DEFAULT_MAX_TOKENS};

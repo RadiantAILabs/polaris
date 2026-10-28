@@ -3,4 +3,4 @@
 /**
  * Status of a single turn within a session's history.
  */
-export type TurnStatus = "running" | "completed" | "failed";
+export type TurnStatus = "running" | "completed" | "failed" | "interrupted";

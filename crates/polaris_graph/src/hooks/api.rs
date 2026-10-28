@@ -54,7 +54,7 @@
 //! hooks.register_provider::<OnSystemStart, SystemInfo, _>("devtools", |event: &GraphEvent| {
 //!     match event {
 //!         GraphEvent::SystemStart { node_id, node_name, .. } => {
-//!             Some(SystemInfo::new(node_id.clone(), node_name))
+//!             Some(SystemInfo::new(node_id.clone(), node_name.clone()))
 //!         }
 //!         _ => None,
 //!     }
@@ -318,7 +318,7 @@ impl HooksAPI {
     ///     |event: &GraphEvent| {
     ///         match event {
     ///             GraphEvent::SystemStart { node_id, node_name, .. } => {
-    ///                 Some(SystemInfo::new(node_id.clone(), node_name))
+    ///                 Some(SystemInfo::new(node_id.clone(), node_name.clone()))
     ///             }
     ///             _ => None,
     ///         }
@@ -457,12 +457,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn sample_system_start(node_name: &'static str) -> GraphEvent {
+    fn sample_system_start(node_name: impl Into<crate::node::NodeName>) -> GraphEvent {
         GraphEvent::SystemStart {
             run_id: RunId::new(),
             labels: RunLabels::empty(),
             node_id: NodeId::new(),
-            node_name,
+            node_name: node_name.into(),
         }
     }
 
@@ -735,7 +735,7 @@ mod tests {
                 run_id: RunId::new(),
                 labels: RunLabels::empty(),
                 node_id: NodeId::new(),
-                node_name: "test",
+                node_name: "test".into(),
             },
         );
 
@@ -746,7 +746,7 @@ mod tests {
                 run_id: RunId::new(),
                 labels: RunLabels::empty(),
                 node_id: NodeId::new(),
-                node_name: "test",
+                node_name: "test".into(),
                 duration: Duration::ZERO,
             },
         );
@@ -782,7 +782,7 @@ mod tests {
                 run_id: RunId::new(),
                 labels: RunLabels::empty(),
                 node_id: NodeId::new(),
-                node_name: "my_system",
+                node_name: "my_system".into(),
             },
         );
 

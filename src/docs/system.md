@@ -33,6 +33,15 @@ graph. See [Graph error handling](crate::graph) for details.
 Zero-parameter async functions implement `IntoSystem` via a blanket impl
 and do not need the macro.
 
+A reusable graph builder that takes a caller-supplied system erases it at the
+call site with [`erase`](crate::system::system::erase), yielding a
+[`TypedSystem<O>`](crate::system::system::TypedSystem): the concrete system and
+`IntoSystem` marker types drop out of the helper's signature while `O` stays
+part of the handle's type, so the wrong stage is rejected where it is passed.
+`O` is the output type, which for a fallible system is the success type;
+fallibility rides alongside it as
+[`TypedSystem::is_fallible`](crate::system::system::TypedSystem::is_fallible).
+
 # Parameters
 
 | Type | Resolution | Access | Use for |
@@ -40,6 +49,7 @@ and do not need the macro.
 | [`Res<T>`](crate::system::param::Res) | Hierarchy (local -> parent -> global) | Immutable | Config, registries, per-request input |
 | [`ResMut<T>`](crate::system::param::ResMut) | Current context only | Exclusive | Accumulated state (history, counters) |
 | [`Out<T>`](crate::system::param::Out) | Previous system output | Immutable | System-to-system data handoff |
+| [`OutAll<T>`](crate::system::param::OutAll) | Current context outputs | Immutable | Collect same-typed outputs and their producer keys |
 | [`ErrOut<T>`](crate::system::param::ErrOut) | Error-edge output | Immutable | Error context in handler subgraphs |
 
 See [Data flow patterns](crate#data-flow-patterns) for a decision guide.

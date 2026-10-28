@@ -8,7 +8,10 @@
 //! selectors.
 
 use polaris_graph::executor::{ExecutionError, GraphExecutor, ResourceValidationError};
-use polaris_graph::graph::{Graph, GraphSignature, ValidationError};
+use polaris_graph::graph::{
+    Graph, GraphSignature, MatchingMode, SignatureDiff, ValidationError, ValidationResult,
+    ValidationWarning,
+};
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::hooks::events::GraphEvent;
 use polaris_graph::hooks::schedule::{OnDynamicComplete, OnDynamicStart, OnGraphStart};
@@ -43,6 +46,11 @@ struct Base {
     n: i32,
 }
 impl LocalResource for Base {}
+impl ForkStrategy for Base {
+    fn fork(&self) -> Self {
+        self.clone()
+    }
+}
 
 /// Drives the selector: names the candidate key to run.
 struct Choice {
@@ -211,6 +219,177 @@ impl System for CountLedger {
     }
 }
 
+/// Extra context only the expensive rung of an escalation ladder consults.
+/// `Clone` so a non-`Shared` policy could forward it like [`Base`].
+#[derive(Clone)]
+struct Dossier {
+    weight: i32,
+}
+impl LocalResource for Dossier {}
+
+/// The expensive rung of the escalation ladder: reads [`Base`] *and*
+/// [`Dossier`], records and returns their product. Its interface is the ladder
+/// slot contract exactly.
+struct DeepAnalysis {
+    recorder: Arc<Mutex<Vec<i32>>>,
+}
+
+impl System for DeepAnalysis {
+    type Output = i32;
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let recorder = Arc::clone(&self.recorder);
+        Box::pin(async move {
+            let base = ctx
+                .get_resource::<Base>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            let dossier = ctx
+                .get_resource::<Dossier>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            let value = base.n * dossier.weight;
+            recorder.lock().unwrap().push(value);
+            Ok(value)
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "deep_analysis"
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.add_read::<Base>();
+        access.add_read::<Dossier>();
+        access
+    }
+}
+
+/// Reads everything the ladder slot guarantees *plus* [`Ledger`], which it does
+/// not — a candidate that needs strictly *more* than the slot. This is the case
+/// `GraphSignature::satisfies` would admit, and neither matching mode may.
+struct GreedyAnalysis;
+
+impl System for GreedyAnalysis {
+    type Output = i32;
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn name(&self) -> &'static str {
+        "greedy_analysis"
+    }
+
+    fn access(&self) -> SystemAccess {
+        let mut access = SystemAccess::default();
+        access.add_read::<Base>();
+        access.add_read::<Dossier>();
+        access.add_read::<Ledger>();
+        access
+    }
+}
+
+/// Produces a `String` note alongside the ladder's `i32` verdict, so a
+/// candidate can produce a *superset* of what the slot promises.
+struct Annotate;
+
+impl System for Annotate {
+    type Output = String;
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok("note".to_string()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "annotate"
+    }
+}
+
+/// Produces the authoritative `String` the parent chain owns, upstream of the
+/// slot. Paired with [`ReadNote`] it shows whether a candidate's *extra*
+/// `String` output shadows it at merge time.
+struct UpstreamNote;
+
+impl System for UpstreamNote {
+    type Output = String;
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok("upstream".to_string()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "upstream_note"
+    }
+}
+
+/// Reads `Out<String>` downstream of the slot and records what it saw, so a
+/// shadowed value is observable rather than merely inferred.
+struct ReadNote {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl System for ReadNote {
+    type Output = i32;
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            let note = ctx
+                .get_output::<String>()
+                .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+            seen.lock().unwrap().push(note.clone());
+            Ok(0)
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "read_note"
+    }
+
+    fn access(&self) -> SystemAccess {
+        SystemAccess::new().with_output::<String>()
+    }
+}
+
+/// Reads a free `Out<String>` no system in its graph produces, so the parent
+/// would have to supply it — a free-output read the ladder slot never
+/// sanctioned.
+struct ReadsFreeNote;
+
+impl System for ReadsFreeNote {
+    type Output = i32;
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn name(&self) -> &'static str {
+        "reads_free_note"
+    }
+
+    fn access(&self) -> SystemAccess {
+        SystemAccess::new().with_output::<String>()
+    }
+}
+
 /// Builds a single-system candidate graph for `factor`.
 fn candidate(factor: i32, recorder: &Arc<Mutex<Vec<i32>>>) -> Graph {
     let mut graph = Graph::new();
@@ -234,7 +413,8 @@ fn candidate_nesting_a_scope(recorder: &Arc<Mutex<Vec<i32>>>) -> Graph {
     candidate
 }
 
-/// A candidate that nests a `Dynamic` boundary — likewise rejected.
+/// A candidate that nests a `Dynamic` boundary whose slot contract is its
+/// complete derived interface.
 fn candidate_nesting_a_dynamic() -> Graph {
     let mut candidate = Graph::new();
     candidate.add_dynamic_registry(
@@ -254,6 +434,65 @@ fn contract() -> GraphSignature {
 
 fn registry_for_contract() -> SubgraphRegistry {
     SubgraphRegistry::new(contract())
+}
+
+/// The escalation-ladder slot contract — the *expensive* rung's full
+/// interface: reads `Base` and `Dossier`, produces an `i32` verdict. Cheaper
+/// rungs deliberately consume less of it.
+fn ladder_contract() -> GraphSignature {
+    GraphSignature::new()
+        .require_read::<Base>()
+        .require_read::<Dossier>()
+        .produce::<i32>()
+}
+
+/// The expensive rung: matches [`ladder_contract`] exactly.
+fn deep_rung(recorder: &Arc<Mutex<Vec<i32>>>) -> Graph {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(DeepAnalysis {
+        recorder: Arc::clone(recorder),
+    }));
+    graph
+}
+
+/// A rung reading a resource ([`Ledger`]) the ladder slot never guarantees.
+fn greedy_rung() -> Graph {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(GreedyAnalysis));
+    graph
+}
+
+/// A cheap rung that also produces a `String` note — a *superset* of the
+/// slot's `produces`.
+fn rung_producing_extra(recorder: &Arc<Mutex<Vec<i32>>>) -> Graph {
+    let mut graph = candidate(10, recorder);
+    graph.add_boxed_system(Box::new(Annotate));
+    graph
+}
+
+/// A rung that produces only the `String` note — a *subset* of the slot's
+/// `produces`, missing the `i32` verdict downstream was validated against.
+fn rung_missing_the_verdict() -> Graph {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(Annotate));
+    graph
+}
+
+/// A rung producing the contracted `i32` while reading *nothing* — it diverges
+/// from [`contract`] on the `requires` axis only, so it separates the two
+/// matching modes without any `produces` divergence confounding the result.
+fn rung_reading_nothing() -> Graph {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(Constant { value: 1 }));
+    graph
+}
+
+/// A cheap rung that additionally reads a free `Out<String>` the slot never
+/// sanctioned.
+fn rung_reading_a_free_output() -> Graph {
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(ReadsFreeNote));
+    graph
 }
 
 /// Selector reading the `Choice` resource; falls back to `"a"` if absent.
@@ -615,8 +854,8 @@ fn loop_heading_candidate() -> Graph {
     graph
 }
 
-/// The slot contract a loop-heading candidate genuinely satisfies: the parent
-/// supplies the seed (`require_output`), and the body's outputs merge back.
+/// A loop-heading candidate needs the parent seed, but its body output is not
+/// guaranteed because the loop may complete zero iterations.
 fn loop_contract() -> GraphSignature {
     GraphSignature::new()
         .require_output::<Progress>()
@@ -656,12 +895,16 @@ fn branch_seeded_loop_contract() -> GraphSignature {
 }
 
 #[test]
-fn registry_accepts_loop_heading_candidate_when_contract_supplies_seed() {
+fn registry_rejects_loop_heading_candidate_that_only_may_produce() {
     let mut registry = SubgraphRegistry::new(loop_contract());
-    registry
+    let err = registry
         .register("episode", loop_heading_candidate())
-        .expect("candidate whose seed the contract supplies should register");
-    assert!(registry.contains("episode"));
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        RegistryError::MissingGuaranteedOutputs { .. }
+    ));
+    assert!(!registry.contains("episode"));
 }
 
 #[test]
@@ -693,31 +936,16 @@ fn registry_rejects_loop_heading_candidate_when_contract_lacks_seed() {
     assert!(!registry.contains("episode"));
 }
 
-#[tokio::test]
-async fn registry_loop_heading_candidate_runs_with_parent_seed() {
-    let mut graph = Graph::new();
-    graph.add_system(seed_progress);
-    graph.add_dynamic_registry(
-        "route",
-        |_ctx| Arc::from("episode"),
-        DynamicSlot::new(loop_contract(), ContextPolicy::shared()),
-    );
-    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
-
+#[test]
+fn registry_rejects_loop_heading_candidate_even_when_parent_has_seed() {
     let mut registry = SubgraphRegistry::new(loop_contract());
-    registry
+    let err = registry
         .register("episode", loop_heading_candidate())
-        .unwrap();
-
-    let mut ctx = SystemContext::new().with(registry);
-    let result = GraphExecutor::new()
-        .execute(&graph, &mut ctx, None, None)
-        .await
-        .expect("parent-seeded loop-heading candidate should run");
-
-    // Seed (round 0) fails the first termination check, the body advances to
-    // round 1, and the second check terminates the loop.
-    assert_eq!(result.output::<Progress>().map(|p| p.round), Some(1));
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        RegistryError::MissingGuaranteedOutputs { .. }
+    ));
 }
 
 #[tokio::test]
@@ -756,6 +984,434 @@ async fn registry_accepts_and_runs_branch_local_seeded_loop_without_parent_seed(
         result.output::<Progress>().map(|progress| progress.round),
         Some(1)
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Guaranteed production across parallel and scope boundaries
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The contract a self-seeding loop candidate satisfies: it asks its parent for
+/// nothing and merges `Progress` back. Note this is the *same* shape that
+/// rejects a bare loop-heading candidate in
+/// `registry_rejects_loop_heading_candidate_when_contract_lacks_seed`.
+fn self_seeded_loop_contract() -> GraphSignature {
+    GraphSignature::new().produce::<Progress>()
+}
+
+/// A candidate that seeds its own loop from a parallel branch. The seed is off
+/// the main chain, but every branch runs and merges its outputs back, so it is
+/// guaranteed to the loop's first termination check.
+fn parallel_seeded_loop_candidate() -> Graph {
+    let mut graph = Graph::new();
+    graph.add_parallel(
+        "fan_out",
+        [|g: &mut Graph| {
+            g.add_system(seed_progress);
+        }],
+    );
+    graph.add_loop::<Progress, _, _>(
+        "refine",
+        |progress| progress.round >= 1,
+        |body| {
+            body.add_system(advance_progress);
+        },
+    );
+    graph
+}
+
+/// The same shape with the seed behind a fully isolated scope: inner outputs
+/// merge back on exit whatever the context policy.
+fn scope_seeded_loop_graph() -> Graph {
+    let mut inner = Graph::new();
+    inner.add_system(seed_progress);
+
+    let mut graph = Graph::new();
+    graph.add_scope("seed", inner, ContextPolicy::new());
+    graph.add_loop::<Progress, _, _>(
+        "refine",
+        |progress| progress.round >= 1,
+        |body| {
+            body.add_system(advance_progress);
+        },
+    );
+    graph
+}
+
+#[tokio::test]
+async fn registry_accepts_and_runs_parallel_seeded_loop_without_parent_seed() {
+    let candidate = parallel_seeded_loop_candidate();
+    assert!(
+        candidate.signature().requires_outputs().is_empty(),
+        "guaranteed parallel production satisfies the loop's first check, \
+         and the candidate asks its parent for nothing else: {}",
+        candidate.signature()
+    );
+
+    // The contract that rejects a bare loop-heading candidate admits this one:
+    // the seed is no longer the parent's to supply.
+    let contract = self_seeded_loop_contract();
+    let mut registry = SubgraphRegistry::new(contract.clone());
+    registry
+        .register("episode", candidate)
+        .expect("a parallel-seeded loop should satisfy a contract without the seed");
+
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("episode"),
+        DynamicSlot::new(contract, ContextPolicy::shared()),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new().with(registry);
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the candidate supplies its own loop seed");
+
+    // Round 0 from the branch fails the first check, the body advances to 1,
+    // and the second check terminates the loop.
+    assert_eq!(
+        result.output::<Progress>().map(|progress| progress.round),
+        Some(1)
+    );
+}
+
+#[test]
+fn registry_rejects_parallel_seeded_loop_when_contract_pads_the_seed() {
+    // The behavior break this change ships. `loop_contract()` pads
+    // `require_output::<Progress>()` for a seed the candidate now supplies
+    // itself, and exact-match admission compares sets — so the padding that
+    // was once required is now the thing that fails. It surfaces at
+    // `register()` with a diff naming the type, never at runtime.
+    let mut registry = SubgraphRegistry::new(loop_contract());
+    let err = registry
+        .register("episode", parallel_seeded_loop_candidate())
+        .expect_err("a padded contract no longer matches a self-seeding candidate");
+
+    match &err {
+        RegistryError::Incompatible { diff, .. } => {
+            let missing = diff.missing_requires_outputs();
+            assert_eq!(
+                missing.len(),
+                1,
+                "diff should name exactly the padded seed, got: {diff:?}"
+            );
+            assert!(
+                missing[0].type_name.contains("Progress"),
+                "diff names the seed the contract pads, got: {}",
+                missing[0].type_name
+            );
+        }
+        other => panic!("expected Incompatible, got: {other:?}"),
+    }
+    assert!(!registry.contains("episode"));
+
+    // The upgrade action in the changelog: drop the padding and it registers.
+    let mut registry = SubgraphRegistry::new(self_seeded_loop_contract());
+    registry
+        .register("episode", parallel_seeded_loop_candidate())
+        .expect("the unpadded contract admits the candidate");
+    assert!(registry.contains("episode"));
+}
+
+#[tokio::test]
+async fn scope_seeded_loop_runs_but_stays_inadmissible_as_a_candidate() {
+    let graph = scope_seeded_loop_graph();
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+    assert!(
+        graph.signature().requires_outputs().is_empty(),
+        "a scope's merged-back output satisfies the loop, and nothing else \
+         is free: {}",
+        graph.signature()
+    );
+
+    let mut ctx = SystemContext::new();
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the isolated scope merges its seed back before the first check");
+    assert_eq!(
+        result.output::<Progress>().map(|progress| progress.round),
+        Some(1)
+    );
+
+    // Slot admission is a separate gate, and crediting guaranteed production
+    // does not open it: a candidate containing an *undeclared* scope still
+    // hides what its interior *needs* — interior resource reads and free
+    // outputs never reach the parent signature — so it stays inadmissible.
+    // Declaring the boundary's contract is what opens the gate (below).
+    let mut registry = SubgraphRegistry::new(self_seeded_loop_contract());
+    let err = registry
+        .register("episode", scope_seeded_loop_graph())
+        .expect_err("a scope-bearing candidate is not admissible on production alone");
+    match &err {
+        RegistryError::NestedCandidate { id } => assert_eq!(
+            &**id, "episode",
+            "the refusal names the key being registered"
+        ),
+        other => panic!("expected NestedCandidate, got: {other:?}"),
+    }
+    assert!(
+        !registry.contains("episode"),
+        "a refused candidate is not half-inserted"
+    );
+}
+
+/// Records each scope/loop step independently of the final output.
+struct RecordProgress {
+    round: usize,
+    recorder: Arc<Mutex<Vec<usize>>>,
+}
+
+impl System for RecordProgress {
+    type Output = Progress;
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Progress, SystemError>> {
+        Box::pin(async move {
+            self.recorder.lock().unwrap().push(self.round);
+            Ok(Progress { round: self.round })
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "record_progress"
+    }
+    fn access(&self) -> SystemAccess {
+        SystemAccess::new()
+    }
+}
+
+/// The scope-seeded shape with the boundary's interface declared: the contract
+/// produces `Progress`, so the parent derivation credits it, and slot admission
+/// can check the declared boundary instead of refusing it.
+fn declared_scope_seeded_loop_graph(recorder: &Arc<Mutex<Vec<usize>>>) -> Graph {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(RecordProgress {
+        round: 0,
+        recorder: Arc::clone(recorder),
+    }));
+
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "seed",
+        inner,
+        ContextPolicy::new(),
+        GraphSignature::new().produce::<Progress>(),
+    );
+    graph.add_loop::<Progress, _, _>(
+        "refine",
+        |progress| progress.round >= 1,
+        |body| {
+            body.add_boxed_system(Box::new(RecordProgress {
+                round: 1,
+                recorder: Arc::clone(recorder),
+            }));
+        },
+    );
+    graph
+}
+
+#[tokio::test]
+async fn declared_scope_contract_admits_the_candidate_and_it_executes() {
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let candidate = declared_scope_seeded_loop_graph(&recorder);
+    assert!(
+        candidate.validate().is_ok(),
+        "the interior satisfies its declared contract: {}",
+        candidate.validate()
+    );
+    assert!(
+        candidate
+            .signature()
+            .requires_outputs()
+            .iter()
+            .all(|access| access.type_id != TypeId::of::<Progress>()),
+        "the declared produce satisfies the loop's first check: {}",
+        candidate.signature()
+    );
+
+    // The exact contract that rejected the plain-scope shape above admits the
+    // declared one: the boundary's IO is no longer hidden.
+    let mut registry = SubgraphRegistry::new(self_seeded_loop_contract());
+    registry
+        .register("episode", candidate)
+        .expect("a declared scope contract makes the boundary checkable");
+
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "route",
+        |_ctx| Arc::from("episode"),
+        DynamicSlot::new(self_seeded_loop_contract(), ContextPolicy::shared()),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new().with(registry);
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the declared scope executes exactly like a plain one");
+    assert_eq!(
+        result.output::<Progress>().map(|progress| progress.round),
+        Some(1)
+    );
+    assert_eq!(
+        *recorder.lock().unwrap(),
+        vec![0, 1],
+        "seed then exactly one loop body"
+    );
+}
+
+/// The interior has no resource or output requirements; only its boundary
+/// needs Base. Recording proves entry happened after the policy checks.
+struct BoundaryProbe(Arc<Mutex<Vec<&'static str>>>);
+
+impl System for BoundaryProbe {
+    type Output = ();
+    fn run<'a>(&'a self, _ctx: &'a SystemContext<'_>) -> BoxFuture<'a, Result<(), SystemError>> {
+        Box::pin(async move {
+            self.0.lock().unwrap().push("entered");
+            Ok(())
+        })
+    }
+    fn name(&self) -> &'static str {
+        "boundary_probe"
+    }
+    fn access(&self) -> SystemAccess {
+        SystemAccess::new()
+    }
+}
+
+fn boundary_only_candidate(
+    policy: ContextPolicy,
+    contract: GraphSignature,
+    recorder: &Arc<Mutex<Vec<&'static str>>>,
+) -> Graph {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(BoundaryProbe(Arc::clone(recorder))));
+    let mut candidate = Graph::new();
+    candidate.add_scope_with_contract("copy", inner, policy, contract);
+    candidate
+}
+
+#[tokio::test]
+async fn declared_scope_contract_accounts_for_boundary_only_copy_inputs() {
+    for policy in [
+        ContextPolicy::new().forward::<Base>(),
+        ContextPolicy::new().fork::<Base>(),
+    ] {
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let invalid = boundary_only_candidate(policy.clone(), GraphSignature::new(), &recorder);
+        let result = invalid.validate();
+        assert!(
+            matches!(result.errors.as_slice(), [
+            ValidationError::ScopeContractViolated { name, diff, .. }
+        ] if *name == "copy"
+            && diff.extra_requires().len() == 1
+            && diff.extra_requires()[0].type_id == TypeId::of::<Base>()
+            && diff.extra_requires()[0].mode == AccessMode::Read),
+            "{result}"
+        );
+        let mut empty_registry = SubgraphRegistry::new(GraphSignature::new());
+        assert!(matches!(
+            empty_registry.register("copy", invalid),
+            Err(RegistryError::Invalid { .. })
+        ));
+        assert!(!empty_registry.contains("copy"));
+
+        let contract = GraphSignature::new().require_read::<Base>();
+        let candidate = boundary_only_candidate(policy, contract.clone(), &recorder);
+        assert!(candidate.validate().is_ok(), "{}", candidate.validate());
+        assert_eq!(candidate.signature(), contract);
+        let mut registry = SubgraphRegistry::new(contract.clone());
+        registry
+            .register("copy", candidate)
+            .expect("declared boundary input is checkable");
+        let mut graph = Graph::new();
+        graph.add_dynamic_registry(
+            "route",
+            |_ctx| Arc::from("copy"),
+            DynamicSlot::new(contract, ContextPolicy::shared()),
+        );
+        assert!(graph.validate().is_ok(), "{}", graph.validate());
+        let mut ctx = SystemContext::new().with(registry);
+        let executor = GraphExecutor::new();
+        let errors = executor
+            .validate_resources(&graph, &ctx, None)
+            .expect_err("Base is required");
+        assert!(
+            errors.iter().any(|err| matches!(err,
+            ResourceValidationError::DynamicContractMissingResource { resource, .. }
+            if *resource == std::any::type_name::<Base>())),
+            "{errors:?}"
+        );
+        let error = executor
+            .execute(&graph, &mut ctx, None, None)
+            .await
+            .expect_err("copy has no source");
+        assert!(
+            matches!(error, ExecutionError::ScopeMissingResource { ref scope, resource, .. }
+            if *scope == "copy" && resource == std::any::type_name::<Base>()),
+            "{error:?}"
+        );
+        assert!(
+            recorder.lock().unwrap().is_empty(),
+            "failed entry must not run the interior"
+        );
+        ctx.insert(Base { n: 7 });
+        assert!(executor.validate_resources(&graph, &ctx, None).is_ok());
+        executor
+            .execute(&graph, &mut ctx, None, None)
+            .await
+            .expect("supplied source permits entry");
+        assert_eq!(*recorder.lock().unwrap(), vec!["entered"]);
+        assert_eq!(ctx.get_resource::<Base>().unwrap().n, 7);
+    }
+}
+
+#[test]
+fn declared_scope_contract_rejects_unrepresentable_factory_inputs() {
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    for contract in [
+        GraphSignature::new(),
+        GraphSignature::new().require_read::<Base>(),
+    ] {
+        let candidate = boundary_only_candidate(
+            ContextPolicy::new().forward_fresh::<Base>(),
+            contract.clone(),
+            &recorder,
+        );
+        let result = candidate.validate();
+        assert!(
+            result.errors.iter().any(|error| matches!(error,
+            ValidationError::ScopeContractFactoryUnsupported { name, resource, .. }
+            if *name == "copy" && *resource == std::any::type_name::<Base>())),
+            "{result}"
+        );
+        let mut registry = SubgraphRegistry::new(contract.clone());
+        assert!(matches!(
+            registry.register("copy", candidate.duplicate()),
+            Err(RegistryError::Invalid { .. })
+        ));
+        assert!(!registry.contains("copy"));
+        let mut inline = Graph::new();
+        inline.add_dynamic(
+            "route",
+            |_ctx| Arc::from("copy"),
+            [("copy", candidate)],
+            DynamicSlot::new(contract, ContextPolicy::shared()),
+        );
+        let result = inline.validate();
+        assert!(
+            result.errors.iter().any(|error| matches!(error,
+            ValidationError::DynamicCandidateInvalid { inner, .. }
+            if matches!(**inner, ValidationError::ScopeContractFactoryUnsupported { .. }))),
+            "{result}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -897,7 +1553,7 @@ fn validate_rejects_inline_candidate_that_nests_a_scope() {
 }
 
 #[test]
-fn validate_rejects_inline_candidate_that_nests_a_dynamic() {
+fn validate_accepts_inline_candidate_that_nests_a_dynamic() {
     let mut graph = Graph::new();
     graph.add_dynamic(
         "route",
@@ -908,12 +1564,90 @@ fn validate_rejects_inline_candidate_that_nests_a_dynamic() {
 
     let result = graph.validate();
     assert!(
-        result
-            .errors
+        result.is_ok(),
+        "expected a checked slot interface: {result}"
+    );
+}
+
+#[test]
+fn registry_rejects_candidate_with_nested_dynamic_resource_requirement() {
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(Multiply {
+        factor: 1,
+        recorder,
+    }));
+
+    // This boundary intentionally runs in an isolated child context. Its
+    // contract is therefore the only interface an enclosing candidate can
+    // expose to registry admission.
+    let mut outer_candidate = Graph::new();
+    outer_candidate.add_dynamic(
+        "inner",
+        |_ctx| Arc::from("read-base"),
+        [("read-base", inner)],
+        DynamicSlot::new(contract(), ContextPolicy::new()),
+    );
+    assert!(
+        outer_candidate.validate().is_ok(),
+        "{:#?}",
+        outer_candidate.validate().errors
+    );
+
+    // The outer registry admits an i32 producer but does not make `Base`
+    // available. A Dynamic contract's resource requirement must therefore
+    // reach this admission check instead of becoming a runtime failure.
+    let mut registry = SubgraphRegistry::new(GraphSignature::new().produce::<i32>());
+    let err = registry
+        .register("nested", outer_candidate)
+        .expect_err("the nested Dynamic requirement must be visible to the registry");
+    assert!(
+        matches!(err, RegistryError::Incompatible { ref diff, .. }
+            if diff.extra_requires().iter().any(|access| access.type_id == TypeId::of::<Base>())),
+        "expected the hidden Base requirement to reject registration, got {err:?}"
+    );
+}
+
+#[test]
+fn nested_dynamic_contract_exposes_free_output_requirement() {
+    let mut inner = Graph::new();
+    inner.add_boxed_system(Box::new(ReadsFreeNote));
+
+    let mut outer_candidate = Graph::new();
+    outer_candidate.add_dynamic(
+        "inner",
+        |_ctx| Arc::from("read-note"),
+        [("read-note", inner)],
+        DynamicSlot::new(
+            GraphSignature::new()
+                .require_output::<String>()
+                .produce::<i32>(),
+            ContextPolicy::shared(),
+        ),
+    );
+    assert!(
+        outer_candidate.validate().is_ok(),
+        "{:#?}",
+        outer_candidate.validate().errors
+    );
+
+    let signature = outer_candidate.signature();
+    assert!(
+        signature
+            .requires_outputs()
             .iter()
-            .any(|err| matches!(err, ValidationError::DynamicCandidateNested { .. })),
-        "expected DynamicCandidateNested, got {:?}",
-        result.errors
+            .any(|access| access.type_id == TypeId::of::<String>()),
+        "nested Dynamic free-output requirement is missing: {signature:?}"
+    );
+
+    let mut registry = SubgraphRegistry::new(GraphSignature::new().produce::<i32>());
+    let err = registry
+        .register("nested", outer_candidate)
+        .expect_err("the nested Dynamic output requirement must be visible to the registry");
+    assert!(
+        matches!(err, RegistryError::Incompatible { ref diff, .. }
+            if diff.extra_requires_outputs().iter().any(|access| access.type_id == TypeId::of::<String>())),
+        "expected the hidden String output requirement to reject registration, got {err:?}"
     );
 }
 
@@ -990,9 +1724,9 @@ fn validate_resources_flags_missing_registry_for_registry_slot() {
         errors.iter().any(|err| matches!(
             err,
             ResourceValidationError::DynamicRegistryUnavailable {
-                node_name: "route",
+                node_name,
                 ..
-            }
+            } if *node_name == "route"
         )),
         "expected DynamicRegistryUnavailable, got {errors:?}"
     );
@@ -1206,7 +1940,7 @@ fn validate_resources_accepts_required_output_produced_upstream() {
 #[test]
 fn validate_resources_rejects_hook_resource_for_dynamic_required_output() {
     // Provider hooks insert resources, while `requires_outputs` describes the
-    // separate output channel. Matching type IDs cannot bridge that boundary.
+    // separate output channel. MatchingMode type IDs cannot bridge that boundary.
     let mut graph = Graph::new();
     graph.add_dynamic_registry(
         "route",
@@ -1242,10 +1976,10 @@ fn validate_resources_rejects_hook_resource_for_dynamic_required_output() {
         errors.iter().any(|err| matches!(
             err,
             ResourceValidationError::DynamicContractMissingOutput {
-                node_name: "route",
+                node_name,
                 output,
                 ..
-            } if output.contains("HookProvidedResource")
+            } if *node_name == "route" && output.contains("HookProvidedResource")
         )),
         "expected DynamicContractMissingOutput, got: {errors:?}"
     );
@@ -1383,9 +2117,9 @@ async fn registry_absent_from_context_errors() {
         validation_errors.iter().any(|err| matches!(
             err,
             ResourceValidationError::DynamicRegistryUnavailable {
-                node_name: "route",
+                node_name,
                 ..
-            }
+            } if *node_name == "route"
         )),
         "expected DynamicRegistryUnavailable before execution, got {validation_errors:?}"
     );
@@ -1424,9 +2158,9 @@ async fn registry_hidden_by_scope_policy_errors_out_of_scope() {
         validation_errors.iter().any(|err| matches!(
             err,
             ResourceValidationError::DynamicRegistryUnavailable {
-                node_name: "route",
+                node_name,
                 ..
-            }
+            } if *node_name == "route"
         )),
         "expected DynamicRegistryUnavailable before execution, got {validation_errors:?}"
     );
@@ -1506,13 +2240,11 @@ async fn registry_contract_mismatch_is_refused() {
     );
 }
 
-#[test]
-fn self_referential_registry_candidate_is_refused_as_nested() {
-    // A candidate that is itself a registry-backed dynamic node would recurse on
-    // each execution. Rather than lean on the runtime recursion limit to bound
-    // it, registration refuses the candidate up front: it nests a dynamic
-    // boundary that flat signature derivation cannot see across. The unbounded
-    // recursion is thus prevented at build time, not merely capped at run time.
+#[tokio::test]
+async fn self_referential_registry_candidate_is_bounded_by_recursion_limit() {
+    // A nested dynamic node exposes its slot contract, so registration can
+    // admit it. Recursion is a runtime property and is bounded by the
+    // executor's configured depth limit.
     fn loop_graph() -> Graph {
         let mut graph = Graph::new();
         // A lone dynamic node has no aggregate IO, so an empty slot contract.
@@ -1525,14 +2257,21 @@ fn self_referential_registry_candidate_is_refused_as_nested() {
     }
 
     let mut registry = SubgraphRegistry::new(GraphSignature::new());
-    let err = registry
+    registry
         .register("loop", loop_graph())
-        .expect_err("a candidate nesting a dynamic node must be refused");
+        .expect("the nested dynamic exposes an empty slot contract");
+
+    let root = loop_graph();
+    let mut ctx = SystemContext::new().with(registry);
+    let err = GraphExecutor::new()
+        .with_max_recursion_depth(2)
+        .execute(&root, &mut ctx, None, None)
+        .await
+        .expect_err("the recursive candidate must reach the configured limit");
     assert!(
-        matches!(err, RegistryError::NestedCandidate { .. }),
-        "expected NestedCandidate, got {err:?}"
+        matches!(err, ExecutionError::RecursionLimitExceeded { max: 2, .. }),
+        "expected RecursionLimitExceeded, got {err:?}"
     );
-    assert!(registry.is_empty());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1706,10 +2445,10 @@ async fn dynamic_node_emits_start_and_complete_hooks() {
         matches!(
             &events[0],
             GraphEvent::DynamicStart {
-                node_name: "route",
+                node_name,
                 mode: ContextMode::Shared,
                 ..
-            }
+            } if *node_name == "route"
         ),
         "got {:?}",
         events[0]
@@ -1718,12 +2457,12 @@ async fn dynamic_node_emits_start_and_complete_hooks() {
         matches!(
             &events[1],
             GraphEvent::DynamicComplete {
-                node_name: "route",
+                node_name,
                 mode: ContextMode::Shared,
                 nodes_executed: 1,
                 selected,
                 ..
-            } if &**selected == "b"
+            } if *node_name == "route" && &**selected == "b"
         ),
         "expected DynamicComplete selecting 'b' with 1 node executed, got {:?}",
         events[1]
@@ -1999,6 +2738,34 @@ fn validate_rejects_inline_candidate_with_handler_io_outside_the_contract() {
         "expected DynamicCandidateIncompatible naming the handler's extra output, got {:?}",
         result.errors
     );
+}
+
+#[test]
+fn a_substitutable_slot_rejects_a_handler_that_skips_the_contract_output() {
+    let mut sneaky = Graph::new();
+    sneaky.add_boxed_system(Box::new(FailingCandidate));
+    sneaky.add_error_handler(|g| {
+        g.add_boxed_system(Box::new(HandlerExtra));
+    });
+
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "route",
+        |_ctx| Arc::from("sneaky"),
+        [("sneaky", sneaky)],
+        DynamicSlot::new(
+            GraphSignature::new().produce::<i32>(),
+            ContextPolicy::shared(),
+        )
+        .with_matching(MatchingMode::Substitutable),
+    );
+
+    let result = graph.validate();
+    assert!(matches!(
+        result.errors.as_slice(),
+        [ValidationError::DynamicCandidateMissingGuaranteedOutputs { missing, .. }]
+            if missing.iter().any(|access| access.type_name == std::any::type_name::<i32>())
+    ));
 }
 
 #[test]
@@ -2439,8 +3206,9 @@ fn candidate_warnings_propagate_as_dynamic_candidate_warnings() {
     assert!(
         result.warnings.iter().any(|warn| matches!(
             warn,
-            ValidationWarning::DynamicCandidateWarning { name: "route", key, inner, .. }
-                if &**key == "noisy"
+            ValidationWarning::DynamicCandidateWarning { name, key, inner, .. }
+                if *name == "route"
+                    && &**key == "noisy"
                     && matches!(
                         &**inner,
                         ValidationWarning::ConflictingParallelOutputs { .. }
@@ -2716,13 +3484,701 @@ async fn dynamic_complete_reports_multi_node_candidate_execution_count() {
         matches!(
             &events[0],
             GraphEvent::DynamicComplete {
-                node_name: "route",
+                node_name,
                 nodes_executed: 2,
                 selected,
                 ..
-            } if &**selected == "multi"
+            } if *node_name == "route" && &**selected == "multi"
         ),
         "expected DynamicComplete selecting 'multi' with 2 nodes executed, got {:?}",
         events[0]
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slot matching mode (escalation ladder)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds a ladder graph whose slot uses `matching`, with the cheap rung under
+/// `"a"` and the expensive rung under `"deep"`.
+fn ladder(matching: MatchingMode, recorder: &Arc<Mutex<Vec<i32>>>) -> Graph {
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "ladder",
+        pick_choice,
+        [
+            ("a", candidate(10, recorder)),
+            ("deep", deep_rung(recorder)),
+        ],
+        DynamicSlot::new(ladder_contract(), ContextPolicy::shared()).with_matching(matching),
+    );
+    graph
+}
+
+/// The first `DynamicCandidateIncompatible` diff in a validation result, or a
+/// panic naming what was found instead.
+fn incompatible_diff(result: &ValidationResult) -> &SignatureDiff {
+    result
+        .errors
+        .iter()
+        .find_map(|err| match err {
+            ValidationError::DynamicCandidateIncompatible { diff, .. } => Some(&**diff),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected DynamicCandidateIncompatible, got {:?}",
+                result.errors
+            )
+        })
+}
+
+#[tokio::test]
+async fn escalation_ladder_admits_the_cheap_rung_only_under_substitutable() {
+    // The motivating shape. Rungs are tried in order and the cheap rung
+    // legitimately needs *less* context than the expensive one the contract was
+    // written for. Exact-set match rejects it, which is backwards for
+    // substitutability — so the slot has to opt in.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+
+    let strict = ladder(MatchingMode::Exact, &recorder);
+    let strict_result = strict.validate();
+    assert!(!strict_result.is_ok(), "exact match rejects the cheap rung");
+    let diff = incompatible_diff(&strict_result);
+    assert_eq!(
+        diff.missing_requires().len(),
+        1,
+        "the diff names the resource the cheap rung declines to read: {diff}"
+    );
+    assert_eq!(
+        diff.missing_requires()[0].type_id,
+        TypeId::of::<Dossier>(),
+        "{diff}"
+    );
+
+    // Opting the slot into `Substitutable` admits it — and it runs, reading
+    // only the part of the guaranteed environment it needs.
+    let relaxed = ladder(MatchingMode::Substitutable, &recorder);
+    assert!(
+        relaxed.validate().is_ok(),
+        "{:?}",
+        relaxed.validate().errors
+    );
+
+    let mut ctx = SystemContext::new()
+        .with(Base { n: 3 })
+        .with(Dossier { weight: 7 })
+        .with(Choice { pick: "a" });
+    let result = GraphExecutor::new()
+        .execute(&relaxed, &mut ctx, None, None)
+        .await
+        .expect("the cheap rung should run under Substitutable");
+
+    assert_eq!(*recorder.lock().unwrap(), vec![30], "the cheap rung ran");
+    assert_eq!(result.output::<i32>(), Some(&30));
+}
+
+#[tokio::test]
+async fn escalation_ladder_still_runs_the_expensive_rung_under_substitutable() {
+    // Widening the relation must not cost the exact rung its admission: the
+    // expensive rung matches the contract exactly and still selects and runs.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let graph = ladder(MatchingMode::Substitutable, &recorder);
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new()
+        .with(Base { n: 3 })
+        .with(Dossier { weight: 7 })
+        .with(Choice { pick: "deep" });
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the expensive rung should still run");
+
+    assert_eq!(*recorder.lock().unwrap(), vec![21]);
+}
+
+#[test]
+fn a_candidate_needing_more_is_rejected_under_both_modes() {
+    // The polarity guard. `GraphSignature::satisfies` — the relation the
+    // capability registry uses, and the one request #4 proposed reusing here —
+    // *admits* a candidate that requires more than the slot, because a
+    // capability registrant's own setup is presumed to provide the extra. A
+    // `Dynamic` slot has no registrant: the parent graph is the environment and
+    // it was validated against the contract alone, so the extra read would find
+    // nothing there. Both matching modes must therefore refuse it.
+    let greedy = greedy_rung();
+    assert!(
+        greedy.signature().satisfies(&ladder_contract()),
+        "subsumption admits it — which is exactly why it is the wrong relation here"
+    );
+
+    for matching in [MatchingMode::Exact, MatchingMode::Substitutable] {
+        let mut graph = Graph::new();
+        graph.add_dynamic(
+            "ladder",
+            pick_choice,
+            [("a", greedy_rung())],
+            DynamicSlot::new(ladder_contract(), ContextPolicy::shared()).with_matching(matching),
+        );
+
+        let result = graph.validate();
+        assert!(!result.is_ok(), "{matching:?} must reject the greedy rung");
+        let diff = incompatible_diff(&result);
+        assert_eq!(
+            diff.extra_requires().len(),
+            1,
+            "{matching:?} names the unguaranteed read: {diff}"
+        );
+        assert_eq!(
+            diff.extra_requires()[0].type_id,
+            TypeId::of::<Ledger>(),
+            "{diff}"
+        );
+    }
+}
+
+#[test]
+fn produces_superset_is_admitted_only_under_substitutable() {
+    // Covariance on outputs: a rung that also produces a `String` note still
+    // merges back everything downstream was validated against, so it is a legal
+    // substitute — but not an exact match.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+
+    let mut strict = Graph::new();
+    strict.add_dynamic(
+        "ladder",
+        pick_choice,
+        [("a", rung_producing_extra(&recorder))],
+        DynamicSlot::new(ladder_contract(), ContextPolicy::shared()),
+    );
+    let strict_result = strict.validate();
+    assert!(!strict_result.is_ok());
+    let diff = incompatible_diff(&strict_result);
+    assert_eq!(
+        diff.extra_produces().len(),
+        1,
+        "exact match flags the extra output: {diff}"
+    );
+
+    let mut relaxed = Graph::new();
+    relaxed.add_dynamic(
+        "ladder",
+        pick_choice,
+        [("a", rung_producing_extra(&recorder))],
+        DynamicSlot::new(ladder_contract(), ContextPolicy::shared())
+            .with_matching(MatchingMode::Substitutable),
+    );
+    assert!(
+        relaxed.validate().is_ok(),
+        "{:?}",
+        relaxed.validate().errors
+    );
+}
+
+#[test]
+fn produces_subset_is_rejected_under_both_modes() {
+    // The other direction is never safe: dropping the `i32` verdict leaves the
+    // parent's downstream nodes reading an output nothing produced.
+    for matching in [MatchingMode::Exact, MatchingMode::Substitutable] {
+        let mut graph = Graph::new();
+        graph.add_dynamic(
+            "ladder",
+            pick_choice,
+            [("a", rung_missing_the_verdict())],
+            DynamicSlot::new(ladder_contract(), ContextPolicy::shared()).with_matching(matching),
+        );
+
+        let result = graph.validate();
+        assert!(!result.is_ok(), "{matching:?} must reject a dropped output");
+        let diff = incompatible_diff(&result);
+        assert_eq!(
+            diff.missing_produces().len(),
+            1,
+            "{matching:?} names the dropped verdict: {diff}"
+        );
+        assert_eq!(
+            diff.missing_produces()[0].type_id,
+            TypeId::of::<i32>(),
+            "{diff}"
+        );
+    }
+}
+
+#[test]
+fn free_output_reads_beyond_the_slot_are_rejected_under_both_modes() {
+    // The parent deposits only the free `Out<T>`s the contract names, so a
+    // candidate reading one it never sanctioned would dangle at runtime. This
+    // axis is contravariant under both modes, so neither may admit it.
+    for matching in [MatchingMode::Exact, MatchingMode::Substitutable] {
+        let mut graph = Graph::new();
+        graph.add_dynamic(
+            "ladder",
+            pick_choice,
+            [("a", rung_reading_a_free_output())],
+            DynamicSlot::new(ladder_contract(), ContextPolicy::shared()).with_matching(matching),
+        );
+
+        let result = graph.validate();
+        assert!(!result.is_ok(), "{matching:?} must reject the free read");
+        let diff = incompatible_diff(&result);
+        assert_eq!(
+            diff.extra_requires_outputs().len(),
+            1,
+            "{matching:?} names the unsanctioned free read: {diff}"
+        );
+        assert_eq!(
+            diff.extra_requires_outputs()[0].type_id,
+            TypeId::of::<String>(),
+            "{diff}"
+        );
+    }
+}
+
+#[test]
+fn inline_admission_agrees_with_the_matching_relation() {
+    // Binds the admission point to the relation itself: `validate()` accepts a
+    // candidate exactly when the slot's mode admits its signature, and the
+    // carried diff is empty exactly then too. This is the relation ⇔
+    // empty-diff invariant observed through the API rather than the predicate.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let candidates: Vec<(&str, fn(&Arc<Mutex<Vec<i32>>>) -> Graph)> = vec![
+        ("cheap", |rec| candidate(10, rec)),
+        ("deep", deep_rung),
+        ("greedy", |_rec| greedy_rung()),
+        ("extra_produce", rung_producing_extra),
+        ("missing_produce", |_rec| rung_missing_the_verdict()),
+        ("free_read", |_rec| rung_reading_a_free_output()),
+    ];
+
+    for matching in [MatchingMode::Exact, MatchingMode::Substitutable] {
+        for (label, build) in &candidates {
+            let signature = build(&recorder).signature();
+            let mut graph = Graph::new();
+            graph.add_dynamic(
+                "ladder",
+                pick_choice,
+                [("a", build(&recorder))],
+                DynamicSlot::new(ladder_contract(), ContextPolicy::shared())
+                    .with_matching(matching),
+            );
+
+            let admitted = matching.admits(&signature, &ladder_contract());
+            assert_eq!(
+                graph.validate().is_ok(),
+                admitted,
+                "{matching:?} admission of '{label}' must follow the relation"
+            );
+            assert_eq!(
+                matching.diff(&signature, &ladder_contract()).is_empty(),
+                admitted,
+                "{matching:?} diff for '{label}' must be empty exactly when admitted"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn registry_insertion_honours_the_matching_mode() {
+    // The second admission point. A registry carries its own relation, and the
+    // cheap rung is refused by a default (`Exact`) registry and taken by a
+    // `Substitutable` one — then runs through a slot that matches.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+
+    let mut strict = SubgraphRegistry::new(ladder_contract());
+    assert_eq!(
+        strict.matching(),
+        MatchingMode::Exact,
+        "the default is Exact"
+    );
+    let err = strict
+        .register("rung", candidate(10, &recorder))
+        .expect_err("an exact registry refuses the cheap rung");
+    match err {
+        RegistryError::Incompatible { ref diff, .. } => {
+            assert_eq!(
+                diff.missing_requires().len(),
+                1,
+                "the diff names the resource it declines to read: {diff}"
+            );
+            assert_eq!(
+                diff.missing_requires()[0].type_id,
+                TypeId::of::<Dossier>(),
+                "{diff}"
+            );
+        }
+        other => panic!("expected Incompatible, got {other:?}"),
+    }
+    assert!(!strict.contains("rung"));
+
+    let mut relaxed =
+        SubgraphRegistry::new(ladder_contract()).with_matching(MatchingMode::Substitutable);
+    relaxed
+        .register("rung", candidate(10, &recorder))
+        .expect("a substitutable registry admits the cheap rung");
+    // A candidate needing *more* than the contract is still refused, and the
+    // refusal leaves the registry unchanged.
+    match relaxed.register("greedy", greedy_rung()) {
+        Err(RegistryError::Incompatible { diff, matching, .. }) => {
+            assert_eq!(
+                matching,
+                MatchingMode::Substitutable,
+                "the error names the relation that actually ran"
+            );
+            assert_eq!(
+                diff.extra_requires()[0].type_id,
+                TypeId::of::<Ledger>(),
+                "{diff}"
+            );
+        }
+        other => panic!("expected Incompatible, got {other:?}"),
+    }
+    assert!(!relaxed.contains("greedy"));
+
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "ladder",
+        |_ctx| Arc::from("rung"),
+        DynamicSlot::new(ladder_contract(), ContextPolicy::shared())
+            .with_matching(MatchingMode::Substitutable),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new()
+        .with(Base { n: 4 })
+        .with(Dossier { weight: 7 })
+        .with(relaxed);
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the registry-admitted cheap rung should run");
+    assert_eq!(*recorder.lock().unwrap(), vec![40]);
+}
+
+#[tokio::test]
+async fn slot_without_an_explicit_mode_matches_exactly_as_before() {
+    // Regression guard on the default. A slot built the way every existing
+    // caller builds one reports `Exact`, admits only the exact candidate, and
+    // executes it — unchanged by the new knob.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let slot = DynamicSlot::new(contract(), ContextPolicy::shared());
+    assert_eq!(slot.matching(), MatchingMode::Exact);
+    assert_eq!(
+        slot,
+        DynamicSlot::new(contract(), ContextPolicy::shared()).with_matching(MatchingMode::Exact),
+        "the default is the same value an explicit Exact produces"
+    );
+
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "route",
+        pick_choice,
+        [("a", candidate(10, &recorder))],
+        slot,
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+    assert_eq!(
+        graph.nodes().iter().find_map(|node| match node {
+            Node::Dynamic(dynamic) => Some(dynamic.matching()),
+            _ => None,
+        }),
+        Some(MatchingMode::Exact),
+        "the node carries the slot's mode"
+    );
+
+    let mut ctx = SystemContext::new().with(Base { n: 5 });
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the unchanged default path should still execute");
+    assert_eq!(*recorder.lock().unwrap(), vec![50]);
+
+    // And a candidate reading less than that contract is still rejected — the
+    // pre-change behaviour, unchanged unless a slot opts in. `Constant`
+    // produces the contracted `i32` and reads nothing, so it diverges on the
+    // `requires` axis *only*: `Exact` must refuse it and `Substitutable` would
+    // admit it, which is what makes this discriminate between the two.
+    let mut strict = Graph::new();
+    strict.add_dynamic(
+        "route",
+        pick_choice,
+        [("a", rung_reading_nothing())],
+        DynamicSlot::new(contract(), ContextPolicy::shared()),
+    );
+    let strict_result = strict.validate();
+    assert!(
+        !strict_result.is_ok(),
+        "the default still requires an exact match"
+    );
+    let diff = incompatible_diff(&strict_result);
+    assert_eq!(
+        diff.missing_requires()[0].type_id,
+        TypeId::of::<Base>(),
+        "{diff}"
+    );
+
+    let mut relaxed = Graph::new();
+    relaxed.add_dynamic(
+        "route",
+        pick_choice,
+        [("a", rung_reading_nothing())],
+        DynamicSlot::new(contract(), ContextPolicy::shared())
+            .with_matching(MatchingMode::Substitutable),
+    );
+    assert!(
+        relaxed.validate().is_ok(),
+        "the same candidate is admitted once the slot opts in: {:?}",
+        relaxed.validate().errors
+    );
+}
+
+#[tokio::test]
+async fn a_substitutable_candidates_extra_output_is_dropped_and_warns() {
+    // The contract is the Dynamic boundary's export list. A substitutable
+    // candidate may compute an extra output, but it never crosses that
+    // boundary, even when the parent already has the same type. This is still
+    // worth warning about: the candidate performed work whose value is lost.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    // upstream `String` -> slot -> downstream reader of that `String`.
+    let build = |matching: MatchingMode| {
+        let mut graph = Graph::new();
+        graph.add_boxed_system(Box::new(UpstreamNote));
+        graph.add_dynamic(
+            "ladder",
+            pick_choice,
+            [("a", rung_producing_extra(&recorder))],
+            DynamicSlot::new(ladder_contract(), ContextPolicy::shared()).with_matching(matching),
+        );
+        graph.add_boxed_system(Box::new(ReadNote {
+            seen: Arc::clone(&seen),
+        }));
+        graph
+    };
+
+    // `Exact` refuses the candidate outright — the extra output is a divergence.
+    let strict_result = build(MatchingMode::Exact).validate();
+    assert!(
+        !strict_result.is_ok(),
+        "exact match rejects the extra output"
+    );
+    assert_eq!(
+        incompatible_diff(&strict_result).extra_produces().len(),
+        1,
+        "and names it"
+    );
+
+    // `Substitutable` admits it, and says so: the contract does not name the
+    // extra `String`, so it will be dropped at the Dynamic boundary.
+    let relaxed = build(MatchingMode::Substitutable);
+    let relaxed_result = relaxed.validate();
+    assert!(relaxed_result.is_ok(), "{:?}", relaxed_result.errors);
+    let dropped: Vec<&str> = relaxed_result
+        .warnings()
+        .iter()
+        .filter_map(|warning| match warning {
+            ValidationWarning::DynamicCandidateShadowsOutput {
+                key, output_type, ..
+            } => {
+                assert_eq!(&**key, "a");
+                Some(*output_type)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dropped.len(),
+        1,
+        "the dropped type is named: {:?}",
+        relaxed_result.warnings()
+    );
+    assert!(dropped[0].contains("String"), "got {}", dropped[0]);
+
+    // The warning is not theoretical: downstream keeps the parent value;
+    // the candidate's undeclared extra cannot escape the boundary.
+    let mut ctx = SystemContext::new()
+        .with(Base { n: 3 })
+        .with(Dossier { weight: 7 })
+        .with(Choice { pick: "a" });
+    GraphExecutor::new()
+        .execute(&relaxed, &mut ctx, None, None)
+        .await
+        .expect("the graph still executes — this is a warning, not an error");
+    assert_eq!(*recorder.lock().unwrap(), vec![30], "the candidate ran");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["upstream".to_string()],
+        "the candidate's undeclared extra output was dropped at the boundary"
+    );
+}
+
+#[test]
+fn an_extra_output_the_parent_never_produces_still_warns() {
+    // Every undeclared extra is dropped, whether or not it happens to collide
+    // with a parent output. That makes the warning a useful signal for wasted
+    // candidate work rather than a collision-only diagnostic.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "ladder",
+        pick_choice,
+        [("a", rung_producing_extra(&recorder))],
+        DynamicSlot::new(ladder_contract(), ContextPolicy::shared())
+            .with_matching(MatchingMode::Substitutable),
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "{:?}", result.errors);
+    assert!(
+        result.warnings().iter().any(|warning| matches!(
+            warning,
+            ValidationWarning::DynamicCandidateShadowsOutput { output_type, .. }
+            if output_type.contains("String")
+        )),
+        "the dropped extra is named: {:?}",
+        result.warnings()
+    );
+}
+
+#[test]
+fn substitutable_does_not_relax_the_contracts_claim_on_the_parent() {
+    // The PR's most load-bearing "deliberately unchanged" decision, made
+    // executable. `MatchingMode` governs candidate admission; it does not
+    // weaken what the *contract* demands of the surroundings. Under
+    // `Substitutable` the contract's `requires` is the upper bound of what an
+    // admissible candidate may consume, so the parent must still be able to
+    // feed the maximal candidate whichever rung the selector picks.
+    for matching in [MatchingMode::Exact, MatchingMode::Substitutable] {
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let mut graph = Graph::new();
+        graph.add_dynamic(
+            "ladder",
+            pick_choice,
+            [("deep", deep_rung(&recorder))],
+            DynamicSlot::new(ladder_contract(), ContextPolicy::shared()).with_matching(matching),
+        );
+        assert!(graph.validate().is_ok(), "the graph itself is well-formed");
+
+        // `Dossier` is named by the contract but absent from the context.
+        let ctx = SystemContext::new().with(Base { n: 3 });
+        let errors = GraphExecutor::new()
+            .validate_resources(&graph, &ctx, None)
+            .expect_err("the contract's own requirement is still enforced");
+        assert!(
+            errors.iter().any(|err| matches!(err,
+                ResourceValidationError::DynamicContractMissingResource { resource, .. }
+                if *resource == std::any::type_name::<Dossier>())),
+            "{matching:?} must still flag the missing contract resource, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_preserves_a_substitutable_slots_mode() {
+    // `Node::duplicate` copies the mode. Without a non-default case the field
+    // could be replaced by `MatchingMode::default()` and no test would notice.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "ladder",
+        pick_choice,
+        [("a", candidate(10, &recorder))],
+        DynamicSlot::new(ladder_contract(), ContextPolicy::shared())
+            .with_matching(MatchingMode::Substitutable),
+    );
+
+    let clone = graph.duplicate();
+
+    let modes: Vec<MatchingMode> = clone
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            Node::Dynamic(dynamic) => Some(dynamic.matching()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        modes,
+        vec![MatchingMode::Substitutable],
+        "the duplicated node keeps the slot's mode, not the default"
+    );
+    assert!(clone.validate().is_ok(), "{:?}", clone.validate().errors);
+}
+
+#[tokio::test]
+async fn a_registrys_mode_decides_on_the_registry_path_not_the_slots() {
+    // The documented asymmetry, pinned. On a registry-backed node the slot's
+    // own mode gates nothing: candidates are admitted at `register()` by the
+    // *registry's* relation, and the executor re-checks only that the
+    // registry's contract is this node's. A slot left at `Exact` therefore
+    // still runs a candidate only `Substitutable` would have admitted.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+
+    let mut registry =
+        SubgraphRegistry::new(ladder_contract()).with_matching(MatchingMode::Substitutable);
+    registry
+        .register("rung", candidate(10, &recorder))
+        .expect("the registry's own relation admits the cheap rung");
+
+    let mut graph = Graph::new();
+    graph.add_dynamic_registry(
+        "ladder",
+        |_ctx| Arc::from("rung"),
+        // Deliberately left at the default: the slot asks for exact matching.
+        DynamicSlot::new(ladder_contract(), ContextPolicy::shared()),
+    );
+    assert_eq!(
+        graph.nodes().iter().find_map(|node| match node {
+            Node::Dynamic(dynamic) => Some(dynamic.matching()),
+            _ => None,
+        }),
+        Some(MatchingMode::Exact),
+        "the slot records Exact"
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new()
+        .with(Base { n: 4 })
+        .with(Dossier { weight: 7 })
+        .with(registry);
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("execution does not re-check the candidate against the node's mode");
+    assert_eq!(
+        *recorder.lock().unwrap(),
+        vec![40],
+        "the registry's relation, not the slot's, decided admission"
+    );
+}
+
+#[tokio::test]
+async fn substitutable_admits_a_cheap_rung_across_a_non_shared_boundary() {
+    // The relation is about signatures, not context plumbing: crossings are
+    // driven by the slot's `ContextPolicy`, so a candidate consuming less than
+    // the contract behaves the same behind a `forward` boundary as a shared one.
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let mut graph = Graph::new();
+    graph.add_dynamic(
+        "ladder",
+        pick_choice,
+        [("a", candidate(10, &recorder))],
+        DynamicSlot::new(
+            ladder_contract(),
+            ContextPolicy::new().forward::<Base>().forward::<Dossier>(),
+        )
+        .with_matching(MatchingMode::Substitutable),
+    );
+    assert!(graph.validate().is_ok(), "{:?}", graph.validate().errors);
+
+    let mut ctx = SystemContext::new()
+        .with(Base { n: 3 })
+        .with(Dossier { weight: 7 })
+        .with(Choice { pick: "a" });
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await
+        .expect("the cheap rung should run behind a forwarding boundary too");
+    assert_eq!(*recorder.lock().unwrap(), vec![30]);
 }

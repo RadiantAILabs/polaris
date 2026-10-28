@@ -20,7 +20,7 @@ pub(crate) fn register(mw: &MiddlewareAPI) {
     mw.register_system("tracing", |info, ctx, next| {
         let span = tracing::info_span!(
             "polaris.graph.execute_system",
-            polaris.graph.system.name = info.node_name,
+            polaris.graph.system.name = %info.node_name,
             polaris.graph.system.node_id = %info.node_id,
         );
         Box::pin(async move { next.run(ctx).await }.instrument(span))
@@ -29,7 +29,7 @@ pub(crate) fn register(mw: &MiddlewareAPI) {
     mw.register_loop("tracing", |info, ctx, next| {
         let span = tracing::info_span!(
             "polaris.graph.execute_loop",
-            polaris.graph.loop.name = info.node_name,
+            polaris.graph.loop.name = %info.node_name,
             polaris.graph.loop.max_iterations = info.max_iterations,
         );
         Box::pin(async move { next.run(ctx).await }.instrument(span))
@@ -46,7 +46,7 @@ pub(crate) fn register(mw: &MiddlewareAPI) {
     mw.register_parallel("tracing", |info, ctx, next| {
         let span = tracing::info_span!(
             "polaris.graph.execute_parallel",
-            polaris.graph.parallel.name = info.node_name,
+            polaris.graph.parallel.name = %info.node_name,
             polaris.graph.parallel.branch_count = info.branch_count,
         );
         Box::pin(async move { next.run(ctx).await }.instrument(span))
@@ -63,7 +63,7 @@ pub(crate) fn register(mw: &MiddlewareAPI) {
     mw.register_decision("tracing", |info, ctx, next| {
         let span = tracing::info_span!(
             "polaris.graph.execute_decision",
-            polaris.graph.decision.name = info.node_name,
+            polaris.graph.decision.name = %info.node_name,
             polaris.graph.decision.branch_index = Empty,
         );
         Box::pin(async move { next.run(ctx).await }.instrument(span))
@@ -72,7 +72,7 @@ pub(crate) fn register(mw: &MiddlewareAPI) {
     mw.register_switch("tracing", |info, ctx, next| {
         let span = tracing::info_span!(
             "polaris.graph.execute_switch",
-            polaris.graph.switch.name = info.node_name,
+            polaris.graph.switch.name = %info.node_name,
             polaris.graph.switch.case_index = Empty,
             polaris.graph.switch.used_default = Empty,
         );
@@ -111,7 +111,10 @@ pub(crate) fn register_outcome_hooks(hooks: &HooksAPI) {
             } = event
             {
                 let span = tracing::Span::current();
-                span.record("polaris.graph.switch.case_index", *selected_case);
+                span.record(
+                    "polaris.graph.switch.case_index",
+                    tracing::field::display(selected_case),
+                );
                 span.record("polaris.graph.switch.used_default", *used_default);
             }
         })

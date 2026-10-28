@@ -35,6 +35,7 @@ middleware.
 | Resource | Scope | What systems use it for |
 |----------|-------|-------------------------|
 | [`SystemInfo`](crate::graph::SystemInfo) | Local | Inspect the current node — name, system type, retry attempt, etc. Provided by [`DevToolsPlugin`](crate::graph::DevToolsPlugin); used by tracing, logging, and custom instrumentation systems. |
+| [`RunCancellation`](crate::graph::RunCancellation) | Local | Notice that the run was interrupted, and race a long await against the signal with `run_until_cancelled`, so a system returns promptly instead of holding the stop until its next node boundary. Consumer-supplied — [`SessionsAPI`](crate::sessions::SessionsAPI) inserts one per turn; a direct executor caller inserts [`CancellationSource::token`](crate::graph::CancellationSource::token) or [`RunCancellation::never`](crate::graph::RunCancellation::never). Raising is [`CancellationSource`](crate::graph::CancellationSource)'s capability, never this one's. |
 | [`SubgraphRegistry`](crate::graph::SubgraphRegistry) | Local | Hold the candidate subgraphs a [`Dynamic`](crate::graph::DynamicNode) node selects from, keyed by name, and swap them between turns to change what the slot runs. Inserted by the user (not a plugin); each candidate is signature-checked at registration. |
 
 # Layer 3 — Models
@@ -82,7 +83,7 @@ Cross-cutting capabilities every agent typically needs.
 | [`Clock`](crate::plugins::Clock) | Global | Wall-clock time. Provided by [`TimePlugin`](crate::plugins::TimePlugin); substitutable with `MockClock` under feature `test-utils`. |
 | [`Stopwatch`](crate::plugins::Stopwatch) | Local | Per-turn elapsed-time tracking. Provided by [`TimePlugin`](crate::plugins::TimePlugin). |
 | [`TracingConfig`](crate::plugins::TracingConfig) | Global | Current tracing log level. Provided by [`TracingPlugin`](crate::plugins::TracingPlugin); consumed mostly by other plugins, occasionally by systems that adapt output verbosity. |
-| [`UserIO`](crate::plugins::UserIO) | Local | Per-turn bidirectional I/O channel (used by interactive agents and the HTTP/SSE bridge). Provided by [`IOProvider`](crate::plugins::IOProvider) implementations — `StdioIOProvider` for CLIs, `HttpIOProvider` for HTTP, `MockIOProvider` under `test-utils`. |
+| [`UserIO`](crate::plugins::UserIO) | Local | Per-turn bidirectional I/O channel (used by interactive agents and the HTTP/SSE bridge). Provided by [`IOProvider`](crate::plugins::IOProvider) implementations — `StdioIOProvider` for CLIs, [`ChannelIOProvider`](crate::sessions::HttpIOProvider) for caller-owned channels (including HTTP; available without `sessions-http`), `MockIOProvider` under `test-utils`. |
 
 # Layer 3 — Shell
 
@@ -90,7 +91,7 @@ Shell command execution.
 
 | Resource | Scope | What systems use it for |
 |----------|-------|-------------------------|
-| [`ShellExecutor`](crate::shell::ShellExecutor) | Global | Execute shell commands behind the [`ShellPermission`](crate::shell::ShellPermission) gate. Provided by [`ShellPlugin`](crate::shell::ShellPlugin). |
+| [`ShellExecutor`](crate::shell::ShellExecutor) | Global | Start, stream, inspect, stop, and await bounded shell processes behind the [`ShellPermission`](crate::shell::ShellPermission) gate. Its shared process table retains live runs and a bounded set of unconsumed results. Provided by [`ShellPlugin`](crate::shell::ShellPlugin). |
 
 # Related
 

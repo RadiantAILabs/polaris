@@ -8,7 +8,8 @@ use polaris_tools::ToolRegistry;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-/// Plugin that provides shell command execution capabilities.
+/// Use `ShellPlugin` when typed systems or LLM agents need permission-gated
+/// shell execution and managed process cleanup.
 ///
 /// Registers [`ShellExecutor`] as a global resource and a [`ShellTools`]
 /// toolset against [`ToolRegistry`] so the underlying executor is reachable
@@ -45,10 +46,11 @@ use std::time::{Duration, SystemTime};
 ///
 /// - **`build()`** — inserts [`ShellExecutor`] as a global resource and
 ///   registers the [`ShellTools`] toolset with [`ToolRegistry`].
-/// - **`cleanup()`** — when a cache directory is configured, garbage-
-///   collects expired shell overflow files (`shell_stdout_*` /
-///   `shell_stderr_*`) older than the configured overflow TTL. A no-op
-///   when no cache directory is set.
+/// - **`cleanup()`** — bounds managed-process cleanup by the configured
+///   `shutdown_grace` and logs a warning if that deadline expires, then
+///   continues with best-effort garbage collection of expired shell overflow
+///   files (`shell_stdout_*` / `shell_stderr_*`) when a cache directory is
+///   configured.
 /// - No `ready()` override; registers no tick schedules.
 ///
 /// # Extends
@@ -127,7 +129,20 @@ impl Plugin for ShellPlugin {
         registry.register_toolset(ShellTools::new(executor));
     }
 
-    async fn cleanup(&self, _server: &mut Server) {
+    async fn cleanup(&self, server: &mut Server) {
+        let executor = server
+            .get_global::<ShellExecutor>()
+            .map(|resource| (*resource).clone());
+        if let Some(executor) = executor {
+            let cleanup = executor.stop_all();
+            if tokio::time::timeout(self.config.shutdown_grace, cleanup)
+                .await
+                .is_err()
+            {
+                tracing::warn!("shell process cleanup exceeded shutdown grace");
+            }
+        }
+
         let Some(cache_dir) = &self.config.cache_dir else {
             return;
         };

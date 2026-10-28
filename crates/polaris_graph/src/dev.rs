@@ -53,7 +53,7 @@
 use crate::hooks::HooksAPI;
 use crate::hooks::events::GraphEvent;
 use crate::hooks::schedule::{AllGraphSchedules, OnSystemStart};
-use crate::node::NodeId;
+use crate::node::{NodeId, NodeName};
 use polaris_system::plugin::{Plugin, Version};
 use polaris_system::resource::LocalResource;
 use polaris_system::server::Server;
@@ -72,18 +72,20 @@ use polaris_system::server::Server;
 pub struct SystemInfo {
     /// The ID of the node currently being executed.
     node_id: NodeId,
-    /// The name of the system being executed.
-    system_name: &'static str,
+    /// The runtime display name of the system node being executed. Defaults
+    /// to the system's static function name; overridden per-node with
+    /// [`SystemNodeBuilder::named`](crate::graph::SystemNodeBuilder::named).
+    system_name: NodeName,
 }
 
 impl LocalResource for SystemInfo {}
 
 impl SystemInfo {
     /// Creates a new `SystemInfo` with the given execution context.
-    pub fn new(node_id: NodeId, system_name: &'static str) -> Self {
+    pub fn new(node_id: NodeId, system_name: impl Into<NodeName>) -> Self {
         Self {
             node_id,
-            system_name,
+            system_name: system_name.into(),
         }
     }
 
@@ -93,10 +95,11 @@ impl SystemInfo {
         self.node_id.clone()
     }
 
-    /// Returns the name of the system currently being executed.
+    /// Returns the runtime display name of the system node currently being
+    /// executed.
     #[must_use]
-    pub fn system_name(&self) -> &'static str {
-        self.system_name
+    pub fn system_name(&self) -> &NodeName {
+        &self.system_name
     }
 }
 
@@ -204,7 +207,7 @@ impl Plugin for DevToolsPlugin {
                         ..
                     } = event
                     {
-                        Some(SystemInfo::new(node_id.clone(), system_name))
+                        Some(SystemInfo::new(node_id.clone(), system_name.clone()))
                     } else {
                         None
                     }

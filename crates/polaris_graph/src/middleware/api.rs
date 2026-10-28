@@ -509,7 +509,7 @@ mod tests {
     /// Creates a mock [`SystemInfo`].
     fn mock_system_info() -> SystemInfo {
         SystemInfo {
-            node_name: "test",
+            node_name: "test".into(),
             node_id: NodeId::new(),
         }
     }
@@ -667,7 +667,7 @@ mod tests {
 
         let mut ctx = SystemContext::new();
         let info = SystemInfo {
-            node_name: "my_system",
+            node_name: "my_system".into(),
             node_id: NodeId::new(),
         };
 

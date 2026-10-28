@@ -178,6 +178,21 @@ fn convert_tool_call(
 // Tool configuration
 // -----------------------------------------------------------------------------
 
+/// Bedrock's Converse API cannot currently take a `strict` tool
+/// specification safely across models: some models reject the field outright
+/// (`ValidationException: tools.N.custom.strict: Extra inputs are not
+/// permitted`, observed live on Claude Sonnet 5 via `global.anthropic.*`),
+/// and others accept it but overflow their constrained-decoding grammar
+/// compiler once more than a handful of tools are marked strict (`"The
+/// compiled grammar is too large ... Simplify your tool schemas or reduce
+/// the number of strict tools."`, observed live on Claude Haiku 4.5 with
+/// this crate's default toolset). Until Bedrock's strict tool support
+/// stabilizes, every tool degrades to non-strict here — the same
+/// overflow-degrades-to-non-strict mechanism
+/// `anthropic::provider::MAX_STRICT_TOOLS` uses for its own (much higher)
+/// per-request budget, just with the budget dialed to zero.
+const MAX_STRICT_TOOLS: usize = 0;
+
 /// Builds a Bedrock tool configuration from a generation request.
 pub fn build_tool_config(
     request: &LlmRequest,
@@ -187,9 +202,10 @@ pub fn build_tool_config(
         _ => return Ok(None),
     };
 
+    let mut strict_budget = MAX_STRICT_TOOLS;
     let tool_specs: Vec<bedrock::Tool> = tools
         .iter()
-        .map(convert_tool_spec)
+        .map(|tool| convert_tool_spec(tool, &mut strict_budget))
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut config_builder = bedrock::ToolConfiguration::builder().set_tools(Some(tool_specs));
@@ -205,20 +221,42 @@ pub fn build_tool_config(
     })
 }
 
-/// Converts a Polaris tool definition to a Bedrock tool specification.
-fn convert_tool_spec(tool: &polaris_llm::ToolDefinition) -> Result<bedrock::Tool, GenerationError> {
-    let normalized = normalize_schema_for_strict_mode(tool.parameters.clone());
-    let input_schema = json_to_document(&normalized);
+/// Converts a Polaris tool definition to a Bedrock tool specification,
+/// degrading to non-strict once `strict_budget` is exhausted (see
+/// [`MAX_STRICT_TOOLS`]).
+fn convert_tool_spec(
+    tool: &polaris_llm::ToolDefinition,
+    strict_budget: &mut usize,
+) -> Result<bedrock::Tool, GenerationError> {
+    let strict = tool.strict && *strict_budget > 0;
+    if strict {
+        *strict_budget -= 1;
+    } else if tool.strict {
+        tracing::debug!(
+            tool = %tool.name,
+            max_strict_tools = MAX_STRICT_TOOLS,
+            "strict-tool budget exhausted; tool sent non-strict"
+        );
+    }
 
-    let spec = bedrock::ToolSpecification::builder()
+    let input_schema = if strict {
+        normalize_schema_for_strict_mode(tool.parameters.clone())
+    } else {
+        tool.parameters.clone()
+    };
+    let document = json_to_document(&input_schema);
+
+    let mut builder = bedrock::ToolSpecification::builder()
         .name(&tool.name)
         .description(&tool.description)
-        .input_schema(bedrock::ToolInputSchema::Json(input_schema))
-        .strict(true)
-        .build()
-        .map_err(|err| {
-            GenerationError::InvalidRequest(format!("failed to build tool specification: {err}"))
-        })?;
+        .input_schema(bedrock::ToolInputSchema::Json(document));
+    if strict {
+        builder = builder.strict(true);
+    }
+
+    let spec = builder.build().map_err(|err| {
+        GenerationError::InvalidRequest(format!("failed to build tool specification: {err}"))
+    })?;
 
     Ok(bedrock::Tool::ToolSpec(spec))
 }
@@ -258,6 +296,17 @@ fn convert_tool_choice(
 // Output configuration
 // -----------------------------------------------------------------------------
 
+/// Builds the Bedrock inference configuration carrying the effective output
+/// token ceiling (the provider's registered `max_tokens`, lowered but never
+/// raised by `request.max_output_tokens` — see
+/// `BedrockProvider::effective_max_tokens`). Always present, mirroring
+/// Anthropic's `max_tokens`, which is a required field on every request.
+pub fn build_inference_config(max_tokens: u32) -> bedrock::InferenceConfiguration {
+    bedrock::InferenceConfiguration::builder()
+        .max_tokens(max_tokens.min(i32::MAX as u32) as i32)
+        .build()
+}
+
 /// Builds a Bedrock output configuration from a generation request.
 pub fn build_output_config(
     request: &LlmRequest,
@@ -295,4 +344,295 @@ pub fn build_output_config(
         .build();
 
     Ok(Some(output_config))
+}
+
+// -----------------------------------------------------------------------------
+// Prompt caching
+// -----------------------------------------------------------------------------
+
+/// Bedrock's Converse API honors the same cache-checkpoint budget as the
+/// underlying Claude model: 4 per request, matching Anthropic's
+/// `cache_control` budget (`anthropic::provider::MAX_CACHE_BREAKPOINTS`).
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// The single cache-point marker Bedrock defines. Infallible to build (its
+/// only field is `type`, always set).
+fn cache_point() -> bedrock::CachePointBlock {
+    bedrock::CachePointBlock::builder()
+        .r#type(bedrock::CachePointType::Default)
+        .build()
+        .expect("CachePointBlock requires only `type`, which is always set")
+}
+
+/// Applies `cache` to the already-converted `system`/`tool_config`/`messages`
+/// by appending `CachePoint` sentinel blocks (everything before a sentinel in
+/// its list is cached).
+///
+/// Mirrors `anthropic::provider::apply_cache_control`'s prefix-then-breakpoints
+/// budget policy: the stable prefix (system + tools) is covered by one
+/// checkpoint placed after the system block, or after the last tool spec when
+/// there is no system prompt; each requested message breakpoint places a
+/// checkpoint after that message's content. Markers are budgeted to
+/// [`MAX_CACHE_BREAKPOINTS`]; extras are dropped in the order applied (prefix
+/// first, then message breakpoints in the order given). The mechanism differs
+/// from Anthropic's (a sentinel block appended after the cached region,
+/// rather than a marker on the last existing block within it), but the
+/// budgeting policy is identical.
+pub fn apply_cache_control(
+    cache: &polaris_llm::CacheControl,
+    system: &mut Option<Vec<bedrock::SystemContentBlock>>,
+    tool_config: Option<&mut bedrock::ToolConfiguration>,
+    messages: &mut [bedrock::Message],
+) {
+    if cache.is_disabled() {
+        return;
+    }
+
+    let mut budget = MAX_CACHE_BREAKPOINTS;
+
+    match (cache.prefix, system.as_mut()) {
+        (true, Some(blocks)) if budget > 0 => {
+            blocks.push(bedrock::SystemContentBlock::CachePoint(cache_point()));
+            budget -= 1;
+        }
+        (true, None) if budget > 0 => {
+            if let Some(config) = tool_config {
+                config.tools.push(bedrock::Tool::CachePoint(cache_point()));
+                budget -= 1;
+            }
+        }
+        _ => {}
+    }
+
+    for &idx in &cache.breakpoints {
+        if budget == 0 {
+            break;
+        }
+        let Some(message) = messages.get_mut(idx) else {
+            // A stale breakpoint (index past the message list): silently
+            // producing no marker in release degrades the cache hit rate
+            // with no signal. Trip the assertion in debug to fail fast in
+            // tests, and warn in release so the misconfiguration is
+            // observable rather than invisible — mirrors the Anthropic
+            // provider's handling of the same condition.
+            debug_assert!(
+                idx < messages.len(),
+                "cache breakpoint index {idx} out of range for {} messages; \
+                 a context strategy produced a stale breakpoint",
+                messages.len()
+            );
+            tracing::warn!(
+                breakpoint = idx,
+                message_count = messages.len(),
+                "dropping cache breakpoint with no markable message; \
+                 a context strategy produced a stale breakpoint"
+            );
+            continue;
+        };
+        message
+            .content
+            .push(bedrock::ContentBlock::CachePoint(cache_point()));
+        budget -= 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polaris_llm::{CacheControl, Message, ToolDefinition};
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition::new(
+            name,
+            format!("{name} tool"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    fn is_cache_point_system(block: &bedrock::SystemContentBlock) -> bool {
+        matches!(block, bedrock::SystemContentBlock::CachePoint(_))
+    }
+
+    fn is_cache_point_tool(tool: &bedrock::Tool) -> bool {
+        matches!(tool, bedrock::Tool::CachePoint(_))
+    }
+
+    fn is_cache_point_content(block: &bedrock::ContentBlock) -> bool {
+        matches!(block, bedrock::ContentBlock::CachePoint(_))
+    }
+
+    #[test]
+    fn output_token_limit_builds_bedrock_inference_config() {
+        let config = build_inference_config(512);
+        assert_eq!(config.max_tokens(), Some(512));
+    }
+
+    #[test]
+    fn output_token_limit_respects_bedrocks_i32_ceiling() {
+        let config = build_inference_config(u32::MAX);
+        assert_eq!(config.max_tokens(), Some(i32::MAX));
+    }
+
+    #[test]
+    fn tool_config_never_marks_a_tool_strict() {
+        // Bedrock's Converse API cannot reliably accept `strict` tool specs
+        // today (see the doc comment on `MAX_STRICT_TOOLS`), so even a
+        // caller-requested strict tool must degrade to non-strict.
+        assert!(
+            tool_def("search").strict,
+            "test fixture should default to strict, matching ToolDefinition::default"
+        );
+
+        let tool_config = build_tool_config(&LlmRequest {
+            tools: Some(vec![tool_def("search"), tool_def("fetch")]),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            tool_config.tools.len(),
+            2,
+            "both strict fixtures must reach the Bedrock tool configuration"
+        );
+        for tool in &tool_config.tools {
+            let bedrock::Tool::ToolSpec(spec) = tool else {
+                continue;
+            };
+            assert_eq!(
+                spec.strict(),
+                None,
+                "Bedrock tool specs must never set strict: true"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_prefix_appends_a_checkpoint_after_the_system_block() {
+        let mut system = Some(vec![bedrock::SystemContentBlock::Text("sys".to_string())]);
+        let mut tool_config = build_tool_config(&LlmRequest {
+            tools: Some(vec![tool_def("search")]),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut messages: Vec<bedrock::Message> = vec![];
+
+        apply_cache_control(
+            &CacheControl::prefix(),
+            &mut system,
+            tool_config.as_mut(),
+            &mut messages,
+        );
+
+        let system = system.unwrap();
+        assert_eq!(
+            system.len(),
+            2,
+            "a checkpoint should be appended: {system:?}"
+        );
+        assert!(is_cache_point_system(&system[1]));
+        // One checkpoint covers tools + system, so the tool list is untouched.
+        assert!(
+            !tool_config.unwrap().tools.iter().any(is_cache_point_tool),
+            "tools should not also get a checkpoint when the system prompt already carries one"
+        );
+    }
+
+    #[test]
+    fn cache_prefix_without_system_appends_a_checkpoint_after_the_last_tool() {
+        let mut system = None;
+        let mut tool_config = build_tool_config(&LlmRequest {
+            tools: Some(vec![tool_def("a"), tool_def("b")]),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut messages: Vec<bedrock::Message> = vec![];
+
+        apply_cache_control(
+            &CacheControl::prefix(),
+            &mut system,
+            tool_config.as_mut(),
+            &mut messages,
+        );
+
+        assert!(system.is_none());
+        let tools = tool_config.unwrap().tools;
+        assert_eq!(tools.len(), 3, "a checkpoint should be appended: {tools:?}");
+        assert!(is_cache_point_tool(&tools[2]));
+    }
+
+    #[test]
+    fn cache_prefix_without_system_or_tools_is_a_noop() {
+        let mut system = None;
+        let mut messages: Vec<bedrock::Message> = vec![];
+        apply_cache_control(&CacheControl::prefix(), &mut system, None, &mut messages);
+        assert!(system.is_none());
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn cache_breakpoints_append_checkpoints_to_message_content() {
+        let mut system = None;
+        let mut messages: Vec<bedrock::Message> = vec![
+            convert_message(&Message::user("first")).unwrap(),
+            convert_message(&Message::assistant("second")).unwrap(),
+            convert_message(&Message::user("third")).unwrap(),
+        ];
+
+        apply_cache_control(
+            &CacheControl::default().with_breakpoints([0, 2]),
+            &mut system,
+            None,
+            &mut messages,
+        );
+
+        assert!(messages[0].content.iter().any(is_cache_point_content));
+        assert!(!messages[1].content.iter().any(is_cache_point_content));
+        assert!(messages[2].content.iter().any(is_cache_point_content));
+    }
+
+    #[test]
+    fn cache_markers_are_budget_capped_at_four() {
+        let mut system = Some(vec![bedrock::SystemContentBlock::Text("sys".to_string())]);
+        let mut messages: Vec<bedrock::Message> = (0..5)
+            .map(|i| convert_message(&Message::user(format!("m{i}"))).unwrap())
+            .collect();
+
+        apply_cache_control(
+            &CacheControl::prefix().with_breakpoints([0, 1, 2, 3, 4]),
+            &mut system,
+            None,
+            &mut messages,
+        );
+
+        // Prefix takes one marker; the remaining three go to the lowest
+        // breakpoint indices in the order given (0, 1, 2); 3 & 4 are dropped.
+        let marked: Vec<usize> = (0..5)
+            .filter(|&i| messages[i].content.iter().any(is_cache_point_content))
+            .collect();
+        assert_eq!(marked, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn no_cache_control_appends_no_checkpoints() {
+        let mut system = Some(vec![bedrock::SystemContentBlock::Text("sys".to_string())]);
+        let mut messages = vec![convert_message(&Message::user("hi")).unwrap()];
+        apply_cache_control(&CacheControl::default(), &mut system, None, &mut messages);
+        assert_eq!(system.unwrap().len(), 1);
+        assert_eq!(messages[0].content.len(), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn out_of_range_breakpoint_trips_debug_assert() {
+        let mut system = None;
+        let mut messages = vec![convert_message(&Message::user("only one")).unwrap()];
+        apply_cache_control(
+            &CacheControl::default().with_breakpoints([5]),
+            &mut system,
+            None,
+            &mut messages,
+        );
+    }
 }

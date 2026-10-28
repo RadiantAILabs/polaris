@@ -11,6 +11,7 @@
 //! - [`Edge`](crate::edge::Edge) - Connections defining execution flow
 //! - [`Predicate`](crate::predicate::Predicate) - Type-safe predicates for control flow decisions
 //! - [`GraphExecutor`] - Runtime engine for graph traversal and execution
+//! - [`CancellationSource`] / [`RunCancellation`] - Cooperative per-run stop signal
 //!
 //! # Example
 //!
@@ -47,6 +48,8 @@
 //! For the full framework guide, architecture overview, and integration patterns,
 //! see the [`polaris-ai` crate documentation](https://docs.rs/polaris-ai).
 
+pub mod cancel;
+
 pub mod edge;
 
 pub mod executor;
@@ -67,8 +70,13 @@ pub mod dev;
 
 pub mod middleware;
 
+mod output_layers;
+
+mod producer;
+
 /// Re-export all common types for easy access.
 pub mod prelude {
+    pub use crate::cancel::{CancellationSource, RunCancellation};
     pub use crate::edge::{
         ConditionalEdge, Edge, EdgeId, ErrorEdge, LoopBackEdge, ParallelEdge, SequentialEdge,
         TimeoutEdge,
@@ -78,37 +86,40 @@ pub mod prelude {
         ResourceValidationError,
     };
     pub use crate::graph::{
-        Graph, GraphSignature, MergeError, RenderedSignature, SignatureDiff, SystemNodeBuilder,
-        ValidationError, ValidationResult, ValidationWarning,
+        Graph, GraphSignature, MatchingMode, MergeError, RenderedSignature, RouteKind,
+        SignatureDiff, SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
     };
     pub use crate::middleware::{MiddlewareAPI, MiddlewareError};
     pub use crate::node::{
         CandidateSource, ContextMode, ContextPolicy, DecisionNode, DynamicNode, DynamicSlot,
-        IntoSystemNode, LoopNode, Node, NodeId, NodeMarker, ParallelNode, RetryPolicy,
+        IntoSystemNode, LoopNode, Node, NodeId, NodeMarker, NodeName, ParallelNode, RetryPolicy,
         ScheduledNodeMarker, ScopeNode, SwitchNode, SystemNode,
     };
     pub use crate::predicate::{
         BoxedDiscriminator, BoxedPredicate, Discriminator, ErasedDiscriminator, ErasedPredicate,
         Predicate, PredicateError,
     };
+    pub use crate::producer::ProducerInfo;
     pub use crate::registry::{RegistryError, SubgraphRegistry};
     pub use crate::selector::{BoxedSelector, ErasedSelector, Selector};
 }
 
 // Re-export key types at crate root for convenience
+pub use cancel::{CancellationSource, RunCancellation};
 pub use dev::{DevToolsPlugin, SystemInfo};
 pub use executor::{
     CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor, ResourceValidationError,
 };
 pub use graph::{
-    Graph, GraphSignature, MergeError, RenderedSignature, SignatureDiff, SystemNodeBuilder,
-    ValidationError, ValidationResult, ValidationWarning,
+    Graph, GraphSignature, MatchingMode, MergeError, RenderedSignature, RouteKind, SignatureDiff,
+    SystemNodeBuilder, ValidationError, ValidationResult, ValidationWarning,
 };
 pub use hooks::{RunId, RunLabels};
 pub use middleware::{MiddlewareAPI, MiddlewareError};
 pub use node::{
-    CandidateSource, ContextMode, ContextPolicy, DynamicNode, DynamicSlot, NodeId, RetryPolicy,
-    ScopeNode,
+    CandidateSource, ContextMode, ContextPolicy, DynamicNode, DynamicSlot, NodeId, NodeName,
+    RetryPolicy, ScopeNode,
 };
+pub use producer::ProducerInfo;
 pub use registry::{RegistryError, SubgraphRegistry};
 pub use selector::{BoxedSelector, ErasedSelector, Selector};

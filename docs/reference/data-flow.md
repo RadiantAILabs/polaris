@@ -5,13 +5,15 @@ title: Data Flow Patterns
 
 # Data Flow Patterns
 
-Polaris systems declare their dependencies as typed parameters, and the framework wires data between systems through three mechanisms: resources (`Res<T>`, `ResMut<T>`) and outputs (`Out<T>`). This document is a decision guide for choosing the right one.
+Polaris systems declare their dependencies as typed parameters, and the framework wires data between systems through three mechanisms: resources (`Res<T>`, `ResMut<T>`) and outputs (`Out<T>`, `OutAll<T>`). This document is a decision guide for choosing the right one.
 
 ## Decision Table
 
 | Pattern | Use | Avoid |
 |---------|-----|-------|
 | Step A's result feeds step B | **`Out<T>`** — A returns `T`, B declares `Out<T>` | `ResMut<SharedState>` with `Option` fields |
+| Several systems return `T`, and B needs one particular producer's `T` | **`Out<T>` + `read_from`** — `graph.system(b).read_from::<T>(producer_id)` ([Graph — `read_from`](graph.md#reading-a-specific-producer-read_from)) | A wrapper newtype per producer just to tell them apart |
+| Collect results from several producers of `T` | **`OutAll<T>`** — iterate borrowed entries, oldest first | Cloning results into a `ResMut<Vec<T>>` |
 | Immutable per-request input (HTTP body, auth claims, correlation ID) | **`Res<T>`** via `ctx.insert(T)` in setup closure | `ResMut<WorkingState>` with `.input.clone()` |
 | Accumulated cross-cutting state (issue list, conversation history, counters) | **`ResMut<T>`** — local resource mutated across systems | `Out<T>` — outputs are per-system, not accumulated |
 | Shared server-wide config (model registry, tool registry) | **`Res<T>`** — global resource via `server.insert_global(T)` | `ResMut<T>` — compile error on `GlobalResource` |
@@ -24,9 +26,13 @@ Polaris systems declare their dependencies as typed parameters, and the framewor
 
 A system's return type is inserted into the context's output store under its concrete type. The *next* system declaring `Out<T>` reads it by type. This is the primary data pipeline within a graph.
 
-- **Lifetime:** current scope only. Unlike `Res<T>`, outputs never walk the parent chain: a parallel branch starts with an *empty* output store, so it cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a local resource on the parent context: update the resource before the fork with `ResMut<T>`, then read it in each branch with `Res<T>`. Branch outputs merge back into the parent only after all branches complete successfully, in declaration order. At run time, two branches producing the same `T` collapse to the last one. Loops overwrite each iteration.
-- **Resolution:** by `TypeId`. Two systems that return the same `T` in a linear chain mean the second overwrites the first.
+- **Lifetime:** current scope only. Unlike `Res<T>`, outputs never walk the parent chain: a parallel branch starts with an *empty* output store, so it cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a local resource on the parent context: update the resource before the fork with `ResMut<T>`, then read it in each branch with `Res<T>`. Branch outputs merge back into the parent only after all branches complete successfully, in declaration order.
+- **Resolution:** `Out<T>` resolves the newest entry by `TypeId`; it preserves the existing one-value handoff. Other producers of the same `T` remain available through `OutAll<T>`.
 - **Use when:** the value is produced by one step and consumed by the next.
+
+### `OutAll<T>` — collect same-typed outputs
+
+`OutAll<T>` returns every visible output of `T`, oldest first. Its entries borrow the values and expose their opaque `ProducerKey`; `polaris_graph::ProducerInfo::of(entry.producer())` returns the graph provenance the executor attached: the producer node id, name, run id, structural path, and loop iteration. Use it to fold or collect results from several systems; it has the same output-read access declaration as `Out<T>`.
 
 ### `Res<T>` — immutable shared data
 
@@ -86,7 +92,7 @@ async fn add_issue(prev: Out<IssueList>) -> IssueList {
 }
 ```
 
-In a loop, each iteration's output replaces the previous one, but the systems read/write cost grows linearly. This is also broken when the accumulator spans parallel branches: each branch starts with an empty output store, so it cannot read the accumulator at all, and same-type branch outputs collapse to the last branch at merge time. Keep the accumulator as a local resource on the parent context so systems before the fork can update it with `ResMut<IssueList>` and branches can read it through the parent chain with `Res<IssueList>`.
+In a loop, each iteration writes a new copy into its own layer, and only the last [retained](graph.md#loop-output-retention) iterations stay readable (1 by default), so the list is copied on every iteration and older copies vanish. This is also broken when the accumulator spans parallel branches: each branch starts with an empty output store, so it cannot read the accumulator at all. `OutAll<T>` can collect finished branch outputs after the join, but it does not provide a shared mutable accumulator. Keep the accumulator as a local resource on the parent context so systems before the fork can update it with `ResMut<IssueList>` and branches can read it through the parent chain with `Res<IssueList>`.
 
 **Fix:** `ResMut<IssueList>` is correct for accumulated state. Outputs are for point-to-point handoff, not shared buffers.
 
@@ -98,6 +104,7 @@ In a loop, each iteration's output replaces the previous one, but the systems re
 | For the lifetime of a session | `LocalResource` inserted in `create_session_with` + `Res<T>` or `ResMut<T>` |
 | For a single turn | `LocalResource` inserted in `process_turn_with` + `Res<T>` or `ResMut<T>` |
 | Between two adjacent systems | Return value + `Out<T>` |
+| From several producers in one output scope | Return value + `OutAll<T>` |
 | Inside an error handler subgraph | `ErrOut<CaughtError>` |
 
 ## See Also

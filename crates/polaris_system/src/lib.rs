@@ -70,6 +70,9 @@ pub use polaris_system_macros::system;
 /// Re-export the `#[plugin]` attribute macro.
 pub use polaris_system_macros::plugin;
 
+/// Re-export the all-output system parameter and its entry view.
+pub use param::{OutAll, OutAllEntry};
+
 /// Re-export all common types for easy access.
 pub mod prelude {
     pub use crate::api::*;

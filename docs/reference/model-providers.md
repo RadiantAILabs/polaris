@@ -70,7 +70,7 @@ pub trait LlmProvider: Send + Sync + 'static {
 }
 ```
 
-The `name()` must be stable and lowercase — it becomes the prefix in `"<name>/<model>"`. `stream()` has a default implementation that returns `UnsupportedOperation`; override it to support streaming. `pricing()` is optional — return `Some(ModelPricing::new(input_per_million_usd, output_per_million_usd))` to publish per-million-token rates for a given model; the tracing decorator multiplies token counts by the rate and records `gen_ai.usage.cost` on chat spans, so cost surfaces in any console subscriber or OTel exporter. The defaulted `None` means cost stays unset end-to-end. `endpoint()` is optional — return the base URL the provider sends requests to (or the proxy address, if one is used); the tracing decorator records it as the `server.address` attribute on chat spans. The defaulted `None` leaves the attribute unset.
+The `name()` must be stable and lowercase — it becomes the prefix in `"<name>/<model>"`. `stream()` has a default implementation that returns `UnsupportedOperation`; override it to support streaming. `pricing()` is optional — return `Some(ModelPricing::new(input_per_million_usd, output_per_million_usd))` to publish per-million-token rates for a given model (a vendored provider should hold a [`PriceStore`](#pricing) and return `self.pricing.get(model)` instead of hardcoding rates); the tracing decorator multiplies token counts by the rate and records `gen_ai.usage.cost` on chat spans, so cost surfaces in any console subscriber or OTel exporter. The defaulted `None` means cost stays unset end-to-end. `endpoint()` is optional — return the base URL the provider sends requests to (or the proxy address, if one is used); the tracing decorator records it as the `server.address` attribute on chat spans. The defaulted `None` leaves the attribute unset.
 
 ## Building a Provider
 
@@ -193,6 +193,125 @@ let response = llm.builder()
     .await?;
 ```
 
+## Output token limits
+
+There are two places to set an output token limit:
+
+- **The registration** sets a ceiling for every request sent through that
+  provider (Anthropic and Bedrock).
+- **The request** sets `LlmRequest::max_output_tokens` (a `NonZeroU32`, also
+  set with `LlmRequestBuilder::max_output_tokens`). A request limit can only
+  **lower** the registration ceiling for that one request. It never raises it.
+
+The limit that is sent is `min(request limit, registration ceiling)`.
+
+| Provider | Registration ceiling | Default | Request limit |
+|----------|----------------------|---------|---------------|
+| Anthropic | `AnthropicPlugin::with_max_tokens` | 4096 | lowers the ceiling |
+| Bedrock | `BedrockPlugin::with_max_tokens` / `BedrockProvider::with_max_tokens` | 4096 (`bedrock::DEFAULT_MAX_TOKENS`) | lowers the ceiling |
+| OpenAI | none | none sent | sent as given |
+
+To raise the ceiling for long responses or extended thinking, set it at
+registration:
+
+```rust
+use core::num::NonZeroU32;
+
+server.add_plugins(
+    AnthropicPlugin::from_env("ANTHROPIC_API_KEY")
+        .with_max_tokens(NonZeroU32::new(32_000).unwrap()),
+);
+```
+
+To use fewer tokens for one call, set the limit on the request:
+
+```rust
+let response = llm
+    .builder()
+    .user("Summarize in one line.")
+    .max_output_tokens(NonZeroU32::new(256).unwrap())
+    .generate()
+    .await?;
+```
+
+Thinking tokens count against the same output budget. Values above a model's
+real output limit are sent unchanged, not clamped locally; the provider API
+reports the error.
+
+On Bedrock, model-specific settings that `LlmRequest` does not cover go in
+`with_additional_model_request_fields` — see [AWS Bedrock](#aws-bedrock).
+
+## Pricing
+
+The built-in providers (Anthropic, OpenAI, Bedrock) answer `LlmProvider::pricing()` from a `PriceStore` in `polaris_model_providers::pricing`. The tracing decorator uses it to record `gen_ai.usage.cost`.
+
+A store looks up a model in this order, each by longest model-id prefix:
+
+1. its own overrides (`with_override`);
+2. the fetched or cached price table (live stores only);
+3. the built-in table (`fallback_table()`).
+
+**Default: built-in prices only.** Every provider starts with `PriceStore::builtin()`. It never uses the network and never reads or writes a file. Built-in rates can go stale when a vendor changes prices.
+
+**Opt in to live prices** with `with_pricing_store(PriceStore::live())` on the plugin or the provider:
+
+```rust
+use polaris_model_providers::pricing::PriceStore;
+
+server.add_plugins(
+    AnthropicPlugin::from_env("ANTHROPIC_API_KEY")
+        .with_pricing_store(PriceStore::live()),
+);
+```
+
+`PriceStore::live()` returns one store shared by the whole process. It:
+
+- reads the cache file at `default_cache_path()` (`<cache dir>/polaris/model-prices.json`) when it is created;
+- fetches `DEFAULT_SOURCE_URL` (LiteLLM's price JSON) on a background thread when prices are missing or older than `DEFAULT_TTL` (24 hours). `get` never waits for the network; it answers with the prices it already has;
+- writes the cache file after a successful fetch;
+- after a failed fetch, keeps the old prices and waits `FAILED_REFRESH_RETRY_DELAY` (15 minutes) before trying again.
+
+Fetched data and the cache file are capped at `MAX_PRICE_DATA_BYTES` (32 MiB). A fetched row is dropped if a rate is not finite, is negative, is above 10,000 USD per million tokens, or if input and output are both zero. For another source use `PriceStore::new(source, cache_path, ttl)`; in tests use `PriceStore::with_fetcher` with a fake `PriceFetcher`, so no test touches the network.
+
+**Per-provider overrides.** `with_pricing_override(prefix, ModelPricing)` on a provider (or `store.with_override(...)` before handing the store over) sets a rate that wins over every table. An override belongs to that handle only: other providers sharing the same live store do not see it, but they still share the fetched prices.
+
+```rust
+let provider = AnthropicProvider::new(api_key)
+    .with_pricing_store(PriceStore::live())
+    .with_pricing_override("claude-sonnet-4-6", ModelPricing::new(1.0, 5.0));
+```
+
+## AWS Bedrock
+
+`BedrockPlugin::from_env()` loads credentials from the default AWS chain; `BedrockPlugin::from_sdk_config(config)` uses a config you built. Model ids are `bedrock/<bedrock model id>`, for example `bedrock/us.anthropic.claude-sonnet-4-6`.
+
+**Two request paths.**
+
+- Most models use the Converse API (`ConverseStream` for `stream`). Prompt-cache points are sent only to `anthropic.*` and `amazon.nova*` models.
+- Models whose id contains `openai.` (for example `bedrock/global.openai.gpt-6-luna`) go to Bedrock's signed OpenAI Responses endpoint. That path needs the AWS SDK config to sign and route the call. `BedrockPlugin` passes it for you. A `BedrockProvider` you build yourself needs `.with_sdk_config(config)`; without it the call fails with `GenerationError::InvalidRequest("Bedrock SDK configuration is missing")`. Transient errors (HTTP errors, rate limits, 429/500/502/503/504) are retried with exponential backoff, up to the SDK retry config's max attempts. `stream` on this path makes one call and replays the result as a stream.
+
+Because the Responses path reuses the OpenAI provider's types, the `bedrock` feature also enables the `openai` feature.
+
+**Output limit.** `with_max_tokens(NonZeroU32)` sets the ceiling (default `bedrock::DEFAULT_MAX_TOKENS`, 4096). A request may lower it — see [Output token limits](#output-token-limits).
+
+**Model-specific fields.** `with_additional_model_request_fields(serde_json::Value)` sends settings that `LlmRequest` does not cover:
+
+- on Converse, as `additionalModelRequestFields`;
+- on the Responses path, as top-level body keys, which replace any value the provider set for the same key. A value that is not a JSON object is ignored on this path.
+
+```rust
+// Fields depend on the model; this one is for an `openai.*` model.
+server.add_plugins(
+    BedrockPlugin::from_env()
+        .with_max_tokens(NonZeroU32::new(16_000).unwrap())
+        .with_additional_model_request_fields(serde_json::json!({
+            "reasoning": { "effort": "high" }
+        })),
+);
+```
+
+`bedrock::normalize_bedrock_model_id` turns a Bedrock Anthropic id into the first-party Claude id by dropping everything up to `anthropic.` and a trailing version suffix (`us.anthropic.claude-opus-4-1-20250805-v1:0` → `claude-opus-4-1-20250805`). Other ids are returned unchanged.
+
 ## Prompt Caching
 
 Prompt caching is a provider-agnostic request feature: the builder marks which parts of a request are stable enough to cache, and each provider decides how to honor them. A provider that supports caching translates the markers into its native cache directives; one that does not simply ignores them, so the same `LlmRequest` runs unchanged on every provider.
@@ -253,6 +372,7 @@ Strict mode is best-effort schema enforcement, not a correctness requirement: a 
 | `polaris_model_providers/src/anthropic/` | Reference impl — Anthropic |
 | `polaris_model_providers/src/openai/` | Reference impl — OpenAI |
 | `polaris_model_providers/src/bedrock/` | Reference impl — AWS Bedrock |
+| `polaris_model_providers/src/pricing.rs` | `PriceStore`, `PricingTable`, live price fetching |
 
 ## See Also
 

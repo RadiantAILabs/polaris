@@ -7,7 +7,9 @@ use super::types::{
     Role, StreamContentBlock, StreamDelta, SystemBlock, SystemPrompt, ToolChoiceParam, ToolDef,
     ToolResultBlock, ToolResultContent,
 };
+use crate::pricing::PriceStore;
 use crate::schema::normalize_schema_for_strict_mode;
+use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures_core::Stream;
@@ -19,7 +21,10 @@ use polaris_models::llm::{
 };
 
 /// Default maximum tokens for generation requests.
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+///
+/// Used when whoever registers the provider sets no limit of their own, so an
+/// existing consumer keeps the value it has always sent.
+pub const DEFAULT_MAX_TOKENS: NonZeroU32 = NonZeroU32::new(4096).unwrap();
 
 /// Maximum number of tools Anthropic allows to be marked `strict` in a single
 /// request. Beyond this the API rejects the request, so we honor each tool's
@@ -32,15 +37,142 @@ const MAX_STRICT_TOOLS: usize = 20;
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     client: AnthropicClient,
+    max_tokens: NonZeroU32,
+    pricing: PriceStore,
 }
 
 impl AnthropicProvider {
-    /// Creates a new provider.
+    /// Creates a new provider that sends [`DEFAULT_MAX_TOKENS`] on every
+    /// request.
+    ///
+    /// Pricing defaults to [`PriceStore::builtin`]: the built-in price table,
+    /// with no network access and no files. Use
+    /// [`with_pricing_store`](Self::with_pricing_store) to opt into live
+    /// prices, for example with [`PriceStore::live`].
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: AnthropicClient::new(api_key),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            pricing: PriceStore::builtin(),
         }
+    }
+
+    /// Sets the `max_tokens` this provider sends on every request.
+    ///
+    /// Anthropic requires the field, and it caps the *output* of one
+    /// response. A response that hits it comes back truncated with
+    /// [`StopReason::MaxOutputTokens`], so the value is load-bearing for any
+    /// consumer that generates long answers.
+    ///
+    /// The *upper* bound is passed through unchanged. It is per-model and
+    /// changes as models ship, this provider does not know at registration
+    /// time which models it will be asked to serve, and silently clamping
+    /// would lower a configured limit without telling anyone — which is worse
+    /// than the API's own explicit `400`, surfaced as
+    /// [`GenerationError::Provider`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use polaris_model_providers::anthropic::AnthropicProvider;
+    /// # use core::num::NonZeroU32;
+    /// let provider =
+    ///     AnthropicProvider::new("api-key").with_max_tokens(NonZeroU32::new(32_000).unwrap());
+    /// assert_eq!(provider.max_tokens().get(), 32_000);
+    /// ```
+    #[must_use]
+    pub fn with_max_tokens(mut self, max_tokens: NonZeroU32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// The `max_tokens` this provider sends on every request.
+    #[must_use]
+    pub fn max_tokens(&self) -> NonZeroU32 {
+        self.max_tokens
+    }
+
+    /// Points the provider at a local server instead of the real Anthropic
+    /// API, so tests can read the requests it sends.
+    #[cfg(test)]
+    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.client = self.client.with_base_url(base_url);
+        self
+    }
+
+    /// Replaces this provider's price store (default: [`PriceStore::builtin`]).
+    ///
+    /// Pass [`PriceStore::live`] to fetch current prices from the web and
+    /// cache them on disk, or build your own store to choose the source,
+    /// cache path, and TTL. A live store fetches and writes files; see
+    /// [`crate::pricing`] for exactly when.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use polaris_model_providers::anthropic::AnthropicProvider;
+    /// use polaris_model_providers::pricing::PriceStore;
+    ///
+    /// let provider = AnthropicProvider::new("api-key").with_pricing_store(PriceStore::live());
+    /// # let _ = provider;
+    /// ```
+    #[must_use]
+    pub fn with_pricing_store(mut self, pricing: PriceStore) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    /// Adds a per-model pricing override for this provider only, beating
+    /// whatever its price store says for models starting with `prefix`.
+    ///
+    /// Other providers are not affected, even when they share the same
+    /// [`PriceStore`] (see [`PriceStore::with_override`]). Call it after
+    /// [`with_pricing_store`](Self::with_pricing_store), which replaces the
+    /// store together with its overrides.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_model_providers::anthropic::AnthropicProvider;
+    /// use polaris_models::llm::{LlmProvider, ModelPricing};
+    ///
+    /// let provider = AnthropicProvider::new("api-key")
+    ///     .with_pricing_override("claude-sonnet-4-6", ModelPricing::new(1.5, 7.5));
+    /// assert_eq!(
+    ///     provider.pricing("claude-sonnet-4-6"),
+    ///     Some(ModelPricing::new(1.5, 7.5))
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_pricing_override(
+        mut self,
+        prefix: impl Into<String>,
+        pricing: ModelPricing,
+    ) -> Self {
+        self.pricing = self.pricing.with_override(prefix, pricing);
+        self
+    }
+
+    /// Builds the wire request this provider would send for `model` and
+    /// `request`, capped by this provider's configured `max_tokens`.
+    ///
+    /// `generate`, `stream`, and the test helper all call this instead of
+    /// each building their own request, so a wire value that diverges from
+    /// the configured ceiling cannot go unnoticed at only one of the sites.
+    fn build_request(
+        &self,
+        model: &str,
+        request: &LlmRequest,
+    ) -> Result<CreateMessageRequest, GenerationError> {
+        convert_request(
+            model,
+            request,
+            request
+                .max_output_tokens
+                .map_or(self.max_tokens, |limit| limit.min(self.max_tokens))
+                .get(),
+        )
     }
 }
 
@@ -54,7 +186,7 @@ impl LlmProvider for AnthropicProvider {
         model: &str,
         request: LlmRequest,
     ) -> Result<LlmResponse, GenerationError> {
-        let anthropic_request = convert_request(model, &request)?;
+        let anthropic_request = self.build_request(model, &request)?;
 
         let response = self.client.create_message(&anthropic_request).await?;
 
@@ -70,7 +202,7 @@ impl LlmProvider for AnthropicProvider {
     /// Returns [`GenerationError::InvalidResponse`] if an SSE frame contains
     /// invalid UTF-8 or unparseable JSON.
     async fn stream(&self, model: &str, request: LlmRequest) -> Result<LlmStream, GenerationError> {
-        let anthropic_request = convert_request(model, &request)?;
+        let anthropic_request = self.build_request(model, &request)?;
 
         let raw_stream = self.client.create_message_stream(anthropic_request).await?;
 
@@ -78,35 +210,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
-        // Anthropic public list prices, USD per million base input / output
-        // tokens. Cache-tier rates are derived from the base input rate by
-        // `ModelPricing::new` (0.1× read, 1.25× write — the 5-minute ephemeral
-        // ratios). `starts_with` tolerates dated ids (e.g.
-        // `claude-opus-4-7-20260115`). List prices drift and new model ids must
-        // be added here; verify against anthropic.com/pricing before relying on
-        // the figure for billing.
-        let (input_per_million_usd, output_per_million_usd) = if model
-            .starts_with("claude-opus-4-5")
-            || model.starts_with("claude-opus-4-6")
-            || model.starts_with("claude-opus-4-7")
-        {
-            (5.0, 25.0)
-        } else if model.starts_with("claude-opus-4") {
-            // Legacy Opus 4 / 4.1.
-            (15.0, 75.0)
-        } else if model.starts_with("claude-sonnet-4") {
-            (3.0, 15.0)
-        } else if model.starts_with("claude-haiku-4") {
-            (1.0, 5.0)
-        } else if model.starts_with("claude-haiku-3-5") {
-            (0.8, 4.0)
-        } else {
-            return None;
-        };
-        Some(ModelPricing::new(
-            input_per_million_usd,
-            output_per_million_usd,
-        ))
+        self.pricing.get(model)
     }
 
     fn endpoint(&self) -> Option<String> {
@@ -303,9 +407,12 @@ where
 // Request/Response Conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Builds the wire request using the effective output-token limit selected by
+/// the calling [`AnthropicProvider`].
 fn convert_request(
     model: &str,
     request: &LlmRequest,
+    max_tokens: u32,
 ) -> Result<CreateMessageRequest, GenerationError> {
     let mut messages = request
         .messages
@@ -368,7 +475,7 @@ fn convert_request(
 
     Ok(CreateMessageRequest {
         model: model.to_string(),
-        max_tokens: DEFAULT_MAX_TOKENS,
+        max_tokens,
         messages,
         system,
         tools,
@@ -669,9 +776,16 @@ mod tests {
     };
     use super::*;
 
+    /// A store that serves only the built-in table and never touches the
+    /// network or the disk, so pricing tests stay hermetic.
+    fn fallback_only_pricing_store() -> PriceStore {
+        PriceStore::builtin()
+    }
+
     #[test]
     fn pricing_maps_claude_families_to_list_prices() {
-        let provider = AnthropicProvider::new("test-key");
+        let provider =
+            AnthropicProvider::new("test-key").with_pricing_store(fallback_only_pricing_store());
         // Opus 4.5+ is the $5 / $25 tier.
         assert_eq!(
             provider.pricing("claude-opus-4-7"),
@@ -1021,9 +1135,120 @@ mod tests {
         )
     }
 
-    /// The JSON the wire request serializes to.
+    /// The JSON the wire request serializes to for a provider registered with
+    /// no limit of its own.
     fn request_json(request: &LlmRequest) -> serde_json::Value {
-        serde_json::to_value(convert_request("claude-sonnet-4-6", request).unwrap()).unwrap()
+        wire_request(&AnthropicProvider::new("test-key"), request)
+    }
+
+    /// The JSON `provider` would put on the wire — built through the same
+    /// `build_request` method that `generate` and `stream` call, so it cannot
+    /// drift from what production sends.
+    fn wire_request(provider: &AnthropicProvider, request: &LlmRequest) -> serde_json::Value {
+        serde_json::to_value(
+            provider
+                .build_request("claude-sonnet-4-6", request)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn max_tokens(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).unwrap()
+    }
+
+    // ── max_tokens: configured at registration, sent on every request ──
+
+    /// A provider registered with nothing sends exactly what it sends today.
+    #[test]
+    fn unconfigured_provider_sends_the_default_max_tokens() {
+        let provider = AnthropicProvider::new("test-key");
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        assert_eq!(
+            provider.max_tokens(),
+            DEFAULT_MAX_TOKENS,
+            "getter should report the default"
+        );
+        assert_eq!(
+            wire_request(&provider, &request)["max_tokens"],
+            4096,
+            "wire value should be the default"
+        );
+    }
+
+    /// A provider registered with a limit sends that limit.
+    #[test]
+    fn configured_provider_sends_the_configured_max_tokens() {
+        let provider = AnthropicProvider::new("test-key").with_max_tokens(max_tokens(64_000));
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        assert_eq!(
+            wire_request(&provider, &request)["max_tokens"],
+            64_000,
+            "wire value should match the configured limit"
+        );
+    }
+
+    #[test]
+    fn request_output_token_limit_lowers_the_provider_ceiling() {
+        let provider = AnthropicProvider::new("test-key").with_max_tokens(max_tokens(4_096));
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            max_output_tokens: Some(max_tokens(512)),
+            ..Default::default()
+        };
+
+        assert_eq!(wire_request(&provider, &request)["max_tokens"], 512);
+    }
+
+    #[test]
+    fn request_output_token_limit_cannot_raise_the_provider_ceiling() {
+        let provider = AnthropicProvider::new("test-key").with_max_tokens(max_tokens(512));
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            max_output_tokens: Some(max_tokens(4_096)),
+            ..Default::default()
+        };
+
+        assert_eq!(wire_request(&provider, &request)["max_tokens"], 512);
+    }
+
+    /// The smallest value the type can hold is accepted and sent unchanged.
+    #[test]
+    fn smallest_max_tokens_is_accepted() {
+        let provider = AnthropicProvider::new("test-key").with_max_tokens(max_tokens(1));
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        assert_eq!(wire_request(&provider, &request)["max_tokens"], 1);
+    }
+
+    /// A value above any current model ceiling is passed through rather than
+    /// clamped: the API's own rejection is louder and more accurate than a
+    /// guess this crate would have to keep up to date.
+    #[test]
+    fn oversized_max_tokens_is_passed_through_not_clamped() {
+        let provider = AnthropicProvider::new("test-key").with_max_tokens(max_tokens(10_000_000));
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        assert_eq!(
+            provider.max_tokens().get(),
+            10_000_000,
+            "getter should report the configured value"
+        );
+        assert_eq!(
+            wire_request(&provider, &request)["max_tokens"],
+            10_000_000,
+            "wire value should match the configured value, not a clamp"
+        );
     }
 
     #[test]
@@ -1294,6 +1519,7 @@ mod tests {
     fn cached_input_is_billed_at_the_discount_tier() {
         // Sonnet: $3/M input, derived 0.1× read ($0.30/M) and 1.25× write ($3.75/M).
         let rate = AnthropicProvider::new("k")
+            .with_pricing_store(fallback_only_pricing_store())
             .pricing("claude-sonnet-4-6")
             .unwrap();
         // 1M cache-read tokens cost a tenth of 1M full-price input tokens.

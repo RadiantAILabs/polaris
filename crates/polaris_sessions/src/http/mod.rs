@@ -50,13 +50,12 @@
 
 mod error;
 mod handlers;
-mod io;
-pub mod models;
+pub use crate::models;
 
 use crate::api::SessionsAPI;
+pub use crate::io::{ChannelIOProvider, HttpIOProvider};
 use axum::Router;
 use axum::routing::{get, post};
-pub use io::HttpIOProvider;
 pub use models::{
     AgentSignature, AgentTypeSummary, CheckpointResponse, CreateSessionRequest,
     CreateSessionResponse, ListAgentTypesResponse, ListCheckpointsResponse, ListSessionsResponse,

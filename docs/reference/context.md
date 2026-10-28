@@ -84,13 +84,13 @@ Every context write returns the value it overwrote, matching `HashMap::insert`:
 | `replace_inspection()` | `Option<Arc<dyn InspectionSink>>` |
 | `with_inspection()` | `Self` — **discards** the displaced sink |
 
-`Some` means the write clobbered a value the caller may not have known was there — two independent `ctx.insert(Memory { .. })` calls are otherwise indistinguishable from one. The scope is *this* context only: shadowing a parent's resource returns `None`, since nothing in this scope was displaced. (`replace_inspection()` is the one row where that reads differently — see below.)
+`Some` means the write replaced a value the caller may not have known was there — two independent `ctx.insert(Memory { .. })` calls are otherwise indistinguishable from one. For outputs, replacement is narrower: only a same-typed entry from the same producer is displaced; a different producer's entry is retained. The scope is *this* context only: shadowing a parent's resource returns `None`, since nothing in this scope was displaced. (`replace_inspection()` is the one row where that reads differently — see below.)
 
 `None` is not quite a *guarantee* that nothing was displaced. One pathological case returns `None` after dropping a value: a slot occupied under `T`'s type ID but holding some other type, which is only reachable once an earlier `insert_boxed()` has already violated its own type-correctness contract. Nothing well-behaved reaches it, but `Some` is the load-bearing half of the signal — treat `None` as "nothing this scope knew about" rather than "nothing at all".
 
 The type-erased forms return the displaced value still boxed, because the concrete type is not known at that boundary; downcast it if you need the value. Only the value comes back: `insert_boxed_with_factory()` drops the displaced entry's factory and clone function rather than returning them. Neither is recoverable afterwards, so capture what you need *before* writing — `factory_fn_by_type_id()` hands out a clone of the factory still in force.
 
-Ignoring the return is fine and is what most call sites do — the `insert*` family is not `#[must_use]`, because the executor overwrites outputs by design. The point is that an overwrite is *observable* when a caller cares. `replace_inspection()` is the exception and *is* `#[must_use]`: the sink it displaces belongs to whoever installed it, so dropping that handle cuts them off silently — bind it to `_` if losing it is genuinely what you mean. One write is deliberately outside the contract: `Outputs::merge_from()`, the parallel-branch join, reports nothing, because there overwriting is the defined outcome rather than an accident.
+Ignoring the return is fine and is what most call sites do — the `insert*` family is not `#[must_use]`, because the executor may replace an earlier entry from the same producer. The point is that a replacement is *observable* when a caller cares. `replace_inspection()` is the exception and *is* `#[must_use]`: the sink it displaces belongs to whoever installed it, so dropping that handle cuts them off silently — bind it to `_` if losing it is genuinely what you mean. One write is deliberately outside the contract: `Outputs::merge_from()`, the parallel-branch join, reports nothing, because it replays the child entries in branch order rather than reporting each possible replacement.
 
 `with_inspection()` is the one write that cannot report: it returns `Self`, so the builder chain has nowhere to hand the displaced sink back and drops it silently. On a context you just created that is exactly right. On one that may already carry a sink — including any `child()`, which inherits the handle by value (below) — use `inspection_arc()` and `replace_inspection()` instead.
 
@@ -251,7 +251,7 @@ ctx ──→ [System A] ──→ [Decision] ──→ [System B] ──→ ...
 
 ### Parallel
 
-Each branch gets its own **child context** via `ctx.child()` and runs concurrently with isolated local writes. `Res<T>` reads walk the parent chain, but **outputs do not**: the child starts with an empty output store, so a branch cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a resource on the parent context and read them in each branch with `Res<T>`. After all branches complete successfully, their outputs are merged back into the parent in declaration order; at run time, duplicate types use the last branch's value.
+Each branch gets its own **child context** via `ctx.child()` and runs concurrently with isolated local writes. `Res<T>` reads walk the parent chain, but **outputs do not**: the child starts with an empty output store, so a branch cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a resource on the parent context and read them in each branch with `Res<T>`. After all branches complete successfully, their outputs are merged back into the parent in declaration order; `Out<T>` then resolves the newest same-typed entry, while `OutAll<T>` retains branch-order access to all of them.
 
 ```text
 ctx ──→ [Parallel]
@@ -283,6 +283,8 @@ The policy is then composed from per-resource verbs:
 | `exclude::<T>()` | Suppresses any earlier verb / `share_rest()` for `T` | nothing | Combine with `share_rest()` to opt one resource out of the catch-all |
 | `share_rest()` | Apply `share` to every resource not otherwise mentioned | nothing | "Mostly inherit, with a few overrides" pattern |
 
+For [declared scope contracts](./graph.md#declared-scope-contracts), include every eager `forward`/`fork` input in the contract, even if the interior does not access it. `forward_fresh` is supported on plain scopes but rejected on declared scopes: resource requirements cannot express factory availability.
+
 Verbs are applied in declaration order; later verbs override earlier ones for the same `T`. `share_rest()` only applies to types not otherwise named.
 
 At runtime the executor branches on the policy:
@@ -294,6 +296,8 @@ At runtime the executor branches on the policy:
 | Pure isolation (only `forward` / `fork` / `forward_fresh`) | `ctx.child_filtered(AllowOnly(empty))` | Globals + forwarded/forked/fresh locals | Child's local scope | Merged back to parent |
 
 Every non-`shared()` policy builds the child via `child_filtered` and retains the (filtered) parent reference. For pure isolation the filter is an empty `AllowOnly`, so no parent local is readable — but keeping the reference lets a blocked read return `ParamError::ResourceOutOfScope` (naming the verb that would expose it) instead of an indistinct "not found". Globals still flow through the retained parent.
+
+"Merged back to parent" in the table above is unfiltered for a plain scope: every output the interior wrote crosses. A [declared scope contract](./graph.md#declared-scope-contracts) narrows that merge on a non-`shared()` policy to only the output types named in the contract's `produces` — see [Output Merging](#output-merging) below for the mechanism, and `graph.md`'s *Declared scope contracts* section for the validation side.
 
 ```rust
 // Sub-agent: shared registry, fresh fragment store.
@@ -343,7 +347,7 @@ See [Graph — Dynamic](graph.md#dynamic) for selection, contracts, and candidat
 
 ## Outputs
 
-System return values are stored in the context's output storage, keyed by `TypeId`. Downstream systems access them via `Out<T>`.
+System return values are stored in the context's output storage, keyed by `TypeId` and producer. Downstream systems access the newest one via `Out<T>` or every visible entry via `OutAll<T>`.
 
 ```rust
 #[system]
@@ -353,14 +357,56 @@ async fn reason() -> ReasoningResult { /* ... */ }
 async fn act(reasoning: Out<ReasoningResult>) -> ActionResult { /* ... */ }
 ```
 
-- If multiple systems return the same type, last-write-wins — the write returns the value it displaced, so the clobber is observable (see [Writes Return What They Displaced](#writes-return-what-they-displaced))
+- If multiple producers return the same type, all entries are retained. `Out<T>` reads the newest one; `OutAll<T>` yields all entries oldest first, each with its `ProducerKey`. A later write by the same producer replaces that producer's prior entry (within the same output layer — see [Output Layers](#output-layers)).
 - Outputs persist for the duration of graph execution
 - `ErrOut<T>` reads error context from a failed system (via error edges)
 - Outputs are cleared between agent runs via `ctx.clear_outputs()`
 
+### Producer Keys
+
+Every output entry carries a `ProducerKey`. The key is an opaque id: two keys are equal when their ids are equal, and nothing else is compared. Code that is not the executor should treat it as a handle, not parse it.
+
+The graph executor attaches graph provenance to the key. Read it with `polaris_graph::ProducerInfo::of(key)`:
+
+```rust
+#[system]
+async fn summarize(drafts: OutAll<Draft>) -> Summary {
+    for entry in &drafts {
+        if let Some(info) = ProducerInfo::of(entry.producer()) {
+            // info.node(), info.node_name(), info.run_id(),
+            // info.path(), info.loop_iteration()
+        }
+    }
+    /* ... */
+}
+```
+
+`ProducerInfo::of` returns `None` for entries the graph executor did not write — for example an output a caller seeded with `ctx.insert_output(...)` before running the graph. `loop_iteration()` is the innermost loop's iteration (0 outside any loop); `path()` is a readable path of the scopes, slots, loop iterations and parallel branches entered, meant for people, not for parsing.
+
+### Output Layers
+
+The output store is a stack of layers. A loop gives each iteration its own layer: writes go to the newest layer, and reads see every layer. This is how [loop retention](graph.md#loop-output-retention) keeps earlier iterations readable and then drops them.
+
+Layers are opened and closed only through guard types on `SystemContext`:
+
+| Guard | Opened with | On drop |
+|-------|-------------|---------|
+| `OutputLayerScope` | `ctx.output_layer_scope()`, then `push_layer()` | Discards every layer it pushed, unless `promote_newest(...)` was called first. `retain_layers(default, per_type)` drops older layers while it is open. |
+| `ReadFromScope` | `ctx.read_from_scope(bindings)` | Restores the `read_from` bindings that were installed before. |
+
+Both guards deref to the context, so work inside them runs through the guard. Nested guards close before their parents.
+
+**Cancel safety.** Closing is tied to the guard's `Drop`, not to code that runs after an `.await`. So when a run's future is dropped part-way — a turn cancelled because an HTTP client disconnected, a `tokio::select!` that picked another branch, a graph-level timeout — the context's output layers and bindings are left exactly as they were before the region opened. Nothing half-written from an unfinished loop iteration survives.
+
+The executor opens these guards for you. Use them directly only when you drive systems yourself outside a graph.
+
 ### Output Merging
 
-When child contexts (from Parallel, Scope, or Dynamic nodes) complete, their outputs are merged into the parent via `ctx.outputs_mut().merge_from(child_outputs)`. A scope or dynamic `ContextPolicy` controls which resources enter the child; it does not filter outputs returning to the parent. Merge is deterministic — branches are processed in order, so the last branch's output wins for duplicate types.
+When child contexts (from Parallel, Scope, or Dynamic nodes) complete, their outputs are merged into the parent. A scope or dynamic `ContextPolicy` controls which *resources* enter the child; by itself it does not filter *outputs* returning to the parent. Merge is deterministic — branches are processed in order, and that order is preserved by `OutAll<T>` for duplicate types.
+
+Parallel, plain `add_scope`, and Dynamic all merge unfiltered, via `ctx.outputs_mut().merge_from(child_outputs)`: every child entry joins the parent. An entry replaces only a same-typed entry from the same producer.
+
+A [declared scope contract](./graph.md#declared-scope-contracts) is the one exception, and only on a non-`shared()` policy: `execute_embedded` merges via `ctx.outputs_mut().merge_filtered(child_outputs, allowed)` instead, where `allowed` is the contract's `produces` type set. Every other output the child context held — declared-but-unguaranteed can't happen (`validate()` rejects it), but guaranteed-and-undeclared can and is the intended way to keep an interior detail private — is dropped along with the child context, and a parent entry of the same type is left exactly as it was; there is no partial write to undo, since the type never reached `merge_filtered`'s `allowed` set. `ContextPolicy::shared()` has no child context and thus no merge step at all, so a declared contract paired with `shared()` cannot hide anything: every interior write, named in the contract or not, lands directly in the parent's own output store as it happens.
 
 ## Resource Validation
 
@@ -369,7 +415,7 @@ Before execution, `GraphExecutor::validate_resources()` checks that all resource
 - `Res<T>` — checked against the full hierarchy (local + parents + globals)
 - `ResMut<T>` — checked against local scope only
 - Hook-provided resources (`OnGraphStart`, `OnSystemStart`) are considered available
-- `Out<T>` — validated along the linear (sequential) chain. Each system's declared output dependencies are checked against outputs produced by preceding nodes plus outputs already present in the context (callers may seed via `insert_output`), and each loop's termination predicate input is checked the same way (the predicate is evaluated before the first iteration, so the loop body cannot satisfy it). Hook-provided resource types never count: provider hooks insert resources, while `Out<T>`, predicates, and dynamic `requires_outputs` read the separate output channel. The pre-flight/run-start model is optimistic: Decision, Switch, Loop, and Parallel contribute every output type their subgraphs may deposit, including outputs behind nested Scope boundaries, handler paths, and Dynamic contracts. This does not change pessimistic composition signatures, where conditional production is not guaranteed and therefore cannot erase a free-output requirement. Shared-boundary embedded graphs (scope graphs, inline dynamic candidates) are validated recursively against the outputs available at their chain position; non-shared ones against an empty output set, since outputs never cross a non-shared boundary inward. Conditional and parallel branch interiors are not individually validated because their execution paths are dynamic.
+- `Out<T>` — validated along the linear (sequential) chain. Each system's declared output dependencies are checked against outputs produced by preceding nodes plus outputs already present in the context (callers may seed via `insert_output`), and each loop's termination predicate input is checked the same way (the predicate is evaluated before the first iteration, so the loop body cannot satisfy it). Hook-provided resource types never count: provider hooks insert resources, while `Out<T>`, predicates, and dynamic `requires_outputs` read the separate output channel. The pre-flight/run-start model is optimistic: Decision, Switch, Loop, and Parallel contribute every output type their subgraphs may deposit, including outputs behind nested Scope boundaries, handler paths, and Dynamic contracts. A non-`shared()` Scope carrying a declared contract is the one narrower case: it contributes exactly the contract's `produces`, not the full interior, because that is all the runtime merge-back filter actually lets through — crediting more here would pass this check for a read the boundary then drops. This is wider than pessimistic composition signatures, which credit only what every execution deposits — a preceding system, a parallel node, a scope, or the intersection of every decision/switch arm. Production in only some decision/switch arms, a loop body, or a dynamic candidate remains conditional. Shared-boundary embedded graphs (scope graphs, inline dynamic candidates) are validated recursively against the outputs available at their chain position; non-shared ones against an empty output set, since outputs never cross a non-shared boundary inward. Conditional and parallel branch interiors are not individually validated because their execution paths are dynamic.
 - Scope nodes are validated recursively with synthetic child contexts matching runtime behavior
 
 ```rust
@@ -382,7 +428,7 @@ This pass is run-start analysis performed ahead of time, and it credits no more 
 
 | File | Purpose |
 |------|---------|
-| `polaris_system/src/param/mod.rs` | `SystemContext` struct, `Res<T>`, `ResMut<T>`, `Out<T>`, `ErrOut<T>` |
+| `polaris_system/src/param/mod.rs` | `SystemContext` struct, `Res<T>`, `ResMut<T>`, `Out<T>`, `OutAll<T>`, `ErrOut<T>` |
 | `polaris_system/src/resource/resource.rs` | `Resources` container, `GlobalResource`, `LocalResource`, RAII guards |
 | `polaris_system/src/resource/output.rs` | `Outputs` container, output merging |
 | `polaris_system/src/server.rs` | `Server::create_context()`, `ContextFactory`, deferred binding |

@@ -28,6 +28,7 @@ use super::model::Llm;
 use super::types::{
     CacheControl, LlmRequest, LlmResponse, LlmStream, Message, ToolChoice, ToolDefinition,
 };
+use core::num::NonZeroU32;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -56,6 +57,7 @@ pub struct LlmRequestBuilder<'a, S = Empty> {
     system_prompt_version: Option<String>,
     messages: Vec<Message>,
     tool_choice: Option<ToolChoice>,
+    max_output_tokens: Option<NonZeroU32>,
     cache: CacheControl,
     _state: PhantomData<S>,
 }
@@ -111,6 +113,40 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
     #[must_use]
     pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
         self.tool_choice = Some(choice);
+        self
+    }
+
+    /// Sets the maximum number of tokens the model may generate.
+    ///
+    /// Providers that support output limits pass this bound to their native
+    /// request. A response stopped at the bound reports
+    /// [`StopReason::MaxOutputTokens`](super::types::StopReason::MaxOutputTokens).
+    ///
+    /// A provider with its own registered output ceiling (such as the
+    /// Anthropic and Bedrock providers' `with_max_tokens`) uses the lower of
+    /// the two: this limit can lower the ceiling for one request, never raise
+    /// it.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use core::num::NonZeroU32;
+    /// # use polaris_models::llm::{GenerationError, Llm};
+    /// # async fn example(llm: &Llm) -> Result<(), GenerationError> {
+    /// let limit = NonZeroU32::new(512).expect("512 is non-zero");
+    /// let response = llm
+    ///     .builder()
+    ///     .max_output_tokens(limit)
+    ///     .user("Summarize this in one line.")
+    ///     .generate()
+    ///     .await?;
+    /// # let _ = response;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn max_output_tokens(mut self, max_output_tokens: NonZeroU32) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
         self
     }
 
@@ -194,6 +230,7 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
             system_prompt_version: self.system_prompt_version,
             messages: self.messages,
             tool_choice: self.tool_choice,
+            max_output_tokens: self.max_output_tokens,
             cache: self.cache,
             _state: PhantomData,
         }
@@ -247,6 +284,7 @@ impl<'a> LlmRequestBuilder<'a, Ready> {
             tools,
             tool_choice: self.tool_choice,
             output_schema: None,
+            max_output_tokens: self.max_output_tokens,
             cache: self.cache,
         };
 
@@ -307,6 +345,7 @@ impl<'a> LlmRequestBuilder<'a, Empty> {
             system_prompt_version: None,
             messages: Vec::new(),
             tool_choice: None,
+            max_output_tokens: None,
             cache: CacheControl::default(),
             _state: PhantomData,
         }
@@ -548,6 +587,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_passes_max_output_tokens() {
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(AssertingProvider(|request: &LlmRequest| {
+            assert_eq!(request.max_output_tokens, NonZeroU32::new(512));
+        }));
+        let llm = registry.llm("mock/test").unwrap();
+        llm.builder()
+            .max_output_tokens(NonZeroU32::new(512).unwrap())
+            .user("Hi")
+            .generate()
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn request_defaults_to_no_output_token_limit() {
+        assert_eq!(LlmRequest::default().max_output_tokens, None);
+    }
+
+    #[test]
+    fn a_zero_output_token_limit_does_not_deserialize() {
+        let zero = serde_json::json!({"messages": [], "max_output_tokens": 0});
+        assert!(
+            serde_json::from_value::<LlmRequest>(zero).is_err(),
+            "a zero limit must be rejected when the request is read"
+        );
+        let one = serde_json::json!({"messages": [], "max_output_tokens": 1});
+        let request = serde_json::from_value::<LlmRequest>(one).unwrap();
+        assert_eq!(request.max_output_tokens, NonZeroU32::new(1));
+    }
+
+    #[tokio::test]
     async fn send_without_tools_sets_none() {
         struct MockProvider;
 
@@ -703,6 +774,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             output_schema: None,
+            max_output_tokens: None,
             cache: CacheControl::default(),
         };
         let stream = llm.stream(request).await.unwrap();

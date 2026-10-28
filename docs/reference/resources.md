@@ -110,8 +110,7 @@ or kept non-`pub`.
 
 The catalog drift guard at `tests/resource_catalog.rs` enforces that every
 consumer-facing resource appears in the [Resource Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/resources/);
-documentation-standard conformance itself is checked by `/review-docs` on
-every PR.
+documentation-standard conformance itself is checked in code review.
 
 ### Required Sections
 
@@ -149,6 +148,41 @@ reading the resource's source — what `T` represents, who's responsible for
 putting it there, what mutation looks like, and whether there's a better
 choice for their case. A missing resource doc forces them to grep for who
 calls `insert_global::<T>` and reverse-engineer the contract.
+
+## `ShellExecutor`
+
+`ShellExecutor` is a global resource provided by `ShellPlugin`. Systems use it
+through `Res<ShellExecutor>` when they need permission-gated foreground or
+managed shell execution. It is safe to share across contexts because clones
+refer to an internally synchronized executor-owned process table; callers
+cannot obtain `ResMut<ShellExecutor>`.
+
+The resource offers status snapshots, explicit stop operations, and
+exactly-once result consumption. Live entries are retained until terminal; by
+default, 64 unconsumed completed results remain discoverable for late waiters.
+Incremental delivery is caller-supplied through `ShellSinkHandle`, rather than
+through the `UserIO` local resource. For LLM tool calls, pass the sink and an
+optional `ShellCancel` through `ToolContext` and `ToolRegistry::execute_with`.
+
+```rust
+# use polaris_ai::polaris_system;
+use polaris_ai::system::{system, system::SystemError};
+use polaris_ai::system::param::Res;
+use polaris_ai::shell::{ShellExecutor, ShellRequest};
+
+#[system]
+async fn start_build(shell: Res<ShellExecutor>) -> Result<(), SystemError> {
+    let process = shell
+        .start_confirmed(ShellRequest::new("cargo build"))
+        .await
+        .map_err(|err| SystemError::ExecutionError(err.to_string()))?;
+    let _process_id = process.detach();
+    Ok(())
+}
+```
+
+Use `ShellTools` when an LLM should invoke `run_command`; use `ShellExecutor`
+directly when the host or a typed system owns process lifecycle and policy.
 
 ## Anti-Patterns
 
