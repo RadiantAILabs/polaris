@@ -212,7 +212,7 @@ fn type_display(ty: &Type) -> String {
 }
 
 /// Returns the resource type inside a recognized wrapper — the `T` of
-/// `Res<T>`, `ResMut<T>`, `Out<T>`, `ErrOut<T>`, unwrapping one `Option<..>`
+/// `Res<T>`, `ResMut<T>`, `Out<T>`, `OutAll<T>`, `ErrOut<T>`, unwrapping one `Option<..>`
 /// layer, and skipping lifetime arguments (`Res<'_, T>` yields `T`).
 ///
 /// Returns `None` for unclassified types, which the caller reports with the
@@ -232,7 +232,7 @@ fn inner_type(ty: &Type) -> Option<&Type> {
 
     match segment.ident.to_string().as_str() {
         "Option" => inner_type(first_type),
-        "Res" | "ResMut" | "Out" | "ErrOut" => Some(first_type),
+        "Res" | "ResMut" | "Out" | "OutAll" | "ErrOut" => Some(first_type),
         _ => None,
     }
 }
@@ -243,6 +243,7 @@ fn param_kind_expr(ty: &Type, ps: &TokenStream2) -> TokenStream2 {
         Some("Res") => quote!(Res),
         Some("ResMut") => quote!(ResMut),
         Some("Out") => quote!(Out),
+        Some("OutAll") => quote!(OutAll),
         Some("ErrOut") => quote!(ErrOut),
         _ => quote!(Other),
     };

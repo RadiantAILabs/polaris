@@ -74,6 +74,11 @@ jobs:
 
       # Note: stale-bindings drift is enforced by the `test-bindings` task inside
       # `cargo make test` above, so no separate verification step is needed here.
+      #
+      # The same run also covers `polaris_sessions` with default features (the
+      # `test-sessions-default-features` task). `--all-features` turns on
+      # `sessions-http`, so only that run notices an API that the feature newly
+      # gates.
 
   feature-matrix:
     name: Feature matrix

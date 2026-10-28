@@ -7,6 +7,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-request output token limits: `LlmRequest::max_output_tokens` and `LlmRequestBuilder::max_output_tokens`** (`polaris_models`) — callers can cap one response before it is generated. The limit is a `NonZeroU32`, so a limit of 0 cannot be set and a serialized request carrying `"max_output_tokens": 0` fails to deserialize. Anthropic and Bedrock enforce their registration-wide ceiling, so a request can lower it but not raise it; OpenAI sends the request value as given. An unset limit preserves each provider's existing behavior. See [Model Providers — Output token limits](docs/reference/model-providers.md#output-token-limits).
+
+- **Predicate loop iteration caps: `Graph::set_loop_max_iterations`** (`polaris_graph`) — a predicate loop can now carry its own maximum iteration count, independent of the executor default. When a false predicate reaches the cap, execution returns `MaxIterationsExceeded`; a zero cap runs no body iterations, matching `add_loop_n`.
+
+- **`GraphSignature::guaranteed_produces`** (`polaris_graph`) — exposes the output types a built graph deposits on every successful path, distinct from `produces`, which remains the union of all reachable production. Dynamic nodes now expose and guarantee their slot contract's outputs, so callers can check a built graph's guaranteed output surface against a contract without treating branch-only outputs as promises.
+
+- **Graphs built from runtime data: `NodeName`, `BoxedPredicate`, `BoxedDiscriminator`, `add_loop_boxed`, `add_switch_boxed`, `add_conditional_branch_boxed`** (`polaris_graph`) — node names, switch case keys and discriminator results accept `impl Into<NodeName>`, so they can come from runtime `String`s; literal call sites compile unchanged. The boxed builders take a predicate or discriminator built from a typed closure (`BoxedPredicate::new::<T>(...)`), which keeps its input type for signature derivation and the loop entry check. A graph whose shape is known only at runtime can be built, validated and executed without `Box::leak` or per-type code.
+
+- **`Outputs::merge_filtered`** (`polaris_system`) — merges only the entries whose type is in a given allow-set; used by the declared-scope boundary.
+
+- **Configurable Anthropic output token limit** (`polaris_model_providers`) — adds `AnthropicPlugin::new`, `AnthropicPlugin::with_max_tokens`, `AnthropicProvider::with_max_tokens`, and `AnthropicProvider::max_tokens` to configure and inspect the registration-wide ceiling, plus a public `DEFAULT_MAX_TOKENS: NonZeroU32` (4096, the unchanged default). The plugin's new `Debug` implementation redacts the API key; see [Output token limits](docs/reference/model-providers.md#output-token-limits).
+
+- **Turn interrupts: `SessionsAPI::interrupt_turn`, `TurnStatus::Interrupted`** (`polaris_sessions`) — stop the turn a session is running. Over HTTP an interrupted turn returns `409 turn_interrupted`. See [Sessions — Interrupting a turn](docs/reference/sessions.md#interrupting-a-turn).
+
+- **Durable session checkpoints: `SessionsAPI::checkpoints()`** (`polaris_sessions`) — capture, list, pin and restore checkpoints by stable `CheckpointId`; they persist through the `SessionStore`. Adds `RestoreFailureCause`. See [Sessions — Checkpointing and Rollback](docs/reference/sessions.md#checkpointing-and-rollback).
+
+- **Run cancellation: `CancellationSource`, `RunCancellation`, `ExecutionError::Interrupted`** (`polaris_graph`) — stop a run between nodes without dropping running futures. New dependency: `tokio-util`. See [Graph — Cancellation](docs/reference/graph.md#cancellation).
+
+- **Managed shell processes and streaming** (`polaris_shell`) — `ShellExecutor::start`, `wait_for`, `stop` and related types for background runs with streamed output. See [Shell — Managed execution and streaming](src/docs/shell.md#managed-execution-and-streaming).
+
+- **Typed system erasure: `TypedSystem<O>`, `erase`, and `IntoBoxedSystem`** (`polaris_system`) — `erase(system)` yields a `TypedSystem<O>` that hides the concrete system and `IntoSystem` marker types while keeping the output type, so a reusable graph builder accepts a caller-supplied stage without a system/marker type parameter and still rejects the wrong output at compile time. The handle exposes `name`, `output_type_name`, `access`, and `is_fallible`. See the system reference under Typed Erasure for Composition.
+
+- **`SystemNodeBuilder::with_schedules`** (`polaris_graph`) — attaches custom hook schedules to a pre-boxed or typed-erased system node, which the `(schedule, system)` tuple form cannot reach. Schedules accumulate and de-duplicate. See the graph reference under Custom System Schedules.
+
+- **Declared scope contracts** (`polaris_graph`) — `Graph::add_scope_with_contract` preserves a scoped subgraph’s checked interface in parent signatures and enables its use as a dynamic candidate. See [Declared scope contracts](docs/reference/graph.md#declared-scope-contracts).
+
+- **Opt-in substitutability matching for `Dynamic` slots: `MatchingMode`, `GraphSignature::substitutable_for()` / `substitutable_diff()`** (`polaris_graph`) — a slot chooses the relation its candidates are admitted under via `DynamicSlot::new(contract, policy).with_matching(...)`, and `SubgraphRegistry::with_matching` sets it for registry candidates. `MatchingMode::Exact` is the default, so no existing slot changes what it admits. See [Graph — Dynamic](docs/reference/graph.md#dynamic).
+
+- **`ValidationWarning::DynamicCandidateShadowsOutput`** (`polaris_graph`) — `validate()` warns when a `MatchingMode::Substitutable` inline candidate produces an output type its slot contract does not name and the surrounding graph produces too; that value is dropped at the `Dynamic` boundary. See [Extra outputs stop at the Dynamic boundary](docs/reference/graph.md#extra-outputs-stop-at-the-dynamic-boundary).
+
+- **`ChannelIOProvider`** (`polaris_sessions`) — new name for the channel-based `IOProvider`; `HttpIOProvider` remains as an alias. See [Sessions — History and channel IO without HTTP](docs/reference/sessions.md#history-and-channel-io-without-http).
+
+- **`FileStoreLimits`** (`polaris_sessions`) — `FileStore` bounds file size and checkpoint counts on load and save. See [Sessions — Persistence](docs/reference/sessions.md#persistence-saveresume).
+
+- **Shell child environment settings: `ShellConfig::env`, `env_allowlist`, `path`, `inherit_env`** (`polaris_shell`) — see the `ShellConfig` rustdoc.
+
+- **`Outputs` keeps one entry per producer: `ProducerKey`, `insert_from`, `insert_boxed_from`, `entries`, `by_producer`** (`polaris_system`) — two systems writing the same output type no longer overwrite each other; the store keeps one entry per `(type, producer)` in write order. `Out<T>` / `get_output::<T>()` still return the newest entry, and `insert`, `contains`, `len` and `is_empty` behave as before. `ProducerKey` is opaque: `ProducerKey::new(id)` plus an optional attached value (`with_provenance` / `provenance::<P>()`) that `polaris_system` stores but never reads; equality and hashing use `id()` only. The graph executor derives the id from the node, so a session reusing one context, or a loop writing every iteration, keeps one entry per node (per layer — see loop output layers below). `SystemContext::insert_output_from` / `insert_output_boxed_from` expose the producer-aware writes.
+
+- **`OutAll<T>`** (`polaris_system`) — a borrowed, oldest-first read of every output of type `T`, with each entry's `ProducerKey` and parameter-inspection support. `OutAll` and `OutAllEntry` implement `Debug`.
+
+- **`ProducerInfo`** (`polaris_graph`) — the graph provenance the executor attaches to every output write: `ProducerInfo::of(entry.producer())` returns the node id, runtime node name (the one set with `SystemNodeBuilder::named`), run id, structural path and innermost loop iteration, or `None` for an output the graph executor did not write. Also in the prelude. See [Context — Producer Keys](docs/reference/context.md#producer-keys).
+
+- **Loop output layers: `Graph::set_loop_retention`, `set_loop_retention_for_type::<T>`** (`polaris_graph`) — each loop iteration writes to its own output layer. Retention sets how many completed iterations stay readable while the next one runs (default 1: the previous iteration stays readable; 0: none, on both setters); the per-type setting wins over the per-loop one. The termination predicate sees the iteration that just finished. On loop exit only the newest iteration's outputs pass to the enclosing context. See [Graph — Loop output retention](docs/reference/graph.md#loop-output-retention).
+
+- **Cancel-safe output scopes: `OutputLayerScope` and `ReadFromScope`** (`polaris_system`) — `SystemContext::output_layer_scope()` and `SystemContext::read_from_scope(bindings)` return guards that undo their changes on drop: an output layer region is discarded unless `promote_newest` was called, and earlier `read_from` bindings are restored. The executor uses them around every system run, loop and output boundary, so a run whose future is dropped part-way (for example a turn cancelled by an HTTP client disconnect) leaves the context exactly as it was. These guards are the only public way to open and close output layers. See [Context — Output Layers](docs/reference/context.md#output-layers).
+
+- **Producer wiring: `read_from`** (`polaris_graph`) — `graph.system(act).read_from::<T>(producer_id)`, or `Graph::read_from::<T>(reader, producer)` by id, makes a system's plain `Out<T>` / `Option<Out<T>>` read one chosen producer's entry during its run, without copying a value or changing the store. `validate()` rejects a wire whose producer is missing or from another `Graph` (`ReadFromProducerMissing`), is not a system node (`ReadFromProducerNotASystem`), has the wrong output type (`ReadFromTypeMismatch`), is the reader itself (`ReadFromSelf`), or is not guaranteed to finish before the reader (`ReadFromNotGuaranteed`). The exception is a backward wire inside one loop body, which reads an earlier iteration's entry and must be `Option<Out<T>>` (`ValidationError::ReadFromBackwardRequiresOptional`). A binding for a type the reader does not read through `Out<T>` / `Option<Out<T>>` fails as `ValidationError::ReadFromUnread`. `Graph::duplicate` remaps wires with node ids. Built on the new `SystemContext::get_output_from`, `SystemContext::read_from_scope` and `ReadFromBindings` (`polaris_system`). See [Graph — `read_from`](docs/reference/graph.md#reading-a-specific-producer-read_from).
+
+- **`SystemNodeBuilder::named`** (`polaris_graph`) — sets a system node's runtime name (default: the system's static `name()`), so two copies of one system can be told apart in hook events and both `SystemInfo` types. Backed by the new public `SystemNode::node_name` field and `SystemNode::with_name`.
+
+- **`Borrow<str>`, `PartialOrd` and `Ord` for `NodeName`** (`polaris_graph`) — `HashMap<NodeName, _>::get("literal")` and other `Borrow`-based lookups now compile, and names can be sorted or used as `BTreeMap` keys.
+
+- **Model pricing: `polaris_model_providers::pricing`** (`polaris_model_providers`) — `PriceStore` answers `LlmProvider::pricing()` for every built-in provider from, in order, its own overrides, a fetched price table, and the built-in `fallback_table()`, each by longest model-id prefix (`PricingTable`). `PriceStore::builtin()` (also `Default`) uses only built-in prices and never touches the network or disk. `PriceStore::live()` is the opt-in, process-wide live store: it reads a cache file at `default_cache_path()`, refreshes `DEFAULT_SOURCE_URL` (LiteLLM's price table) on a background thread when prices are older than `DEFAULT_TTL` (24 h) without ever blocking `get`, writes the cache after a successful fetch, and waits `FAILED_REFRESH_RETRY_DELAY` (15 min) after a failed one. Fetched data and cache reads are capped at `MAX_PRICE_DATA_BYTES` (32 MiB) with a 10 s fetch timeout, and rows whose rates are non-finite, negative, above 10,000 USD per million tokens, or both zero are dropped. `PriceStore::new(source, cache_path, ttl)` and `PriceStore::with_fetcher` (with a `PriceFetcher` returning the `#[non_exhaustive]` `PriceFetchError`) serve other sources and tests. `PriceStore::with_override` sets a rate on one handle only. See [Model Providers — Pricing](docs/reference/model-providers.md#pricing).
+
+- **Provider pricing hooks: `with_pricing_store` and `with_pricing_override`** (`polaris_model_providers`) — `AnthropicProvider`, `OpenAiProvider` and `BedrockProvider` take a `PriceStore` with `with_pricing_store`, and `AnthropicPlugin`, `OpenAiPlugin` and `BedrockPlugin` pass one through to the provider they register. `with_pricing_override(prefix, ModelPricing)` on a provider changes that provider's rate only. `BedrockProvider` now reports pricing at all.
+
+- **Bedrock: `openai.*` models, model-specific fields and an output ceiling** (`polaris_model_providers`) — models whose id contains `openai.` are sent to Bedrock's signed `OpenAI` Responses endpoint instead of Converse, with transient errors (HTTP, rate limit, 429/500/502/503/504) retried with exponential backoff up to the SDK retry config's max attempts; `stream` on that path replays one generate call as a stream. This path needs the AWS SDK config: `BedrockPlugin` passes it, and a hand-built provider calls the new `BedrockProvider::with_sdk_config`, or the call fails with `GenerationError::InvalidRequest`. `BedrockProvider` / `BedrockPlugin::with_additional_model_request_fields` send model-specific JSON (Converse `additionalModelRequestFields`; top-level body keys on the Responses path, replacing the provider's own value for a key). `with_max_tokens(NonZeroU32)` on both, `BedrockProvider::max_tokens`, and `bedrock::DEFAULT_MAX_TOKENS` (4096) set and read the output ceiling. `bedrock::normalize_bedrock_model_id` maps a Bedrock Anthropic id to its first-party Claude id. Converse sends prompt-cache points only to `anthropic.*` and `amazon.nova*` models. See [Model Providers — AWS Bedrock](docs/reference/model-providers.md#aws-bedrock).
+
+### Changed
+
+- **Source-breaking: `LlmRequest` gains the public `max_output_tokens` field** (`polaris_models`) — because `LlmRequest` is not `#[non_exhaustive]`, downstream struct literals that list every field must now include the optional `NonZeroU32` limit. **Migration:** add `max_output_tokens: None`, use `..Default::default()`, or construct requests with `LlmRequestBuilder`.
+
+- **Source-breaking: `SystemNode` gains the public `node_name` field** (`polaris_graph`) — downstream struct literals must now provide the runtime display name. **Migration:** prefer `SystemNode::new` / `new_boxed` and optionally `.with_name(...)`; a literal should initialize `node_name` from the system's static name with `.into()`.
+
+- **Breaking: Dynamic candidate admission requires guaranteed contract outputs** (`polaris_graph`) — inline candidates and `SubgraphRegistry::register` now reject a candidate that only may produce an output the slot contract promises. Every contracted output must be in the candidate's `guaranteed_produces()` set, preventing branch-, switch-, and loop-only output from being promoted as a downstream guarantee.
+
+- **Guarded production crediting** (`polaris_graph`) — a system with error or timeout handlers now guarantees the intersection of its normal continuation and every handler continuation. Matching fallback outputs satisfy downstream reads; an output missing from any handler remains unguaranteed. Retry behavior is unchanged.
+
+- **Declared scopes are a runtime boundary** (`polaris_graph`) — on a non-`shared()` policy, a scope added with `add_scope_with_contract` merges back only the output types its contract `produces`; other interior outputs are dropped, and a parent output of the same type is left untouched. `validate()` now accepts a contract whose `produces` is a subset of what the interior guarantees, so a composite can keep internals private. `shared()` scopes and plain `add_scope` are unchanged. See [Declared scope contracts](docs/reference/graph.md#declared-scope-contracts).
+
+- **Source-breaking: node-name fields are `NodeName`** (`polaris_graph`) — hook events, middleware `*Info` structs and graph errors carry `NodeName` instead of `&'static str` for system, decision, switch, loop, parallel, scope and dynamic nodes. This includes `GraphEvent::SystemStart` / `SystemComplete` / `SystemError`, middleware `SystemInfo::node_name`, and devtools `SystemInfo`, whose `new` takes `impl Into<NodeName>` and whose `system_name()` returns `&NodeName`. A system node's runtime name defaults to its static `name()` (see `SystemNodeBuilder::named`). **Migration:** comparisons with `&str` and `Display` still work; a `match` pattern on a string literal must become a guard, a struct literal needs `.into()`, and a tracing field needs the `%` sigil (`name = %info.node_name`). A missing output feeding a loop is reported as the new `ResourceValidationError::LoopMissingOutput`; its message now names the loop: "loop '…' (…) termination predicate requires missing output: …".
+
+- **Session history and `ChannelIOProvider` no longer need `sessions-http`** (`polaris_sessions`) — see [Sessions — History and channel IO without HTTP](docs/reference/sessions.md#history-and-channel-io-without-http).
+
+- **Breaking: `SessionData` is `#[non_exhaustive]`** (`polaris_sessions`) — build it with `SessionData::new(...)`.
+
+- **Checkpoint retention is bounded by default** (`polaris_sessions`) — 64 checkpoints and 16 MiB per session. Use `CheckpointRetention::unbounded()` for the old behaviour. See [Sessions — Checkpoint retention](docs/reference/sessions.md#checkpoint-retention).
+
+- **Breaking: `ShellRequest`, `ExecutionResult`, `ShellConfig`, `ShellEvent` and `ShellProcessStatus` are `#[non_exhaustive]`** (`polaris_shell`) — build with `new()` plus the `with_*` builders, and keep a wildcard arm when matching.
+
+- **Behaviour-breaking: shell commands start with a cleared environment** (`polaris_shell`) — only a trusted `PATH`, a small base set and allowlisted variables are passed. `ShellConfig::with_inherit_env(true)` restores the old behaviour.
+
+- **Shell auto-allow asks for confirmation on commands it cannot split safely** (`polaris_shell`) — for example `$(…)`, `eval`, line continuations and newlines. See [Shell — Permission Architecture](src/docs/shell.md#permission-architecture).
+
+- **The boxed system-node APIs accept `impl IntoBoxedSystem`** (`polaris_graph`) — `Graph::add_boxed_system`, `Graph::system_boxed`, and `SystemNode::new_boxed` take a boxed concrete system, a `BoxedSystem`, or a `TypedSystem<O>`. **Upgrade action:** none, except a function-item binding with nothing to infer from (`let f = Graph::add_boxed_system;`), which now needs a type annotation.
+
+- **`SystemNode::with_schedules` accumulates instead of replacing** (`polaris_graph`) — schedules append and de-duplicate, so a helper stamping its own marker onto a caller-supplied node keeps the author's. **Upgrade action:** a caller that relied on replacing or clearing assigns the public `SystemNode::schedules` field; the API offers no replace or clear counterpart.
+
+- **Breaking: `Graph::validate()` rejects a second route for the same outcome, and orphaned nodes** (`polaris_graph`) — a graph that previously validated cleanly can now fail at registration. Two independent tightenings:
+  - **`ValidationError::AmbiguousRoute` and `RouteKind`** — a node declaring more than one *distinct* route for the same outcome (success, error, or timeout) is now a validate-time error, because route lookup is first-match and the second route was therefore silently dead. Fan-*in* and repeated routes to the *same* target stay legal. **Upgrade action:** wire any node-specific error/timeout handler *before* a blanket `add_error_handler` call, and never attach two specific handlers to the same node.
+  - **`ValidationError::DisconnectedNodes`** — a node with no route to it from the entry point is now a validate-time error rather than passing because its own fields looked valid. **Upgrade action:** remove the orphaned node, or wire a route to it.
+
+  The rule, the accepted shapes, and the handler ordering live in the graph reference under Construction Patterns → Sequential and Error Handling → Error Edges.
+
+- **Signature derivation credits guaranteed parallel and scope production** (`polaris_graph`) — `requires_outputs` no longer advertises a free `Out<T>` that a preceding parallel branch or scope is guaranteed to have merged back, so a self-seeding `Parallel → Loop<T>` subgraph is now admissible to a `DynamicSlot` whose contract does not supply the seed. Conditional producers — a decision or switch case, a loop body, a dynamic contract's `produces` — stay uncredited, as does anything at or after a node carrying an error or timeout edge: a caught failure ends the region in its handler, which merges back without those outputs.
+
+  **Behavior-breaking for padded slot contracts.** Under exact-match admission (`compatible_with` / `diff`, used for `Dynamic` slot substitution and `SubgraphRegistry::register`), a contract supplying `require_output::<T>()` for a candidate that is now self-sufficient no longer matches it: the diff reports `missing_requires_outputs: [T]` at `validate()` or `register()` time, never at runtime. **Upgrade action:** drop the padding from the contract. Subsumption matching (`satisfies`, used for sessions capability contracts) moves only in the safe direction and needs no action.
+
+  The crediting rules live in the graph reference under Construction Patterns → Parallel Execution, Loop, and Scope.
+
+- **Source-breaking: `ErasedDiscriminator::discriminate` returns `NodeName`** (`polaris_graph`) — a custom implementation must return `Result<NodeName, PredicateError>` instead of `&'static str`. **Migration:** wrap the returned `&'static str` or `String` in `.into()`.
+
+- **Source-breaking: `BoxedPredicate` and `BoxedDiscriminator` are wrapper structs, not `Box<dyn Erased*>` aliases** (`polaris_graph`) — `From<Box<dyn ErasedPredicate>>` and `From<Box<dyn ErasedDiscriminator>>` convert a custom erased implementation. **Migration:** `let p: BoxedPredicate = Box::new(Custom);` no longer compiles; use `.into()` or `BoxedPredicate::from(...)`.
+
+- **Behaviour-breaking: a `Dynamic` slot passes up only its contract's `produces`** (`polaris_graph`) — outputs a `MatchingMode::Substitutable` candidate writes beyond the slot contract are dropped, and `ValidationWarning::DynamicCandidateShadowsOutput` now describes them as dropped at the boundary. **Migration:** name any output the parent needs in the slot contract's `produces`.
+
+- **Behaviour-breaking: a failed loop drops all its iteration layers** (`polaris_graph`) — on error, timeout, cancellation, max iterations, a termination-predicate error, or a dropped run future, the loop's partial outputs no longer reach the enclosing context. **Migration:** an error handler can no longer read a failed loop's partial outputs; a successful loop is unaffected.
+
+- **Output provenance records a system node's runtime name** (`polaris_graph`) — `ProducerInfo::node_name` is the name set with `SystemNodeBuilder::named`, not the static system name.
+
+- **Source-breaking: `SystemAccess` gains `bindable_outputs`** (`polaris_system`) — records which output types a system reads through `Out<T>` / `Option<Out<T>>`, for `read_from` validation. `PartialEq` / `Eq` ignore it, so scheduling and existing equality checks are unchanged. `SystemAccess` is not `#[non_exhaustive]`, so the new public field breaks downstream struct literals. **Migration:** build with `SystemAccess::new()` (or `Default`) and assign fields.
+
+- **Behaviour-breaking: built-in provider prices come from a shared table** (`polaris_model_providers`) — `AnthropicProvider` and `OpenAiProvider` no longer hardcode `starts_with` match arms in `pricing()`; they answer from `PriceStore::builtin()`, whose built-in table may report a different rate for some model ids than the old arms did. No provider fetches prices unless given `PriceStore::live()`. **Migration:** to keep a specific rate, set it with `with_pricing_override`.
+
+- **Behaviour-breaking: Bedrock sends an output limit** (`polaris_model_providers`) — `BedrockProvider` previously sent no `maxTokens` and used each model's own default; it now sends `min(request limit, provider ceiling)`, with the ceiling defaulting to 4096. **Migration:** raise it with `BedrockPlugin::with_max_tokens` for models that answered longer before.
+
+- **The `bedrock` feature enables `openai`** (`polaris_model_providers`) — the Bedrock Responses path reuses the `OpenAI` provider's request and response types, so enabling `bedrock` now also compiles `OpenAiPlugin` and its `async-openai` dependency, plus `aws-sigv4`.
+
+### Fixed
+
+- **Loop output retention set on a subgraph now survives `append` and nesting** (`polaris_graph`) — composing a configured subgraph no longer drops its per-loop or per-type retention settings.
+
+- **Bedrock Responses-API client now has connect and request timeouts** (`polaris_model_providers`) — signed `openai.*` requests cannot wait indefinitely while connecting or awaiting a response.
+
+- **Contracted boundaries compose in validation** (`polaris_graph`) — a dynamic node now contributes its checked slot contract's complete interface — `requires`, `requires_outputs`, and `produces` — when it is nested inside a declared scope or another dynamic candidate, rather than being treated as opaque. Loop-body validation likewise credits outputs guaranteed by declared scopes and dynamic contracts, while the predicate's first check still requires an earlier or caller-provided seed.
+
+- **Signatures credit outputs every branch arm guarantees** (`polaris_graph`) — an output guaranteed by both arms of a decision, or by every arm of a switch (including its default), now counts as guaranteed after the branch.
+
+- **Loop entry check respects sealed scopes** (`polaris_graph`) — the run-start check no longer counts an output that a declared scope keeps private, so a loop that reads it fails with `LoopPredicateInputMissingOnEntry` instead of mid-run.
+
+- **`add_error_handler`, `add_error_handler_for`, and `add_timeout_handler` no longer merge an unwired handler subgraph** (`polaris_graph`) — each built and merged the handler closure's subgraph before checking whether any source needed it, so a call that wired nothing left those nodes in the graph as orphans. The subgraph is now dropped instead. Surfaced by `ValidationError::DisconnectedNodes` above.
+
+- **Managed commands spawn in the validated working directory** (`polaris_shell`) — a symlink swapped in after validation could escape `allowed_dirs`.
+
+- **Shell output spill files are capped and no longer block the runtime** (`polaris_shell`) — output past `max_output_bytes` spills to a file of at most 64 MiB by default.
+
+- **`ShellConfig`'s `Debug` output hides environment values** (`polaris_shell`).
+
+- **A filtered scope-boundary merge no longer loses the run's final output** (`polaris_system`, `polaris_graph`) — `Outputs::take_last()` tracked only the last-written type, so when a declared scope's boundary dropped the child's last write, the entry that did cross became unreachable as `ExecutionResult::output::<T>()`. It now returns the newest entry in the store, so the newest allowed entry wins.
+
+- **Bedrock can no longer send `max_tokens: 0`** (`polaris_model_providers`) — every output limit, per request and per provider, is a `NonZeroU32`.
+
+- **A live price store backs off after a failed refresh and checks what it fetches** (`polaris_model_providers`) — see the pricing entry above: a failed fetch keeps the previous prices and waits `FAILED_REFRESH_RETRY_DELAY` instead of retrying on every lookup, fetched and cached rows are validated, and both are size-capped.
+
 ## [0.6.0] - 2026-08-25
 
 Closes the loop-entry gap: a loop's termination predicate is evaluated *before* its body has ever run, but signature derivation assumed the opposite (omitting the predicate input from `requires_outputs`) and nothing verified the input existed when the loop was reached — a loop-heading graph validated cleanly and then died mid-run with `PredicateError::OutputNotFound`. The need is now recorded in the derived signature, so the existing contract checks enforce it at every composition boundary, and the executor verifies it against the live context at run start, before any node executes. Separately, parameter inspection becomes usable end to end: the plugin-layer half (runtime policy, listener registry, telemetry export) joins the Layer-1 capture mechanism.
@@ -385,14 +531,6 @@ Per-tool **strict** preference and two registry-level levers — **exposure** an
 - **CORS `allow_headers` includes `Authorization`** (`polaris_app`) — the CORS layer previously whitelisted only `Content-Type`, which caused cross-origin preflights to strip `Authorization: Bearer …` headers before they reached the `AuthProvider`. Browser SPAs hosted on a separate origin (e.g. a `polaris-dashboard` deployment talking to a Polaris backend) now have their bearer-token preflights succeed without operator-side workarounds.
 
 - **`AuthProvider` doc example uses constant-time comparison** (`polaris_app`) — the rustdoc example on `AuthProvider` previously compared bearer tokens with `==`, which short-circuits on the first mismatched byte and leaks the length of the matching prefix through timing. The example now demonstrates a constant-time comparison helper and points readers at `subtle::ConstantTimeEq`, `ring::constant_time`, and `openssl::memcmp::eq` for production use. Documentation-only — no runtime behavior change.
-
-- **Dashboard bridge plan** (`docs/plans/polaris-dashboard.md`) substantially revised:
-  - Expanded from 9 to 14 architectural decisions — adds the in-core `polaris_dashboard` crate (registry-only, zero frontend), free-form descriptors with curated `kind` vocabulary, `ts-rs` Rust→TS typegen, lean registry with broadcast channel.
-  - New Layer A items: **A6** (`polaris_dashboard` crate), **A7** (`ts-rs` typegen wiring), **A8** (feature-gated core plugin contributions).
-  - **B3** and **B4** marked superseded by A6; **B5** added for the external plugin's asset-serving role; **C6** added for the manifest-driven shell.
-  - Removed legacy WS-envelope decision that mirrored the inherited frontend shape (envelope now designed with B2).
-  - Subscription keying extended: `Agent::name` doubles as graph-identity key alongside session id — no separate `graph_id` needed.
-  - Added "Naming Conventions" legend disambiguating `polaris_dashboard` (Rust crate) vs `polaris-dashboard` (Svelte repo) vs `polaris-dashboard-plugin` (consumer crate) vs `@polaris/dashboard` (npm package).
 
 ### Fixed
 

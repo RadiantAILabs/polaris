@@ -81,11 +81,62 @@ impl Access {
     }
 }
 
+/// One output type read through `Out<T>` or `Option<Out<T>>` — the only
+/// forms a graph-level `read_from` binding can redirect to a chosen
+/// producer.
+///
+/// `OutAll<T>` (reads every producer) and `ErrOut<T>` (always reads the
+/// newest `CaughtError`, ignoring any installed binding) do not add an
+/// entry here even though they also read `outputs` — a `read_from` binding
+/// naming a type reachable only through one of them would have no effect,
+/// so the graph layer rejects it the same way it rejects a typo'd type
+/// (`ValidationError::ReadFromUnread` in `polaris_graph`).
+///
+/// # Examples
+///
+/// ```
+/// use polaris_system::param::{Out, OutAll, SystemParam};
+/// use std::any::TypeId;
+///
+/// struct Plan;
+///
+/// let bindable = <Out<Plan> as SystemParam>::access().bindable_outputs;
+/// assert_eq!(bindable.len(), 1);
+/// assert_eq!(bindable[0].type_id, TypeId::of::<Plan>());
+/// assert!(!bindable[0].optional);
+///
+/// // `OutAll<T>` reads the same channel but cannot be bound.
+/// assert!(<OutAll<Plan> as SystemParam>::access().bindable_outputs.is_empty());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindableOutput {
+    /// The type ID of the output being read.
+    pub type_id: TypeId,
+    /// The human-readable name of the type (for error messages).
+    pub type_name: &'static str,
+    /// Whether the read tolerates a missing entry (`Option<Out<T>>`) rather
+    /// than requiring one (`Out<T>`).
+    ///
+    /// Only `read_from` backward-wire validation consults this flag —
+    /// existing resource/output conflict detection is unaffected and still
+    /// treats an optional read the same as a required one.
+    pub optional: bool,
+}
+
 /// Aggregated access patterns for a system or parameter.
 ///
 /// Used to detect conflicts between systems that would violate
 /// Rust's borrowing rules at the resource level.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` are implemented by hand (below) to compare only
+/// `resources`, `outputs` and `context_requirements` — the fields that
+/// describe scheduling/conflict behavior, which is what "two systems have
+/// the same access" has always meant here. `bindable_outputs` is
+/// `read_from`-validation metadata layered on top of an existing `outputs`
+/// read, not an independent access, so two descriptors that read the same
+/// outputs through different bindable-ness (`Out<T>` vs `OutAll<T>`, say)
+/// still compare equal.
+#[derive(Debug, Clone, Default)]
 pub struct SystemAccess {
     /// Resources accessed by this system/parameter.
     pub resources: Vec<Access>,
@@ -96,7 +147,22 @@ pub struct SystemAccess {
     /// Parameters can declare opaque string tags describing the execution
     /// context they need (e.g. [`ERROR_CONTEXT`](super::ERROR_CONTEXT)).
     pub context_requirements: Vec<&'static str>,
+    /// Output types read through `Out<T>` or `Option<Out<T>>`, for
+    /// `read_from` binding validation. A subset of `outputs`: every entry
+    /// here has a matching `outputs` entry, but not every `outputs` entry
+    /// has a match here (`OutAll<T>`, `ErrOut<T>`).
+    pub bindable_outputs: Vec<BindableOutput>,
 }
+
+impl PartialEq for SystemAccess {
+    fn eq(&self, other: &Self) -> bool {
+        self.resources == other.resources
+            && self.outputs == other.outputs
+            && self.context_requirements == other.context_requirements
+    }
+}
+
+impl Eq for SystemAccess {}
 
 impl SystemAccess {
     /// Creates an empty access descriptor.
@@ -118,6 +184,36 @@ impl SystemAccess {
     /// Adds an output write access.
     pub fn add_output<T: 'static>(&mut self) {
         self.outputs.push(Access::write::<T>());
+    }
+
+    /// Records a `read_from`-bindable output read (`Out<T>` or
+    /// `Option<Out<T>>`). Callers also push the matching `outputs` read
+    /// access separately — this only affects `read_from` validation.
+    ///
+    /// A hand-written [`SystemParam`](super::SystemParam) that resolves its
+    /// value through `Out<T>` calls this so a graph can wire it with
+    /// `read_from`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_system::param::{Access, SystemAccess};
+    ///
+    /// struct Plan;
+    ///
+    /// let mut access = SystemAccess::new();
+    /// access.outputs.push(Access::read::<Plan>());
+    /// access.add_bindable_output::<Plan>(true);
+    ///
+    /// assert_eq!(access.bindable_outputs.len(), 1);
+    /// assert!(access.bindable_outputs[0].optional);
+    /// ```
+    pub fn add_bindable_output<T: 'static>(&mut self, optional: bool) {
+        self.bindable_outputs.push(BindableOutput {
+            type_id: TypeId::of::<T>(),
+            type_name: type_name::<T>(),
+            optional,
+        });
     }
 
     /// Creates access for a read-only resource.
@@ -154,6 +250,8 @@ impl SystemAccess {
     pub fn merge(&mut self, other: &SystemAccess) {
         self.resources.extend(other.resources.iter().cloned());
         self.outputs.extend(other.outputs.iter().cloned());
+        self.bindable_outputs
+            .extend(other.bindable_outputs.iter().copied());
         for &tag in &other.context_requirements {
             self.require_context(tag);
         }
@@ -375,6 +473,33 @@ mod tests {
         access.add_output::<Output>();
         assert_eq!(access.outputs.len(), 1);
         assert_eq!(access.outputs[0].mode, AccessMode::Write);
+    }
+
+    #[test]
+    fn add_bindable_output_records_type_and_optionality() {
+        let mut access = SystemAccess::new();
+        assert!(access.bindable_outputs.is_empty());
+
+        access.add_bindable_output::<Counter>(false);
+        assert_eq!(access.bindable_outputs.len(), 1);
+        assert_eq!(access.bindable_outputs[0].type_id, TypeId::of::<Counter>());
+        assert!(!access.bindable_outputs[0].optional);
+
+        access.add_bindable_output::<Config>(true);
+        assert_eq!(access.bindable_outputs.len(), 2);
+        assert!(access.bindable_outputs[1].optional);
+    }
+
+    #[test]
+    fn merge_combines_bindable_outputs() {
+        let mut a = SystemAccess::new();
+        a.add_bindable_output::<Counter>(false);
+        let mut b = SystemAccess::new();
+        b.add_bindable_output::<Config>(true);
+
+        a.merge(&b);
+        assert_eq!(a.bindable_outputs.len(), 2);
+        assert!(a.bindable_outputs.iter().any(|bound| bound.optional));
     }
 
     #[test]

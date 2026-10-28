@@ -22,7 +22,7 @@ polaris_models = { path = "../polaris_models", version = "0.6" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.43", features = ["process", "time", "io-util"] }
+tokio = { version = "1.43", features = ["process", "signal", "time", "io-util", "fs", "sync", "rt", "macros"] }
 tracing = "0.1"
 names = { version = "0.14.0", default-features = false }
 
@@ -33,3 +33,6 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 # the unified feature resolution turns on `polaris_tools/dashboard`, which
 # makes `ToolsPlugin` require `AppPlugin`.
 polaris_app = { path = "../polaris_app", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

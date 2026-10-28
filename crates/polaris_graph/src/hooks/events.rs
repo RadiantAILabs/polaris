@@ -31,7 +31,7 @@
 //! ```
 
 use crate::ExecutionError;
-use crate::node::{ContextMode, NodeId};
+use crate::node::{ContextMode, NodeId, NodeName};
 use hashbrown::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -201,7 +201,7 @@ pub enum GraphEvent {
         /// Number of nodes in the graph.
         node_count: usize,
         /// Node ID to name mapping for all nodes in the graph.
-        node_map: Vec<(NodeId, &'static str)>,
+        node_map: Vec<(NodeId, NodeName)>,
     },
 
     /// Event fired after graph execution completes.
@@ -237,8 +237,10 @@ pub enum GraphEvent {
         labels: RunLabels,
         /// The node ID of the executing system.
         node_id: NodeId,
-        /// The system's name.
-        node_name: &'static str,
+        /// The system node's runtime display name. Defaults to the system's
+        /// static function name; overridden per-node with
+        /// [`SystemNodeBuilder::named`](crate::graph::SystemNodeBuilder::named).
+        node_name: NodeName,
     },
 
     /// Event emitted after a system completes successfully.
@@ -249,8 +251,10 @@ pub enum GraphEvent {
         labels: RunLabels,
         /// The node ID of the completed system.
         node_id: NodeId,
-        /// The system's name.
-        node_name: &'static str,
+        /// The system node's runtime display name. Defaults to the system's
+        /// static function name; overridden per-node with
+        /// [`SystemNodeBuilder::named`](crate::graph::SystemNodeBuilder::named).
+        node_name: NodeName,
         /// How long the system took to execute.
         duration: Duration,
     },
@@ -263,8 +267,10 @@ pub enum GraphEvent {
         labels: RunLabels,
         /// The node ID of the failed system.
         node_id: NodeId,
-        /// The system's name.
-        node_name: &'static str,
+        /// The system node's runtime display name. Defaults to the system's
+        /// static function name; overridden per-node with
+        /// [`SystemNodeBuilder::named`](crate::graph::SystemNodeBuilder::named).
+        node_name: NodeName,
         /// The error message.
         error: Arc<str>,
     },
@@ -281,7 +287,7 @@ pub enum GraphEvent {
         /// The node ID of the decision node.
         node_id: NodeId,
         /// The decision node's name.
-        node_name: &'static str,
+        node_name: NodeName,
     },
 
     /// Event emitted after a decision branch is selected and executed.
@@ -293,7 +299,7 @@ pub enum GraphEvent {
         /// The node ID of the decision node.
         node_id: NodeId,
         /// The decision node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The branch that was selected ("true" or "false").
         selected_branch: &'static str,
     },
@@ -310,7 +316,7 @@ pub enum GraphEvent {
         /// The node ID of the switch node.
         node_id: NodeId,
         /// The switch node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// Number of cases in the switch.
         case_count: usize,
         /// Whether a default case exists.
@@ -326,9 +332,9 @@ pub enum GraphEvent {
         /// The node ID of the switch node.
         node_id: NodeId,
         /// The switch node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The case key that was selected.
-        selected_case: &'static str,
+        selected_case: NodeName,
         /// Whether the default case was used.
         used_default: bool,
     },
@@ -345,7 +351,7 @@ pub enum GraphEvent {
         /// The node ID of the loop node.
         node_id: NodeId,
         /// The loop's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The maximum iterations allowed.
         max_iterations: usize,
     },
@@ -359,7 +365,7 @@ pub enum GraphEvent {
         /// The node ID of the loop node.
         node_id: NodeId,
         /// The loop's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The current iteration number (0-indexed).
         iteration: usize,
     },
@@ -373,7 +379,7 @@ pub enum GraphEvent {
         /// The node ID of the loop node.
         node_id: NodeId,
         /// The loop's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The total number of iterations executed.
         iterations: usize,
         /// Total nodes executed across all iterations.
@@ -394,7 +400,7 @@ pub enum GraphEvent {
         /// The node ID of the parallel node.
         node_id: NodeId,
         /// The parallel node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The number of parallel branches.
         branch_count: usize,
     },
@@ -408,7 +414,7 @@ pub enum GraphEvent {
         /// The node ID of the parallel node.
         node_id: NodeId,
         /// The parallel node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The number of parallel branches.
         branch_count: usize,
         /// Total nodes executed across all branches.
@@ -429,7 +435,7 @@ pub enum GraphEvent {
         /// The node ID of the scope node.
         node_id: NodeId,
         /// The scope node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// High-level context-boundary classification — `Shared`, `Inherit`,
         /// or `Isolated`. See
         /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
@@ -447,7 +453,7 @@ pub enum GraphEvent {
         /// The node ID of the scope node.
         node_id: NodeId,
         /// The scope node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// High-level context-boundary classification — `Shared`, `Inherit`,
         /// or `Isolated`. See
         /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
@@ -467,7 +473,7 @@ pub enum GraphEvent {
         /// The node ID of the dynamic node.
         node_id: NodeId,
         /// The dynamic node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// High-level context-boundary classification — `Shared`, `Inherit`,
         /// or `Isolated`. See
         /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
@@ -484,7 +490,7 @@ pub enum GraphEvent {
         /// The node ID of the dynamic node.
         node_id: NodeId,
         /// The dynamic node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// High-level context-boundary classification — `Shared`, `Inherit`,
         /// or `Isolated`. See
         /// [`ContextPolicy::mode`](crate::node::ContextPolicy::mode).
@@ -872,7 +878,7 @@ mod serde_tests {
             run_id: RunId::from_string("run-1"),
             labels: RunLabels::empty(),
             node_id: NodeId::from_string("node-1"),
-            node_name: "route",
+            node_name: "route".into(),
             mode: ContextMode::Shared,
         };
         assert_eq!(start.schedule_name(), "OnDynamicStart");
@@ -887,7 +893,7 @@ mod serde_tests {
             run_id: RunId::from_string("run-1"),
             labels: RunLabels::empty(),
             node_id: NodeId::from_string("node-1"),
-            node_name: "route",
+            node_name: "route".into(),
             mode: ContextMode::Shared,
             selected: Arc::from("evil\nkey"),
             nodes_executed: 3,

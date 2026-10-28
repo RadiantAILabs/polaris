@@ -4,6 +4,9 @@
 //! as a directed graph of systems and control flow constructs.
 
 mod builder;
+mod loop_output_retention;
+mod output_provenance;
+mod output_wiring;
 mod signature;
 mod validation;
 
@@ -11,12 +14,14 @@ use crate::edge::{Edge, EdgeId, SequentialEdge};
 use crate::node::{Node, NodeId, SystemNode, remap_node_id};
 pub use builder::SystemNodeBuilder;
 use hashbrown::{HashMap, HashSet};
+use loop_output_retention::LoopRetentionTable;
+use output_wiring::OutputWiring;
 use signature::LoopEntryCache;
-pub use signature::{GraphSignature, RenderedSignature, SignatureDiff};
+pub use signature::{GraphSignature, MatchingMode, RenderedSignature, SignatureDiff};
 use std::any::TypeId;
 use std::sync::RwLock;
 use std::time::Duration;
-pub use validation::{MergeError, ValidationError, ValidationResult, ValidationWarning};
+pub use validation::{MergeError, RouteKind, ValidationError, ValidationResult, ValidationWarning};
 
 /// A directed graph of systems.
 ///
@@ -74,6 +79,16 @@ pub struct Graph {
     /// recomputed. [`duplicate`](Graph::duplicate) starts the clone with an
     /// empty cache because node IDs are remapped.
     pub(crate) loop_entry_cache: RwLock<Option<LoopEntryCache>>,
+    /// Per-loop output retention configuration, keyed by the loop node's
+    /// [`NodeId`] — see [`loop_output_retention`](crate::graph::loop_output_retention)
+    /// for why this lives beside `LoopNode` rather than on it.
+    pub(crate) loop_retention: LoopRetentionTable,
+    /// `read_from` bindings recorded by
+    /// [`SystemNodeBuilder::read_from`], keyed by reader node and output
+    /// type. A side table rather than a field on [`SystemNode`](crate::node::SystemNode)
+    /// so [`duplicate`](Graph::duplicate) remaps it in one place; see
+    /// `output_wiring.rs`.
+    pub(crate) output_wiring: OutputWiring,
 }
 
 impl Graph {
@@ -129,6 +144,13 @@ impl Graph {
     #[must_use]
     pub fn max_duration(&self) -> Option<Duration> {
         self.max_duration
+    }
+
+    /// Returns the default and per-type output retention for `node`. The
+    /// default is one iteration and there are no overrides when the loop was
+    /// never configured.
+    pub(crate) fn loop_output_retention(&self, node: &NodeId) -> (usize, Vec<(TypeId, usize)>) {
+        self.loop_retention.for_node(node)
     }
 
     /// Gets a node by ID.
@@ -346,6 +368,8 @@ impl Graph {
             // The memoized loop-entry analysis names the *original* node IDs;
             // the clone recomputes against its own.
             loop_entry_cache: RwLock::new(None),
+            loop_retention: self.loop_retention.remap(&node_map),
+            output_wiring: self.output_wiring.remap(&node_map),
         }
     }
 
@@ -354,9 +378,47 @@ impl Graph {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Adds a sequential edge between two nodes.
+    ///
+    /// Callers must not give one source two edges to *distinct* targets: only
+    /// the first is ever followed, and [`Graph::validate`](Self::validate)
+    /// reports the shape as
+    /// [`ValidationError::AmbiguousRoute`](crate::graph::ValidationError::AmbiguousRoute).
+    /// Every builder upholds this by chaining from `last_node` and then
+    /// advancing `last_node` past the edge it just created; a new builder must
+    /// do the same.
     pub(crate) fn add_sequential_edge(&mut self, from: NodeId, to: NodeId) {
         let edge = Edge::Sequential(SequentialEdge::new(from, to));
         self.edges.push(edge);
+    }
+
+    /// Moves `other`'s nodes, edges, and per-node side tables into `self`,
+    /// keeping every node id as it is.
+    ///
+    /// Every builder method that builds a branch, case, loop body, handler, or
+    /// appended subgraph as a temporary `Graph` flattens it with this, so
+    /// configuration recorded against the temporary graph's nodes (loop
+    /// retention, `read_from` bindings) survives the move. It leaves out what
+    /// the caller wires by hand: `entry`, `last_node`, `max_duration`, and the
+    /// loop-entry cache, which describes `other`'s shape alone.
+    ///
+    /// The destructuring names every field on purpose: a field added to
+    /// [`Graph`] stops this from compiling until it is merged or listed as
+    /// left out, as [`duplicate`](Self::duplicate) does for the same reason.
+    pub(crate) fn absorb(&mut self, other: Graph) {
+        let Graph {
+            nodes,
+            edges,
+            entry: _,
+            last_node: _,
+            max_duration: _,
+            loop_entry_cache: _,
+            loop_retention,
+            output_wiring,
+        } = other;
+        self.nodes.extend(nodes);
+        self.edges.extend(edges);
+        self.loop_retention.merge(loop_retention);
+        self.output_wiring.merge(output_wiring);
     }
 
     /// Returns `Ok(())` if every node is reachable from `entry`, or a
@@ -510,22 +572,26 @@ impl Graph {
     }
 
     /// Returns `true` if any node reachable from the entry — including handler
-    /// subgraphs — is a [`Scope`](Node::Scope) or [`Dynamic`](Node::Dynamic)
-    /// boundary.
+    /// subgraphs — is a boundary whose IO the derived
+    /// [signature](Graph::signature) cannot see: a [`Scope`](Node::Scope)
+    /// with no declared contract.
     ///
-    /// Flat [signature](Graph::signature) derivation treats those boundaries as
-    /// opaque, so a candidate containing one presents a signature that hides the
-    /// IO crossing it — which is why such candidates are rejected as dynamic-node
-    /// candidates until recursive derivation lands. Handler subgraphs are
-    /// searched too: a boundary smuggled behind an error edge would otherwise
-    /// evade the rejection and re-enter selection at runtime.
+    /// Flat signature derivation treats those boundaries as opaque, so a
+    /// candidate containing one presents a signature that hides the IO crossing
+    /// it — which is why such candidates are rejected as dynamic-node
+    /// candidates until recursive derivation lands. A scope carrying a declared
+    /// contract and every dynamic node are *not* hidden: their contracts are
+    /// folded into the derived signature, and [`validate`](Graph::validate)
+    /// checks the interior or candidates against that interface. Handler
+    /// subgraphs are searched too: a boundary smuggled behind an error edge
+    /// would otherwise evade the rejection and re-enter selection at runtime.
     pub(crate) fn contains_nested_boundary(&self) -> bool {
         let Some(entry) = self.entry() else {
             return false;
         };
         self.reachable_nodes_with_handlers(&entry)
             .iter()
-            .any(|node| matches!(node, Node::Scope(_) | Node::Dynamic(_)))
+            .any(|node| matches!(node, Node::Scope(scope) if scope.contract.is_none()))
     }
 
     /// Collects output types produced by all system nodes reachable from `entry`.
@@ -550,9 +616,10 @@ impl Graph {
     /// This is the *optimistic* production set — "could any execution deposit
     /// this type?" — used to credit a node's contribution in analyses that
     /// must never reject a graph the runtime would execute (the run-start loop
-    /// check, output-reachability validation). It is the opposite direction
-    /// from [`Graph::signature`]'s pessimistic `requires_outputs` derivation,
-    /// which credits only *guaranteed* production. Dynamic candidates are
+    /// check, output-reachability validation). Its pessimistic dual is
+    /// [`Graph::must_produce_output_types`] — "will every execution have
+    /// deposited it?" — which backs [`Graph::signature`]'s `requires_outputs`
+    /// derivation; the two models must stay distinct. Dynamic candidates are
     /// represented by their contract, never recursed into. Scope graphs are
     /// traversed iteratively, so arbitrarily deep graphs do not consume the
     /// call stack and the analysis never needs to under-credit production at
@@ -573,8 +640,21 @@ impl Graph {
     /// handlers, descends through [`Scope`](Node::Scope) graphs, and credits a
     /// [`Dynamic`](Node::Dynamic) node's contract `produces`. Use it when a
     /// check must not reject a graph if any execution path could produce the
-    /// output. It deliberately does not replace happy-path or guaranteed-output
-    /// analyses.
+    /// output. It deliberately does not replace happy-path analysis or the
+    /// guaranteed-production walk
+    /// ([`Graph::must_produce_output_types_from`]).
+    ///
+    /// A [`Scope`](Node::Scope) carrying a declared contract is credited with
+    /// exactly the contract's `produces` rather than a full descent — *unless*
+    /// its [`ContextPolicy`](crate::node::ContextPolicy) is
+    /// [`shared()`](crate::node::ContextPolicy::shared), which still descends,
+    /// because there is no merge-back to narrow. This mirrors what the
+    /// executor actually does on exit: a non-shared declared scope filters its
+    /// merge-back to the contract, so crediting the full interior here would
+    /// let this optimistic pass admit a downstream read that the boundary
+    /// then drops, contradicting the check it exists to predict (an
+    /// undeclared-but-possible interior output must not pass a pre-flight
+    /// check it cannot survive at runtime).
     pub(crate) fn may_produce_output_types_from(&self, entry: &NodeId, acc: &mut HashSet<TypeId>) {
         let mut graphs = vec![(self, entry.clone())];
         while let Some((graph, graph_entry)) = graphs.pop() {
@@ -583,11 +663,16 @@ impl Graph {
                     Node::System(sys) => {
                         acc.insert(sys.output_type_id());
                     }
-                    Node::Scope(scope) => {
-                        if let Some(scope_entry) = scope.graph.entry() {
-                            graphs.push((&scope.graph, scope_entry));
+                    Node::Scope(scope) => match scope.contract() {
+                        Some(contract) if !scope.context_policy().is_shared() => {
+                            acc.extend(contract.produces().iter().map(|a| a.type_id));
                         }
-                    }
+                        _ => {
+                            if let Some(scope_entry) = scope.graph.entry() {
+                                graphs.push((&scope.graph, scope_entry));
+                            }
+                        }
+                    },
                     Node::Dynamic(dynamic) => {
                         acc.extend(dynamic.contract().produces().iter().map(|a| a.type_id));
                     }
@@ -1042,6 +1127,92 @@ mod duplicate_tests {
     }
 
     #[test]
+    fn duplicate_remaps_loop_retention_configuration() {
+        // Retention lives in a side table keyed by `NodeId`, not on `LoopNode`
+        // itself, so `duplicate` must remap its key alongside every other
+        // per-node reference — otherwise a configured loop's clone would
+        // silently fall back to the default.
+        let mut original = Graph::new();
+        original.add_loop::<i32, _, _>(
+            "loop",
+            |value| *value > 5,
+            |branch| {
+                branch.add_system(out_i32);
+            },
+        );
+        let loop_id = original.last_node().expect("the loop was just added");
+        original.set_loop_retention(loop_id.clone(), 3);
+        original.set_loop_retention_for_type::<String>(loop_id.clone(), 7);
+
+        assert_eq!(original.loop_output_retention(&loop_id).0, 3);
+
+        let clone = original.duplicate();
+        let cloned_loop_id = clone
+            .nodes()
+            .iter()
+            .find_map(|node| match node {
+                Node::Loop(lp) => Some(lp.id.clone()),
+                _ => None,
+            })
+            .expect("loop node");
+        assert_ne!(
+            cloned_loop_id, loop_id,
+            "duplicate mints a fresh id for the loop node"
+        );
+        assert_eq!(
+            clone.loop_output_retention(&cloned_loop_id).0,
+            3,
+            "the default retention carries over under the clone's own id"
+        );
+        assert_eq!(
+            clone.loop_output_retention(&loop_id).0,
+            1,
+            "the original's id means nothing in the clone's own table"
+        );
+    }
+
+    #[test]
+    fn absorb_moves_nodes_edges_and_side_tables_but_leaves_entry_and_last_node() {
+        let mut receiving = Graph::new();
+        receiving.add_system(out_i32);
+        let entry = receiving.entry();
+        let last_node = receiving.last_node();
+
+        let mut incoming = Graph::new();
+        incoming.add_loop_n("loop", 2, |body| {
+            body.add_system(out_string);
+        });
+        let loop_id = incoming.last_node().expect("the loop was just added");
+        incoming.set_loop_retention(loop_id.clone(), 3);
+        incoming.set_loop_retention_for_type::<String>(loop_id.clone(), 0);
+        let producer = incoming.add_system_node(out_i32);
+        let reader = incoming.add_system_node(out_bool);
+        incoming.read_from::<i32>(reader.clone(), producer);
+        let (incoming_nodes, incoming_edges) = (incoming.node_count(), incoming.edge_count());
+
+        receiving.absorb(incoming);
+
+        assert_eq!(receiving.node_count(), 1 + incoming_nodes);
+        assert_eq!(receiving.edge_count(), incoming_edges);
+        assert_eq!(
+            receiving.loop_output_retention(&loop_id),
+            (3, vec![(TypeId::of::<String>(), 0)]),
+            "the absorbed loop keeps its default and per-type retention"
+        );
+        assert_eq!(
+            receiving.output_wiring.for_reader(&reader).count(),
+            1,
+            "the absorbed read_from binding is kept"
+        );
+        assert_eq!(receiving.entry(), entry, "the receiver's entry is its own");
+        assert_eq!(
+            receiving.last_node(),
+            last_node,
+            "the caller wires last_node by hand"
+        );
+    }
+
+    #[test]
     fn duplicate_remaps_error_and_timeout_edges() {
         // The entry system carries both an error handler and a timeout handler,
         // so the clone must remap Error and Timeout edges in addition to the
@@ -1143,6 +1314,32 @@ mod duplicate_tests {
         original.add_scope("outer", middle, ContextPolicy::shared());
 
         let clone = original.duplicate();
+        assert!(clone.validate().is_ok());
+    }
+
+    #[test]
+    fn duplicate_preserves_a_declared_scope_contract() {
+        let mut inner = Graph::new();
+        inner.add_system(out_i32);
+        let mut original = Graph::new();
+        original.add_scope_with_contract(
+            "worker",
+            inner,
+            ContextPolicy::shared(),
+            GraphSignature::new().produce::<i32>(),
+        );
+
+        let clone = original.duplicate();
+        assert_eq!(
+            first_scope(&clone).contract(),
+            first_scope(&original).contract(),
+            "the declared contract must survive duplication"
+        );
+        assert_eq!(
+            clone.signature(),
+            original.signature(),
+            "a duplicate presents the same interface"
+        );
         assert!(clone.validate().is_ok());
     }
 

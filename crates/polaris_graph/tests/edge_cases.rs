@@ -7,7 +7,7 @@ mod test_utils;
 
 use polaris_graph::NodeId;
 use polaris_graph::executor::{ErrorKind, ExecutionError, GraphExecutor};
-use polaris_graph::graph::{Graph, GraphSignature};
+use polaris_graph::graph::{Graph, GraphSignature, ValidationError};
 use polaris_graph::hooks::schedule::{OnGraphFailure, OnGraphStart};
 use polaris_graph::hooks::{GraphEvent, HooksAPI};
 use polaris_graph::node::{ContextPolicy, DynamicSlot, RetryPolicy};
@@ -372,6 +372,72 @@ async fn loop_predicate_terminates_early() {
     );
 }
 
+/// Verifies that a predicate loop's explicit cap applies when the executor
+/// has no default iteration limit.
+#[tokio::test]
+async fn predicate_loop_uses_explicit_iteration_cap() {
+    let mut graph = Graph::new();
+    let counter = Arc::new(Mutex::new(0usize));
+    graph.add_boxed_system(Box::new(InitialStateSystem));
+
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "capped_loop",
+        |_state| false,
+        move |body| {
+            body.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+    let loop_id = graph.last_node().expect("the loop was just added");
+    graph.set_loop_max_iterations(loop_id, 2);
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+    let result = GraphExecutor::without_iteration_limit()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ExecutionError::MaxIterationsExceeded { max: 2, .. })
+    ));
+    assert_eq!(*counter.lock().unwrap(), 2);
+}
+
+/// Verifies that a predicate can end a loop before its explicit cap.
+#[tokio::test]
+async fn predicate_loop_ends_before_explicit_iteration_cap() {
+    let mut graph = Graph::new();
+    let counter = Arc::new(Mutex::new(0usize));
+    graph.add_boxed_system(Box::new(InitialStateSystem));
+
+    let counter_clone = Arc::clone(&counter);
+    graph.add_loop::<LoopState, _, _>(
+        "capped_loop",
+        |state| state.iteration >= 3,
+        move |body| {
+            body.add_boxed_system(Box::new(LoopIterationSystem {
+                counter: Arc::clone(&counter_clone),
+            }));
+        },
+    );
+    let loop_id = graph.last_node().expect("the loop was just added");
+    graph.set_loop_max_iterations(loop_id, 5);
+
+    let server = create_test_server();
+    let hooks = get_hooks(&server);
+    let mut ctx = server.create_context();
+    GraphExecutor::without_iteration_limit()
+        .execute(&graph, &mut ctx, hooks, None)
+        .await
+        .expect("predicate ends the loop before its cap");
+
+    assert_eq!(*counter.lock().unwrap(), 3);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOOP ENTRY GUARANTEE TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -559,7 +625,7 @@ async fn loop_entry_input_crosses_shared_scope_boundary() {
 fn loop_predicate_input_missing_on_entry_display() {
     let err = ExecutionError::LoopPredicateInputMissingOnEntry {
         node: NodeId::from_string("1"),
-        name: "unseeded_loop",
+        name: "unseeded_loop".into(),
         output_type: "LoopState",
     };
     let msg = format!("{err}");
@@ -620,13 +686,10 @@ async fn loop_entry_input_blocked_by_isolated_scope_fails_fast() {
     );
 }
 
-/// The dynamic twin of the isolated-scope fail-fast: a loop-heading candidate
-/// behind a non-shared dynamic boundary cannot see the parent seed, and the
-/// failure is the upfront entry error at the boundary. Scope and dynamic
-/// nodes share `execute_embedded`; this pins the dynamic side against future
-/// divergence.
-#[tokio::test]
-async fn loop_entry_input_blocked_by_isolated_dynamic_fails_fast() {
+/// A dynamic contract cannot promise an output produced only by a loop body:
+/// zero iterations are a successful path with no output to promote.
+#[test]
+fn isolated_dynamic_rejects_a_loop_only_contract_output() {
     let counter = Arc::new(Mutex::new(0usize));
 
     let counter_clone = Arc::clone(&counter);
@@ -654,33 +717,11 @@ async fn loop_entry_input_blocked_by_isolated_dynamic_fails_fast() {
         DynamicSlot::new(contract, ContextPolicy::new()),
     );
 
-    assert_graph_valid(&graph);
-    let executor = GraphExecutor::new();
-    let server = create_test_server();
-    let hooks = get_hooks(&server);
-    let mut ctx = server.create_context();
-    // The parent seed does not cross the non-shared boundary.
-    ctx.insert_output(LoopState { iteration: 0 });
-
-    let result = executor.execute(&graph, &mut ctx, hooks, None).await;
-
-    match result {
-        Err(ExecutionError::LoopPredicateInputMissingOnEntry {
-            name, output_type, ..
-        }) => {
-            assert_eq!(name, "inner_loop", "error names the candidate's loop");
-            assert!(
-                output_type.contains("LoopState"),
-                "error names the missing type: {output_type}"
-            );
-        }
-        other => panic!("expected LoopPredicateInputMissingOnEntry, got: {other:?}"),
-    }
-    assert_eq!(
-        *counter.lock().unwrap(),
-        0,
-        "no candidate iteration may run when the entry check fails"
-    );
+    assert!(matches!(
+        graph.validate().errors.as_slice(),
+        [ValidationError::DynamicCandidateMissingGuaranteedOutputs { missing, .. }]
+            if missing.iter().any(|access| access.type_name.contains("LoopState"))
+    ));
 }
 
 /// A max-iterations-only loop (`add_loop_n`, no termination predicate) heading

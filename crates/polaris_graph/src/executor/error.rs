@@ -1,7 +1,8 @@
 //! Error types for graph execution.
 
 use crate::graph::SignatureDiff;
-use crate::node::NodeId;
+use crate::hooks::events::RunId;
+use crate::node::{NodeId, NodeName};
 use crate::predicate::PredicateError;
 use polaris_system::param::{AccessMode, ErrorContext};
 use std::any::TypeId;
@@ -86,7 +87,7 @@ pub enum ExecutionError {
         /// The loop node whose predicate input is missing.
         node: NodeId,
         /// The loop node's name.
-        name: &'static str,
+        name: NodeName,
         /// The output type the predicate expects.
         output_type: &'static str,
     },
@@ -113,7 +114,7 @@ pub enum ExecutionError {
         /// The switch node ID.
         node: NodeId,
         /// The discriminator value that didn't match any case.
-        key: &'static str,
+        key: NodeName,
     },
     /// A dynamic node's selector chose a candidate key not present in the
     /// candidate set, and no usable default was configured.
@@ -121,7 +122,7 @@ pub enum ExecutionError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        name: &'static str,
+        name: NodeName,
         /// The candidate key that could not be resolved.
         key: Arc<str>,
     },
@@ -139,7 +140,7 @@ pub enum ExecutionError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        name: &'static str,
+        name: NodeName,
         /// How the registry's contract diverges from this node's slot contract.
         /// Boxed to keep [`ExecutionError`] small on the common success path.
         diff: Box<SignatureDiff>,
@@ -157,7 +158,7 @@ pub enum ExecutionError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        name: &'static str,
+        name: NodeName,
     },
     /// A registry-backed dynamic node could not read the [`SubgraphRegistry`]
     /// because it is currently held mutably (write-locked) during selection.
@@ -167,7 +168,7 @@ pub enum ExecutionError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        name: &'static str,
+        name: NodeName,
     },
     /// A registry-backed dynamic node's [`SubgraphRegistry`] exists in the parent
     /// context but is hidden by an enclosing scope's [`ContextPolicy`].
@@ -178,7 +179,7 @@ pub enum ExecutionError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        name: &'static str,
+        name: NodeName,
     },
     /// An internal framework invariant was violated.
     InternalError(String),
@@ -196,11 +197,42 @@ pub enum ExecutionError {
         /// The configured maximum duration.
         max: Duration,
     },
+    /// The run's [`RunCancellation`](crate::cancel::RunCancellation) was
+    /// raised and the executor stopped at a node boundary.
+    ///
+    /// Not a failure of any system: whatever the last node returned was
+    /// recorded normally, its hooks fired, and no error or timeout handler was
+    /// entered. Reported through the normal failure path, so `OnGraphFailure`
+    /// fires with this variant.
+    ///
+    /// A run that reaches its terminal node is **not** reported this way —
+    /// it completed, and there was nothing left to decline to start. That
+    /// holds for a terminal parallel node too, unless one of its branches
+    /// declined a node.
+    Interrupted {
+        /// The run that was interrupted. Matches the `run_id` on every
+        /// [`GraphEvent`](crate::hooks::events::GraphEvent) the run emitted.
+        run_id: RunId,
+        /// Where the stop was observed: the node the executor declined to
+        /// start, or — when the signal was observed as a node's error was
+        /// about to propagate — that node.
+        ///
+        /// When a branch of a parallel node stopped, this is the parallel
+        /// node's own id; the innermost branch boundary is not recoverable
+        /// once branches are joined.
+        node: NodeId,
+        /// Nodes that started before the stop, counted as
+        /// [`ExecutionResult::nodes_executed`](crate::ExecutionResult::nodes_executed)
+        /// counts them: a declined node is excluded, a failed one is included.
+        nodes_executed: usize,
+        /// Time from run start to the stop.
+        elapsed: Duration,
+    },
     /// A scope's `ContextPolicy` declared `forward_fresh::<T>()` for a resource
     /// that has no registered factory anywhere in the parent hierarchy.
     ScopeMissingFactory {
         /// The scope node's name.
-        scope: &'static str,
+        scope: NodeName,
         /// The resource type that was missing a factory.
         resource: &'static str,
     },
@@ -209,7 +241,7 @@ pub enum ExecutionError {
     /// in the parent's local scope at execution time.
     ScopeMissingResource {
         /// The scope node's name.
-        scope: &'static str,
+        scope: NodeName,
         /// The resource type that was missing.
         resource: &'static str,
         /// Which verb declared the crossing — `"forward"` or `"fork"`.
@@ -225,7 +257,7 @@ pub enum ExecutionError {
     /// resource is present but momentarily unavailable.
     ScopeResourceBusy {
         /// The scope node's name.
-        scope: &'static str,
+        scope: NodeName,
         /// The resource type that was held mutably.
         resource: &'static str,
         /// Which verb declared the crossing — `"forward"` or `"fork"`.
@@ -334,6 +366,17 @@ impl fmt::Display for ExecutionError {
                     "graph execution timed out after {elapsed:?} (max: {max:?})"
                 )
             }
+            ExecutionError::Interrupted {
+                node,
+                nodes_executed,
+                elapsed,
+                ..
+            } => {
+                write!(
+                    f,
+                    "run interrupted at node {node} after {nodes_executed} nodes ({elapsed:?})"
+                )
+            }
             ExecutionError::ScopeMissingFactory { scope, resource } => {
                 write!(
                     f,
@@ -426,6 +469,22 @@ pub enum ResourceValidationError {
         /// The type ID of the missing output.
         type_id: TypeId,
     },
+    /// A required output from a previous system is missing, detected while
+    /// validating a loop node's termination predicate.
+    ///
+    /// This mirrors [`MissingOutput`](Self::MissingOutput) but carries a
+    /// [`NodeName`] rather than `&'static str`, since loop names can be
+    /// runtime-constructed.
+    LoopMissingOutput {
+        /// The node ID of the loop requiring the output.
+        node: NodeId,
+        /// The name of the loop.
+        name: NodeName,
+        /// The type name of the missing output.
+        output_type: &'static str,
+        /// The type ID of the missing output.
+        type_id: TypeId,
+    },
     /// A scope's `ContextPolicy` declared `forward_fresh::<T>()` for a resource
     /// that has no registered factory in the parent context or globals.
     ///
@@ -438,7 +497,7 @@ pub enum ResourceValidationError {
         /// The scope node ID.
         scope: NodeId,
         /// The scope node's name.
-        scope_name: &'static str,
+        scope_name: NodeName,
         /// The resource type that was missing a factory.
         resource: &'static str,
     },
@@ -458,7 +517,7 @@ pub enum ResourceValidationError {
         /// The scope node ID.
         scope: NodeId,
         /// The scope node's name.
-        scope_name: &'static str,
+        scope_name: NodeName,
         /// The resource type that was missing.
         resource: &'static str,
         /// Which verb declared the crossing — `"forward"` or `"fork"`.
@@ -474,7 +533,7 @@ pub enum ResourceValidationError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The resource type the contract requires.
         resource: &'static str,
         /// The access mode the contract declared (read or write).
@@ -490,7 +549,7 @@ pub enum ResourceValidationError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        node_name: &'static str,
+        node_name: NodeName,
         /// The output type the contract requires.
         output: &'static str,
     },
@@ -508,7 +567,7 @@ pub enum ResourceValidationError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        node_name: &'static str,
+        node_name: NodeName,
     },
     /// A registry-backed dynamic node cannot reach a [`SubgraphRegistry`] from
     /// the context where candidate selection will run.
@@ -525,7 +584,7 @@ pub enum ResourceValidationError {
         /// The dynamic node ID.
         node: NodeId,
         /// The dynamic node's name.
-        node_name: &'static str,
+        node_name: NodeName,
     },
     /// Resource validation stopped descending because scope/dynamic nesting
     /// exceeded the executor's
@@ -572,6 +631,17 @@ impl fmt::Display for ResourceValidationError {
                 write!(
                     f,
                     "system '{system_name}' ({node}) requires missing output: {output_type}"
+                )
+            }
+            ResourceValidationError::LoopMissingOutput {
+                node,
+                name,
+                output_type,
+                ..
+            } => {
+                write!(
+                    f,
+                    "loop '{name}' ({node}) termination predicate requires missing output: {output_type}"
                 )
             }
             ResourceValidationError::ScopeMissingFactory {
@@ -743,4 +813,24 @@ pub(crate) enum SystemOutcome {
     Err(polaris_system::system::SystemError),
     /// System timed out after all retry attempts.
     Timeout,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_missing_output_names_the_loop() {
+        let node = NodeId::from_string("loop_1");
+        let error = ResourceValidationError::LoopMissingOutput {
+            node: node.clone(),
+            name: NodeName::from("refine"),
+            output_type: "Score",
+            type_id: TypeId::of::<u32>(),
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("loop 'refine' ({node}) termination predicate requires missing output: Score")
+        );
+    }
 }

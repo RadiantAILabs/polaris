@@ -115,3 +115,122 @@ pub fn document_to_json(doc: &Document) -> serde_json::Value {
         ),
     }
 }
+
+/// Whether a Bedrock model id accepts explicit `CachePoint` blocks.
+///
+/// Bedrock documents explicit prompt caching for Anthropic Claude and Amazon
+/// Nova models. Other vendors' models (`OpenAI`, Moonshot Kimi, xAI Grok) cache
+/// prefixes automatically and reject a request that carries a cache point, so
+/// the provider must leave the markers out for them.
+pub fn accepts_cache_points(id: &str) -> bool {
+    id.contains("anthropic.") || id.contains("amazon.nova")
+}
+
+/// Whether the model accepts its earlier reasoning back in the message
+/// history. Only Claude round-trips reasoning; `OpenAI` models on Bedrock
+/// reject a `reasoningText` block in assistant messages.
+pub fn accepts_reasoning_history(id: &str) -> bool {
+    id.contains("anthropic.")
+}
+
+/// Strips a Bedrock cross-region-inference-profile prefix (`us.`, `eu.`,
+/// `apac.`, `global.`, ...) and the `anthropic.` vendor prefix, and a
+/// trailing Bedrock version suffix (`-v1:0`), leaving a bare id shaped like a
+/// first-party Anthropic model id (e.g. `us.anthropic.claude-opus-4-1-20250805-v1:0`
+/// -> `claude-opus-4-1-20250805`).
+///
+/// Returns `id` unchanged when it contains no `anthropic.` substring (not a
+/// Bedrock Anthropic id), so passing an already-bare id is a no-op rather
+/// than mangling it.
+#[must_use]
+pub fn normalize_bedrock_model_id(id: &str) -> &str {
+    const VENDOR_PREFIX: &str = "anthropic.";
+    let without_prefix = match id.find(VENDOR_PREFIX) {
+        Some(idx) => &id[idx + VENDOR_PREFIX.len()..],
+        None => return id,
+    };
+    strip_bedrock_version_suffix(without_prefix)
+}
+
+/// Strips a trailing `-v<digits>:<digits>` Bedrock version suffix (e.g.
+/// `-v1:0`), if present; returns `id` unchanged otherwise.
+fn strip_bedrock_version_suffix(id: &str) -> &str {
+    let Some(colon_idx) = id.rfind(':') else {
+        return id;
+    };
+    let (before_colon, minor) = id.split_at(colon_idx);
+    let minor = &minor[1..];
+    if minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
+        return id;
+    }
+    let Some(v_idx) = before_colon.rfind("-v") else {
+        return id;
+    };
+    let major = &before_colon[v_idx + 2..];
+    if major.is_empty() || !major.bytes().all(|b| b.is_ascii_digit()) {
+        return id;
+    }
+    &before_colon[..v_idx]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_region_and_vendor_prefix_and_version_suffix() {
+        assert_eq!(
+            normalize_bedrock_model_id("us.anthropic.claude-opus-4-1-20250805-v1:0"),
+            "claude-opus-4-1-20250805"
+        );
+        assert_eq!(
+            normalize_bedrock_model_id("global.anthropic.claude-fable-5-1"),
+            "claude-fable-5-1"
+        );
+        assert_eq!(
+            normalize_bedrock_model_id("anthropic.claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn leaves_a_bare_first_party_id_unchanged() {
+        assert_eq!(
+            normalize_bedrock_model_id("claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn leaves_an_unversioned_id_unchanged_after_stripping_vendor_prefix() {
+        assert_eq!(
+            normalize_bedrock_model_id("us.anthropic.claude-opus-5-5"),
+            "claude-opus-5-5"
+        );
+    }
+
+    #[test]
+    fn does_not_strip_a_colon_that_is_not_a_version_suffix() {
+        // No `-v<digits>` immediately before the colon segment: left alone.
+        assert_eq!(
+            normalize_bedrock_model_id("anthropic.claude-weird:latest"),
+            "claude-weird:latest"
+        );
+    }
+
+    #[test]
+    fn only_claude_and_nova_accept_cache_points() {
+        assert!(accepts_cache_points("global.anthropic.claude-sonnet-5"));
+        assert!(accepts_cache_points(
+            "anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        assert!(accepts_cache_points("global.amazon.nova-2-lite-v1:0"));
+        assert!(!accepts_cache_points("global.openai.gpt-6-luna"));
+        assert!(accepts_reasoning_history(
+            "global.anthropic.claude-sonnet-5"
+        ));
+        assert!(!accepts_reasoning_history("global.openai.gpt-6-luna"));
+        assert!(!accepts_cache_points("global.moonshotai.kimi-k3"));
+        assert!(!accepts_cache_points("deepseek.v3.2"));
+    }
+}

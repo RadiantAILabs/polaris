@@ -3,7 +3,7 @@
 //! Uses the `OpenAI` Responses API.
 
 mod plugin;
-mod provider;
+pub(crate) mod provider;
 
 pub use plugin::OpenAiPlugin;
 pub use provider::OpenAiProvider;

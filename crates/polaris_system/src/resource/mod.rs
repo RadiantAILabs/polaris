@@ -55,7 +55,7 @@ mod output;
 )]
 mod resource;
 
-pub use output::{Output, OutputError, OutputId, OutputRef, Outputs};
+pub use output::{Output, OutputError, OutputId, OutputRef, Outputs, ProducerKey};
 pub use resource::{
     ForkStrategy, GlobalResource, LocalResource, Resource, ResourceError, ResourceFactory,
     ResourceId, ResourceRef, ResourceRefMut, Resources,

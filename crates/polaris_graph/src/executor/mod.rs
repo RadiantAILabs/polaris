@@ -30,19 +30,22 @@ mod run;
 pub use error::{CaughtError, ErrorKind, ExecutionError, ResourceValidationError};
 pub use run::DEFAULT_SWITCH_CASE;
 
+use crate::cancel::RunCancellation;
 use crate::edge::Edge;
 use crate::graph::Graph;
 use crate::hooks::HooksAPI;
 use crate::hooks::events::{GraphEvent, RunId, RunLabels};
 use crate::hooks::schedule::{OnGraphComplete, OnGraphFailure, OnGraphStart, OnSystemStart};
 use crate::middleware::{self, MiddlewareAPI};
-use crate::node::{CandidateSource, ContextPolicy, CrossingAction, DynamicNode, Node, NodeId};
+use crate::node::{
+    CandidateSource, ContextPolicy, CrossingAction, DynamicNode, Node, NodeId, NodeName,
+};
 use crate::registry::SubgraphRegistry;
 use hashbrown::HashSet;
 use polaris_system::param::{AccessMode, SystemContext};
 use polaris_system::plugin::{Schedule, ScheduleId};
 use std::any::{Any, TypeId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Per-invocation correlation context threaded through executor internals.
 ///
@@ -55,6 +58,140 @@ pub(crate) struct RunContext {
     pub(crate) run_id: RunId,
     /// Caller-supplied correlation labels.
     pub(crate) labels: RunLabels,
+    /// The run's cancellation observer, snapshotted from the caller's context
+    /// once at run start.
+    ///
+    /// `None` when the caller inserted no token — the boundary check is then a
+    /// `None` test per node and behaviour is exactly as it was. A token
+    /// inserted by a hook or system *after* run start is visible to later
+    /// `Res<RunCancellation>` reads but is not what the executor checks: the
+    /// executor's signal is fixed for the run.
+    pub(crate) cancellation: Option<RunCancellation>,
+    /// When this invocation started, so an interrupted outcome can report
+    /// elapsed time from wherever in the traversal it is constructed.
+    pub(crate) started_at: Instant,
+    /// The current loop iteration, recorded in the
+    /// [`ProducerInfo`](crate::ProducerInfo) of every output write.
+    ///
+    /// `0` outside any loop. [`execute_loop`](GraphExecutor::execute_loop)
+    /// overwrites this for the body's traversal; nested loops each overwrite
+    /// it again for their own body, so a write inside a doubly-nested loop
+    /// reports only the innermost loop's iteration (`output_path` records
+    /// every level). Diagnostic only: it never affects which entry replaces
+    /// which.
+    pub(crate) loop_iteration: u64,
+    /// Breadcrumb of scope/loop-iteration/parallel-branch nesting entered so
+    /// far, recorded in every output write's
+    /// [`ProducerInfo`](crate::ProducerInfo) — see [`crate::output_layers`]
+    /// for why this stays diagnostic-only. `root()` at the top of a run;
+    /// each boundary crossing shadows a local copy with one more segment
+    /// appended, exactly like `loop_iteration` already does.
+    pub(crate) output_path: crate::output_layers::WritePath,
+}
+
+impl RunContext {
+    /// Returns whether the run's cancellation signal is raised.
+    ///
+    /// One short lock-guarded read when a token is present, one `Option` test
+    /// when not.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(RunCancellation::is_cancelled)
+    }
+
+    /// The key an output written by `node` (named `node_name`) is stored
+    /// under: the node id as the key's id, plus a
+    /// [`ProducerInfo`](crate::ProducerInfo) for this run's position.
+    pub(crate) fn producer_key(
+        &self,
+        node: &NodeId,
+        node_name: &NodeName,
+    ) -> polaris_system::resource::ProducerKey {
+        crate::producer::ProducerInfo::new(
+            node.clone(),
+            node_name.clone(),
+            self.run_id.clone(),
+            self.output_path.clone(),
+            self.loop_iteration,
+        )
+        .into_key()
+    }
+
+    /// Builds the interrupted outcome for a stop observed at `node`.
+    pub(crate) fn interrupted(&self, node: &NodeId, nodes_executed: usize) -> ExecutionError {
+        ExecutionError::Interrupted {
+            run_id: self.run_id.clone(),
+            node: node.clone(),
+            nodes_executed,
+            elapsed: self.started_at.elapsed(),
+        }
+    }
+
+    /// Reports `err` as an interrupt when the signal is raised and the error is
+    /// node-attributable.
+    ///
+    /// `Interrupted` supersedes exactly a system failure, a per-node timeout, a
+    /// middleware failure, and an already-propagating `Interrupted` (whose node
+    /// count is accumulated). Every other variant — every structural fault and
+    /// `GraphTimeout` — propagates unchanged, so an ill-timed interrupt reports
+    /// "interrupted" instead of "your graph is malformed" for exactly none of
+    /// them. The allowlist is closed, so a future variant defaults to
+    /// propagating rather than being silently swallowed.
+    pub(crate) fn supersede(
+        &self,
+        node: &NodeId,
+        nodes_executed: usize,
+        err: ExecutionError,
+    ) -> ExecutionError {
+        match err {
+            ExecutionError::Interrupted { .. } => Self::accumulate(nodes_executed, err),
+            err if Self::yields_to_interrupt(&err) && self.is_cancelled() => {
+                self.interrupted(node, nodes_executed)
+            }
+            other => other,
+        }
+    }
+
+    /// Returns whether a raised signal takes the place of `err`.
+    ///
+    /// The closed allowlist [`supersede`](Self::supersede) applies: a system
+    /// failure, a per-node timeout, a middleware failure, or an interrupt that
+    /// is already propagating. Every other variant is a structural fault or
+    /// `GraphTimeout` and is reported as itself.
+    pub(crate) fn yields_to_interrupt(err: &ExecutionError) -> bool {
+        matches!(
+            err,
+            ExecutionError::SystemError(_)
+                | ExecutionError::Timeout { .. }
+                | ExecutionError::MiddlewareError { .. }
+                | ExecutionError::Interrupted { .. }
+        )
+    }
+
+    /// Adds the nodes this traversal level started to a propagating
+    /// `Interrupted`, leaving every other error untouched.
+    ///
+    /// Used where a level accumulates counts across several `execute_from`
+    /// calls — loop iterations, parallel branches — so the reported total
+    /// matches what `ExecutionResult::nodes_executed` would have reported had
+    /// the run finished.
+    pub(crate) fn accumulate(added: usize, err: ExecutionError) -> ExecutionError {
+        match err {
+            ExecutionError::Interrupted {
+                run_id,
+                node,
+                nodes_executed,
+                elapsed,
+            } => ExecutionError::Interrupted {
+                run_id,
+                node,
+                nodes_executed: nodes_executed + added,
+                elapsed,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Result of executing a graph.
@@ -459,7 +596,7 @@ impl GraphExecutor {
                         // and `share_rest` govern parent-chain visibility. Pure
                         // isolation (no `share` verbs) is `AllowOnly(empty)` — the
                         // child still sees globals through the parent.
-                        Self::validate_scope_crossings(&scope.id, scope.name, policy, ctx, errors);
+                        Self::validate_scope_crossings(&scope.id, &scope.name, policy, ctx, errors);
                         let mut child = ctx.child_filtered(policy.parent_filter_arc());
                         Self::populate_validation_locals(policy, ctx, &mut child);
                         self.validate_graph_resources(
@@ -498,7 +635,7 @@ impl GraphExecutor {
                     } else {
                         Self::validate_scope_crossings(
                             &dynamic.id,
-                            dynamic.name,
+                            &dynamic.name,
                             policy,
                             ctx,
                             errors,
@@ -541,7 +678,7 @@ impl GraphExecutor {
         {
             errors.push(ResourceValidationError::DynamicRegistryUnavailable {
                 node: dynamic.id.clone(),
-                node_name: dynamic.name,
+                node_name: dynamic.name.clone(),
             });
         }
     }
@@ -563,7 +700,7 @@ impl GraphExecutor {
     /// boundary — in the recorded error.
     fn validate_scope_crossings(
         node_id: &NodeId,
-        node_name: &'static str,
+        node_name: &NodeName,
         policy: &ContextPolicy,
         ctx: &SystemContext<'_>,
         errors: &mut Vec<ResourceValidationError>,
@@ -574,7 +711,7 @@ impl GraphExecutor {
                     if ctx.factory_fn_by_type_id(crossing.type_id).is_none() {
                         errors.push(ResourceValidationError::ScopeMissingFactory {
                             scope: node_id.clone(),
-                            scope_name: node_name,
+                            scope_name: node_name.clone(),
                             resource: crossing.type_name,
                         });
                     }
@@ -583,7 +720,7 @@ impl GraphExecutor {
                     if !ctx.contains_resource_by_type_id(crossing.type_id) {
                         errors.push(ResourceValidationError::ScopeMissingResource {
                             scope: node_id.clone(),
-                            scope_name: node_name,
+                            scope_name: node_name.clone(),
                             resource: crossing.type_name,
                             action: match crossing.action {
                                 CrossingAction::Fork(_) => "fork",
@@ -621,7 +758,7 @@ impl GraphExecutor {
             if !reachable {
                 errors.push(ResourceValidationError::DynamicContractMissingResource {
                     node: dynamic.id.clone(),
-                    node_name: dynamic.name,
+                    node_name: dynamic.name.clone(),
                     resource: access.type_name,
                     mode: access.mode,
                 });
@@ -692,8 +829,10 @@ impl GraphExecutor {
     /// ([`Graph::unguaranteed_loop_predicate_inputs`]): Decision, Switch,
     /// Loop, and Parallel contribute every output type reachable from their
     /// subgraphs; Scope contributes what its inner graph may merge back
-    /// (outputs cross the boundary outward on exit regardless of policy);
-    /// Dynamic contributes its contract's `produces`.
+    /// (outputs cross the boundary outward on exit regardless of policy) — or,
+    /// for a declared contract on a non-shared policy, exactly the contract's
+    /// `produces`, since that is all the runtime merge-back actually lets
+    /// through; Dynamic contributes its contract's `produces`.
     ///
     /// Embedded graphs recurse at their chain position: a shared scope graph
     /// or inline dynamic candidate is validated against the outputs available
@@ -779,9 +918,9 @@ impl GraphExecutor {
                             && !produced_outputs.contains(&input)
                             && !in_ctx(input)
                         {
-                            errors.push(ResourceValidationError::MissingOutput {
+                            errors.push(ResourceValidationError::LoopMissingOutput {
                                 node: lp.id.clone(),
-                                system_name: lp.name,
+                                name: lp.name.clone(),
                                 output_type: termination.input_type_name(),
                                 type_id: input,
                             });
@@ -800,7 +939,13 @@ impl GraphExecutor {
                 // it against the outputs available here (shared boundary) or
                 // against none (non-shared — outputs never cross inward), and
                 // credit what it may merge back, since scope outputs cross the
-                // boundary outward on exit regardless of policy.
+                // boundary outward on exit regardless of policy. A declared
+                // contract on a non-shared scope narrows that credit to the
+                // contract's `produces`, matching the executor's runtime
+                // merge-back filter — crediting the full interior here would
+                // pass this pre-flight check for a read the boundary then
+                // drops. `shared()` has no merge step to narrow, so it still
+                // credits the full interior regardless of any contract.
                 Node::Scope(scope) => {
                     if scope.context_policy.is_shared() {
                         self.validate_output_reachability(
@@ -810,6 +955,7 @@ impl GraphExecutor {
                             errors,
                             depth + 1,
                         );
+                        scope.graph.may_produce_output_types(&mut produced_outputs);
                     } else {
                         self.validate_output_reachability(
                             &scope.graph,
@@ -818,8 +964,14 @@ impl GraphExecutor {
                             errors,
                             depth + 1,
                         );
+                        match scope.contract() {
+                            Some(contract) => {
+                                produced_outputs
+                                    .extend(contract.produces().iter().map(|a| a.type_id));
+                            }
+                            None => scope.graph.may_produce_output_types(&mut produced_outputs),
+                        }
                     }
-                    scope.graph.may_produce_output_types(&mut produced_outputs);
                 }
                 // A dynamic node's contract is its interface. Its
                 // `requires_outputs` are free outputs the parent must supply to
@@ -843,7 +995,7 @@ impl GraphExecutor {
                                 errors.push(
                                     ResourceValidationError::DynamicContractMissingOutput {
                                         node: dynamic.id.clone(),
-                                        node_name: dynamic.name,
+                                        node_name: dynamic.name.clone(),
                                         output: access.type_name,
                                     },
                                 );
@@ -852,7 +1004,7 @@ impl GraphExecutor {
                     } else if !outputs.is_empty() {
                         errors.push(ResourceValidationError::DynamicContractOutputsBlocked {
                             node: dynamic.id.clone(),
-                            node_name: dynamic.name,
+                            node_name: dynamic.name.clone(),
                         });
                     }
                     if let CandidateSource::Inline(candidates) = &dynamic.source {
@@ -1018,9 +1170,22 @@ impl GraphExecutor {
         let entry = graph.entry().ok_or(ExecutionError::EmptyGraph)?;
         let node_count = graph.node_count();
 
+        // Snapshot the run's cancellation observer once, before any node runs.
+        // The lookup walks the caller's context normally, so a token in a
+        // parent of a `child()` is found; the guard is dropped here so it never
+        // competes with a system's own `Res<RunCancellation>` read.
+        let cancellation = ctx
+            .get_resource::<RunCancellation>()
+            .ok()
+            .map(|guard| RunCancellation::clone(&guard));
+
         let run_ctx = RunContext {
             run_id: RunId::new(),
             labels,
+            cancellation,
+            started_at: Instant::now(),
+            loop_iteration: 0,
+            output_path: crate::output_layers::WritePath::root(),
         };
 
         let middleware_info = middleware::info::GraphInfo {
@@ -1048,7 +1213,7 @@ impl GraphExecutor {
         middleware: &MiddlewareAPI,
         run_ctx: RunContext,
     ) -> Result<ExecutionResult, ExecutionError> {
-        let start = std::time::Instant::now();
+        let start = run_ctx.started_at;
 
         let node_map: Vec<_> = graph
             .nodes()
@@ -1164,7 +1329,7 @@ impl GraphExecutor {
             if !ctx.contains_output_by_type_id(unguaranteed.input_type_id) {
                 return Err(ExecutionError::LoopPredicateInputMissingOnEntry {
                     node: unguaranteed.node.clone(),
-                    name: unguaranteed.name,
+                    name: unguaranteed.name.clone(),
                     output_type: unguaranteed.input_type_name,
                 });
             }

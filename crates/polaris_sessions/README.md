@@ -9,7 +9,8 @@ Session management and orchestration for Polaris agents.
 - **`SessionsAPI`** - Core API for creating, resuming, and running sessions
 - **`SessionsPlugin`** - Plugin that registers the sessions infrastructure
 - **`SessionStore`** - Trait for pluggable persistence backends
-- **`InMemoryStore`** / **`FileStore`** - Built-in store implementations
+- **`InMemoryStore`** / **`FileStore`** - Built-in store implementations. `FileStore` refuses to save a session past its file-size and checkpoint-count limits (raise them with `FileStore::with_load_limits`), so a stored session can always be resumed
+- **`SessionsAPI::checkpoints()`** - Checkpoint capture, restore, pinning and retention. A failed restore leaves the session incoherent: turns, captures and `save_session` return `SessionError::RestoreFailed` until a restore succeeds
 
 ## Quick Start
 
@@ -36,7 +37,8 @@ let sessions = server.api::<SessionsAPI>().unwrap();
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `file-store` | Yes | File-based session persistence |
-| `http` | No | HTTP endpoints via `axum` |
+| `sessions-http` | No | HTTP endpoints via `axum` |
+| `typegen` | No | TypeScript bindings for `SessionMetadata` and the other model types |
 
 ## License
 

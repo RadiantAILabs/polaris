@@ -180,6 +180,13 @@ impl Edge {
 /// The simplest edge type, connecting one node to another
 /// with output flowing directly to input.
 ///
+/// A node has at most one sequential successor. Traversal is first-match, so a
+/// second edge from the same source is never followed;
+/// [`Graph::validate`](crate::Graph::validate) rejects that shape as
+/// [`ValidationError::AmbiguousRoute`](crate::graph::ValidationError::AmbiguousRoute).
+/// Fan-*in* is unrestricted — the rule is one successor per node, not one
+/// predecessor.
+///
 /// # Examples
 ///
 /// ```

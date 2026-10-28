@@ -1,7 +1,8 @@
 //! Shell command execution for Polaris agents.
 //!
 //! This crate provides shell command execution with a safety-first permission
-//! model, directory sandboxing, timeout enforcement, and output truncation.
+//! model, directory sandboxing, bounded incremental output, and managed
+//! process-tree cleanup.
 //!
 //! # Architecture
 //!
@@ -31,31 +32,79 @@
 //! call [`ShellExecutor::execute_confirmed`] with the preserved
 //! [`ShellRequest`] to run it.
 //!
-//! ## Known Limitation: Shell Expression Bypass
+//! ## Auto-allow is fail-closed
 //!
 //! Permission evaluation operates on the **literal command string** — it
 //! splits on shell operators (`&&`, `||`, `;`, `|`, `&`) but does **not**
-//! parse shell expressions. Command substitutions (`$(...)`, backticks),
-//! `eval`, `bash -c`, and similar constructs are treated as opaque text.
+//! parse shell expressions, while `sh -c` understands the whole grammar. A
+//! construct that the split cannot account for can therefore hide a second
+//! command inside one that matches an allow pattern.
+//!
+//! Rather than parse a shell grammar, the auto-allow path is fail-closed: a
+//! command that would otherwise be [`ShellPermission::Allow`] is downgraded to
+//! [`ShellPermission::Confirm`] when it contains a command substitution
+//! (`$(…)`, backticks), an arithmetic expansion, a process substitution
+//! (`<(…)` / `>(…)`), an indirect execution word (`eval`, `exec`, `source`,
+//! `.`), a redirection displacing the command word, or an unbalanced quote.
 //!
 //! For example, with `allowed_commands: ["echo *"]`:
 //! - `echo hello` → **allowed** (matches pattern)
 //! - `echo hello && rm -rf /` → **denied** (splits; `rm -rf /` checked separately)
-//! - `echo $(rm -rf /)` → **allowed** (matches `echo *` as literal text)
+//! - `echo $(rm -rf /)` → **confirm** (a substitution is never auto-allowed)
+//! - `echo '$(x)'` → **allowed** (single quotes are literal in `sh`)
 //!
-//! This is a deliberate design trade-off: perfectly parsing shell syntax is
-//! infeasible (nested substitutions, encoded strings, `printf` tricks, etc.),
-//! and heuristic detection provides a false sense of security. The pattern
-//! matching layer is a **convenience for reducing confirmation noise**, not a
-//! security boundary. The actual security boundary is Layer 4 — runtime user
-//! confirmation for unrecognized commands.
+//! The downgrade only ever moves a command from `Allow` to `Confirm`; `Deny`
+//! still wins over everything, and a command that decomposes cleanly is
+//! unaffected. Pattern matching remains a **convenience for reducing
+//! confirmation noise**, not a security boundary — the actual security
+//! boundary is Layer 4, runtime user confirmation for unrecognized commands.
 //!
-//! ## Known Limitation: Background Process Timeout
+//! ## Child environment
 //!
-//! Commands using the `&` operator (e.g., `sleep 100 &`) may leave orphaned
-//! processes after timeout. The shell exits immediately when backgrounding,
-//! so `kill_on_drop` only terminates the shell process, not its children.
-//! Process group isolation is planned as a future enhancement.
+//! Children do **not** inherit the server's environment by default. Each one
+//! is spawned with a cleared environment holding a trusted `PATH`
+//! ([`ShellConfig::path`]), whichever of `HOME`, `USER`, `LOGNAME`, `SHELL`,
+//! `LANG`, `TERM`, and `TMPDIR` the host has set, then
+//! [`ShellConfig::env_allowlist`], then [`ShellConfig::env`]. That keeps host
+//! credentials out of the captured or streamed output of an allowed command
+//! such as `env`. [`ShellConfig::with_inherit_env`]`(true)` restores full
+//! inheritance when a command genuinely needs the server's environment.
+//!
+//! ## Streaming and process management
+//!
+//! [`ShellExecutor::start`] returns a stable [`ShellProcess`] handle while
+//! preserving the same permission checks used by foreground execution. Output
+//! is read from distinct stdout and stderr pipes, retained within configured
+//! bounds, and optionally delivered through a non-blocking [`ShellSink`].
+//! Each [`ChannelSink`] accepts one run, including across its clones. Reuse
+//! fails before spawning. Dropping all producers drains an incomplete event
+//! stream and then closes it without synthesizing `Finished`.
+//! Overflow files contain the complete byte stream when creation succeeds and
+//! the per-stream spill quota ([`ShellConfig::max_overflow_bytes`]) is not
+//! reached.
+//!
+//! ## Who owns a running child
+//!
+//! A [`ShellProcess`] is the owner of its run's foreground lifetime:
+//!
+//! - **Dropping the handle requests a stop.** If the future awaiting a command
+//!   is dropped — a graph node's `max_duration` elapsing, a cancelled request,
+//!   an early `return` — the child is terminated rather than left running.
+//!   That includes the handle held internally by [`ShellExecutor::execute`].
+//! - **[`ShellProcess::detach`] is the explicit opt-out.** It returns the run's
+//!   [`ShellProcessId`] and leaves the child running under executor ownership,
+//!   reachable through [`ShellExecutor::process`], [`ShellExecutor::stop`], and
+//!   [`ShellExecutor::wait_for`].
+//! - **[`ShellPlugin`] cleanup is the backstop.** At server shutdown it stops
+//!   and reaps whatever detached runs are still live.
+//!
+//! On Unix, cancellation, timeout, and plugin shutdown signal every descendant
+//! that remains in the spawned process group. Normal leader exit forcibly
+//! stops remaining group members before reaping the leader. A program that deliberately
+//! leaves the group with `setsid` or `setpgid` is outside that guarantee. On
+//! Windows, version one is direct-child-only and descendants may survive. This
+//! crate uses pipes rather than a PTY, so interactive terminal behavior is not
+//! provided.
 //!
 //! # Permission Architecture (4 Layers)
 //!
@@ -113,11 +162,19 @@ pub mod error;
 pub mod executor;
 pub mod permission;
 pub mod plugin;
+pub mod process;
 pub mod tools;
 
 // Re-export core types at crate root.
 pub use error::ShellError;
-pub use executor::{ExecutionResult, ShellConfig, ShellExecutor, ShellRequest, ShellResponse};
+pub use executor::{
+    ExecutionResult, ShellConfig, ShellExecutor, ShellRequest, ShellResponse, ShellStartResponse,
+};
 pub use permission::ShellPermission;
 pub use plugin::ShellPlugin;
+pub use process::{
+    ChannelSink, ProcessTreeGuarantee, ShellCancel, ShellEvent, ShellEventDelivery,
+    ShellEventReceiver, ShellOutcome, ShellProcess, ShellProcessId, ShellProcessState,
+    ShellProcessStatus, ShellSink, ShellSinkHandle, ShellStream,
+};
 pub use tools::{ShellToolResponse, ShellTools};

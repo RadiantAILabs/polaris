@@ -8,7 +8,7 @@ use super::models::{
     RollbackRequest, SessionUptimeResponse, StreamTurnDone, Turn, TurnExecutionMetadata,
 };
 use crate::api::SessionsAPI;
-use crate::http::HttpIOProvider;
+use crate::http::ChannelIOProvider;
 use crate::info::SessionMetadata;
 use crate::store::{SessionId, TurnNumber};
 use axum::Json;
@@ -93,7 +93,7 @@ const TURN_OUTPUT_BUFFER: usize = 64;
 
 /// `POST /v1/sessions/{id}/turns` — process a turn.
 ///
-/// Creates an [`HttpIOProvider`] to bridge the request message to the
+/// Creates a [`ChannelIOProvider`] to bridge the request message to the
 /// agent's [`UserIO`] and collects all agent output into the response.
 ///
 /// Both input and output channels are bounded; agents that emit more than
@@ -116,7 +116,7 @@ pub(crate) async fn process_turn(
 
     // Bounded input (one user message per turn) and bounded output to
     // apply backpressure on agents that emit faster than we drain.
-    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, TURN_OUTPUT_BUFFER);
+    let (provider, input_tx, mut output_rx) = ChannelIOProvider::new(1, TURN_OUTPUT_BUFFER);
     let provider = Arc::new(provider);
     let recording = Arc::new(RecordingIOProvider {
         inner: Arc::clone(&provider),
@@ -234,7 +234,7 @@ pub(crate) async fn process_turn_stream(
     let info = sessions.session_info(&session_id)?;
     let turn_before = info.turn_number;
 
-    let (provider, input_tx, output_rx) = HttpIOProvider::new(1, TURN_OUTPUT_BUFFER);
+    let (provider, input_tx, output_rx) = ChannelIOProvider::new(1, TURN_OUTPUT_BUFFER);
     let provider = Arc::new(provider);
     let recording = Arc::new(RecordingIOProvider {
         inner: Arc::clone(&provider),
@@ -555,12 +555,12 @@ pub(crate) async fn get_uptime(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// IO provider that records each outbound message before delegating to an
-/// inner [`HttpIOProvider`].
+/// inner [`ChannelIOProvider`].
 ///
 /// Recording writes directly into the bounded turn-history entry, so SSE
 /// execution never accumulates a second unbounded message buffer.
 struct RecordingIOProvider {
-    inner: Arc<HttpIOProvider>,
+    inner: Arc<ChannelIOProvider>,
     sessions: SessionsAPI,
     session_id: SessionId,
     turn: TurnNumber,

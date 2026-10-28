@@ -505,8 +505,7 @@ without reading source.
 
 The catalog drift guard at `tests/plugin_catalog.rs` enforces that every plugin
 appears in the [Plugin Catalog](https://docs.rs/polaris-ai/latest/polaris_ai/plugins/);
-documentation-standard conformance itself is checked by `/review-docs` on every
-PR.
+documentation-standard conformance itself is checked in code review.
 
 ### Required Sections
 

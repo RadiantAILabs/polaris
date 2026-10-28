@@ -32,11 +32,13 @@
 //! assert!(result);
 //! ```
 
+use crate::node::NodeName;
 use polaris_system::param::SystemContext;
 use polaris_system::resource::Output;
 use std::any::{Any, TypeId, type_name};
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Deref;
 
 /// Errors that can occur during predicate evaluation.
 ///
@@ -89,13 +91,13 @@ impl std::error::Error for PredicateError {}
 /// # Examples
 ///
 /// ```
-/// use polaris_graph::predicate::{Predicate, BoxedPredicate, ErasedPredicate};
+/// use polaris_graph::predicate::{BoxedPredicate, ErasedPredicate};
 /// use polaris_system::param::SystemContext;
 ///
 /// struct Score { value: i32 }
 ///
 /// // Box a typed predicate into the trait object
-/// let pred: BoxedPredicate = Box::new(Predicate::<Score, _>::new(|s| s.value > 50));
+/// let pred = BoxedPredicate::new::<Score>(|s| s.value > 50);
 ///
 /// let mut ctx = SystemContext::new();
 /// ctx.insert_output(Score { value: 75 });
@@ -125,8 +127,78 @@ impl fmt::Debug for dyn ErasedPredicate {
     }
 }
 
-/// Type alias for boxed predicates stored in graph nodes.
-pub type BoxedPredicate = Box<dyn ErasedPredicate>;
+/// A type-erased, boxed predicate stored in graph nodes.
+///
+/// Construct one from a typed closure with [`BoxedPredicate::new`] without
+/// naming the concrete [`Predicate<T, F>`] type — the way a runtime graph
+/// builder assembles control flow from a registry of closures it only knows
+/// by input type at construction time, not at the call site.
+///
+/// Derefs to `dyn ErasedPredicate`, so `.evaluate(..)`, `.input_type_id()` and
+/// `.input_type_name()` are called directly on it exactly as they were on the
+/// former `Box<dyn ErasedPredicate>` type alias.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::predicate::BoxedPredicate;
+/// use polaris_system::param::SystemContext;
+///
+/// struct Score { value: i32 }
+///
+/// let pred = BoxedPredicate::new::<Score>(|s| s.value > 50);
+///
+/// let mut ctx = SystemContext::new();
+/// ctx.insert_output(Score { value: 75 });
+/// assert!(pred.evaluate(&ctx).unwrap());
+/// ```
+pub struct BoxedPredicate(Box<dyn ErasedPredicate>);
+
+impl BoxedPredicate {
+    /// Builds a boxed predicate from a typed closure reading `&T`.
+    #[must_use]
+    pub fn new<T>(func: impl Fn(&T) -> bool + Send + Sync + 'static) -> Self
+    where
+        T: Output,
+    {
+        Self(Box::new(Predicate::<T, _>::new(func)))
+    }
+
+    /// Unwraps into the underlying trait object.
+    pub(crate) fn into_inner(self) -> Box<dyn ErasedPredicate> {
+        self.0
+    }
+}
+
+impl Deref for BoxedPredicate {
+    type Target = dyn ErasedPredicate;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl fmt::Debug for BoxedPredicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl<T, F> From<Predicate<T, F>> for BoxedPredicate
+where
+    T: Output,
+    F: Fn(&T) -> bool + Send + Sync + 'static,
+{
+    fn from(predicate: Predicate<T, F>) -> Self {
+        Self(Box::new(predicate))
+    }
+}
+
+impl From<Box<dyn ErasedPredicate>> for BoxedPredicate {
+    fn from(predicate: Box<dyn ErasedPredicate>) -> Self {
+        Self(predicate)
+    }
+}
 
 /// Object-safe trait for type-erased discriminators.
 ///
@@ -136,13 +208,12 @@ pub type BoxedPredicate = Box<dyn ErasedPredicate>;
 /// # Examples
 ///
 /// ```
-/// use polaris_graph::predicate::{Discriminator, BoxedDiscriminator, ErasedDiscriminator};
+/// use polaris_graph::predicate::{BoxedDiscriminator, ErasedDiscriminator};
 /// use polaris_system::param::SystemContext;
 ///
 /// struct RouterOutput { action: &'static str }
 ///
-/// let disc: BoxedDiscriminator =
-///     Box::new(Discriminator::<RouterOutput, _>::new(|out| out.action));
+/// let disc = BoxedDiscriminator::new::<RouterOutput, _>(|out| out.action);
 ///
 /// let mut ctx = SystemContext::new();
 /// ctx.insert_output(RouterOutput { action: "tool" });
@@ -157,7 +228,7 @@ pub trait ErasedDiscriminator: Send + Sync {
     ///
     /// Returns an error if the required output is not found or
     /// if there's a context access error.
-    fn discriminate(&self, ctx: &SystemContext<'_>) -> Result<&'static str, PredicateError>;
+    fn discriminate(&self, ctx: &SystemContext<'_>) -> Result<NodeName, PredicateError>;
 
     /// Returns the [`TypeId`] of the input type this discriminator reads.
     fn input_type_id(&self) -> TypeId;
@@ -174,8 +245,83 @@ impl fmt::Debug for dyn ErasedDiscriminator {
     }
 }
 
-/// Type alias for boxed discriminators stored in switch nodes.
-pub type BoxedDiscriminator = Box<dyn ErasedDiscriminator>;
+/// A type-erased, boxed discriminator stored in switch nodes.
+///
+/// Construct one from a typed closure with [`BoxedDiscriminator::new`]
+/// without naming the concrete [`Discriminator<T, F>`] type — the way a
+/// runtime graph builder assembles a switch from a registry of closures it
+/// only knows by input type at construction time, not at the call site.
+///
+/// Derefs to `dyn ErasedDiscriminator`, so `.discriminate(..)`,
+/// `.input_type_id()` and `.input_type_name()` are called directly on it
+/// exactly as they were on the former `Box<dyn ErasedDiscriminator>` type
+/// alias.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_graph::predicate::BoxedDiscriminator;
+/// use polaris_system::param::SystemContext;
+///
+/// struct RouterOutput { action: &'static str }
+///
+/// let disc = BoxedDiscriminator::new::<RouterOutput, _>(|out| out.action);
+///
+/// let mut ctx = SystemContext::new();
+/// ctx.insert_output(RouterOutput { action: "tool" });
+/// assert_eq!(disc.discriminate(&ctx).unwrap(), "tool");
+/// ```
+pub struct BoxedDiscriminator(Box<dyn ErasedDiscriminator>);
+
+impl BoxedDiscriminator {
+    /// Builds a boxed discriminator from a typed closure reading `&T` and
+    /// returning a case key — a literal, an owned `String`, or any other
+    /// `impl Into<NodeName>`.
+    #[must_use]
+    pub fn new<T, R>(func: impl Fn(&T) -> R + Send + Sync + 'static) -> Self
+    where
+        T: Output,
+        R: Into<NodeName>,
+    {
+        Self(Box::new(Discriminator::<T, _>::new(func)))
+    }
+
+    /// Unwraps into the underlying trait object.
+    pub(crate) fn into_inner(self) -> Box<dyn ErasedDiscriminator> {
+        self.0
+    }
+}
+
+impl Deref for BoxedDiscriminator {
+    type Target = dyn ErasedDiscriminator;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl fmt::Debug for BoxedDiscriminator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl<T, F, R> From<Discriminator<T, F>> for BoxedDiscriminator
+where
+    T: Output,
+    F: Fn(&T) -> R + Send + Sync + 'static,
+    R: Into<NodeName>,
+{
+    fn from(discriminator: Discriminator<T, F>) -> Self {
+        Self(Box::new(discriminator))
+    }
+}
+
+impl From<Box<dyn ErasedDiscriminator>> for BoxedDiscriminator {
+    fn from(discriminator: Box<dyn ErasedDiscriminator>) -> Self {
+        Self(discriminator)
+    }
+}
 
 /// A typed predicate that evaluates a condition on a previous system output.
 ///
@@ -285,15 +431,17 @@ pub struct Discriminator<T, F> {
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<T, F> Discriminator<T, F>
+impl<T, F, R> Discriminator<T, F>
 where
     T: Output,
-    F: Fn(&T) -> &'static str + Send + Sync + 'static,
+    F: Fn(&T) -> R + Send + Sync + 'static,
+    R: Into<NodeName>,
 {
     /// Creates a new discriminator from a closure.
     ///
-    /// The closure receives an immutable reference to the output
-    /// and should return a case key string.
+    /// The closure receives an immutable reference to the output and should
+    /// return a case key — a `&'static str` literal, an owned `String`, or
+    /// any other `impl Into<NodeName>`.
     #[must_use]
     pub fn new(func: F) -> Self {
         Self {
@@ -303,24 +451,25 @@ where
     }
 }
 
-impl<T, F> ErasedDiscriminator for Discriminator<T, F>
+impl<T, F, R> ErasedDiscriminator for Discriminator<T, F>
 where
     T: Output,
-    F: Fn(&T) -> &'static str + Send + Sync + 'static,
+    F: Fn(&T) -> R + Send + Sync + 'static,
+    R: Into<NodeName>,
 {
-    fn discriminate(&self, ctx: &SystemContext<'_>) -> Result<&'static str, PredicateError> {
+    fn discriminate(&self, ctx: &SystemContext<'_>) -> Result<NodeName, PredicateError> {
         // Keep unit discriminators consistent with unit predicates: `()` is
         // implicit and never needs to be deposited as a system output.
         let unit = ();
         if let Some(input) = (&unit as &dyn Any).downcast_ref::<T>() {
-            return Ok((self.func)(input));
+            return Ok((self.func)(input).into());
         }
         let output = ctx
             .get_output::<T>()
             .map_err(|_| PredicateError::OutputNotFound {
                 type_name: type_name::<T>(),
             })?;
-        Ok((self.func)(&output))
+        Ok((self.func)(&output).into())
     }
 
     fn input_type_id(&self) -> TypeId {
@@ -400,7 +549,7 @@ mod tests {
 
     #[test]
     fn boxed_predicate() {
-        let pred: BoxedPredicate = Box::new(Predicate::<TestOutput, _>::new(|o| o.done));
+        let pred = BoxedPredicate::new::<TestOutput>(|o| o.done);
 
         let mut ctx = SystemContext::new();
         ctx.insert_output(TestOutput {
@@ -409,6 +558,136 @@ mod tests {
         });
 
         assert!(pred.evaluate(&ctx).unwrap());
+    }
+
+    /// A hand-written `ErasedPredicate`, not built via the `Predicate<T, F>`
+    /// typed wrapper — the shape a caller's own erased implementation takes.
+    struct AlwaysDone;
+
+    impl ErasedPredicate for AlwaysDone {
+        fn evaluate(&self, _ctx: &SystemContext<'_>) -> Result<bool, PredicateError> {
+            Ok(true)
+        }
+
+        fn input_type_id(&self) -> TypeId {
+            TypeId::of::<TestOutput>()
+        }
+
+        fn input_type_name(&self) -> &'static str {
+            "TestOutput"
+        }
+    }
+
+    #[test]
+    fn boxed_predicate_from_box_dyn_erased_predicate() {
+        let boxed: Box<dyn ErasedPredicate> = Box::new(AlwaysDone);
+        let pred: BoxedPredicate = boxed.into();
+
+        let ctx = SystemContext::new();
+        assert!(pred.evaluate(&ctx).unwrap());
+    }
+
+    /// A hand-written `ErasedDiscriminator`, not built via the
+    /// `Discriminator<T, F>` typed wrapper.
+    struct FixedKey;
+
+    impl ErasedDiscriminator for FixedKey {
+        fn discriminate(&self, _ctx: &SystemContext<'_>) -> Result<NodeName, PredicateError> {
+            Ok("fixed".into())
+        }
+
+        fn input_type_id(&self) -> TypeId {
+            TypeId::of::<TestOutput>()
+        }
+
+        fn input_type_name(&self) -> &'static str {
+            "TestOutput"
+        }
+    }
+
+    #[test]
+    fn boxed_discriminator_from_box_dyn_erased_discriminator() {
+        let boxed: Box<dyn ErasedDiscriminator> = Box::new(FixedKey);
+        let disc: BoxedDiscriminator = boxed.into();
+
+        let ctx = SystemContext::new();
+        assert_eq!(disc.discriminate(&ctx).unwrap(), "fixed");
+    }
+
+    #[tokio::test]
+    async fn custom_erased_predicate_boxed_builds_working_loop() {
+        use crate::executor::GraphExecutor;
+        use crate::graph::Graph;
+        use polaris_system::param::Out;
+
+        #[derive(Debug, Clone)]
+        struct Counter {
+            value: i32,
+        }
+
+        #[polaris_system::system]
+        async fn init_counter() -> Counter {
+            Counter { value: 0 }
+        }
+
+        #[polaris_system::system]
+        async fn increment(counter: Out<Counter>) -> Counter {
+            Counter {
+                value: counter.value + 1,
+            }
+        }
+
+        /// A hand-written `ErasedPredicate`, boxed the way custom
+        /// implementations were boxed before `BoxedPredicate` became a
+        /// newtype: `Box::new(..) as Box<dyn ErasedPredicate>` converted with
+        /// `.into()`.
+        struct DoneAtThree;
+
+        impl ErasedPredicate for DoneAtThree {
+            fn evaluate(&self, ctx: &SystemContext<'_>) -> Result<bool, PredicateError> {
+                let counter =
+                    ctx.get_output::<Counter>()
+                        .map_err(|_| PredicateError::OutputNotFound {
+                            type_name: "Counter",
+                        })?;
+                Ok(counter.value >= 3)
+            }
+
+            fn input_type_id(&self) -> TypeId {
+                TypeId::of::<Counter>()
+            }
+
+            fn input_type_name(&self) -> &'static str {
+                "Counter"
+            }
+        }
+
+        let termination: BoxedPredicate =
+            (Box::new(DoneAtThree) as Box<dyn ErasedPredicate>).into();
+
+        let mut graph = Graph::new();
+        graph.add_system(init_counter);
+        graph.add_loop_boxed("counter_loop", termination, |g| {
+            g.add_system(increment);
+        });
+
+        let mut ctx = SystemContext::new();
+        let executor = GraphExecutor::new();
+        let result = executor
+            .execute(&graph, &mut ctx, None, None)
+            .await
+            .expect("loop should complete");
+
+        // The final `increment` call's return value is taken out of `ctx` and
+        // into the result (`ExecutionResult::output`), not left queryable on
+        // `ctx` — see `ctx.outputs_mut().take_last()` in `executor/mod.rs`.
+        let counter = result
+            .output::<Counter>()
+            .expect("the loop's last iteration produces the final Counter");
+        assert_eq!(
+            counter.value, 3,
+            "loop should run until the predicate is satisfied"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -466,8 +745,7 @@ mod tests {
 
     #[test]
     fn boxed_discriminator() {
-        let disc: BoxedDiscriminator =
-            Box::new(Discriminator::<RouterOutput, _>::new(|o| o.action));
+        let disc = BoxedDiscriminator::new::<RouterOutput, _>(|o| o.action);
 
         let mut ctx = SystemContext::new();
         ctx.insert_output(RouterOutput { action: "agent" });

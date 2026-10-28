@@ -109,7 +109,9 @@ graph.add_loop::<LoopState, _, _>(
 );
 ```
 
-**Dynamic selection** (runtime choice among signature-checked subgraphs; see
+**Dynamic selection** (runtime choice among signature-checked subgraphs;
+[`MatchingMode`](crate::graph::MatchingMode) selects how strictly a candidate is
+held to the slot contract, and see
 [`SubgraphRegistry`](crate::graph::SubgraphRegistry) for a per-session,
 swappable candidate set):
 
@@ -139,12 +141,12 @@ graph.add_dynamic(
 
 | Type | Purpose |
 |------|---------|
-| **Sequential** | Linear flow (created automatically by builder chaining) |
+| **Sequential** | Linear flow (created automatically by builder chaining; at most one per node) |
 | **Conditional** | True/false branch from a Decision node |
 | **Parallel** | Fork to parallel branches |
 | **`LoopBack`** | End of loop body back to loop node |
-| **Error** | Route from failed system to error handler subgraph |
-| **Timeout** | Route from timed-out system to timeout handler |
+| **Error** | Route from failed system to error handler subgraph (at most one per node) |
+| **Timeout** | Route from timed-out system to timeout handler (at most one per node) |
 
 # Execution
 
@@ -174,6 +176,51 @@ let result = executor.execute(&graph, &mut ctx, None, None).await?;
 # Ok(())
 # }
 ```
+
+# Cancellation
+
+A run carries at most one stop signal, split in two:
+[`CancellationSource`](crate::graph::CancellationSource) raises it,
+[`RunCancellation`](crate::graph::RunCancellation) — an ordinary per-run
+`LocalResource` — notices it. Whoever drives the executor inserts the observer
+into the run's root context; a caller that inserts nothing gets today's
+behaviour, and the run is not cancellable.
+
+```no_run
+# use polaris_ai::graph::{CancellationSource, Graph, GraphExecutor};
+# use polaris_ai::system::param::SystemContext;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let graph = Graph::new();
+let source = CancellationSource::new();
+let mut ctx = SystemContext::new();
+ctx.insert(source.token());
+
+// From a signal-listener task, a UI callback, or another task:
+source.cancel();
+
+# let executor = GraphExecutor::new();
+let outcome = executor.execute(&graph, &mut ctx, None, None).await;
+// Err(ExecutionError::Interrupted { run_id, node, nodes_executed, elapsed })
+# Ok(())
+# }
+```
+
+The executor checks the signal at the node boundary — before starting a node,
+and before letting a node-attributable error propagate — and **never drops a
+running future**, including a parallel sibling's. An interrupt is not a
+failure of any system: no error or timeout handler is entered, the last node's
+hooks fire normally, and `OnGraphFailure` reports
+[`ExecutionError::Interrupted`](crate::graph::ExecutionError). A run that
+reaches its terminal node completes — including a final parallel node, unless
+one of its branches declined a node because the signal was raised.
+
+How promptly a node stops is the system's choice, and both choices are safe: a
+system that races `RunCancellation::run_until_cancelled` returns at once, and
+one that never reads the token runs to completion while the run stops at the
+next boundary. Sessions raise the signal through
+[`SessionsAPI`](crate::sessions::SessionsAPI)'s `interrupt_turn`.
+Details live in the repository's `docs/reference/graph.md` under
+"Cancellation".
 
 # Error Handling
 
@@ -238,7 +285,11 @@ mw.register_system("timer", |info: SystemInfo, ctx, next| {
 # Validation
 
 `graph.validate()` checks structural validity (entry point, edge
-connectivity, predicate/branch presence). `executor.validate_resources()`
+connectivity, predicate/branch presence, and that no node declares more than
+one route for the same outcome — success, error, or timeout: lookup is
+first-match, so a second route is never taken, and it is reported as
+[`ValidationError::AmbiguousRoute`](crate::graph::ValidationError::AmbiguousRoute)).
+`executor.validate_resources()`
 checks that all `Res<T>`, `ResMut<T>`, and `Out<T>` parameters can be
 satisfied before execution. Independently, the executor always verifies at
 run start that every main-chain loop's termination predicate input is
@@ -246,12 +297,19 @@ produced before the loop or already present in the context, failing fast
 with `LoopPredicateInputMissingOnEntry` otherwise.
 
 Conditional production is phase-specific. Composition signatures are
-pessimistic: a decision or switch branch is not guaranteed to run, so its
-outputs cannot erase a declared requirement. Pre-flight and run-start checks
-are optimistic: they credit every branch that might run, preserving outputs
-from nested scopes, parallel branches, and dynamic contracts. After a branch
-is selected, execution observes the live output channel exactly and returns a
-typed missing-output error if the selected path did not produce the value.
+pessimistic: they erase a declared requirement only for production the
+runtime guarantees. A parallel node's branches all run and a scope's
+interior always merges back, so what those regions guarantee is credited to
+the enclosing chain; a decision or switch case, a loop body, and a dynamic
+candidate are not guaranteed to run, so their outputs are not. Production
+behind an error or timeout handler is not credited either -- a caught
+failure diverts into the handler and ends the region, so the region
+completes with that output missing. Pre-flight and run-start checks are
+optimistic instead: they credit every branch that might run, preserving
+outputs from nested scopes, parallel branches, and dynamic contracts. After
+a branch is selected, execution observes the live output channel exactly and
+returns a typed missing-output error if the selected path did not produce
+the value.
 
 Every such check follows the layer's verification-phase rules. Checks run
 at one of five phases -- Rust compile time, graph validate time,

@@ -29,6 +29,7 @@
 use crate::param::{ParamError, SystemAccess, SystemContext};
 use crate::resource::Output;
 use std::any::{Any, TypeId, type_name};
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -167,6 +168,206 @@ pub trait ErasedSystem: Send + Sync + 'static {
 ///
 /// Use this type alias for storing heterogeneous systems in collections.
 pub type BoxedSystem = Box<dyn ErasedSystem>;
+
+/// A type-erased system whose output type remains visible at compile time.
+///
+/// `TypedSystem<O>` lets composition helpers name the output they require
+/// without exposing the concrete system type or the marker used by
+/// [`IntoSystem`]. Convert a system at the call site with [`erase`], then pass
+/// the handle to an API that accepts boxed systems, such as
+/// `Graph::system_boxed` in `polaris_graph`.
+///
+/// `O` is the system's [`Output`](System::Output), which for a fallible system
+/// is the success type — a `Result<T, SystemError>` return erases to
+/// `TypedSystem<T>`, matching how `Out<T>` reads a fallible system's value.
+/// Fallibility travels alongside `O` and is readable via
+/// [`is_fallible`](Self::is_fallible).
+///
+/// The handle is inspectable without being consumed:
+/// [`name`](Self::name), [`output_type_name`](Self::output_type_name),
+/// [`access`](Self::access), and [`is_fallible`](Self::is_fallible) mirror the
+/// [`System`] methods of the same name, so a helper can log or branch on a
+/// caller-supplied stage while still holding its compile-time `O`.
+///
+/// # Example
+///
+/// ```
+/// use polaris_system::system::{TypedSystem, erase};
+///
+/// async fn produce() -> i32 { 42 }
+///
+/// fn accepts_i32(_system: TypedSystem<i32>) {}
+///
+/// accepts_i32(erase(produce));
+/// ```
+///
+/// A mismatched output is rejected at compile time:
+///
+/// ```compile_fail
+/// use polaris_system::system::{TypedSystem, erase};
+///
+/// async fn produce() -> String { String::new() }
+///
+/// fn accepts_i32(_system: TypedSystem<i32>) {}
+///
+/// accepts_i32(erase(produce));
+/// ```
+#[must_use = "a typed system must be added to a graph or converted into a boxed system"]
+pub struct TypedSystem<O: Output> {
+    inner: BoxedSystem,
+    _output: PhantomData<O>,
+}
+
+impl<O: Output> TypedSystem<O> {
+    /// Returns the erased system's name, for logging and tracing.
+    ///
+    /// Mirrors [`System::name`]. Lets a composition helper report which stage
+    /// it was handed without consuming the handle — and so without giving up
+    /// the compile-time `O` the handle exists to carry.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    /// Returns the name of the erased system's output type, for diagnostics.
+    ///
+    /// Mirrors [`ErasedSystem::output_type_name`]. This is the runtime spelling
+    /// of `O`, useful in a helper's own error messages.
+    #[must_use]
+    pub fn output_type_name(&self) -> &'static str {
+        self.inner.output_type_name()
+    }
+
+    /// Returns the erased system's declared resource and output access.
+    ///
+    /// Mirrors [`System::access`]. A helper can inspect what a caller-supplied
+    /// stage reads and writes before deciding where to place it.
+    #[must_use]
+    pub fn access(&self) -> SystemAccess {
+        self.inner.access()
+    }
+
+    /// Returns whether the erased system can fail with a user-defined error.
+    ///
+    /// Mirrors [`System::is_fallible`]. Fallibility is orthogonal to `O`: the
+    /// [`#[system]`](macro@crate::system) macro extracts `T` from a
+    /// `Result<T, SystemError>` return type as the system's output, so both
+    /// `async fn() -> i32` and `async fn() -> Result<i32, SystemError>` erase
+    /// to `TypedSystem<i32>` and are told apart by this flag. A composition
+    /// helper that wires error handling reads it here rather than inferring it
+    /// from the output type.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_system::system;
+    /// use polaris_system::system::{SystemError, erase};
+    ///
+    /// #[system]
+    /// async fn fallible_stage() -> Result<i32, SystemError> { Ok(7) }
+    ///
+    /// async fn infallible_stage() -> i32 { 7 }
+    ///
+    /// assert!(erase(fallible_stage).is_fallible());
+    /// assert!(!erase(infallible_stage).is_fallible());
+    /// ```
+    #[must_use]
+    pub fn is_fallible(&self) -> bool {
+        self.inner.is_fallible()
+    }
+}
+
+impl<O: Output> fmt::Debug for TypedSystem<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypedSystem")
+            .field("name", &self.name())
+            .field("output_type", &self.output_type_name())
+            .field("fallible", &self.is_fallible())
+            .finish()
+    }
+}
+
+/// Erases a system's concrete and marker types while retaining its output type.
+///
+/// This is useful at composition boundaries: callers erase their concrete
+/// systems once, while the receiving helper can declare a compact
+/// [`TypedSystem<O>`] parameter and still reject a system with the wrong
+/// output type at compile time.
+///
+/// Accepts anything [`IntoSystem`] does — a bare async function, or a factory
+/// function returning a [`System`], which is what the
+/// [`#[system]`](macro@crate::system) macro generates.
+///
+/// # Example
+///
+/// ```
+/// use polaris_system::system::{TypedSystem, erase};
+///
+/// // The helper names the output it needs, not the system type or marker.
+/// fn add_stage(stage: TypedSystem<i32>) -> &'static str {
+///     stage.name()
+/// }
+///
+/// async fn predict() -> i32 { 7 }
+///
+/// assert!(add_stage(erase(predict)).contains("predict"));
+/// ```
+///
+/// See [`TypedSystem`] for what the handle preserves and for the compile-time
+/// rejection of a mismatched output.
+pub fn erase<S, M>(system: S) -> TypedSystem<<S::System as System>::Output>
+where
+    S: IntoSystem<M>,
+    S::System: 'static,
+{
+    TypedSystem {
+        inner: Box::new(system.into_system()),
+        _output: PhantomData,
+    }
+}
+
+/// Converts a boxed or typed-erased system into a [`BoxedSystem`].
+///
+/// Graph construction APIs take `impl IntoBoxedSystem` rather than a concrete
+/// [`BoxedSystem`] so existing call sites keep working while typed-erased
+/// handles are accepted too. Three forms convert:
+///
+/// - `Box<S>` where `S` implements [`ErasedSystem`] — a boxed concrete system,
+///   which by the blanket impl covers every `S: System`.
+/// - [`BoxedSystem`] — an already-erased `Box<dyn ErasedSystem>`.
+/// - [`TypedSystem<O>`] — a handle produced by [`erase`].
+///
+/// `Box<dyn System>` is deliberately *not* among them: [`System`] has an
+/// associated `Output` type and so is not object safe, which is the reason
+/// [`ErasedSystem`] and [`BoxedSystem`] exist.
+pub trait IntoBoxedSystem {
+    /// Converts this value into a type-erased boxed system.
+    fn into_boxed_system(self) -> BoxedSystem;
+}
+
+impl<S: ErasedSystem> IntoBoxedSystem for Box<S> {
+    fn into_boxed_system(self) -> BoxedSystem {
+        self
+    }
+}
+
+impl IntoBoxedSystem for BoxedSystem {
+    fn into_boxed_system(self) -> BoxedSystem {
+        self
+    }
+}
+
+impl<O: Output> From<TypedSystem<O>> for BoxedSystem {
+    fn from(system: TypedSystem<O>) -> Self {
+        system.inner
+    }
+}
+
+impl<O: Output> IntoBoxedSystem for TypedSystem<O> {
+    fn into_boxed_system(self) -> BoxedSystem {
+        self.into()
+    }
+}
 
 impl<S: System> ErasedSystem for S {
     fn name(&self) -> &'static str {
@@ -663,5 +864,157 @@ mod tests {
         // Type info preserved
         assert_eq!(systems[0].output_type_id(), TypeId::of::<i32>());
         assert_eq!(systems[1].output_type_id(), TypeId::of::<String>());
+    }
+
+    #[test]
+    fn typed_system_erasure_preserves_runtime_metadata() {
+        async fn int_system() -> i32 {
+            42
+        }
+
+        let typed: TypedSystem<i32> = erase(int_system);
+        let boxed: BoxedSystem = typed.into();
+
+        assert_eq!(boxed.output_type_id(), TypeId::of::<i32>());
+        assert_eq!(boxed.output_type_name(), type_name::<i32>());
+        assert!(boxed.name().contains("int_system"));
+        assert!(
+            !boxed.is_fallible(),
+            "an infallible system stays infallible through erasure"
+        );
+    }
+
+    /// A manual `System` impl that declares fallibility, as a provider outside
+    /// the `#[system]` macro would.
+    struct ManualFallibleSystem;
+
+    impl System for ManualFallibleSystem {
+        type Output = i32;
+
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a SystemContext<'_>,
+        ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+            Box::pin(async move { Err(SystemError::ExecutionError("boom".into())) })
+        }
+
+        fn name(&self) -> &'static str {
+            "manual_fallible_system"
+        }
+
+        fn is_fallible(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn typed_system_reports_fallibility_of_the_erased_system() {
+        // The `#[system]` macro extracts `T` from `Result<T, SystemError>` as
+        // the output type, so a fallible and an infallible system with the same
+        // success type erase to the *same* `TypedSystem<O>`. Fallibility is
+        // carried alongside `O`, not inside it.
+        async fn infallible() -> i32 {
+            42
+        }
+
+        let infallible: TypedSystem<i32> = erase(infallible);
+        let fallible: TypedSystem<i32> = erase(|| ManualFallibleSystem);
+
+        assert!(!infallible.is_fallible());
+        assert!(fallible.is_fallible());
+
+        // The flag survives conversion into a `BoxedSystem`, which is what
+        // graph construction consumes.
+        assert!(!BoxedSystem::from(infallible).is_fallible());
+        assert!(BoxedSystem::from(fallible).is_fallible());
+    }
+
+    #[test]
+    fn typed_system_accessors_mirror_the_erased_system() {
+        use crate::param::Res;
+
+        /// Declares real resource access, so `access()` parity is non-vacuous.
+        struct ReadCounterSystem;
+
+        impl System for ReadCounterSystem {
+            type Output = i32;
+
+            fn run<'a>(
+                &'a self,
+                ctx: &'a SystemContext<'_>,
+            ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+                Box::pin(async move {
+                    let counter = Res::<Counter>::fetch(ctx)?;
+                    Ok(counter.count)
+                })
+            }
+
+            fn name(&self) -> &'static str {
+                "read_counter"
+            }
+
+            fn access(&self) -> SystemAccess {
+                <Res<Counter> as SystemParam>::access()
+            }
+        }
+
+        let direct = ReadCounterSystem;
+        let typed: TypedSystem<i32> = erase(|| ReadCounterSystem);
+
+        // Every accessor reports what the concrete system reports, and the
+        // handle is still usable afterwards — nothing was consumed.
+        assert_eq!(typed.name(), System::name(&direct));
+        assert_eq!(typed.output_type_name(), type_name::<i32>());
+        assert_eq!(typed.access(), System::access(&direct));
+        assert_eq!(typed.is_fallible(), System::is_fallible(&direct));
+
+        // Non-vacuous: `Res<Counter>` declares a read, so `access()` is
+        // comparing real declarations rather than two empty sets.
+        assert!(
+            !typed.access().resources.is_empty(),
+            "the fixture must declare resource access for this to be meaningful"
+        );
+
+        let boxed: BoxedSystem = typed.into();
+        assert_eq!(boxed.name(), System::name(&direct));
+    }
+
+    #[test]
+    fn typed_system_erasure_preserves_fallible_metadata() {
+        let direct: BoxedSystem = Box::new(ManualFallibleSystem);
+        let erased: BoxedSystem = erase(|| ManualFallibleSystem).into();
+
+        assert_eq!(direct.is_fallible(), erased.is_fallible());
+        assert_eq!(direct.name(), erased.name());
+        assert_eq!(direct.output_type_id(), erased.output_type_id());
+        assert_eq!(direct.output_type_name(), erased.output_type_name());
+        assert_eq!(direct.access(), erased.access());
+    }
+
+    #[test]
+    fn typed_system_debug_reports_name_output_and_fallibility() {
+        async fn int_system() -> i32 {
+            42
+        }
+
+        let typed: TypedSystem<i32> = erase(int_system);
+        let rendered = format!("{typed:?}");
+
+        assert!(
+            rendered.starts_with("TypedSystem {"),
+            "Debug should name the type, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("int_system"),
+            "Debug should report the erased system's name, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(type_name::<i32>()),
+            "Debug should report the output type, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("fallible: false"),
+            "Debug should report fallibility, got: {rendered}"
+        );
     }
 }

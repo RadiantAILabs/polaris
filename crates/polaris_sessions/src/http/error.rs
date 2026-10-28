@@ -17,6 +17,7 @@ pub(crate) mod codes {
     pub(crate) const SESSION_BUSY: &str = "session_busy";
     pub(crate) const SESSION_READ_ONLY: &str = "session_read_only";
     pub(crate) const TURN_NOT_FOUND: &str = "turn_not_found";
+    pub(crate) const TURN_INTERRUPTED: &str = "turn_interrupted";
     pub(crate) const AGENT_NOT_FOUND: &str = "agent_not_found";
     pub(crate) const SESSION_ALREADY_EXISTS: &str = "session_already_exists";
     pub(crate) const GRAPH_VALIDATION: &str = "graph_validation";
@@ -38,6 +39,13 @@ pub(crate) enum ApiError {
     SessionReadOnly(SessionId),
     /// No checkpoint exists for the given turn number.
     TurnNotFound(TurnNumber),
+    /// The turn was interrupted by a caller rather than failing.
+    TurnInterrupted {
+        /// The session whose turn was interrupted.
+        session: SessionId,
+        /// The turn number that was interrupted.
+        turn: TurnNumber,
+    },
     /// Agent type not registered.
     AgentNotFound(String),
     /// A session with the given ID already exists.
@@ -63,6 +71,7 @@ impl ApiError {
             Self::SessionBusy(_) => codes::SESSION_BUSY,
             Self::SessionReadOnly(_) => codes::SESSION_READ_ONLY,
             Self::TurnNotFound(_) => codes::TURN_NOT_FOUND,
+            Self::TurnInterrupted { .. } => codes::TURN_INTERRUPTED,
             Self::AgentNotFound(_) => codes::AGENT_NOT_FOUND,
             Self::Conflict(_) => codes::SESSION_ALREADY_EXISTS,
             Self::GraphValidation(_) => codes::GRAPH_VALIDATION,
@@ -79,6 +88,9 @@ impl ApiError {
             Self::SessionBusy(id) => format!("session already executing a turn: {id}"),
             Self::SessionReadOnly(id) => format!("session is read-only: {id}"),
             Self::TurnNotFound(turn) => format!("no record for turn: {turn}"),
+            Self::TurnInterrupted { session, turn } => {
+                format!("turn {turn} of session {session} was interrupted")
+            }
             Self::AgentNotFound(name) => format!("agent not found: {name}"),
             Self::Conflict(id) => format!("session already exists: {id}"),
             Self::GraphValidation(msg) | Self::BadRequest(msg) => msg.clone(),
@@ -94,9 +106,13 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::SessionNotFound(_) => StatusCode::NOT_FOUND,
-            Self::SessionBusy(_) | Self::Conflict(_) | Self::SessionReadOnly(_) => {
-                StatusCode::CONFLICT
-            }
+            // 409: the request did not fail, it was stopped by a caller —
+            // the same "you asked for something the current state does not
+            // allow to finish" family as a busy session.
+            Self::SessionBusy(_)
+            | Self::Conflict(_)
+            | Self::SessionReadOnly(_)
+            | Self::TurnInterrupted { .. } => StatusCode::CONFLICT,
             // 400 (not 404): the turn number is caller-supplied input that
             // failed validation, not a missing sub-resource.
             Self::TurnNotFound(_) | Self::AgentNotFound(_) | Self::BadRequest(_) => {
@@ -135,6 +151,9 @@ impl From<SessionError> for ApiError {
             SessionError::ReadOnly(id) => Self::SessionReadOnly(id),
             SessionError::SessionAlreadyExists(id) => Self::Conflict(id),
             SessionError::TurnNotFound(turn) => Self::TurnNotFound(turn),
+            SessionError::Interrupted { session, turn, .. } => {
+                Self::TurnInterrupted { session, turn }
+            }
             SessionError::AgentNotFound(name) => Self::AgentNotFound(name),
             SessionError::GraphValidation {
                 agent_name, result, ..

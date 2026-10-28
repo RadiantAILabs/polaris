@@ -1,10 +1,14 @@
 //! Integration tests for the `polaris_shell` crate.
 
-use polaris_shell::{ShellConfig, ShellPlugin};
+use polaris_shell::{
+    ChannelSink, ShellCancel, ShellConfig, ShellEvent, ShellPlugin, ShellSinkHandle,
+};
 use polaris_system::param::{Res, SystemParam};
 use polaris_system::server::Server;
-use polaris_tools::{ToolError, ToolRegistry, ToolsPlugin};
+use polaris_tools::{ToolContext, ToolError, ToolRegistry, ToolsPlugin};
 use serde_json::{Value, json};
+use std::num::NonZeroUsize;
+use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────
 // Plugin registration
@@ -91,6 +95,20 @@ async fn tool_definition_has_correct_schema() {
         !required.contains(&json!("timeout_secs")),
         "timeout_secs should not be required"
     );
+
+    // Host-only `#[context]` parameters must never be advertised to the model.
+    for host_only in ["cancel", "sink"] {
+        assert!(
+            !props.contains_key(host_only),
+            "`{host_only}` is a host-only context value and must stay out of \
+             the LLM-facing schema, got: {props:?}"
+        );
+    }
+    assert_eq!(
+        props.len(),
+        3,
+        "the schema should expose exactly command/working_dir/timeout_secs, got: {props:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -127,6 +145,101 @@ async fn tool_execution_via_registry() {
     );
     assert_eq!(result["exit_code"], json!(0));
     assert_eq!(result["timed_out"], json!(false));
+}
+
+#[tokio::test]
+async fn tool_context_streams_without_changing_the_tool_schema() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let release = temp.path().join("release");
+    let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
+    server.add_plugins(ToolsPlugin);
+    server.add_plugins(ShellPlugin::new(
+        ShellConfig::new()
+            .with_allowed_commands(vec!["*".into()])
+            .disable_sandbox(),
+    ));
+    server.finish().await.unwrap();
+
+    let ctx = server.create_context();
+    let registry = Res::<ToolRegistry>::fetch(&ctx).unwrap();
+    let (sink, mut events) = ChannelSink::new(NonZeroUsize::new(8).unwrap());
+    let tool_context = ToolContext::new().with(ShellSinkHandle::new(sink));
+    let mut execution = Box::pin(registry.execute_with(
+        "run_command",
+        &json!({"command": format!("printf streamed; while [ ! -e '{}' ]; do sleep 0.01; done", release.display())}),
+        &tool_context,
+    ));
+
+    let started = tokio::select! {
+        result = &mut execution => panic!("tool returned before Started: {result:?}"),
+        event = events.recv() => event,
+    };
+    assert!(matches!(started, Some(ShellEvent::Started { .. })));
+    let chunk = tokio::select! {
+        result = &mut execution => panic!("tool returned before incremental output: {result:?}"),
+        event = events.recv() => event,
+    };
+    assert!(matches!(chunk, Some(ShellEvent::Chunk { .. })));
+    std::fs::write(release, b"go").unwrap();
+    let result = execution.await.unwrap();
+    assert_eq!(result["stdout"], "streamed");
+}
+
+#[tokio::test]
+async fn tool_context_cancellation_stops_a_running_command() {
+    let mut server = Server::new();
+    server.add_plugins(polaris_app::AppPlugin::new(
+        polaris_app::AppConfig::new().with_host("127.0.0.1"),
+    ));
+    server.add_plugins(ToolsPlugin);
+    server.add_plugins(ShellPlugin::new(
+        ShellConfig::new()
+            .with_allowed_commands(vec!["*".into()])
+            .disable_sandbox()
+            .with_terminate_grace(Duration::from_millis(30)),
+    ));
+    server.finish().await.unwrap();
+
+    let ctx = server.create_context();
+    let registry = Res::<ToolRegistry>::fetch(&ctx).unwrap();
+    let (sink, mut events) = ChannelSink::new(NonZeroUsize::new(8).unwrap());
+    let (stop, observer) = tokio::sync::watch::channel(false);
+    let tool_context = ToolContext::new()
+        .with(ShellSinkHandle::new(sink))
+        .with(ShellCancel::from_watch(observer));
+
+    // A command that would otherwise run for 30s under a 30s default timeout.
+    let mut execution = Box::pin(registry.execute_with(
+        "run_command",
+        &json!({"command": "printf running; sleep 30"}),
+        &tool_context,
+    ));
+
+    // Wait until the child is definitely up before cancelling it.
+    loop {
+        let event = tokio::select! {
+            result = &mut execution => panic!("tool returned before its first chunk: {result:?}"),
+            event = events.recv() => event,
+        };
+        if matches!(event, Some(ShellEvent::Chunk { .. })) {
+            break;
+        }
+    }
+
+    stop.send_replace(true);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), execution)
+        .await
+        .expect("cancellation should end the tool call well before the timeout")
+        .expect("a cancelled command is not a tool error");
+
+    assert_eq!(result["outcome"], "cancelled");
+    assert_eq!(result["timed_out"], json!(false));
+    assert_eq!(result["stdout"], "running");
+    assert_eq!(result["cleanup_completed"], json!(true));
 }
 
 // ─────────────────────────────────────────────────────────────────────

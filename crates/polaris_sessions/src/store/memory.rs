@@ -59,12 +59,7 @@ mod tests {
     async fn round_trip() {
         let store = InMemoryStore::new();
         let id = SessionId::from_string("test-1");
-        let data = SessionData {
-            agent_type: "TestAgent".into(),
-            turn_number: 0,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            resources: vec![],
-        };
+        let data = SessionData::new("TestAgent", 0, "2026-01-01T00:00:00Z", vec![]);
 
         store.save(&id, &data).await.unwrap();
 
@@ -84,12 +79,7 @@ mod tests {
     async fn delete_removes_entry() {
         let store = InMemoryStore::new();
         let id = SessionId::from_string("test-del");
-        let data = SessionData {
-            agent_type: "TestAgent".into(),
-            turn_number: 0,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            resources: vec![],
-        };
+        let data = SessionData::new("TestAgent", 0, "2026-01-01T00:00:00Z", vec![]);
 
         store.save(&id, &data).await.unwrap();
         store.delete(&id).await.unwrap();
@@ -100,12 +90,7 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_ids() {
         let store = InMemoryStore::new();
-        let data = SessionData {
-            agent_type: "TestAgent".into(),
-            turn_number: 0,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            resources: vec![],
-        };
+        let data = SessionData::new("TestAgent", 0, "2026-01-01T00:00:00Z", vec![]);
 
         let id1 = SessionId::from_string("a");
         let id2 = SessionId::from_string("b");

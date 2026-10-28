@@ -23,7 +23,7 @@ graph
 
 The first node added becomes the graph's entry point. Each subsequent call to the builder connects the new node to the previous one via a sequential edge. This implicit chaining means that for linear pipelines, the builder reads as a sequence of steps.
 
-Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; all edges reference valid nodes; decision and switch nodes have the required predicates and branches; parallel nodes have branches; loop nodes have a body and termination condition or iteration limit; and dynamic nodes have a non-empty, key-unique inline candidate set whose every candidate is structurally valid, flat (no nested `Scope`/`Dynamic` boundary), and signature-compatible with the slot contract. Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body and warning about conflicting output types in parallel branches.
+Before execution, a graph can be validated via `graph.validate()`, which checks that: the graph has a valid entry point; every node is reachable from it, including through error/timeout handler subgraphs; all edges reference valid nodes; no node declares more than one route for the same outcome — success, error, or timeout (see [Sequential](#sequential) and [Error Edges](#error-edges)); decision and switch nodes have the required predicates and branches; parallel nodes have branches; loop nodes have a body and termination condition or iteration limit; dynamic nodes have a non-empty, key-unique inline candidate set whose every candidate is structurally valid, flat (no nested *undeclared* `Scope` boundary), and admitted against the slot contract by the slot's `MatchingMode` relation; and every scope carrying a declared contract has an interior that matches it and a `ContextPolicy` that lets its requirements cross (see [Scope](#scope)). Advanced checks include verifying that loop termination predicates can read outputs produced within the loop body, including outputs a declared scope or dynamic contract guarantees, and warning about conflicting output types in parallel branches or about a `Substitutable` dynamic candidate whose extra output the surrounding graph also produces, since that extra is dropped at the boundary (see [Dynamic](#dynamic)).
 
 A separate runtime validation pass, `executor.validate_resources()`, checks that all `Res<T>`, `ResMut<T>`, and `Out<T>` parameters can be satisfied before execution begins. Output reachability is validated along the linear (sequential) chain — each system's `Out<T>` dependencies are checked against outputs produced by preceding systems, as is each loop's termination predicate input (evaluated before the first iteration, so the loop body cannot satisfy it). Non-system nodes contribute all output types reachable from their subgraphs. See [Execution Context — Resource Validation](context.md#resource-validation) for details. Independently of this opt-in pass, the executor always verifies loop predicate inputs at run start — see [Loop](#loop).
 
@@ -45,7 +45,7 @@ Layer 2 recognizes five verification phases. Knowledge grows monotonically acros
 
 These rules are binding on every current and future Layer 2 check:
 
-1. **No false positives, at any phase.** A check MUST NOT reject a graph that could still execute successfully given facts a later phase would reveal. A rejection is legitimate only when failure is certain on every possible path.
+1. **No false positives, at any phase.** A check MUST NOT reject a graph that could still execute successfully given facts a later phase would reveal. A rejection is legitimate only when failure is certain on every possible path — and "executing successfully" means realizing the structure the graph declares, not merely finishing without error. A declared edge, route, or candidate that the executor's own selection rule guarantees can never be taken (first-match shadowing, a duplicate key) is already a certain failure: no later phase can make it reachable, so the graph finishing anyway, through some other path, does not rescue it.
 2. **Catch at the earliest sound phase.** Every invariant MUST be enforced at the earliest phase where Rule 1 holds for it, and MUST NOT be deferred to a later one. Prefer phase 1 whenever the invariant is expressible in the type system.
 3. **Validate time sees only the fragment.** A phase-2 check MUST depend only on the graph's own structure — never on context contents, hooks, or the embedding graph. A graph is a fragment that can be embedded anywhere, so an environment-dependent rejection here violates Rule 1 by construction.
 4. **Interfaces never under-claim.** Signature derivation MUST be pessimistic: a requirement may be omitted from `requires_outputs` only when production is guaranteed on every path. Over-claiming is sound (a composability tax, to be narrowed over time); under-claiming admits candidates that fail at runtime and is forbidden.
@@ -54,11 +54,13 @@ These rules are binding on every current and future Layer 2 check:
 7. **An advisory pass MUST NOT contradict the mandatory check it predicts.** Whatever an opt-in pass admits, the corresponding mandatory check MUST also admit. Concretely: `validate_resources` is phase-4 analysis performed ahead of time and credits no more than the mandatory run-start entry check does, so pre-flight success is never followed by a run-start refusal from the same analysis.
 8. **Execution-time failures MUST be typed and routed, never panics.** Anticipated failures route through the graph's own error flow ([Error Handling](#error-handling)); infrastructure failures propagate as typed `ExecutionError` values through the normal failure path, firing `OnGraphFailure`, and leave the process running.
 
+`GraphSignature::produces()` is the complete set of outputs a graph may produce on any reachable path. To check a built graph against an output contract that must hold after every successful path, use `GraphSignature::guaranteed_produces()` instead. The latter applies the pessimistic branch, guard, loop, scope, and dynamic crediting rules described below.
+
 To place a new check, ask what it needs to know. If the answer includes "who embeds this graph," it belongs no earlier than phase 3. If it includes "what the caller seeded," no earlier than phase 4. If it includes "which branch was taken," it belongs at phase 5, expressed as a typed error.
 
 ## Adding System Nodes
 
-There are three methods for adding a system node to a graph, each suited to a different use case.
+There are five methods for adding a system node to a graph, each suited to a different use case.
 
 **`add_system`** — the most common method. Adds the node and returns `&mut Self` for fluent chaining. Use this for simple linear pipelines where no per-node configuration is needed.
 
@@ -76,7 +78,7 @@ let reason_id = graph.add_system_node(reason);
 let act_id = graph.add_system_node(act);
 ```
 
-**`system`** — adds the node and returns a `SystemNodeBuilder` for configuring error handling, timeouts, and retry policies. Call `.done()` to return to `&mut Graph` for continued chaining.
+**`system`** — adds the node and returns a `SystemNodeBuilder` for configuring custom schedules, error handling, timeouts, and retry policies. Call `.done()` to return to `&mut Graph` for continued chaining.
 
 ```rust
 graph.system(risky_operation)
@@ -88,7 +90,91 @@ graph.system(risky_operation)
     .add_system(next_step);
 ```
 
-All three methods accept any type implementing `IntoSystemNode`, which includes bare async functions and `(schedule, system)` tuples for attaching custom hook schedules.
+The first three methods accept any type implementing `IntoSystemNode`, which includes bare async functions and `(schedule, system)` tuples for attaching custom hook schedules.
+
+**`system_boxed`** — accepts any of the three boxed forms listed below and
+returns the same `SystemNodeBuilder`. `TypedSystem<O>` is produced by
+`erase(system)`; it hides the concrete system and `IntoSystem` marker types from
+composition-helper signatures while retaining `O` for compile-time stage-slot
+checks. See
+[System — Typed Erasure for Composition](system.md#typed-erasure-for-composition)
+for the handle itself and what it preserves.
+
+```rust
+fn add_stage(graph: &mut Graph, stage: TypedSystem<StageOutput>) {
+    graph.system_boxed(stage)
+        .with_schedules(OnStage)
+        .done();
+}
+```
+
+**`add_boxed_system`** — the same as `system_boxed`, but returns the new `NodeId`
+instead of a builder. Use it when a composition helper needs the ID to wire
+edges itself.
+
+Both boxed methods accept three forms: a boxed concrete system (`Box<S>` where
+`S: ErasedSystem`, which by the blanket impl covers every `S: System`), an
+already-erased `BoxedSystem`, or a `TypedSystem<O>`. Note that
+`Box<dyn System>` is not one of them — `System` has an associated `Output` type
+and so is not object safe, which is why `BoxedSystem` is `Box<dyn ErasedSystem>`.
+
+## Building Graphs from Runtime Data
+
+Graph plans loaded from configuration can supply owned names, case keys, and a
+choice of pre-registered predicates without leaking strings or spelling the
+selected input type at the builder call site. Create the type-erased wrappers
+at the typed registration boundary, then move them into the runtime builder:
+
+| API | Runtime-built role |
+|-----|--------------------|
+| `NodeName` | Owned node names and switch keys; accepts `String`, `Arc<str>`, `Cow<'static, str>`, or a string literal |
+| `BoxedPredicate::new::<T>(predicate)` | Erases a typed `Fn(&T) -> bool` while retaining `T` for signature derivation and validation |
+| `BoxedDiscriminator::new::<T, _>(discriminator)` | Erases a typed discriminator whose result implements `Into<NodeName>` |
+| `add_conditional_branch_boxed(name, predicate, true_path, false_path)` | Adds a decision using a selected `BoxedPredicate` |
+| `add_loop_boxed(name, termination, body)` | Adds a predicate loop using a selected `BoxedPredicate` |
+| `add_switch_boxed(name, discriminator, cases, default)` | Adds a switch whose case keys and name may be runtime strings |
+| `SystemNodeBuilder::named(name)` | Gives a system node a runtime display name before `.done()` |
+
+For example, both the node name and case key below can come from a parsed plan,
+and the discriminator can come from a registry of boxed discriminators:
+
+```rust
+use polaris_graph::predicate::BoxedDiscriminator;
+use polaris_graph::{Graph, NodeName};
+
+struct Route {
+    key: String,
+}
+
+async fn classify() -> Route { Route { key: "tool".into() } }
+async fn call_tool() {}
+async fn fallback() {}
+
+let classifier_name = String::from("configured_classifier");
+let tool_key: NodeName = String::from("tool").into();
+let discriminator =
+    BoxedDiscriminator::new::<Route, _>(|route| route.key.clone());
+
+let mut graph = Graph::new();
+graph.system(classify).named(classifier_name).done();
+graph.add_switch_boxed(
+    String::from("configured_route"),
+    discriminator,
+    vec![
+        (tool_key, Box::new(|branch: &mut Graph| {
+            branch.add_system(call_tool);
+        }) as Box<dyn FnOnce(&mut Graph)>),
+    ],
+    Some(Box::new(|branch: &mut Graph| {
+        branch.add_system(fallback);
+    }) as Box<dyn FnOnce(&mut Graph)>),
+);
+```
+
+Use `BoxedPredicate::new::<T>(...)` in the same way with
+`add_conditional_branch_boxed` or `add_loop_boxed`. `Graph::validate()`,
+signature derivation, and the loop-entry check inspect the erased wrapper's
+retained input type exactly as they do for the generic builders.
 
 ## Construction Patterns
 
@@ -102,6 +188,21 @@ graph
     .add_system(act)
     .add_system(respond);
 ```
+
+**A node has at most one sequential successor.**
+
+- **Why.** Traversal is first-match: the executor follows the first sequential edge whose source is the current node, so every later edge from that node is ignored and the work it declares is never wired into the path the executor walks. Interface derivation reads the same edges into a map keyed by source where the *last* edge wins, so the shape also leaves the graph advertising — and pre-flighted along — a chain execution does not take.
+- **What you get.** `validate()` rejects it with `ValidationError::AmbiguousRoute` (`kind: RouteKind::Sequential`), naming the offending node, the successor followed, and the one whose edge is skipped, each by name as well as ID.
+- **What to write instead.** Model the alternatives as a decision, switch, or parallel node, so the choice is explicit and every branch is wired.
+- **Still allowed.** Fan-*in*, since the rule is one successor per node and not one predecessor; and repeated edges to the *same* successor, which name the node the executor already follows.
+
+Two points about this rule look like exceptions and are not.
+
+**The skipped node may still run.** Another edge can lead to it — a node further along the chain might name it too — so a graph containing a skipped edge can execute start to finish with every node running. That is not a reason to accept it. Validation asks whether the graph says what it means, not whether it happens to survive one particular run. An edge that nothing ever follows is a claim the graph makes and execution ignores; the graph running anyway only means the mistake cost nothing this time. This is exactly what [Rule 1](#phase-rules) means by "executing successfully": the skipped edge is a certain failure of the graph's own declared structure, independent of whether some other path happens to reach the same node.
+
+**This is one instance of a general rule.** A node finishes one of three ways — it succeeded, it failed, or it timed out — and each way has its own kind of outgoing edge. Lookup is first-match for all three, so a node has at most one *effective* route per outcome, and `validate()` applies the same check to each. The error and timeout outcomes are covered under [Error Edges](#error-edges).
+
+**The builder cannot produce the sequential shape.** Every `add_*` method chains from the previous node and then advances the chain point to the node it just added, and no public API wires a sequential edge between two nodes of your choosing or exposes the edge list for mutation. So the check guards an invariant the crate maintains internally, rather than constraining anything you can write today.
 
 ### Conditional Branch
 
@@ -140,11 +241,13 @@ graph
 
 ### Parallel Execution
 
-A parallel node forks execution across multiple subgraphs. Each branch receives its own child context and runs concurrently. If any branch fails, the remaining branches are cancelled, the error propagates, and no branch outputs reach the parent. The child context inherits resource reads through the parent chain but starts with an **empty output store**, so a branch cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a resource on the parent context and read them in each branch with `Res<T>`.
+A parallel node forks execution across multiple subgraphs. Each branch receives its own child context and runs concurrently. If any branch fails, the remaining branches are cancelled, the error propagates, and no branch outputs reach the parent. The one exception is a raised [cancellation](#cancellation) signal: it never causes a running branch to be dropped. The child context inherits resource reads through the parent chain but starts with an **empty output store**, so a branch cannot read an `Out<T>` produced upstream of the parallel node. Put values needed across the fork in a resource on the parent context and read them in each branch with `Res<T>`.
 
-The parallel node is both the entry and exit point. Once all branches complete successfully, every branch's outputs are merged in declaration order and execution continues from the parallel node's outgoing sequential edge. This includes outputs produced behind a nested scope boundary, outputs declared by a nested dynamic node's contract, and outputs from a handler path. At run time, two or more branches producing the same output type collapse to the last one.
+The parallel node is both the entry and exit point. Once all branches complete successfully, every branch's outputs are merged in declaration order and execution continues from the parallel node's outgoing sequential edge. This includes outputs produced behind a nested scope boundary, outputs declared by a nested dynamic node's contract, and outputs from a handler path. When two or more branches produce the same output type, the store retains one entry per producer: `Out<T>` reads the newest entry, while `OutAll<T>` yields all of them oldest first in branch declaration order.
 
 `validate()` reports `ValidationWarning::ConflictingParallelOutputs`, not an error, when it finds the same type from reachable `System` nodes in multiple branches. This check does not cover outputs hidden behind a nested scope, a dynamic node's contract, or a handler path. Validation also does not catch a branch `Out<T>` read that appears satisfied only by an output above the parallel node: signature derivation credits the parent chain to the branch region, but the branch's empty output store makes the read fail at run time with `ParamError::OutputNotFound`.
+
+Because every branch runs, that merge is a *guarantee*, and signature derivation credits it: the union of the branches' own guaranteed production satisfies reads on the chain after the parallel. It does not satisfy reads *inside* a sibling branch — branches run against isolated child contexts and merge only at the join. A guarded system contributes only the intersection of its normal continuation and every error or timeout handler continuation: matching fallback output is guaranteed, while a handler that lacks an output withholds it.
 
 ```rust
 graph
@@ -162,9 +265,11 @@ A loop node repeats its body subgraph until a termination predicate returns true
 
 Because the first check precedes the body, the predicate's input type must already exist when the loop is reached: either an earlier node in the graph produces it, or a caller driving the graph directly pre-seeds it into the context with `SystemContext::insert_output` before executing. Earlier production may come from a preceding system, a parallel fan-out, a scope whose outputs merge back, or a dynamic node's contract `produces`. These sources still count when nested inside a control-flow branch. Outputs are the work products of systems: only system execution (and its merge-back across boundaries) is a sanctioned writer of the output channel — hooks and middleware receive context access for resources and observability, and writing outputs from them is unsupported.
 
+Structural validation also requires the loop body to be able to produce the predicate input on a later iteration. A direct system output and an output a declared scope or dynamic contract guarantees both satisfy that check. This does not relax the first-check requirement: production in the body cannot seed the predicate before the body runs.
+
 How conditional production is credited depends on the verification phase:
 
-- **Composition signatures are pessimistic.** A decision or switch branch has not been selected, so branch production is not guaranteed and cannot remove the predicate input from `requires_outputs`. A subgraph that begins with a loop therefore advertises the seed, and slot contracts must supply it (see [Dynamic](#dynamic)).
+- **Composition signatures are pessimistic — but they credit what the runtime guarantees.** A parallel node runs *every* branch and merges the results; a decision credits the intersection of its true and false arms; a switch credits the intersection of all case arms and its default when present; and a scope merges its inner outputs back on exit whatever its context policy. Those guaranteed sets remove a predicate input from `requires_outputs`, recursively through nested control flow. A switch key that matches neither a case nor a default stops with `NoMatchingCase` before the downstream chain, so it is not an arm in the intersection. A scope with a [declared contract](#declared-scope-contracts) and a dynamic node with a slot contract are credited with their contract's `produces`: validation ensures every admitted interior or candidate supplies them. A loop body (zero iterations is legal) contributes nothing. A guarded system instead intersects its normal continuation with every error and timeout handler continuation, so recovery contributes only output all successful paths share. A subgraph that begins with a loop, or seeds it in only some branch arms, therefore advertises the seed, and slot contracts must supply it (see [Dynamic](#dynamic)).
 - **Pre-flight and run-start checks are optimistic.** Before path selection, they credit every branch that could produce the input — including production behind nested scopes, dynamic contracts, loop bodies, and parallel branches. They may reject only when no path can produce the input and the live context lacks it.
 - **Execution is exact.** Once a decision or switch has selected a branch, a genuinely absent input surfaces as `PredicateError::OutputNotFound` when the loop is reached. Loops inside branch interiors likewise remain execution-time checks.
 
@@ -184,7 +289,72 @@ graph
     );
 ```
 
-For loops that should run a fixed number of times without a predicate, `add_loop_n` accepts only an iteration count.
+For loops that should run a fixed number of times without a predicate, `add_loop_n` accepts only an iteration count. To give a predicate loop its own bound rather than relying on the executor default, call `set_loop_max_iterations` with the loop's `last_node()` ID after adding it. The predicate is evaluated first: when the cap is zero, an already-true predicate ends normally, while a false predicate returns `MaxIterationsExceeded { max: 0 }` without running the body.
+
+#### Loop output retention
+
+Each loop iteration writes its outputs into its own layer. Retention is how many **completed** iterations stay readable while the next one runs:
+
+- The default is 1: an iteration can read what the previous iteration wrote, through `Out<T>` and `OutAll<T>`.
+- A larger value keeps more earlier iterations readable.
+- 0 keeps none: an iteration sees only what it wrote itself, plus what existed before the loop.
+
+Set it per loop with `set_loop_retention(loop_id, n)`, or for one output type with `set_loop_retention_for_type::<T>(loop_id, n)`. The per-type value wins over the per-loop value for `T`, and 0 means the same on both. Call them after adding the loop, with its `last_node()` id.
+
+```rust
+graph.add_loop_n("refine", 5, |g| {
+    g.add_system(draft).add_system(score);
+});
+let loop_id = graph.last_node().expect("the loop was just added");
+// Keep three earlier scores readable, but only the current draft.
+graph
+    .set_loop_retention(loop_id.clone(), 3)
+    .set_loop_retention_for_type::<Draft>(loop_id, 0);
+```
+
+The termination predicate runs before older layers are dropped, so it always sees the iteration that just finished. Whatever the retention, only the **newest** iteration's outputs leave the loop when it ends normally. If the loop ends with an error, a timeout, a cancellation, `MaxIterationsExceeded`, a predicate error, or its future is dropped, every iteration's outputs are discarded and the context is left as it was before the loop.
+
+### Reading a Specific Producer (`read_from`)
+
+By default `Out<T>` reads the newest `T`, whichever system wrote it. `read_from` pins one reader's read of `T` to one producer node:
+
+```rust
+let mut graph = Graph::new();
+let planner = graph.system(plan).id();
+graph.add_system(revise_plan);          // also returns Plan
+graph.system(act).read_from::<Plan>(planner); // reads `plan`'s Plan, not `revise_plan`'s
+```
+
+There are two forms:
+
+- `graph.system(reader).read_from::<T>(producer_id)` — on the node builder, when the producer already exists.
+- `graph.read_from::<T>(reader_id, producer_id)` — by id, when the producer is added after the reader. A loop back-wire needs this form.
+
+A second call for the same reader and `T` replaces the first. The wire is part of the graph, not of the system, so the same system can be reused with a different producer. `Graph::duplicate()` remaps wires to the copy's new ids.
+
+**Loop back-wires.** When the reader and producer are in the same loop body and the producer runs later in the body, the reader reads the producer's value from an **earlier iteration**. The first iteration has no such value, so the read must be `Option<Out<T>>`. It also depends on [loop retention](#loop-output-retention): with retention 0 for `T`, no earlier iteration is readable and the read is always `None`.
+
+```rust
+graph.add_loop_n("loop", 3, |g| {
+    let remember_id = g.system(remember).id(); // remember(previous: Option<Out<Counter>>)
+    let advance_id = g.system(advance).id();   // advance(...) -> Counter
+    g.read_from::<Counter>(remember_id, advance_id);
+});
+```
+
+`validate()` rejects a wire when:
+
+| Error | Cause |
+|-------|-------|
+| `ReadFromSelf` | The reader is its own producer. |
+| `ReadFromProducerMissing` | The producer id is not in this graph (including an id from another `Graph`). |
+| `ReadFromProducerNotASystem` | The producer is a control-flow node, not a system. |
+| `ReadFromTypeMismatch` | The producer does not return `T`. |
+| `ReadFromUnread` | The reader does not read `T` through `Out<T>` or `Option<Out<T>>` (for example only through `OutAll<T>` or `ErrOut<T>`). |
+| `ReadFromNotGuaranteed` | The producer is not sure to have run before the reader on every path. A wire inside one loop body is the exception (a back-wire). |
+| `ReadFromBackwardRequiresOptional` | A loop back-wire reads `Out<T>` instead of `Option<Out<T>>`. |
+
+At run time the executor installs a reader's wires only while that node runs. A pinned read whose producer has no visible entry resolves like a missing output: `Option<Out<T>>` gets `None`, `Out<T>` fails. To see which node wrote each entry without pinning, use `OutAll<T>` with [`ProducerInfo`](context.md#producer-keys).
 
 ### Scope
 
@@ -232,6 +402,48 @@ At runtime the executor branches on the policy: `shared()` reuses the parent con
 
 After the inner graph completes, child outputs are merged back into the parent context regardless of policy. With `shared()` they were written into that context directly; every non-shared policy merges the child's output channel on exit. The policy controls resource ingress, not output egress. See [Execution Context — Context Flow](context.md#context-flow-through-graph-execution) for details.
 
+That merge-back is unconditional, so signature derivation credits the scope's own guaranteed inner production to reads on the enclosing chain — a scope may seed a downstream loop or `Out<T>` read without the parent supplying it. For an inner guarded system, that guarantee is the intersection of normal and handler continuations; a recovered failure contributes a matching fallback output, but not an output absent from any handler. A plain `add_scope` boundary stays opaque in the other direction: what the interior *needs* (its resource reads and its free `Out<T>` reads) never reaches the parent's signature, and its production does not enter the parent's `produces` axis. Outputs do not cross a non-shared boundary *inward* either, so an interior free `Out<T>` read is satisfiable only under `shared()`. That asymmetry is why a candidate containing an *undeclared* scope is inadmissible to a `Dynamic` slot (see [Dynamic](#dynamic)) — declaring the boundary's contract lifts it.
+
+#### Declared scope contracts
+
+`add_scope_with_contract` takes the same arguments as `add_scope` plus a declared `GraphSignature` — the interface the scope presents to the enclosing graph. Where a plain scope silently erases its interior's contract, a declared scope propagates it at the scope's chain position:
+
+- the contract's `requires` surface into the parent's `requires` (resources have no guaranteed-upstream mechanism — derivation cannot see `ctx.insert` — so, like system resource reads, they always surface);
+- its `requires_outputs` are classified against what is guaranteed upstream and surface otherwise, like a system's own `Out<T>` reads;
+- its `produces` enter the parent's `produces` axis and are credited as *guaranteed* production for downstream reads — a declared scope may seed a downstream loop through its contract.
+
+The contract is a **declaration, not a derived inner signature** — mirroring how a `Dynamic` slot's contract stands in for its candidates. Stopping derivation at the declaration keeps it non-recursive and gives `validate()` a stable interface to check drift against; derivation never peeks past a contract, so guaranteed interior production the contract omits is *not* credited.
+
+**The boundary is sealed at runtime, not only at validate time.** On a non-`shared()` policy, when the scope's embedded graph finishes, only the output types named in the contract's `produces` merge back into the parent — every other output the interior wrote, whether or not it is one the interior *guarantees*, is dropped along with the child context that held it. A parent output of the same type as an undeclared interior output is left untouched: the interior's write to it never crosses the boundary, so there is nothing to overwrite. `shared()` is the one exception, by construction: it denotes no boundary at all, so the interior runs directly in the parent's own context and every write is visible immediately — a `shared()` scope's declared `produces` are still a sound credit, just not a privacy boundary, and combining the two only matters when the contract also needs a nonempty `requires_outputs`, which requires `shared()` regardless (see below). A plain `add_scope` is unaffected either way: it keeps merging every interior output unfiltered, contract or no contract, because it never carries one.
+
+`validate()` holds both the interior and the boundary policy to the declaration:
+
+- **Drift** (`ScopeContractViolated`, carrying the `SignatureDiff`): `requires` and `requires_outputs` — augmented with eager `forward`/`fork` inputs — must exactly match the contract on the interior's derived signature, the same exact-match relation `SubgraphRegistry::register` admission uses, because both axes surface verbatim into the parent's own signature. `produces` is checked differently: it is narrowed to the interior's *guaranteed* production first (`must_produce_output_types`), and then every **declared** produce must be present in that guaranteed set — a **subset** relation, not exact match. A declared produce backed only by some decision or switch arms, or by a loop body, is rejected — an output every arm produces is guaranteed, so it is admissible, but one only some arms produce is not — since the parent credits contract produces as guaranteed, and admitting a conditional declaration would let the signature claim more than the runtime truth. Guaranteed production the contract *omits*, conversely, is not drift — it is exactly the case the runtime boundary above exists to keep private, so the contract may name a genuine subset of what the interior guarantees.
+- **Checkability** (`ScopeContractNested`): an interior nesting an *undeclared* `Scope` boundary has an incomplete derived signature, so no drift check against it is meaningful. Declare a contract on the nested scope or flatten the interior. Nested declared scopes and dynamic slots fold their contracts into the interior's signature and validate recursively.
+- **Policy reachability** (`ScopeContractRequireBlocked`, `ScopeContractOutputsBlocked`): a contract `requires` entry the `ContextPolicy` blocks from crossing can never resolve at runtime — a read needs `shared()`, a crossing verb, or an un-excluded `share_rest()`; a write (`ResMut<T>` operates on the current scope only) needs a copy verb (`forward` / `fork`). And since free outputs never cross a non-shared boundary inward, a non-shared policy with a nonempty contract `requires_outputs` is statically unsatisfiable.
+
+The policy copies every `forward::<T>()` and `fork::<T>()` resource at scope entry, even when the interior never accesses `T`. The contract must therefore include those inputs: add `require_read::<T>()` for a crossing-only type. If the interior already requires the type, retain its existing read/write entries; validation does not add a redundant read beside an existing write. This also lets an isolated no-op scope declare the source of an otherwise unused copy without triggering drift.
+
+A factory requirement is distinct from a resource value, and `GraphSignature` currently cannot express it. Declared scopes therefore reject `forward_fresh` with `ScopeContractFactoryUnsupported`, even if the resource is listed in `requires`. Use `forward`/`fork` with a declared source resource, or plain `add_scope` for factory-based initialization. Factory availability for plain scopes remains checked at run start and execution.
+
+Plain `add_scope` keeps today's opaque behavior — declared contracts are opt-in, and no existing derived signature changes.
+
+An error or timeout handler wired *inside* the scope's own embedded graph is not a special case for the runtime filter: its outputs flow into the same child output store as the rest of the interior. A contract can draw on a guarded output only when the normal continuation and every handler continuation guarantee it; a handler-only output remains conditional and is rejected as drift. This is distinct from an error or timeout handler wired to the *scope node itself* in the enclosing graph: `Scope` is not a fallible node, so such a handler is never dispatched by the executor (only `System` nodes route to error/timeout edges); a scope failure always propagates as an `ExecutionError`.
+
+```rust
+// The scope advertises its interface instead of erasing it: the parent's
+// derived signature carries Res<Corpus> and produces Summary at this position.
+let contract = GraphSignature::new()
+    .require_read::<Corpus>()
+    .produce::<Summary>();
+graph.add_scope_with_contract(
+    "research",
+    research_graph,
+    ContextPolicy::new().share::<Corpus>(), // the declared read can cross
+    contract,
+);
+```
+
 ### Dynamic
 
 A dynamic node **selects** one of several pre-built candidate subgraphs at execution time and runs the chosen one through the same context boundary as [Scope](#scope). Use it to *pick* a subgraph by a runtime signal (where `Switch` only routes to branches wired at build time), or to *swap* the unit behind a slot between turns without rebuilding the parent graph.
@@ -243,21 +455,51 @@ Selection is driven by a **selector** — a `Fn(&SystemContext<'_>) -> Arc<str>`
 | **Inline** | `add_dynamic(...)` | fixed at build time | no |
 | **Registry** | `add_dynamic_registry(...)` | a `SubgraphRegistry` local resource | yes |
 
-Every dynamic node declares a **contract** `GraphSignature` describing the slot's interface — the outputs/resources it requires from its surroundings and the outputs it produces. Each candidate's own signature is checked against this contract: inline candidates during `validate()`, registry candidates at `SubgraphRegistry::register` time. **No graph is ever selected whose shape was not verified against the slot first**, so the parent — validated once against the fixed contract — stays sound no matter which candidate runs. This is composition preserving *soundness* without preserving *semantics*: the signature bounds the swappable space; which candidate runs inside it is a runtime choice.
+Every dynamic node declares a **contract** `GraphSignature` describing the slot's complete interface — the outputs/resources it requires from its surroundings and the outputs it produces. Each candidate's own signature is checked against this contract: inline candidates during `validate()`, registry candidates at `SubgraphRegistry::register` time. In addition, every output named by the contract must appear in the candidate's `guaranteed_produces()`, not merely its flat `produces()` set: the boundary promotes contract output as a promise to downstream readers, so output that only a branch, switch case, or loop iteration produces cannot fill the slot. When a Dynamic node is itself nested, its contract contributes all three axes to the enclosing signature: `requires` surface unconditionally, `requires_outputs` are classified at the boundary's chain position, and `produces` are credited downstream. **No graph is ever selected whose shape was not verified against the slot first**, so the parent — validated once against the fixed contract — stays sound no matter which candidate runs. This is composition preserving *soundness* without preserving *semantics*: the signature bounds the swappable space; which candidate runs inside it is a runtime choice.
 
 A candidate is **sound to substitute** for the slot exactly when it demands no more than the slot guarantees and produces at least what the slot promises:
 
 - `candidate.requires ⊆ slot.requires` — it reads no more than what's guaranteed present. Needing *fewer* inputs is fine; the extra available inputs just go unused.
 - `candidate.requires_outputs ⊆ slot.requires_outputs` — the same logic for free `Out<T>` reads.
-- `candidate.produces ⊇ slot.produces` — it produces at least what downstream expects. Producing *more* is harmless; downstream ignores the extras.
+- `candidate.produces ⊇ slot.produces` — it exposes at least what downstream expects on its flat interface.
+- `candidate.guaranteed_produces ⊇ slot.produces` — it deposits every promised output on every successful path. Producing *more* is admissible, but those undeclared outputs stop at the Dynamic boundary; see [Extra outputs stop at the dynamic boundary](#extra-outputs-stop-at-the-dynamic-boundary) below.
 
-The rule is **contravariant in inputs, covariant in outputs**. v1 enforces the stricter special case — *exact-set match* (all three compare by `=`, not `⊆`/`⊇`), so a candidate must match the slot's interface exactly. That is a sound under-approximation: it never admits an unsound candidate, only rejects some safe ones. Loosening to the subset/superset rule above ("variance") is a localized future change. Where two signatures diverge, `GraphSignature::diff` reports the exact axes and types (returned as a `SignatureDiff`, and carried on every mismatch error), so a rejection reads as an edit rather than a puzzle.
+The rule is **contravariant in inputs, covariant in outputs**, and a slot chooses which of two relations it is checked under via `DynamicSlot::with_matching`:
 
-Distinct from substitution is **capability matching** — `GraphSignature::satisfies`, a second comparison relation used by consumer registries (e.g. the sessions [capability-contract registry](./sessions.md#capability-contracts)) to ask whether an agent *can do* what a named capability describes. It matches by subsumption: the slot's `requires` and `produces` must be **subsets** of the candidate's, and the candidate's free-output reads must not exceed the slot's. Note the `requires` direction is *inverted* relative to substitution — a capability slot names the inputs the capability's driver will feed the agent, so a candidate's extra requires are presumed environment-provided by its registrant's setup (conservative derivation reports self-inserted resources as required), not violations. `satisfies_diff` is its lockstep diff mode, reporting only the violating directions. `compatible_with` remains the relation for `Dynamic` slot substitution; the two are deliberately separate, each named for its soundness envelope.
+| `MatchingMode` | `requires` | `requires_outputs` | `produces` | Predicate | Diff mode |
+|---|---|---|---|---|---|
+| `Exact` (default) | `candidate = slot` | `candidate = slot` | `candidate = slot` | `GraphSignature::compatible_with` | `diff` |
+| `Substitutable` | `candidate ⊆ slot` | `candidate ⊆ slot` | `candidate ⊇ slot` | `GraphSignature::substitutable_for` | `substitutable_diff` |
 
-The contract is also validated against the parent's *surroundings*, not only the candidates — the contract is the interface, so this holds even for a registry slot with no registered candidates. At `validate_resources` time every resource the contract `requires` must be reachable from the context the candidate will run against (`DynamicContractMissingResource` otherwise), and every free `Out<T>` in `requires_outputs` must be produced upstream (`DynamicContractMissingOutput`). Free outputs never cross a non-shared boundary inward, so a non-shared `ContextPolicy` combined with a nonempty `requires_outputs` is statically unsatisfiable (`DynamicContractOutputsBlocked`). Finally, because signature derivation is opaque at nested context boundaries, a candidate that itself contains a `Scope` or `Dynamic` node is **rejected** until recursive derivation lands — inline candidates during `validate()` (`DynamicCandidateNested`), registry candidates at `register()` (`RegistryError::NestedCandidate`) — so candidates must be flat.
+`Exact` is the default and the stricter special case: a sound under-approximation that never admits an unsound candidate, only rejects some safe ones. It is the right posture when the candidates behind a slot are meant to be interchangeable *implementations* of one interface, where a divergence is more likely a mistake than an intent.
 
-The slot's fixed configuration — its `contract`, boundary `ContextPolicy`, and optional default key — is bundled into a `DynamicSlot`, passed as one value so there are no positional holes at the call site:
+`Substitutable` enforces the full variance rule above. Opt into it when the candidates deliberately differ in what they consume — the motivating shape is an **escalation ladder**, where a cheap rung legitimately needs less context than the expensive rung the contract was written for; under `Exact` that rung is rejected, which is backwards for substitutability. `Exact` implies `Substitutable`, so opting in only ever widens the admissible set; existing slots are unaffected. On the `requires` axis, entries compare by `(type_id, mode)` under both relations — there is no write-subsumes-read relaxation in either direction. That is a **known limitation** rather than a property: a candidate declaring `Res<T>` is rejected by a slot guaranteeing `ResMut<T>`, even though read access is strictly less than write, so it is the escalation-ladder rejection one level down. It errs safe — a false rejection, never a false admission — and keeps the axis consistent with `satisfies`.
+
+#### Extra outputs stop at the Dynamic boundary
+
+Widening the relation is not free on the `produces` axis. A Dynamic boundary promotes only the slot contract's `produces`, so a candidate output the contract does not name is dropped before it can reach the parent — even when the parent already produced that type. Under `Exact` this cannot arise: the candidate's produced set equals the contract the parent was validated against.
+
+Nothing downstream was ever validated against the extras, so the exposure is bounded to types the parent already produces. Where `validate()` can see that collision it warns, naming the candidate and the type:
+
+```text
+warning: dynamic node 'ladder' (…) candidate 'a' produces output type 'alloc::string::String',
+which its contract does not name; the value is dropped at the boundary and
+never reaches the parent
+```
+
+It is a warning, not an error: the graph still executes, but the candidate did work whose result is deliberately not exported. To clear it, drop the extra output from the candidate, name the type in the contract so it is promoted deliberately, or keep `Exact`. The check covers **inline** candidates only — a registry candidate is admitted after the parent was validated, so no equivalent check is possible there.
+
+Where two signatures diverge, the diff reports the exact axes and types (returned as a `SignatureDiff`, and carried on every mismatch error), so a rejection reads as an edit rather than a puzzle. Each relation is paired with its own lockstep diff mode — the predicate holds exactly when the diff is empty — and the substitutability diff populates only the directions its relation forbids (`extra_requires`, `extra_requires_outputs`, `missing_produces`). `MatchingMode::admits` / `MatchingMode::diff` select the pair.
+
+Distinct from substitution is **capability matching** — `GraphSignature::satisfies`, a third comparison relation used by consumer registries (e.g. the sessions [capability-contract registry](./sessions.md#capability-contracts)) to ask whether an agent *can do* what a named capability describes. It matches by subsumption: the slot's `requires` and `produces` must be **subsets** of the candidate's, and the candidate's free-output reads must not exceed the slot's. Note the `requires` direction is *inverted* relative to substitution — a capability slot names the inputs the capability's driver will feed the agent, so a candidate's extra requires are presumed environment-provided by its registrant's setup (conservative derivation reports self-inserted resources as required), not violations. `satisfies_diff` is its lockstep diff mode, reporting only the violating directions.
+
+That inversion is why `satisfies` is **not** the relaxed relation a `Dynamic` slot selects, even though it agrees with `substitutable_for` on the other two axes. Subsumption is sound only because it trusts a registrant's claim about an environment the registrant controls. A `Dynamic` slot has no registrant: the *parent graph* is the environment, and it was validated against the slot contract alone, so a candidate requirement the contract never named has nothing to supply it and would dangle at runtime. The three relations are deliberately separate, each named for its soundness envelope.
+
+The contract is also validated against the parent's *surroundings*, not only the candidates — the contract is the interface, so this holds even for a registry slot with no registered candidates. At `validate_resources` time every resource the contract `requires` must be reachable from the context the candidate will run against (`DynamicContractMissingResource` otherwise), and every free `Out<T>` in `requires_outputs` must be produced upstream (`DynamicContractMissingOutput`). Free outputs never cross a non-shared boundary inward, so a non-shared `ContextPolicy` combined with a nonempty `requires_outputs` is statically unsatisfiable (`DynamicContractOutputsBlocked`).
+
+These surroundings checks are **unaffected by the matching mode**. `MatchingMode` governs candidate admission; it does not weaken the contract's own claim on the parent. Under `Substitutable` the contract's `requires` / `requires_outputs` become the *upper bound* of what any admissible candidate may consume — a candidate consuming the whole declared set is still admitted — so the parent must be able to satisfy that upper bound whichever candidate the selector picks. Relaxing the checks under `Substitutable` would admit a parent that cannot feed the maximal admissible candidate, which is exactly the runtime failure composition-time checking exists to prevent. A slot that wants a cheaper obligation on its parent should declare a smaller contract; `Substitutable` widens the candidate set, not the parent's duty. Finally, signature derivation is opaque across an *undeclared* nested scope: its interior resource reads and free `Out<T>` reads never reach the enclosing signature, so a candidate containing one is **rejected** — inline candidates during `validate()` (`DynamicCandidateNested`), registry candidates at `register()` (`RegistryError::NestedCandidate`). A scope carrying a [declared contract](#declared-scope-contracts) does not disqualify a candidate, and neither does a nested dynamic node: their contracts fold into the candidate's signature and validate their hidden interiors or candidates, so the boundary IO is fully accounted for.
+
+The slot's fixed configuration — its `contract`, `MatchingMode` mode, boundary `ContextPolicy`, and optional default key — is bundled into a `DynamicSlot`, passed as one value so there are no positional holes at the call site:
 
 ```rust
 // Inline: route between two pre-built sub-agents by a runtime `Choice`.
@@ -281,11 +523,21 @@ graph.add_dynamic_registry(
 let mut registry = SubgraphRegistry::new(contract);
 registry.register("v1", planner_v1)?; // rejected unless compatible with the contract
 ctx.insert(registry);
+
+// An escalation ladder: rungs deliberately differ in what they consume, so the
+// slot matches by substitutability instead of exactly.
+graph.add_dynamic(
+    "ladder",
+    pick_rung,
+    [("cheap", cheap_rung), ("deep", deep_rung)],
+    DynamicSlot::new(deep_rung_contract, ContextPolicy::shared())
+        .with_matching(MatchingMode::Substitutable),
+);
 ```
 
-If the selector returns a key with no matching candidate, the node falls back to its configured default; with no default it fails with `ExecutionError::DynamicCandidateNotFound`. Registry *resolution* failures are distinct and unrecoverable — the default key resolves through the same registry — so they surface as their own typed errors rather than a candidate miss: no registry in context is `DynamicRegistryMissing`, a write-locked one is `DynamicRegistryBusy`, and one hidden by an enclosing scope's policy is `DynamicRegistryOutOfScope` (carrying crossing-verb guidance). For the registry source, the resolved `SubgraphRegistry`'s contract must itself be compatible with the node's slot contract — candidates are signature-checked against the *registry's* contract at `register()` time, so a registry whose contract diverges from the slot is refused at execution with `ExecutionError::DynamicContractMismatch` (which carries a `SignatureDiff` naming the divergence) rather than running a candidate the parent graph was never validated against. The chosen candidate runs under the node's `ContextPolicy` exactly like a scope — see [Scope](#scope) for the boundary and output-merge semantics.
+If the selector returns a key with no matching candidate, the node falls back to its configured default; with no default it fails with `ExecutionError::DynamicCandidateNotFound`. Registry *resolution* failures are distinct and unrecoverable — the default key resolves through the same registry — so they surface as their own typed errors rather than a candidate miss: no registry in context is `DynamicRegistryMissing`, a write-locked one is `DynamicRegistryBusy`, and one hidden by an enclosing scope's policy is `DynamicRegistryOutOfScope` (carrying crossing-verb guidance). For the registry source, the resolved `SubgraphRegistry`'s contract must itself be compatible with the node's slot contract — candidates are signature-checked against the *registry's* contract at `register()` time, so a registry whose contract diverges from the slot is refused at execution with `ExecutionError::DynamicContractMismatch` (which carries a `SignatureDiff` naming the divergence) rather than running a candidate the parent graph was never validated against. That check compares two *contracts* for identity, so it stays exact-set whatever mode either side admits its candidates under. A registry carries its own matching mode (`SubgraphRegistry::with_matching`, also defaulting to `Exact`), and on the registry path **the registry's mode is the only gate**: it admits at `register()`, and the executor re-checks contracts only, never modes — so `DynamicSlot::with_matching` records intent but gates nothing on a registry-backed node. Set them together. A divergence is silent in both directions: a stricter registry registers fewer candidates than its slot would have taken, and a laxer one runs candidates the slot's own mode would have refused. Neither direction is unsound — both modes admit only sound substitutes for the shared contract, so no candidate reads an input the parent does not supply — but a laxer registry does hand a slot that asked for `Exact` the dropped-extra-output case above, past the point where `validate()` could warn about it. The chosen candidate runs under the node's `ContextPolicy` exactly like a scope — see [Scope](#scope) for the boundary and output-merge semantics.
 
-**Bounding runtime candidates.** Signature compatibility constrains a candidate's *interface*, not its *cost*: a candidate may contain arbitrarily many nodes. A candidate may **not**, however, nest another `Scope` or `Dynamic` node — signature derivation cannot see across those boundaries, so such candidates are rejected at build/registration time (see above). That also forecloses a self-referential dynamic candidate recursing unbounded, before the executor's recursion limit (`GraphExecutor::max_recursion_depth`, default 64) would ever catch it. Total node count and wall-clock time are still *not* bounded by default, so when candidates are generated or chosen from untrusted input (e.g. an LLM), set a [`max_duration`](https://docs.rs/polaris-ai/latest/polaris_ai/graph/struct.Graph.html#method.with_max_duration) on the candidate graphs; it wraps each candidate's execution in a timeout at the dynamic boundary.
+**Bounding runtime candidates.** Signature compatibility constrains a candidate's *interface*, not its *cost*: a candidate may contain arbitrarily many nodes. A candidate may not nest an undeclared `Scope` — signature derivation cannot see across that boundary, so it is rejected at build/registration time (see above). Declared-contract scopes and nested dynamic nodes are admissible because their contracts provide checked interfaces. Dynamic nesting is bounded by the executor's recursion limit (`GraphExecutor::max_recursion_depth`, default 64). Total node count and wall-clock time are still *not* bounded by default, so when candidates are generated or chosen from untrusted input (e.g. an LLM), set a [`max_duration`](https://docs.rs/polaris-ai/latest/polaris_ai/graph/struct.Graph.html#method.with_max_duration) on the candidate graphs; it wraps each candidate's execution in a timeout at the dynamic boundary.
 
 See the [`SubgraphRegistry`](https://docs.rs/polaris-ai/latest/polaris_ai/graph/struct.SubgraphRegistry.html) reference for the registry's scope, access pattern, and a worked example, and the [integration guide](./guide.md#common-integration-patterns) row *"Select or swap a subgraph behind a slot at runtime"* for where this pattern fits among the others.
 
@@ -373,7 +625,7 @@ pub enum Edge {
 }
 ```
 
-`SequentialEdge` connects one node to the next and is the primary mechanism for linear flow. The builder creates these automatically when chaining nodes.
+`SequentialEdge` connects one node to the next and is the primary mechanism for linear flow. The builder creates these automatically when chaining nodes. A node may have at most one sequential successor — see [Sequential](#sequential) for what `validate()` rejects and why.
 
 `ErrorEdge` and `TimeoutEdge` define fallback paths from a system node to a handler subgraph.
 
@@ -453,7 +705,102 @@ Graph-level timeout is a **hard abort**. When it fires mid-execution, tokio drop
 
 This is distinct from **per-node timeout** (`SystemNodeBuilder::with_timeout` or `Graph::set_timeout(node_id, duration)`), which integrates with retry policies and timeout handler edges for structured recovery. Use per-node timeout when you need handler-based recovery; use graph-level timeout for hard time budgets.
 
+It is also distinct from [Cancellation](#cancellation) below, which is cooperative: the executor stops *between* nodes and never drops a running system's future, so none of the costs listed above apply to an interrupted run.
+
 Subgraph execution (branches, loop bodies, case handlers) is recursive with depth tracking. The default recursion limit is 64.
+
+### Cancellation
+
+Where a graph-level timeout is a hard abort, cancellation is **cooperative**: the executor stops between nodes and never drops a running system's future. It is how a user's Ctrl-C, a UI stop button, or a host's shutdown ends a run in flight without the costs listed under [Cancel Safety](#cancel-safety).
+
+One run carries at most one signal, split into two halves so that the authority to raise it and the ability to notice it are separate capabilities:
+
+- `CancellationSource` — held by whoever drives the executor. `cancel()` latches and is idempotent. It is synchronous and does not await, but it takes a short internal lock (and `RunCancellation::is_cancelled` does too), so it is not lock-free and not safe to call from a raw signal handler. `Clone`, so a signal-listener task and a UI callback can share one.
+- `RunCancellation` — an ordinary per-run `LocalResource`, read with `Res<RunCancellation>`. It has **no** `cancel`: a system cannot end the run it is inside.
+
+Whoever owns the run inserts the observer into the run's root context before execution. A caller that inserts nothing gets today's behaviour — the run is not cancellable, and the check costs one `Option` test per node.
+
+```rust
+let source = CancellationSource::new();
+let mut ctx = SystemContext::new();
+ctx.insert(source.token());
+
+// From any other task:
+source.cancel();
+```
+
+To end a run on Ctrl-C, forward the signal to an ordinary task rather than calling `cancel()` from a raw signal handler:
+
+```rust
+let on_signal = source.clone();
+tokio::spawn(async move {
+    if tokio::signal::ctrl_c().await.is_ok() {
+        on_signal.cancel();
+    }
+});
+```
+
+`SessionsAPI` inserts one on every turn, so a session-driven turn is always cancellable; see [Sessions — Interrupting a turn](sessions.md#interrupting-a-turn).
+
+#### Where the executor checks
+
+The executor snapshots the observer once at run start and evaluates it at two points inside the single dispatch loop:
+
+1. **Before starting a node.** The node is not dispatched and is not counted.
+2. **Before letting a node-attributable error propagate.** A system that returned `Err` because it noticed the signal ends the run as interrupted, not as a system failure.
+
+Because every construct recurses through the same loop, the first point is observed at every boundary in the graph model:
+
+| Boundary | Behaviour |
+|---|---|
+| Next node on a sequential chain | Declined; the run stops. |
+| Entry of a decision, switch, or scope/dynamic interior | Declined; the enclosing construct's `Complete` hook does not fire. |
+| Before each loop iteration | Declined *before* `OnLoopIteration` fires — an iteration that never starts is not reported as one that did. The termination predicate still runs first, so a loop that is already done ends normally. |
+| Inside each parallel branch | Declined per branch; see below. |
+| Entry of an error or timeout handler | The edge still *selects* the handler; the boundary check then declines to start it. So `on_error` / `on_timeout` are never entered under an interrupt. |
+| Before the first node | `Interrupted { nodes_executed: 0 }`, after `OnGraphStart` has fired. |
+
+Three places the executor owns *inside* a node also observe it:
+
+- **Retry.** A raised signal stops the sequence: the attempt already running is never dropped, the next one does not start, and the inter-attempt backoff is raced rather than waited out.
+- **Parallel branches.** An interrupted branch is returned to `try_join_all` as an ordinary completed branch, so no sibling's future is dropped and a consumer's branch middleware does not observe it as a failure. A branch that fails while the signal is raised — including a failure raised by the branch's own middleware after its body returned — is set aside the same way: the join waits for every branch, the child outputs are merged into the parent, and only then does the parallel node report the stop, counting the work of every branch. A structural fault in a branch is still reported as itself, after the siblings have finished. `OnParallelComplete` does not fire when the node reports a stop. Interrupt latency is therefore the slowest branch's — the price of never dropping a future. With no raise, a failing branch still aborts its siblings, as described under [Parallel Execution](#parallel-execution).
+- **Timeouts.** Unchanged. A graph-level timeout still returns `GraphTimeout` with its dropped-future semantics; a per-node timeout still wraps one attempt.
+
+#### The outcome
+
+```rust
+ExecutionError::Interrupted { run_id, node, nodes_executed, elapsed }
+```
+
+Reported through the normal failure path, so `OnGraphFailure` fires with it; there is no new hook schedule and `ExecutionResult` is unchanged. `node` is where the stop was observed — the node declined, or the node whose error it superseded; when a branch of a parallel node stopped, it is the parallel node's own id, because the innermost branch boundary is not recoverable once branches are joined. `nodes_executed` counts as `ExecutionResult::nodes_executed` counts: a declined node is excluded, a failed one is included.
+
+Two rules keep the outcome honest:
+
+- **A completed run stays completed.** If the signal is raised while the terminal node runs, the run finishes and returns its `ExecutionResult`. There is nothing left to decline to start, and reporting a turn that did all its work as interrupted would discard its output. A terminal parallel node follows the same rule: it completes, `OnParallelComplete` fires, and the run succeeds, unless a branch declined a node or failed under the raised signal. If a successor follows the parallel node, the stop is reported at that successor.
+- **An interrupt never masks a defect.** It supersedes exactly a system failure, a per-node timeout, a middleware failure, and an already-propagating interrupt. Every other variant — `NodeNotFound`, `RecursionLimitExceeded`, `MaxIterationsExceeded`, `MissingPredicate`, the scope and signature faults, and `GraphTimeout` — propagates unchanged. A developer who happens to press Ctrl-C at the wrong moment is still told their graph is malformed.
+
+#### Inside a system
+
+Granularity is the system's choice, and both choices are safe — the executor stores exactly what a system returns, never a partial result.
+
+```rust
+#[system]
+async fn act(cancel: Res<RunCancellation>, llm: Res<AgentLlm>) -> Result<LlmResponse, SystemError> {
+    let Some(response) = cancel.run_until_cancelled(stream_and_collect(&llm)).await else {
+        return Err(SystemError::ExecutionError("interrupted".into()));
+    };
+    Ok(response)
+}
+```
+
+`run_until_cancelled` returning `None` means the work future was dropped at its own await point — the ordinary cost of `select!`, accepted by the system author who chose this form. The returned `Err` is diagnostic only: the boundary check reports `Interrupted` whatever the message says, and the error edge is not followed. A system that never checks runs to completion and the run stops at the next boundary, so **interrupt latency is bounded by the slowest node that ignores the signal**.
+
+Two costs this carries, stated rather than hidden:
+
+- **`requires` grows.** A `Res<RunCancellation>` read lands in the graph's derived `GraphSignature`, so a registered contract or a dynamic slot over that graph must carry the type. That is the honest interface of a cancellable graph, and the same cost `UserIO` pays.
+- **Isolated scopes need `share`.** Inside a `ContextPolicy::new()` scope or dynamic candidate, the in-node read fails with `ResourceOutOfScope` unless the policy declares `.share::<RunCancellation>()` — the same rule `SessionInfo` follows. The *between-node* stop needs nothing: the executor holds the token from the root and checks it inside every boundary.
+
+What an interrupted run leaves behind: outputs produced on the chain the interrupt stopped are present, and `ResMut` writes are committed. Outputs produced inside a scope or dynamic interior the interrupt unwound through are discarded, as they are for any propagating error. Parallel branch outputs are preserved, per the merge rule above.
 
 ## Error Handling
 
@@ -468,6 +815,10 @@ This separation is enforced by the builder: `add_error_handler()` only auto-wire
 ### Error Edges
 
 When a system node fails, the executor checks for an `ErrorEdge` from that node. If one exists, execution continues at the error handler subgraph. If none exists, the error propagates and execution stops.
+
+**A node has at most one error handler, and at most one timeout handler.** That lookup is first-match too, so a second handler wired to the same node is never reached — the recovery logic you wrote would simply not run, which is the worst place for a silent failure. `validate()` rejects it as `ValidationError::AmbiguousRoute` with `kind: RouteKind::Error` or `RouteKind::Timeout`.
+
+**Order matters when you mix specific and global handlers.** `add_error_handler` fills only nodes that have *no* handler yet, so the working pattern is specific first, global second — as in the example below. The reverse order is what `validate()` catches: the global call already gave the node a handler, so a specific one added afterwards is dead. There is no override; to change a node's handler, wire that node's handler before the global call.
 
 ```rust
 // Per-node error handler:
@@ -486,8 +837,10 @@ graph.add_error_handler_fn(|error: &CaughtError| -> ErrorResponse {
     ErrorResponse { code: 500, message: error.message.to_string() }
 });
 
-// Closure-based handler for specific nodes:
-graph.add_error_handler_fn_for([risky_id], |error: &CaughtError| -> String {
+// Closure-based handler for specific nodes — a different node than `risky_id`
+// above, which already has its own specific handler from `add_error_handler_for`:
+let flaky_id = graph.add_system_node(flaky_operation);
+graph.add_error_handler_fn_for([flaky_id], |error: &CaughtError| -> String {
     format!("handled: {}", error.message)
 });
 ```
@@ -641,6 +994,30 @@ Multiple custom schedules can be attached using a tuple:
 graph.add_system(((OnToolCall, OnExpensiveOp), execute_tool));
 ```
 
+Pre-boxed and typed-erased systems attach the same schedule markers through the
+node builder:
+
+```rust
+graph.system_boxed(erase(execute_tool))
+    .with_schedules((OnToolCall, OnExpensiveOp))
+    .done();
+```
+
+`with_schedules` **accumulates** rather than replaces. Markers already attached
+— by the tuple form or by an earlier `with_schedules` call — are preserved, and
+a marker already present is not added twice:
+
+```rust
+graph.system((OnAudit, execute_tool))
+    .with_schedules(OnToolCall)
+    .done();
+// node schedules: [OnAudit, OnToolCall]
+```
+
+This is what lets a reusable composition helper stamp its own role marker onto a
+caller-supplied stage without silently dropping the graph author's observability
+markers.
+
 ### DevToolsPlugin
 
 `DevToolsPlugin` demonstrates provider hooks. It registers a hook on `OnSystemStart` that injects `SystemInfo` into the context before each system executes. Systems can then access the current node ID and system name via `Res<SystemInfo>`:
@@ -689,7 +1066,7 @@ impl Plugin for TracingPlugin {
 
         mw.register_system("tracing::system", |info: SystemInfo, ctx, next| {
             Box::pin(async move {
-                let span = tracing::info_span!("system", name = info.node_name);
+                let span = tracing::info_span!("system", name = %info.node_name);
                 let _guard = span.enter();
                 next.run(ctx).await
             })

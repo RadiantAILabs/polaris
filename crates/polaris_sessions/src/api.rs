@@ -4,36 +4,35 @@
 //! It is registered as an [`API`] by [`SessionsPlugin`]
 //! and accessed via `server.api::<SessionsAPI>()`.
 
+use crate::checkpoint::{
+    CheckpointHistory, CheckpointMeta, CheckpointOrigin, CheckpointRetention, CheckpointSet,
+    ResourceRef, RevisionId, SessionCheckpoints,
+};
 use crate::error::{SessionError, WiringError};
 use crate::guard::SessionGuard;
-#[cfg(feature = "sessions-http")]
-use crate::http::models::{BucketGranularity, SessionUptimeResponse};
-#[cfg(feature = "sessions-http")]
-use crate::http::models::{Turn, TurnStatus, TurnSummary};
 use crate::info::{SessionInfo, SessionMetadata, SessionStatus};
+use crate::models::{BucketGranularity, SessionUptimeResponse};
+use crate::models::{Turn, TurnStatus, TurnSummary};
 use crate::store::{AgentTypeId, ResourceEntry, SessionData, SessionId, SessionStore, TurnNumber};
-#[cfg(feature = "sessions-http")]
 use crate::uptime::{LifecycleKind, UptimeRecorder};
-#[cfg(feature = "sessions-http")]
 use chrono::DateTime;
 use chrono::Utc;
 use hashbrown::{HashMap, hash_map::Entry};
 use parking_lot::RwLock;
 use polaris_agent::Agent;
 use polaris_core_plugins::persistence::{PersistenceAPI, PersistencePlugin, ResourceSerializer};
-#[cfg(feature = "sessions-http")]
 use polaris_core_plugins::{IOContent, IOMessage, IOSource};
 use polaris_graph::MiddlewareAPI;
+use polaris_graph::cancel::CancellationSource;
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::{
-    ExecutionResult, Graph, GraphExecutor, GraphSignature, RunLabels, SignatureDiff,
+    ExecutionError, ExecutionResult, Graph, GraphExecutor, GraphSignature, RunLabels, SignatureDiff,
 };
 use polaris_system::api::API;
 use polaris_system::param::SystemContext;
 use polaris_system::plugin::{Contract, Plugin, PluginAccess, PluginId, Version};
 use polaris_system::resource::Output;
 use polaris_system::server::{ContextFactory, Server};
-#[cfg(feature = "sessions-http")]
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -45,39 +44,23 @@ use tracing::Instrument;
 /// Each completed turn produces one [`TurnHistoryEntry`]. Bounding the
 /// deque prevents an unbounded-running session from leaking memory; the
 /// oldest entries are evicted first when the cap is reached.
-#[cfg(feature = "sessions-http")]
 const MAX_TURN_HISTORY: usize = 256;
 
 /// Maximum number of IO messages retained in one turn-history entry.
-#[cfg(feature = "sessions-http")]
 const MAX_RECORDED_MESSAGES_PER_TURN: usize = 256;
 
 /// Maximum retained payload size across all messages in one turn.
-#[cfg(feature = "sessions-http")]
 const MAX_RECORDED_BYTES_PER_TURN: usize = 1024 * 1024;
 
 /// Maximum retained payload size for one message.
-#[cfg(feature = "sessions-http")]
 const MAX_RECORDED_BYTES_PER_MESSAGE: usize = 64 * 1024;
 
 /// Maximum metadata entries copied from one recorded message.
-#[cfg(feature = "sessions-http")]
 const MAX_RECORDED_METADATA_ENTRIES: usize = 64;
 
 /// Max characters retained from the most recent IO message in a turn's
 /// `last_message_preview`.
-#[cfg(feature = "sessions-http")]
 const PREVIEW_MAX_CHARS: usize = 120;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Checkpoint (internal)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A snapshot of session resources at a specific turn.
-struct Checkpoint {
-    turn_number: TurnNumber,
-    data: SessionData,
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SessionState (internal)
@@ -88,8 +71,8 @@ struct Checkpoint {
 /// The context is held in a `tokio::sync::Mutex` because it is held across
 /// the async `execute()` call. Checkpoints use a `parking_lot::Mutex`
 /// because they are only accessed synchronously.
-struct SessionState {
-    ctx: tokio::sync::Mutex<SystemContext<'static>>,
+pub(crate) struct SessionState {
+    pub(crate) ctx: tokio::sync::Mutex<SystemContext<'static>>,
     graph: Graph,
     executor: GraphExecutor,
     agent_type: AgentTypeId,
@@ -99,13 +82,28 @@ struct SessionState {
     /// The registered agent's description, resolved at session creation and
     /// on resume. `None` when the agent reports no description.
     agent_description: Option<String>,
-    turn_number: AtomicU32,
-    checkpoints: parking_lot::Mutex<Vec<Checkpoint>>,
+    pub(crate) turn_number: AtomicU32,
+    /// The in-flight turn's cancellation authority, or `None` when the
+    /// session is idle.
+    ///
+    /// Filled immediately before the executor call and cleared immediately
+    /// after, so a raise that lands outside that window is not latched into
+    /// the next turn. A `parking_lot::Mutex` rather than the async context
+    /// mutex is the whole point: a turn holds the context lock for its entire
+    /// duration, so [`SessionsAPI::interrupt_turn`] would deadlock behind it.
+    cancellation: parking_lot::Mutex<Option<CancellationSource>>,
+    /// The session's retained checkpoints, their identity counter, their
+    /// removal history and the pins holding them.
+    ///
+    /// One field behind one synchronous lock, as before: every
+    /// [`CheckpointSet`] operation is synchronous, so the comment above still
+    /// holds and the session gains no second lock.
+    pub(crate) checkpoints: parking_lot::Mutex<CheckpointSet>,
     created_at: String,
     /// Read-only sessions reject all mutation paths but stay queryable.
     /// Set by [`SessionsAPI::run_oneshot_preserved`] after the terminal
     /// turn completes.
-    read_only: AtomicBool,
+    pub(crate) read_only: AtomicBool,
     /// Pre-built `(session_id, agent_type)` labels shared across every turn.
     /// `RunLabels` is `Arc`-backed, so per-turn cost is one `Arc::clone`
     /// instead of allocating a fresh `HashMap`.
@@ -114,13 +112,11 @@ struct SessionState {
     ///
     /// Bounded ring; oldest entries are evicted once
     /// [`MAX_TURN_HISTORY`] entries accumulate.
-    #[cfg(feature = "sessions-http")]
     turns: parking_lot::Mutex<VecDeque<TurnHistoryEntry>>,
 }
 
 /// In-memory record for one turn, used as the source-of-truth for
 /// [`SessionsAPI::turn_history`] and [`SessionsAPI::turn`].
-#[cfg(feature = "sessions-http")]
 #[derive(Debug, Clone)]
 struct TurnHistoryEntry {
     turn: TurnNumber,
@@ -132,6 +128,77 @@ struct TurnHistoryEntry {
     recorded_bytes: usize,
     messages_truncated: bool,
     last_message_preview: Option<String>,
+}
+
+/// Owns the accounting one turn opens — its history entry, its `Active`
+/// lifecycle mark and its interrupt slot — and closes all three on **every**
+/// exit path, including the caller dropping the turn future.
+///
+/// Bare stores around the executor `await` were correct only for `return`.
+/// A client that `POST`s a turn and disconnects makes axum drop the handler,
+/// which drops the turn future at that `await`: the context lock is released
+/// so the session is genuinely idle, but the slot stayed `Some(dead_source)`,
+/// so [`SessionsAPI::interrupt_turn`] answered `Ok(true)` for a turn that no
+/// longer existed — and a host implementing the documented "one press
+/// interrupts, a second quits" escalation on that boolean quits on the user's
+/// first press. The same drop stranded the turn record at
+/// [`TurnStatus::Running`] and the session at
+/// [`LifecycleKind::Active`] forever.
+struct TurnGuard<'a> {
+    api: &'a SessionsAPI,
+    state: &'a SessionState,
+    id: &'a SessionId,
+    turn: TurnNumber,
+    /// Set once the turn reached a terminal status of its own, which is what
+    /// tells `Drop` the only thing left to do is nothing.
+    settled: bool,
+}
+
+impl<'a> TurnGuard<'a> {
+    /// Opens the turn: history entry, `Active` lifecycle mark, interrupt slot.
+    ///
+    /// Recording before the executor runs is deliberate — a `Running` entry is
+    /// visible from the dashboard the moment a turn is in flight.
+    fn open(
+        api: &'a SessionsAPI,
+        state: &'a SessionState,
+        id: &'a SessionId,
+        turn: TurnNumber,
+        cancellation: CancellationSource,
+    ) -> Self {
+        api.start_turn_record(state, turn);
+        api.inner.uptime.record(id, LifecycleKind::Active);
+        *state.cancellation.lock() = Some(cancellation);
+        Self {
+            api,
+            state,
+            id,
+            turn,
+            settled: false,
+        }
+    }
+
+    /// Closes the turn with the status the executor actually produced.
+    fn settle(&mut self, status: TurnStatus) {
+        *self.state.cancellation.lock() = None;
+        self.api.finish_turn_record(self.state, self.turn, status);
+        self.api.inner.uptime.record(self.id, LifecycleKind::Idle);
+        self.settled = true;
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // Reached only when the turn future was dropped inside the executor
+        // `await`. `Failed` rather than `Interrupted`: an abandoned turn
+        // neither advanced the turn number nor attempted a checkpoint, and
+        // `TurnStatus::Interrupted` records both. It is not `Completed`
+        // either — nothing returned a result.
+        self.settle(TurnStatus::Failed);
+    }
 }
 
 fn build_session_labels(id: &SessionId, agent_type: &AgentTypeId) -> RunLabels {
@@ -309,11 +376,14 @@ struct SessionsInner {
     contracts: RwLock<HashMap<ContractName, GraphSignature>>,
     sessions: RwLock<HashMap<SessionId, Arc<SessionState>>>,
     auto_checkpoint: AtomicBool,
+    /// Bounds on one session's retained checkpoint set. Injected policy, set
+    /// by [`SessionsPlugin::with_checkpoint_retention`], never a constant at
+    /// a call site.
+    retention: RwLock<CheckpointRetention>,
     hooks: OnceLock<HooksAPI>,
     middleware: OnceLock<MiddlewareAPI>,
     context_factory: OnceLock<ContextFactory>,
     /// Lifecycle recorder backing the per-session uptime endpoint.
-    #[cfg(feature = "sessions-http")]
     uptime: UptimeRecorder,
 }
 
@@ -374,15 +444,17 @@ struct SessionsInner {
 /// | `run_oneshot` | Creates an ephemeral session, runs one turn, returns typed output, deletes the session. |
 /// | `run_oneshot_preserved` | Like `run_oneshot`, but keeps the session alive read-only for later inspection. |
 /// | `with_context` | Runs a closure against a live session's context to read or inject resources. |
+/// | [`interrupt_turn`](Self::interrupt_turn) | Raises the cancellation signal for the turn currently in flight. Synchronous, idempotent, never takes the context lock; `Ok(true)` means a turn was in flight, `Ok(false)` that the session was idle. |
 ///
 /// **Checkpoints & rollback**
 ///
 /// | Method | Description |
 /// |--------|-------------|
-/// | `checkpoint` | Snapshots the session's resources at the current turn. |
-/// | `list_checkpoints` | Lists the turn numbers that have checkpoints. |
-/// | `rollback` | Restores the session's resources to a checkpointed turn. |
-/// | `set_auto_checkpoint` | Enables or disables automatic post-turn checkpoints. |
+/// | `checkpoints` | The [`SessionCheckpoints`] handle: stable checkpoint identity, branch-safe restore, retention bounds and availability reporting. |
+/// | `checkpoint` | Snapshots the session's resources at the current turn. Superseded by `checkpoints().capture`. |
+/// | `list_checkpoints` | Lists the turn numbers that have checkpoints. Superseded by `checkpoints().list`. |
+/// | `rollback` | Restores the session's resources to a checkpointed turn. Superseded by `checkpoints().restore`; see its rustdoc for the run-identity hazard on the automatic path. |
+/// | `set_auto_checkpoint` | Enables or disables creation, resume, completed-turn and interrupted-turn checkpoints. |
 ///
 /// **Persistence**
 ///
@@ -401,9 +473,10 @@ struct SessionsInner {
 /// | `list_live_sessions` | Lists ids of sessions currently held in memory. |
 /// | `session_info` | Returns metadata for one live session. |
 /// | `list_session_metadata` | Returns metadata for every live session. |
-/// | `turn_history` *(feature `sessions-http`)* | Returns recorded turn summaries. |
-/// | `turn` *(feature `sessions-http`)* | Returns the detail of one recorded turn. |
-/// | `uptime_buckets` *(feature `sessions-http`)* | Returns a bucketed session-lifecycle series. |
+/// | `turn_history` | Returns recorded turn summaries. |
+/// | `record_turn_messages` | Attaches IO messages observed during a turn to turn history. |
+/// | `turn` | Returns the detail of one recorded turn. |
+/// | `uptime_buckets` | Returns a bucketed session-lifecycle series. |
 ///
 /// **Plugin wiring** — called by [`SessionsPlugin`] / the HTTP layer, not
 /// by general consumers:
@@ -414,19 +487,29 @@ struct SessionsInner {
 /// | `set_serializers` | Snapshots the resource serializers from [`PersistenceAPI`]. |
 /// | `set_graph_apis` | Stores the hooks/middleware APIs used during turn execution. |
 /// | `set_context_factory` | Stores the factory used to build fresh contexts. |
-/// | `record_turn_messages` *(feature `sessions-http`)* | Attaches IO messages observed during a turn to turn history. |
 ///
 /// # Lifecycle
 ///
 /// The wiring methods (`set_serializers`, `set_graph_apis`,
 /// `set_context_factory`) are called once by [`SessionsPlugin`] during its
 /// `ready()` phase; `set_graph_apis` and `set_context_factory` return
-/// [`WiringError`] if invoked a second time.
+/// [`WiringError`] if invoked a second time. `set_serializers` has no such
+/// guard: it **replaces** the current serializer snapshot wholesale, so a
+/// second call drops any serializer the first one carried. Turns already in
+/// flight hold the snapshot they resolved at their start and are unaffected.
+///
 /// `register_agent` and `register_contract` are intended to be called after
-/// `ready()` and before the first turn. Every other method — session
-/// creation, turn execution, checkpoints, persistence, introspection — is
-/// a runtime operation, valid for the lifetime of the server once the
-/// plugin is ready. All methods take `&self`.
+/// `ready()` and before the first turn. Calling either later is accepted
+/// rather than rejected, and takes effect only for subsequent lookups and
+/// turns: a live session keeps the graph it was created with, so
+/// re-registering an agent name changes nothing for sessions already running
+/// under it. `register_contract` is the exception that stays strict — a
+/// second registration of the same name with a *different* signature returns
+/// [`SessionError::ContractConflict`] whenever it happens.
+///
+/// Every other method — session creation, turn execution, checkpoints,
+/// persistence, introspection — is a runtime operation, valid for the
+/// lifetime of the server once the plugin is ready. All methods take `&self`.
 ///
 /// # Composition
 ///
@@ -441,7 +524,7 @@ struct SessionsInner {
 ///
 /// # Example consumers
 ///
-/// - [`HttpPlugin`](crate::http::HttpPlugin) — resolves `SessionsAPI` during
+/// - `HttpPlugin` (feature `sessions-http`) — resolves `SessionsAPI` during
 ///   app `ready()` and uses it as handler state for the sessions REST
 ///   endpoints.
 /// - Consumer plugins defining agent capabilities — call
@@ -458,12 +541,30 @@ struct SessionsInner {
 ///
 /// # Auto-Checkpoint
 ///
-/// When enabled (the default), a background task creates a checkpoint after
-/// every successful [`process_turn`](Self::process_turn). This provides
-/// automatic rollback points without blocking the turn result. Checkpoint
-/// failures are logged but never propagate as errors. Disable via
-/// [`SessionsPlugin::without_auto_checkpoint`] if unwanted. Checkpoints
-/// are stored in memory and are not persisted to the backing store.
+/// Enabled by default. A checkpoint is captured at four points: session
+/// creation, [`resume_session`](Self::resume_session), and the return path of
+/// every **completed** and every **interrupted**
+/// [`process_turn`](Self::process_turn). A turn that failed for any other
+/// reason takes no checkpoint — its context is not a state anyone can reason
+/// about.
+///
+/// Capture is **synchronous**, taken while the turn still holds the session's
+/// context lock, so the snapshot is of exactly the state the turn produced and
+/// its serialization cost is on the turn's latency. Failures — including a
+/// retention refusal — are logged at `warn` and never propagate: an automatic
+/// checkpoint must not take a user's completed turn down with it.
+///
+/// The retained set is **bounded** by the [`CheckpointRetention`] the host
+/// injects through [`SessionsPlugin::with_checkpoint_retention`], 64
+/// checkpoints / 16 MiB of serialized payload by default;
+/// [`CheckpointRetention::unbounded`] opts out. Retained checkpoints are
+/// **durable**: they ride [`SessionData`] through the configured
+/// [`SessionStore`], so [`save_session`](Self::save_session) writes them and
+/// [`resume_session`](Self::resume_session) brings them back with their
+/// identities intact.
+///
+/// Disable the whole mechanism — turn captures and boundary captures alike —
+/// via [`SessionsPlugin::without_auto_checkpoint`].
 ///
 /// # Interior Mutability
 ///
@@ -474,12 +575,34 @@ struct SessionsInner {
 /// ```no_run
 /// use std::sync::Arc;
 /// use polaris_core_plugins::PersistencePlugin;
+/// use polaris_sessions::store::SessionStore;
 /// use polaris_sessions::{SessionsAPI, SessionsPlugin};
 /// use polaris_sessions::store::memory::InMemoryStore;
+/// use polaris_system::plugin::{Contract, Plugin, PluginAccess, Version};
 /// use polaris_system::server::Server;
 ///
+/// // Provider side — the shape of `SessionsPlugin::build`: declare the
+/// // capability, then construct the API over the configured store and publish
+/// // it so consumers can resolve it.
+/// struct MySessionsPlugin {
+///     store: Arc<dyn SessionStore>,
+/// }
+///
+/// impl Plugin for MySessionsPlugin {
+///     const ID: &'static str = "example::sessions";
+///     const VERSION: Version = Version::new(0, 1, 0);
+///
+///     fn access(&self) -> PluginAccess {
+///         PluginAccess::new().provides::<SessionsAPI>(SessionsAPI::CONTRACT_VERSION)
+///     }
+///
+///     fn build(&self, server: &mut Server) {
+///         server.insert_api(SessionsAPI::new(Arc::clone(&self.store)));
+///     }
+/// }
+///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // Provider side: SessionsPlugin inserts SessionsAPI during build.
+/// // In practice a host adds the shipped plugin rather than writing its own.
 /// let mut server = Server::new();
 /// server
 ///     .add_plugins(PersistencePlugin)
@@ -519,8 +642,18 @@ impl API for SessionsAPI {}
 ///
 /// 0.1.1 added the capability-contract registry (`register_contract`,
 /// `contract_diff`, `agent_signature`, `agent_type_infos`) — additive.
+///
+/// 0.1.2 added the checkpoint surface ([`checkpoints`](SessionsAPI::checkpoints)),
+/// turn interruption ([`interrupt_turn`](SessionsAPI::interrupt_turn)), and made
+/// the turn-history and lifecycle surface unconditional —
+/// [`turn_history`](SessionsAPI::turn_history), [`turn`](SessionsAPI::turn),
+/// [`record_turn_messages`](SessionsAPI::record_turn_messages) and
+/// [`uptime_buckets`](SessionsAPI::uptime_buckets) were previously behind the
+/// `sessions-http` feature. All additive; a caret requirement on 0.1.1 admits
+/// it, so no consumer changes — but a consumer that needs any of these methods
+/// must require 0.1.2, since 0.1.1 does not carry them.
 impl Contract for SessionsAPI {
-    const CONTRACT_VERSION: Version = Version::new(0, 1, 1);
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 2);
 }
 
 impl SessionsAPI {
@@ -547,10 +680,10 @@ impl SessionsAPI {
                 contracts: RwLock::new(HashMap::new()),
                 sessions: RwLock::new(HashMap::new()),
                 auto_checkpoint: AtomicBool::new(true),
+                retention: RwLock::new(CheckpointRetention::default()),
                 hooks: OnceLock::new(),
                 middleware: OnceLock::new(),
                 context_factory: OnceLock::new(),
-                #[cfg(feature = "sessions-http")]
                 uptime: UptimeRecorder::new(),
             }),
         }
@@ -561,6 +694,99 @@ impl SessionsAPI {
     /// Called during the plugin ready phase.
     pub fn set_serializers(&self, serializers: Vec<Arc<dyn ResourceSerializer>>) {
         *self.inner.serializers.write() = Arc::new(serializers);
+    }
+
+    /// Returns the checkpoint surface for this API.
+    ///
+    /// Cheap: one `Arc` clone, the same cost as cloning `SessionsAPI` itself,
+    /// so callers need not cache the handle.
+    ///
+    /// Everything beyond the legacy [`checkpoint`](Self::checkpoint) /
+    /// [`list_checkpoints`](Self::list_checkpoints) /
+    /// [`rollback`](Self::rollback) trio lives on
+    /// [`SessionCheckpoints`]: stable checkpoint identity, branch-safe
+    /// restore, retention bounds and availability reporting. See the
+    /// [`checkpoint`](crate::checkpoint) module.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, SessionId};
+    /// # use polaris_sessions::checkpoint::CheckpointOrigin;
+    /// # async fn example(
+    /// #     sessions: &SessionsAPI,
+    /// #     id: &SessionId,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// let point = sessions.checkpoints().capture(id, CheckpointOrigin::Manual).await?;
+    /// sessions.checkpoints().restore(id, point.id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn checkpoints(&self) -> SessionCheckpoints {
+        SessionCheckpoints::new(self.clone())
+    }
+
+    /// Sets the checkpoint retention policy.
+    ///
+    /// Crate-internal: a host configures this through
+    /// [`SessionsPlugin::with_checkpoint_retention`], which keeps the policy a
+    /// build-time composition choice rather than something a running consumer
+    /// can change under another consumer's pins.
+    pub(crate) fn set_checkpoint_retention(&self, retention: CheckpointRetention) {
+        *self.inner.retention.write() = retention;
+    }
+
+    /// The configured checkpoint retention policy.
+    pub(crate) fn checkpoint_retention(&self) -> CheckpointRetention {
+        *self.inner.retention.read()
+    }
+
+    /// The current serializer snapshot.
+    pub(crate) fn serializers(&self) -> Arc<Vec<Arc<dyn ResourceSerializer>>> {
+        Arc::clone(&self.inner.serializers.read())
+    }
+
+    /// Looks up live session state, for the checkpoint surface.
+    pub(crate) fn session_state(&self, id: &SessionId) -> Result<Arc<SessionState>, SessionError> {
+        self.get_state(id)
+    }
+
+    /// Captures the context as a checkpoint while its lock is already held.
+    ///
+    /// The single capture path: [`SessionCheckpoints::capture`], the legacy
+    /// [`checkpoint`](Self::checkpoint), `auto_checkpoint`, the session
+    /// boundary captures and [`SessionCheckpoints::restore`]'s pre-restore
+    /// snapshot all arrive here, so retention is enforced in exactly one
+    /// place.
+    ///
+    /// `label` overrides the display turn label; `None` uses the resume turn.
+    /// `resume_turn` is always the counter's current value, which is what
+    /// makes an automatic capture resume as correctly as a manual one.
+    pub(crate) fn capture_locked(
+        &self,
+        state: &SessionState,
+        id: &SessionId,
+        ctx: &SystemContext<'static>,
+        origin: CheckpointOrigin,
+        label: Option<TurnNumber>,
+    ) -> Result<CheckpointMeta, SessionError> {
+        if let Some(err) = state.checkpoints.lock().coherence_refusal(id) {
+            return Err(err);
+        }
+        let serializers = self.serializers();
+        let resources = serialize_resources(&serializers, ctx)?;
+        let resume_turn = state.turn_number.load(Ordering::Acquire);
+        let retention = self.checkpoint_retention();
+        state.checkpoints.lock().admit_checkpoint(
+            id,
+            resources,
+            origin,
+            resume_turn,
+            label,
+            utc_now_iso8601(),
+            retention,
+        )
     }
 
     /// Sets whether auto-checkpoint is enabled.
@@ -1156,6 +1382,11 @@ impl SessionsAPI {
                 source,
             })?;
 
+        // A before-first-prompt boundary. Without it the earliest point a
+        // rewind could reach would be "after turn 0", and "rewind to before
+        // the first prompt" would be inexpressible.
+        let checkpoints = self.boundary_checkpoint(&ctx, id, 0);
+
         let state = Arc::new(SessionState {
             ctx: tokio::sync::Mutex::new(ctx),
             graph,
@@ -1164,11 +1395,11 @@ impl SessionsAPI {
             agent_version: agent.version().map(str::to_owned),
             agent_description: agent.description().map(str::to_owned),
             turn_number: AtomicU32::new(0),
-            checkpoints: parking_lot::Mutex::new(Vec::new()),
+            cancellation: parking_lot::Mutex::new(None),
+            checkpoints: parking_lot::Mutex::new(checkpoints),
             created_at: utc_now_iso8601(),
             read_only: AtomicBool::new(false),
             labels: build_session_labels(id, agent_type),
-            #[cfg(feature = "sessions-http")]
             turns: parking_lot::Mutex::new(VecDeque::with_capacity(MAX_TURN_HISTORY)),
         });
 
@@ -1176,7 +1407,6 @@ impl SessionsAPI {
             Entry::Occupied(_) => return Err(SessionError::SessionAlreadyExists(id.clone())),
             Entry::Vacant(entry) => entry.insert(state),
         };
-        #[cfg(feature = "sessions-http")]
         self.inner.uptime.record(id, LifecycleKind::Created);
         Ok(())
     }
@@ -1184,15 +1414,18 @@ impl SessionsAPI {
     /// Executes a single turn for the session.
     ///
     /// [`SessionInfo`] is injected into the context before execution.
-    /// The turn number is incremented after execution completes.
+    /// Completed and interrupted turns advance the turn number; failed turns do not.
     ///
     /// When auto-checkpoint is enabled, the context state is serialized
-    /// after the turn completes. This does not block the return of the
-    /// execution result.
+    /// after a completed or interrupted turn, while holding the context lock.
+    /// Serialization adds to turn latency; a capture failure is logged as a warning.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist,
+    /// [`SessionError::Interrupted`] if execution was interrupted,
+    /// [`SessionError::RestoreFailed`] if a previous restore left the context
+    /// incoherent, [`SessionError::ReadOnly`] if the session is read-only,
     /// or [`SessionError::Execution`] if the graph execution fails.
     ///
     /// # Examples
@@ -1212,15 +1445,18 @@ impl SessionsAPI {
     ///
     /// Before execution, [`SessionInfo`] is injected into the context and
     /// the `setup` closure is called to prepare turn-specific resources.
-    /// The turn number is incremented after execution completes.
+    /// Completed and interrupted turns advance the turn number; failed turns do not.
     ///
     /// When auto-checkpoint is enabled, the context state is serialized
-    /// after the turn completes. This does not block the return of the
-    /// execution result.
+    /// after a completed or interrupted turn, while holding the context lock.
+    /// Serialization adds to turn latency; a capture failure is logged as a warning.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist,
+    /// [`SessionError::Interrupted`] if execution was interrupted,
+    /// [`SessionError::RestoreFailed`] if a previous restore left the context
+    /// incoherent, [`SessionError::ReadOnly`] if the session is read-only,
     /// or [`SessionError::Execution`] if the graph execution fails.
     ///
     /// # Examples
@@ -1259,7 +1495,10 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::SessionBusy`] if the session context lock
     /// is held, [`SessionError::SessionNotFound`] if the session does not
-    /// exist, or [`SessionError::Execution`] if graph execution fails.
+    /// exist, [`SessionError::Interrupted`] if execution was interrupted,
+    /// [`SessionError::RestoreFailed`] if a previous restore left the context
+    /// incoherent, [`SessionError::ReadOnly`] if the session is read-only,
+    /// or [`SessionError::Execution`] if graph execution fails.
     ///
     /// # Examples
     ///
@@ -1288,7 +1527,10 @@ impl SessionsAPI {
     ///
     /// Returns [`SessionError::SessionBusy`] if the session context lock
     /// is held, [`SessionError::SessionNotFound`] if the session does not
-    /// exist, or [`SessionError::Execution`] if graph execution fails.
+    /// exist, [`SessionError::Interrupted`] if execution was interrupted,
+    /// [`SessionError::RestoreFailed`] if a previous restore left the context
+    /// incoherent, [`SessionError::ReadOnly`] if the session is read-only,
+    /// or [`SessionError::Execution`] if graph execution fails.
     ///
     /// # Examples
     ///
@@ -1323,6 +1565,96 @@ impl SessionsAPI {
         self.execute_turn(id, &state, &mut ctx, setup).await
     }
 
+    /// Raises the cancellation signal for the turn currently executing in
+    /// `id`, if any.
+    ///
+    /// Synchronous and idempotent, with short locking of the session registry
+    /// and cancellation slot. It never takes the context mutex held by a
+    /// running turn. Call from a normal task, UI callback, or HTTP handler;
+    /// forward OS signals to a task first because this method is not
+    /// async-signal-safe.
+    ///
+    /// The whole contract a caller may rely on:
+    ///
+    /// - `Ok(true)` means **a turn was in flight**, nothing finer. The session
+    ///   cannot distinguish a turn that is working from one parked waiting for
+    ///   user input; both hold the slot.
+    /// - A raise while the session is idle returns `Ok(false)` and is **not**
+    ///   latched into the next turn. A stray interrupt must not kill the next
+    ///   request.
+    /// - An unknown session returns [`SessionError::SessionNotFound`].
+    /// - Escalation policy — "a second press quits" — belongs to the host and
+    ///   its own timer, never to this method. A second call during the same
+    ///   turn also returns `Ok(true)`.
+    /// - A turn whose future was **dropped** rather than awaited to completion
+    ///   — a client disconnecting mid-request, a `select!` arm losing, a
+    ///   timeout firing — counts as not in flight: the slot is closed as the
+    ///   future unwinds, so this returns `Ok(false)` and the host is told the
+    ///   truth about a session it can start a new turn on.
+    ///
+    /// How promptly the turn ends is the agent's business: a system that races
+    /// [`RunCancellation`](polaris_graph::RunCancellation) returns at once, and
+    /// one that ignores it runs to completion while the executor stops at the
+    /// next node boundary. Either way the turn ends as
+    /// [`SessionError::Interrupted`], the turn record reaches a terminal
+    /// status, and the session returns to idle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::SessionNotFound`] if the session does not
+    /// exist.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionError, SessionsAPI, SessionId};
+    /// # async fn example(
+    /// #     sessions: &SessionsAPI,
+    /// #     id: &SessionId,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// // The turn has to be genuinely in flight for a raise to reach it, so it
+    /// // runs on its own task. Binding the future without polling it would
+    /// // leave the session idle and every raise below would report `false`.
+    /// let turn = tokio::spawn({
+    ///     let sessions = sessions.clone();
+    ///     let id = id.clone();
+    ///     async move { sessions.process_turn(&id).await }
+    /// });
+    ///
+    /// // Tokio forwards the OS signal to this normal async task.
+    /// tokio::signal::ctrl_c().await?;
+    /// let was_running = sessions.interrupt_turn(id)?;
+    ///
+    /// match turn.await? {
+    ///     Err(SessionError::Interrupted { turn, nodes_executed, .. }) => {
+    ///         assert!(was_running, "the raise found the turn it ended");
+    ///         // The turn is recorded as `Interrupted`, the session is idle,
+    ///         // and the next turn may proceed.
+    ///     }
+    ///     Ok(result) => {
+    ///         // The turn finished before the signal reached a node boundary —
+    ///         // `was_running` may be either, and a raise that found nothing is
+    ///         // dropped rather than latched into the next turn.
+    ///     }
+    ///     Err(other) => { /* failed for an unrelated reason */ }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn interrupt_turn(&self, id: &SessionId) -> Result<bool, SessionError> {
+        let state = self.get_state(id)?;
+        // Clone the source out and release the slot before raising, so the
+        // lock is held for exactly one pointer clone.
+        let source = state.cancellation.lock().clone();
+        match source {
+            Some(source) => {
+                source.cancel();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Shared turn execution logic used by both blocking and try-lock variants.
     async fn execute_turn(
         &self,
@@ -1331,6 +1663,14 @@ impl SessionsAPI {
         ctx: &mut SystemContext<'static>,
         setup: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<ExecutionResult, SessionError> {
+        // A restore that failed partway leaves the context half-applied.
+        // Running a turn on it would produce output nobody can reason about,
+        // so refuse until a restore succeeds or the caller resumes from the
+        // store. Unreachable for a caller that never restores.
+        if let Some(refusal) = state.checkpoints.lock().coherence_refusal(id) {
+            return Err(refusal);
+        }
+
         let turn = state.turn_number.load(Ordering::Acquire);
 
         // Inject session metadata.
@@ -1338,6 +1678,12 @@ impl SessionsAPI {
             session_id: id.clone(),
             turn_number: turn,
         });
+
+        // A fresh signal per turn, inserted before the caller's setup closure
+        // so a closure may still override it deliberately — the same idiom the
+        // HTTP handlers use for `UserIO`.
+        let cancellation = CancellationSource::new();
+        ctx.insert(cancellation.token());
 
         setup(ctx);
 
@@ -1390,20 +1736,30 @@ impl SessionsAPI {
             turn_span.record("gen_ai.agent.description", description.as_str());
         }
 
-        // Start turn history + lifecycle recording before executor runs so
-        // a Running entry is visible from the dashboard the moment a turn
-        // is in flight.
-        #[cfg(feature = "sessions-http")]
-        {
-            self.start_turn_record(state, turn);
-            self.inner.uptime.record(id, LifecycleKind::Active);
-        }
+        // Opens the turn's history entry, its `Active` lifecycle mark and its
+        // interrupt slot together, and closes all three on every exit path —
+        // including this future being dropped inside the `await` below. The
+        // slot is open exactly for the duration of the executor call: a raise
+        // landing before it opens or after it closes finds nothing and reports
+        // `Ok(false)`; the token is latched and per-turn, so every interleaving
+        // inside the window is benign.
+        let mut turn_guard = TurnGuard::open(self, state, id, turn, cancellation);
 
         let exec_result = state
             .executor
             .execute_with_labels(&state.graph, ctx, hooks, middleware, labels)
             .instrument(turn_span.clone())
             .await;
+
+        let interrupted = matches!(exec_result, Err(ExecutionError::Interrupted { .. }));
+
+        // Close the slot and finalize the record + lifecycle regardless of
+        // success or failure, so the dashboard reflects what actually happened.
+        turn_guard.settle(match (&exec_result, interrupted) {
+            (Ok(_), _) => TurnStatus::Completed,
+            (Err(_), true) => TurnStatus::Interrupted,
+            (Err(_), false) => TurnStatus::Failed,
+        });
 
         if let Err(err) = &exec_result {
             // `error.type` is meant to be a low-cardinality discriminant, so
@@ -1416,51 +1772,141 @@ impl SessionsAPI {
                 .split(['(', '{', ' '])
                 .next()
                 .unwrap_or("ExecutionError");
-            turn_span.record("otel.status_code", "ERROR");
+            // A user's interrupt is not an error, so the status code stays
+            // unset; `error.type` still carries the low-cardinality
+            // discriminant, which the `Debug` split above already renders as
+            // exactly `"Interrupted"`.
+            if !interrupted {
+                turn_span.record("otel.status_code", "ERROR");
+            }
             turn_span.record("error.type", error_type);
         }
 
-        // Finalize lifecycle + turn record regardless of success/failure,
-        // so the dashboard reflects what actually happened.
-        #[cfg(feature = "sessions-http")]
-        {
-            let status = if exec_result.is_ok() {
-                TurnStatus::Completed
-            } else {
-                TurnStatus::Failed
-            };
-            self.finish_turn_record(state, turn, status);
-            self.inner.uptime.record(id, LifecycleKind::Idle);
-        }
-
-        let result = exec_result?;
+        // The sole conversion point from `ExecutionError` to `SessionError`.
+        // `SessionError::Execution` carries `#[from] ExecutionError`, so a
+        // bare `?` here would silently build
+        // `Execution(Interrupted { .. })` — a second wire shape for one
+        // outcome that every consumer would then have to match twice.
+        let result = match exec_result {
+            Ok(result) => result,
+            Err(ExecutionError::Interrupted {
+                run_id,
+                nodes_executed,
+                elapsed,
+                ..
+            }) => {
+                // An interrupted turn *happened*: its user message and every
+                // node that completed are in the context, and the run's
+                // identity is `(session, turn)`, which two runs must never
+                // share. So the number advances and the state — consistent by
+                // construction, since every system either completed or
+                // returned by its own choice — is a legitimate rollback
+                // target. The `Failed` path keeps its own non-advancing,
+                // non-checkpointing behaviour, unchanged here.
+                state.turn_number.store(turn + 1, Ordering::Release);
+                self.auto_checkpoint(state, id, turn, ctx);
+                return Err(SessionError::Interrupted {
+                    session: id.clone(),
+                    turn,
+                    run_id,
+                    nodes_executed,
+                    elapsed,
+                });
+            }
+            Err(err) => return Err(SessionError::Execution(err)),
+        };
 
         state.turn_number.store(turn + 1, Ordering::Release);
+        self.auto_checkpoint(state, id, turn, ctx);
 
-        // Auto-checkpoint: serialize while we still hold the lock
+        Ok(result)
+    }
+
+    /// Captures the post-turn context as a checkpoint when auto-checkpoint is
+    /// enabled, warning rather than failing the turn if serialization fails.
+    ///
+    /// Called while the context lock is still held, for both the completed and
+    /// the interrupted turn.
+    fn auto_checkpoint(
+        &self,
+        state: &SessionState,
+        id: &SessionId,
+        turn: TurnNumber,
+        ctx: &SystemContext<'static>,
+    ) {
         // TODO @localminimum: look into doing this in a background task
         // to avoid any potential latency impact on the turn result.
         // Get profiling data to see if this is actually a problem
         // worth optimizing.
-        if self.inner.auto_checkpoint.load(Ordering::Relaxed) {
-            let serializers = Arc::clone(&self.inner.serializers.read());
-            match serialize_context(&serializers, state.agent_type, turn, &state.created_at, ctx) {
-                Ok(data) => {
-                    state.checkpoints.lock().push(Checkpoint {
-                        turn_number: turn,
-                        data,
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        session = %id,
-                        "auto-checkpoint failed: {err}"
-                    );
-                }
-            }
+        if !self.inner.auto_checkpoint.load(Ordering::Relaxed) {
+            return;
         }
+        // Both call sites run immediately after `turn_number.store(turn + 1)`,
+        // so the counter — and therefore `resume_turn` — is already `turn + 1`
+        // while the display label stays `turn`. That split is what keeps a
+        // restore from re-running an already-used turn number.
+        if let Err(err) = self.capture_locked(state, id, ctx, CheckpointOrigin::Auto, Some(turn)) {
+            // Warn, never fail the turn: an automatic checkpoint that cannot
+            // fit must not take a user's completed turn down with it. The
+            // warning names the cause so a missing point is diagnosable
+            // rather than inferred.
+            tracing::warn!(
+                session = %id,
+                turn,
+                "auto-checkpoint failed: {err}"
+            );
+        }
+    }
 
-        Ok(result)
+    /// Builds a session's initial checkpoint set with a boundary capture.
+    fn boundary_checkpoint(
+        &self,
+        ctx: &SystemContext<'static>,
+        id: &SessionId,
+        resume_turn: TurnNumber,
+    ) -> CheckpointSet {
+        let mut checkpoints = CheckpointSet::default();
+        self.capture_boundary_into(&mut checkpoints, ctx, id, resume_turn);
+        checkpoints
+    }
+
+    /// Captures a session-boundary checkpoint directly into `checkpoints`,
+    /// before the session state exists to lock.
+    ///
+    /// Subject to auto-checkpoint being enabled and to the same
+    /// warn-don't-fail rule as a post-turn capture: a host that disabled
+    /// automatic checkpoints gets no boundary point either, and a boundary
+    /// point that cannot be taken never fails session creation or resume.
+    fn capture_boundary_into(
+        &self,
+        checkpoints: &mut CheckpointSet,
+        ctx: &SystemContext<'static>,
+        id: &SessionId,
+        resume_turn: TurnNumber,
+    ) {
+        if !self.inner.auto_checkpoint.load(Ordering::Relaxed) {
+            return;
+        }
+        let serializers = self.serializers();
+        let retention = self.checkpoint_retention();
+        let captured = serialize_resources(&serializers, ctx).and_then(|resources| {
+            checkpoints.admit_checkpoint(
+                id,
+                resources,
+                CheckpointOrigin::Auto,
+                resume_turn,
+                None,
+                utc_now_iso8601(),
+                retention,
+            )
+        });
+        if let Err(err) = captured {
+            tracing::warn!(
+                session = %id,
+                resume_turn,
+                "session boundary checkpoint failed: {err}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1471,10 +1917,26 @@ impl SessionsAPI {
     ///
     /// Returns the turn number at which the checkpoint was taken.
     ///
+    /// Superseded by [`SessionCheckpoints::capture`], which returns a stable
+    /// [`CheckpointId`](crate::checkpoint::CheckpointId) instead of a turn
+    /// label. Two checkpoints can share a label, and
+    /// [`rollback`](Self::rollback) then resolves to whichever was taken
+    /// first, so a label cannot identify a snapshot. This method keeps its
+    /// exact signature, return value and permissive behaviour — including on
+    /// a read-only session, which `capture` refuses.
+    ///
+    /// Retained checkpoints are now bounded per session
+    /// ([`CheckpointRetention`]), so
+    /// in a long session the oldest evictable point is reclaimed rather than
+    /// retained forever. [`SessionCheckpoints::status`] reports which.
+    ///
     /// # Errors
     ///
-    /// Returns [`SessionError::SessionNotFound`] or a persistence error
-    /// if serialization fails.
+    /// Returns [`SessionError::SessionNotFound`], a persistence error if
+    /// serialization fails, [`SessionError::RestoreFailed`] if the context is
+    /// incoherent after a failed restore, or
+    /// [`SessionError::CheckpointCapacity`] if the retained set is at a bound
+    /// and nothing is evictable.
     ///
     /// # Examples
     ///
@@ -1489,22 +1951,11 @@ impl SessionsAPI {
     pub async fn checkpoint(&self, id: &SessionId) -> Result<TurnNumber, SessionError> {
         let state = self.get_state(id)?;
         let ctx = state.ctx.lock().await;
-        let turn = state.turn_number.load(Ordering::Acquire);
-
-        let serializers = Arc::clone(&self.inner.serializers.read());
-        let data = serialize_context(
-            &serializers,
-            state.agent_type,
-            turn,
-            &state.created_at,
-            &ctx,
-        )?;
-
-        state.checkpoints.lock().push(Checkpoint {
-            turn_number: turn,
-            data,
-        });
-        Ok(turn)
+        // Deliberately no read-only check: this method accepted a preserved
+        // session before the checkpoint surface existed, and keeping that is
+        // what makes the legacy trio's behaviour unchanged.
+        let meta = self.capture_locked(&state, id, &ctx, CheckpointOrigin::Manual, None)?;
+        Ok(meta.turn)
     }
 
     /// Returns the turn numbers of all checkpoints for the session.
@@ -1529,12 +1980,38 @@ impl SessionsAPI {
     pub fn list_checkpoints(&self, id: &SessionId) -> Result<Vec<TurnNumber>, SessionError> {
         let state = self.get_state(id)?;
         let checkpoints = state.checkpoints.lock();
-        Ok(checkpoints.iter().map(|cp| cp.turn_number).collect())
+        Ok(checkpoints.turn_labels())
     }
 
     /// Rolls back the session to a previously checkpointed turn.
     ///
     /// Checkpoints newer than the target turn are discarded.
+    ///
+    /// # Run-identity hazard on the auto-checkpoint path
+    ///
+    /// **An automatic checkpoint's turn label is the turn that just ran, not
+    /// the turn to resume at, so rolling back to one re-uses a run identity.**
+    /// After turn *N* completes the counter is already `N + 1` while the
+    /// label pushed over the post-turn state is `N`. `rollback(N)` sets the
+    /// counter back to `N`, so the next turn runs as `N` again — and
+    /// `(session_id, turn_number)` is a run's identity, which two runs must
+    /// never share (see the sessions reference). A *manual* checkpoint reads
+    /// the already-incremented counter and does not have the problem, so the
+    /// two paths label byte-identical state differently.
+    ///
+    /// This behaviour is left exactly as it was rather than corrected here:
+    /// changing what a shipped method does is a separate decision from adding
+    /// a correct surface beside it. [`SessionCheckpoints::restore`] is that
+    /// surface — it resumes at the target's
+    /// [`resume_turn`](crate::checkpoint::CheckpointMeta::resume_turn), which
+    /// is stored rather than inferred, so no identity is re-used on either
+    /// path. Prefer it for anything that resumes execution after rewinding.
+    ///
+    /// `restore` also differs in what it keeps: it re-parents onto a new
+    /// revision instead of discarding newer checkpoints, so a second rewind
+    /// after a rewind is well defined. Points this method discards are
+    /// reported as [`CheckpointStatus::Evicted`](crate::checkpoint::CheckpointStatus::Evicted)
+    /// by [`SessionCheckpoints::status`].
     ///
     /// # Errors
     ///
@@ -1562,21 +2039,29 @@ impl SessionsAPI {
         }
         let mut ctx = state.ctx.lock().await;
 
-        let mut checkpoints = state.checkpoints.lock();
-        let checkpoint = checkpoints
-            .iter()
-            .find(|cp| cp.turn_number == turn)
-            .ok_or(SessionError::TurnNotFound(turn))?;
+        // First label match, as before — the set preserves insertion order.
+        let (target, payload) = {
+            let checkpoints = state.checkpoints.lock();
+            let target = checkpoints
+                .find_by_label(turn)
+                .ok_or(SessionError::TurnNotFound(turn))?;
+            let payload = checkpoints.payload(target).unwrap_or_default();
+            (target, payload)
+        };
 
-        let serializers = Arc::clone(&self.inner.serializers.read());
-        deserialize_into_context(&serializers, &checkpoint.data, &mut ctx)?;
+        let serializers = self.serializers();
+        deserialize_entries_into_context(&serializers, &payload, &mut ctx)?;
 
-        state
-            .turn_number
-            .store(checkpoint.turn_number, Ordering::Release);
+        // The label, not the resume turn: this is the documented behaviour and
+        // the hazard above.
+        state.turn_number.store(turn, Ordering::Release);
 
         // Discard checkpoints newer than the rollback target.
-        checkpoints.retain(|cp| cp.turn_number <= turn);
+        let retention = self.checkpoint_retention();
+        state
+            .checkpoints
+            .lock()
+            .discard_above_label(turn, target, &utc_now_iso8601(), retention);
 
         Ok(())
     }
@@ -1589,7 +2074,9 @@ impl SessionsAPI {
     ///
     /// # Errors
     ///
-    /// Returns a persistence or store error on failure.
+    /// Returns [`SessionError::RestoreFailed`] while a failed restore leaves
+    /// the context incoherent; the existing stored session remains untouched.
+    /// Otherwise returns a persistence or store error on failure.
     ///
     /// # Examples
     ///
@@ -1603,16 +2090,29 @@ impl SessionsAPI {
     pub async fn save_session(&self, id: &SessionId) -> Result<(), SessionError> {
         let state = self.get_state(id)?;
         let ctx = state.ctx.lock().await;
+        if let Some(err) = state.checkpoints.lock().coherence_refusal(id) {
+            return Err(err);
+        }
         let turn = state.turn_number.load(Ordering::Acquire);
 
-        let serializers = Arc::clone(&self.inner.serializers.read());
-        let data = serialize_context(
+        let serializers = self.serializers();
+        let mut data = serialize_context(
             &serializers,
             state.agent_type,
             turn,
             &state.created_at,
             &ctx,
         )?;
+        // The retained checkpoint set rides `SessionData` through whatever
+        // store the host configured, which is why durability needs no store
+        // method and no second store.
+        {
+            let checkpoints = state.checkpoints.lock();
+            data.checkpoints = checkpoints.stored().to_vec();
+            data.next_checkpoint = checkpoints.next_checkpoint();
+            data.revision = checkpoints.revision();
+            data.checkpoint_history = checkpoints.history();
+        }
 
         self.inner.store.save(id, &data).await
     }
@@ -1737,7 +2237,7 @@ impl SessionsAPI {
         let graph = agent.to_graph();
 
         let serializers = Arc::clone(&self.inner.serializers.read());
-        deserialize_into_context(&serializers, &data, &mut ctx)?;
+        deserialize_entries_into_context(&serializers, &data.resources, &mut ctx)?;
 
         init(&mut ctx);
 
@@ -1748,6 +2248,23 @@ impl SessionsAPI {
                 source,
             })?;
 
+        // Checkpoints ride `SessionData`, so resuming restores the retained
+        // set, its identity counter, its removal history and the session's
+        // position — the pre-durability behaviour of dropping all of it was
+        // what made checkpoint identity meaningless across a restart.
+        //
+        // Moved, not cloned: `data` is owned here and nothing below reads
+        // either field again, so cloning would duplicate the whole retained
+        // payload — up to the 16 MiB byte bound — on every resume.
+        let mut checkpoints = CheckpointSet::from_stored_with_retention(
+            data.checkpoints,
+            data.next_checkpoint,
+            data.revision,
+            data.checkpoint_history,
+            self.checkpoint_retention(),
+        );
+        self.capture_boundary_into(&mut checkpoints, &ctx, id, data.turn_number);
+
         let state = Arc::new(SessionState {
             ctx: tokio::sync::Mutex::new(ctx),
             graph,
@@ -1756,11 +2273,11 @@ impl SessionsAPI {
             agent_version: agent.version().map(str::to_owned),
             agent_description: agent.description().map(str::to_owned),
             turn_number: AtomicU32::new(data.turn_number),
-            checkpoints: parking_lot::Mutex::new(Vec::new()),
+            cancellation: parking_lot::Mutex::new(None),
+            checkpoints: parking_lot::Mutex::new(checkpoints),
             created_at: data.created_at.clone(),
             read_only: AtomicBool::new(false),
             labels: build_session_labels(id, &agent_type),
-            #[cfg(feature = "sessions-http")]
             turns: parking_lot::Mutex::new(VecDeque::with_capacity(MAX_TURN_HISTORY)),
         });
 
@@ -1773,7 +2290,6 @@ impl SessionsAPI {
             }
             sessions.insert(id.clone(), state);
         }
-        #[cfg(feature = "sessions-http")]
         self.inner.uptime.record(id, LifecycleKind::Created);
         Ok(())
     }
@@ -1837,15 +2353,12 @@ impl SessionsAPI {
     /// ```
     pub async fn delete_session(&self, id: &SessionId) -> Result<(), SessionError> {
         let removed = self.inner.sessions.write().remove(id).is_some();
-        #[cfg(feature = "sessions-http")]
         if removed {
             // Record the terminal transition before forgetting the
             // session so any in-flight uptime query sees the final state.
             self.inner.uptime.record(id, LifecycleKind::Terminated);
             self.inner.uptime.forget(id);
         }
-        #[cfg(not(feature = "sessions-http"))]
-        let _ = removed;
         self.inner.store.delete(id).await
     }
 
@@ -2197,7 +2710,6 @@ impl SessionsAPI {
     /// # Errors
     ///
     /// Returns [`SessionError::SessionNotFound`] if the session does not exist.
-    #[cfg(feature = "sessions-http")]
     pub fn turn_history(
         &self,
         id: &SessionId,
@@ -2222,7 +2734,6 @@ impl SessionsAPI {
     /// Returns [`SessionError::SessionNotFound`] if the session does not
     /// exist, or [`SessionError::TurnNotFound`] if no record exists for
     /// the requested turn number.
-    #[cfg(feature = "sessions-http")]
     pub fn turn(&self, id: &SessionId, turn: TurnNumber) -> Result<Turn, SessionError> {
         let state = self.get_state(id)?;
         let turns = state.turns.lock();
@@ -2242,7 +2753,6 @@ impl SessionsAPI {
     /// capped by message count and payload bytes;
     /// [`TurnSummary::messages_truncated`] reports when the supplied stream
     /// exceeded either limit.
-    #[cfg(feature = "sessions-http")]
     pub fn record_turn_messages(&self, id: &SessionId, turn: TurnNumber, messages: Vec<IOMessage>) {
         let Ok(state) = self.get_state(id) else {
             return;
@@ -2291,7 +2801,6 @@ impl SessionsAPI {
     /// exist. (Lifecycle history is dropped on
     /// [`delete_session`](Self::delete_session), so terminated sessions
     /// are not queryable.)
-    #[cfg(feature = "sessions-http")]
     pub fn uptime_buckets(
         &self,
         id: &SessionId,
@@ -2304,7 +2813,6 @@ impl SessionsAPI {
         Ok(self.inner.uptime.buckets_for(id, bucket, since, until))
     }
 
-    #[cfg(feature = "sessions-http")]
     fn start_turn_record(&self, state: &SessionState, turn: TurnNumber) {
         let entry = TurnHistoryEntry {
             turn,
@@ -2324,7 +2832,6 @@ impl SessionsAPI {
         turns.push_back(entry);
     }
 
-    #[cfg(feature = "sessions-http")]
     fn finish_turn_record(&self, state: &SessionState, turn: TurnNumber, status: TurnStatus) {
         let mut turns = state.turns.lock();
         if let Some(entry) = turns.iter_mut().rev().find(|entry| entry.turn == turn) {
@@ -2348,7 +2855,6 @@ impl SessionsAPI {
     }
 }
 
-#[cfg(feature = "sessions-http")]
 impl TurnHistoryEntry {
     fn to_summary(&self, include_messages: bool) -> TurnSummary {
         TurnSummary {
@@ -2392,7 +2898,6 @@ impl TurnHistoryEntry {
     }
 }
 
-#[cfg(feature = "sessions-http")]
 fn bounded_message_copy(message: &IOMessage, limit: usize) -> (IOMessage, usize, bool) {
     let mut remaining = limit;
     let mut truncated = false;
@@ -2454,7 +2959,6 @@ fn bounded_message_copy(message: &IOMessage, limit: usize) -> (IOMessage, usize,
     (recorded, limit - remaining, truncated)
 }
 
-#[cfg(feature = "sessions-http")]
 fn bounded_string(value: &str, remaining: &mut usize) -> (String, bool) {
     let retained = value.len().min(*remaining);
     let mut end = retained;
@@ -2465,20 +2969,17 @@ fn bounded_string(value: &str, remaining: &mut usize) -> (String, bool) {
     (value[..end].to_owned(), end < value.len())
 }
 
-#[cfg(feature = "sessions-http")]
 struct LimitedWriter {
     written: usize,
     limit: usize,
 }
 
-#[cfg(feature = "sessions-http")]
 impl LimitedWriter {
     fn new(limit: usize) -> Self {
         Self { written: 0, limit }
     }
 }
 
-#[cfg(feature = "sessions-http")]
 impl std::io::Write for LimitedWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if buffer.len() > self.limit.saturating_sub(self.written) {
@@ -2498,7 +2999,6 @@ impl std::io::Write for LimitedWriter {
 /// Renders a short, single-line preview of the last text payload in a
 /// turn's message stream. Non-text content yields `None` so the
 /// dashboard renders a placeholder instead of a misleading excerpt.
-#[cfg(feature = "sessions-http")]
 fn preview_from_message(msg: &IOMessage) -> Option<String> {
     let IOContent::Text(text) = &msg.content else {
         return None;
@@ -2524,14 +3024,15 @@ fn utc_now_iso8601() -> String {
 // Serialization helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Serializes all registered resources from a context into [`SessionData`].
-fn serialize_context(
+/// Serializes all registered resources from a context.
+///
+/// The payload shape shared by a persisted session and a checkpoint: a
+/// checkpoint holds exactly this, rather than a nested [`SessionData`] that
+/// would repeat the session-constant fields in every snapshot.
+pub(crate) fn serialize_resources(
     serializers: &[Arc<dyn ResourceSerializer>],
-    agent_type: AgentTypeId,
-    turn_number: TurnNumber,
-    created_at: &str,
     ctx: &SystemContext<'_>,
-) -> Result<SessionData, SessionError> {
+) -> Result<Vec<ResourceEntry>, SessionError> {
     let mut resources = Vec::new();
     for ser in serializers {
         if let Some(value) = ser.save(ctx)? {
@@ -2543,31 +3044,99 @@ fn serialize_context(
             });
         }
     }
+    Ok(resources)
+}
+
+/// Serializes all registered resources from a context into [`SessionData`].
+///
+/// Leaves the checkpoint fields at their defaults; `save_session` fills them
+/// from the session's live set.
+fn serialize_context(
+    serializers: &[Arc<dyn ResourceSerializer>],
+    agent_type: AgentTypeId,
+    turn_number: TurnNumber,
+    created_at: &str,
+    ctx: &SystemContext<'_>,
+) -> Result<SessionData, SessionError> {
+    let resources = serialize_resources(serializers, ctx)?;
     Ok(SessionData {
         agent_type: agent_type.as_str().to_owned(),
         turn_number,
         created_at: created_at.to_owned(),
         resources,
+        checkpoints: Vec::new(),
+        next_checkpoint: 0,
+        revision: RevisionId::default(),
+        checkpoint_history: CheckpointHistory::default(),
     })
 }
 
-/// Deserializes [`SessionData`] entries back into a context by matching
-/// each entry to the appropriate serializer via `(plugin_id, storage_key)`.
-fn deserialize_into_context(
+/// What a restore actually loaded, and what it could not.
+pub(crate) struct RestoreReport {
+    /// Entries loaded into the context.
+    pub(crate) restored: Vec<ResourceRef>,
+    /// Entries no registered serializer matched, and which were skipped.
+    pub(crate) unmatched: Vec<ResourceRef>,
+}
+
+/// Deserializes serialized resource entries back into a context by matching
+/// each entry to a serializer via `(plugin_id, storage_key, schema_version)`.
+///
+/// Entries that match nothing are skipped, as they always have been — but they
+/// are now *reported* rather than silently dropped, which is what lets a
+/// caller tell a partial restore from a complete one.
+pub(crate) fn deserialize_entries_into_context(
     serializers: &[Arc<dyn ResourceSerializer>],
-    data: &SessionData,
+    entries: &[ResourceEntry],
     ctx: &mut SystemContext<'static>,
-) -> Result<(), SessionError> {
-    for entry in &data.resources {
-        if let Some(ser) = serializers.iter().find(|s| {
-            s.plugin_id() == entry.plugin_id
-                && s.storage_key() == entry.storage_key
-                && s.schema_version() == entry.version
-        }) {
+) -> Result<RestoreReport, SessionError> {
+    let mut report = RestoreReport {
+        restored: Vec::new(),
+        unmatched: Vec::new(),
+    };
+    for entry in entries {
+        if let Some(ser) = matching_serializer(serializers, entry) {
             ser.load(entry.data.clone(), ctx)?;
+            report.restored.push(entry_ref(entry));
+        } else {
+            report.unmatched.push(entry_ref(entry));
         }
     }
-    Ok(())
+    Ok(report)
+}
+
+/// The entries in `payload` that no registered serializer can load.
+///
+/// Computed without touching the context, so a caller can refuse a partial
+/// restore before anything is written.
+pub(crate) fn unmatched_refs(
+    serializers: &[Arc<dyn ResourceSerializer>],
+    payload: &[ResourceEntry],
+) -> Vec<ResourceRef> {
+    payload
+        .iter()
+        .filter(|entry| matching_serializer(serializers, entry).is_none())
+        .map(entry_ref)
+        .collect()
+}
+
+fn matching_serializer<'a>(
+    serializers: &'a [Arc<dyn ResourceSerializer>],
+    entry: &ResourceEntry,
+) -> Option<&'a Arc<dyn ResourceSerializer>> {
+    serializers.iter().find(|ser| {
+        ser.plugin_id() == entry.plugin_id
+            && ser.storage_key() == entry.storage_key
+            && ser.schema_version() == entry.version
+    })
+}
+
+fn entry_ref(entry: &ResourceEntry) -> ResourceRef {
+    ResourceRef {
+        plugin_id: entry.plugin_id.clone(),
+        storage_key: entry.storage_key.clone(),
+        version: entry.version.clone(),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2584,9 +3153,26 @@ fn deserialize_into_context(
 ///
 /// # Auto-Checkpoint
 ///
-/// By default, a background checkpoint is created after every successful
-/// [`process_turn`](SessionsAPI::process_turn). Call
-/// [`without_auto_checkpoint`](Self::without_auto_checkpoint) to disable.
+/// Enabled by default. A checkpoint is captured at session creation, at
+/// [`resume_session`](SessionsAPI::resume_session), and on the return path of
+/// every completed and every interrupted
+/// [`process_turn`](SessionsAPI::process_turn). Capture is synchronous — it
+/// runs while the turn still holds the session's context lock, so its
+/// serialization cost lands on turn latency — and a capture that fails is
+/// logged at `warn` rather than failing the turn.
+///
+/// Retained checkpoints are durable: they ride [`SessionData`] through the
+/// configured [`SessionStore`], written by
+/// [`save_session`](SessionsAPI::save_session) and reloaded by
+/// [`resume_session`](SessionsAPI::resume_session).
+///
+/// Two knobs:
+///
+/// - [`with_checkpoint_retention`](Self::with_checkpoint_retention) bounds the
+///   retained set. The default is 64 checkpoints / 16 MiB of serialized
+///   payload; [`CheckpointRetention::unbounded`] opts out of both.
+/// - [`without_auto_checkpoint`](Self::without_auto_checkpoint) disables the
+///   mechanism entirely — turn captures and boundary captures alike.
 ///
 /// # Lifecycle
 ///
@@ -2634,6 +3220,7 @@ fn deserialize_into_context(
 pub struct SessionsPlugin {
     store: Arc<dyn SessionStore>,
     auto_checkpoint: bool,
+    retention: CheckpointRetention,
 }
 
 impl SessionsPlugin {
@@ -2654,10 +3241,12 @@ impl SessionsPlugin {
         Self {
             store,
             auto_checkpoint: true,
+            retention: CheckpointRetention::default(),
         }
     }
 
-    /// Disables automatic checkpointing after each successful turn.
+    /// Disables automatic checkpoints at creation, resume, and after completed
+    /// or interrupted turns.
     ///
     /// # Examples
     ///
@@ -2672,6 +3261,31 @@ impl SessionsPlugin {
     #[must_use]
     pub fn without_auto_checkpoint(mut self) -> Self {
         self.auto_checkpoint = false;
+        self
+    }
+
+    /// Sets how many checkpoints, and how many serialized bytes of them, one
+    /// session retains.
+    ///
+    /// Retention is injected policy rather than a constant at a call site: the
+    /// host decides, and a consumer reads the decision back with
+    /// [`SessionCheckpoints::retention`] instead of restating a number that
+    /// would then disagree with the framework.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use polaris_sessions::SessionsPlugin;
+    /// use polaris_sessions::checkpoint::CheckpointRetention;
+    /// use polaris_sessions::store::memory::InMemoryStore;
+    ///
+    /// let plugin = SessionsPlugin::new(Arc::new(InMemoryStore::new()))
+    ///     .with_checkpoint_retention(CheckpointRetention::new(Some(8), Some(1 << 20)));
+    /// ```
+    #[must_use]
+    pub fn with_checkpoint_retention(mut self, retention: CheckpointRetention) -> Self {
+        self.retention = retention;
         self
     }
 }
@@ -2691,6 +3305,7 @@ impl Plugin for SessionsPlugin {
     fn build(&self, server: &mut Server) {
         let api = SessionsAPI::new(Arc::clone(&self.store));
         api.set_auto_checkpoint(self.auto_checkpoint);
+        api.set_checkpoint_retention(self.retention);
         server.insert_api(api);
     }
 

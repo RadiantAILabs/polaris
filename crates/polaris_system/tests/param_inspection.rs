@@ -924,7 +924,7 @@ async fn a_sink_replaced_on_a_child_stays_local_to_that_child() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Chaining onto an installed sink (SC-3307)
+// Chaining onto an installed sink
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Forwards every record to both sinks — the composition `inspection_arc` plus

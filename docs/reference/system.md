@@ -123,6 +123,59 @@ async fn produce() -> Output {
 graph.add_system(produce);
 ```
 
+### Typed Erasure for Composition
+
+`erase(system)` converts a concrete system into `TypedSystem<O>`. The concrete
+system type and the inference-only `IntoSystem` marker are erased at that call
+site, while `O` remains part of the handle's compile-time type. This lets a
+composition helper express its real stage contract without carrying a system
+type and marker parameter for every caller-supplied stage:
+
+```rust
+use polaris_system::system::{TypedSystem, erase};
+
+fn add_prediction_stage(graph: &mut Graph, stage: TypedSystem<Prediction>) {
+    graph.system_boxed(stage).done();
+}
+
+add_prediction_stage(&mut graph, erase(predict));
+```
+
+`Graph::system_boxed` and `Graph::add_boxed_system` are the graph-side entry
+points — see [Graph Execution — Adding System Nodes](graph.md#adding-system-nodes).
+A stage arriving as a handle cannot use the `(schedule, system)` tuple form, so
+it attaches hook schedules through
+[`SystemNodeBuilder::with_schedules`](graph.md#custom-system-schedules) instead.
+
+Passing a system whose output is not `Prediction` is a compile error at the
+helper boundary. Once added to a graph, the handle uses the same erased system
+representation as every other system node, so runtime metadata and parameter
+access declarations are unchanged.
+
+`O` is the system's output type in the sense described above: for a fallible
+system it is the success type, since the `#[system]` macro extracts `T` from
+`Result<T, SystemError>`. So `erase` on a system returning
+`Result<Prediction, SystemError>` yields `TypedSystem<Prediction>` — the same
+handle type an infallible `-> Prediction` stage produces, matching how a
+downstream `Out<Prediction>` reads either one. Fallibility travels alongside `O`
+and is readable via `TypedSystem::is_fallible`, so a helper that wires error
+handling asks the handle rather than inferring it from the output type:
+
+```rust
+fn add_prediction_stage(graph: &mut Graph, stage: TypedSystem<Prediction>) {
+    let fallible = stage.is_fallible();
+    let node_id = graph.add_boxed_system(stage);
+
+    if fallible {
+        graph.add_error_handler_fn_for([node_id], |err: &CaughtError| { /* ... */ });
+    }
+}
+```
+
+An erased fallible system is handled exactly like a directly added one:
+`add_error_handler` auto-wires its error edges, and its `SystemError` reaches
+the handler unchanged.
+
 ## Context
 
 The `SystemContext` is the execution context within which a system runs. It provides access to resources, outputs from previously executed systems, and optionally a parent context. This allows the creation of hierarchical contexts, mapping to the execution structure of an agent:
@@ -152,13 +205,14 @@ When a system executes, the framework passes the current `SystemContext` to the 
 
 Any type implementing `SystemParam` may be declared as a system parameter.
 
-There are four built-in parameter types:
+There are five built-in parameter types:
 
 | Type | Resolution Scope | Access | Concurrent Borrows |
 |------|------------------|--------|-------------------|
 | `Res<T>` | Hierarchy (local → parents → global) | Immutable | Permitted |
 | `ResMut<T>` | Current context only | Exclusive | None |
 | `Out<T>` | Current context outputs | Immutable | Permitted |
+| `OutAll<T>` | Current context outputs | Immutable | Permitted |
 | `ErrOut<T>` | Current context outputs (error-edge only) | Immutable | Permitted |
 
 **`Res<T>`** provides immutable access to a resource. `T` may implement either `GlobalResource` or `LocalResource`. Resolution traverses the `SystemContext` hierarchy upward, returning the first matching local resource or falling back to global resources. This shadowing semantic allows child contexts to override inherited resources. Multiple `Res<T>` borrows of the same type are permitted concurrently.
@@ -188,6 +242,19 @@ async fn execute(reasoning: Out<ReasoningResult>, tools: Res<ToolRegistry>) -> T
 }
 ```
 
+**`OutAll<T>`** provides immutable access to every visible `T`, oldest first. Each entry exposes its borrowed value and its opaque `ProducerKey` (read graph provenance with `ProducerInfo::of(entry.producer())` — see [Context — Producer Keys](context.md#producer-keys)), so a system can collect or fold outputs from several producers without cloning them.
+
+```rust
+use polaris_system::{system, OutAll};
+
+struct Score(u32);
+
+#[system]
+async fn total(scores: OutAll<Score>) -> u32 {
+    scores.iter().map(|score| score.0).sum()
+}
+```
+
 **`ErrOut<T>`** provides immutable access to an error-context output produced when a system fails and the executor routes to an error edge. The executor inserts a `CaughtError` into the destination context before invoking the handler, which reads it via `ErrOut<CaughtError>`.
 
 ```rust
@@ -208,7 +275,7 @@ async fn handle_error(error: ErrOut<CaughtError>) -> RecoveryState {
 
 ### Outputs
 
-Outputs are the return values of systems. A system's return type is automatically inserted into the context's output store, and downstream systems read it via `Out<T>`.
+Outputs are the return values of systems. A system's return type is automatically inserted into the context's output store, and downstream systems read the newest value via `Out<T>` or every value of a type via `OutAll<T>`.
 
 For systems that produce multiple logical outputs, the return type should be a struct:
 
@@ -239,7 +306,7 @@ async fn plan(
 }
 ```
 
-A type becomes renderable by deriving `Debug` — there is nothing to implement, so this works on resource types from crates you do not own. Naming a parameter whose type is not `Debug` is a compile error **at that parameter**, not a silent omission. Bare `#[system(inspect)]` selects every parameter, which requires all of them to be `Debug` — but not the return value, which is not a parameter and must be named explicitly (`inspect(.., return)`). `return` selects the system's own return value: for a fallible system (one whose return type is spelled literally `Result<T, SystemError>` — fallibility detection is syntactic) the recorded value is the extracted success value and a failure records nothing, while a `Result` with any other error type is an ordinary output value, so its `Err` arm is recorded like any other value.
+A type becomes renderable by deriving `Debug` — there is nothing to implement, so this works on resource types from crates you do not own. Naming a parameter whose type is not `Debug` is a compile error **at that parameter**, not a silent omission. Bare `#[system(inspect)]` selects every parameter, which requires all of them to be `Debug` — but not the return value, which is not a parameter and must be named explicitly (`inspect(.., return)`). `OutAll<T>` is supported and records its ordered values as `ParamKind::OutAll`. `return` selects the system's own return value: for a fallible system (one whose return type is spelled literally `Result<T, SystemError>` — fallibility detection is syntactic) the recorded value is the extracted success value and a failure records nothing, while a `Result` with any other error type is an ordinary output value, so its `Err` arm is recorded like any other value.
 
 Parameters selected with `inspect(..)` are captured at `Phase::Before`, meaning "this value went in" — those records survive a later fetch failure or a body failure. Only the `return` record implies the system succeeded; a sink must not infer success from the presence of parameter records.
 

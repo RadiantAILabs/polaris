@@ -191,7 +191,7 @@
 //! |------|---------|-------------|
 //! | Run one-shot agent | `sessions.run_oneshot(&agent_type, \|ctx\| { ... })` | [`sessions`] |
 //! | Multi-turn with cleanup | `sessions.scoped_session(&agent_type, \|ctx\| { ... })` | [`sessions`] |
-//! | Execute agent from HTTP | `HttpRouter::add_routes_with` → `SessionsAPI` → `HttpIOProvider` | [`app`] |
+//! | Execute agent from HTTP | `HttpRouter::add_routes_with` → `SessionsAPI` → `ChannelIOProvider` | [`app`] |
 //! | Register HTTP routes | `server.api::<HttpRouter>().add_routes(router)` (stateless) / `add_routes_with(\|server\| ...)` (stateful) | [`app`] |
 //! | Add tools for LLM | `#[tool]` macro + `ToolRegistry` | [`tools`] |
 //! | Add model provider | Implement `LlmProvider` + register via plugin | [`models`] |
@@ -241,7 +241,7 @@
 //! |---------|---------------|---------------|
 //! | `anthropic` | [`models::AnthropicPlugin`] | [`models`] |
 //! | `openai` | [`models::OpenAiPlugin`] | [`models`] |
-//! | `bedrock` | [`models::BedrockPlugin`] | [`models`] |
+//! | `bedrock` | [`models::BedrockPlugin`], [`models::OpenAiPlugin`] | [`models`] |
 //!
 //! ## Observability
 //!
@@ -293,10 +293,10 @@
 //! |---------|-------------------|--------------|-----------------|
 //! | `anthropic` | [`models::anthropic`], [`models::AnthropicPlugin`] | Makes the `anthropic/...` provider family available through [`models::ModelRegistry`] once registered | [`models::AnthropicPlugin`] registers the Anthropic provider |
 //! | `openai` | [`models::openai`], [`models::OpenAiPlugin`] | Makes the `openai/...` provider family available through [`models::ModelRegistry`] once registered | [`models::OpenAiPlugin`] registers the `OpenAI` provider |
-//! | `bedrock` | [`models::bedrock`], [`models::BedrockPlugin`] | Makes the `bedrock/...` provider family available through [`models::ModelRegistry`] once registered | [`models::BedrockPlugin`] registers the Bedrock provider |
+//! | `bedrock` | [`models::bedrock`], [`models::BedrockPlugin`], [`models::openai`], [`models::OpenAiPlugin`] | Also enables `openai`, making both provider implementations available | [`models::BedrockPlugin`] registers the Bedrock provider; [`models::OpenAiPlugin`] is also exposed and can be registered separately |
 //! | `otel` | [`plugins::OpenTelemetryPlugin`] | Integrates with [`plugins::TracingPlugin`] / [`plugins::TracingLayers`] and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names | [`plugins::OpenTelemetryPlugin`] pushes an OTLP export layer into the tracing subscriber; [`app::AppPlugin`] emits spans with `http.request.method` / `url.path` / `http.response.status_code` fields (plus `otel.name` / `otel.kind`) instead of the `polaris.http.*` defaults. With [`plugins::OpenTelemetryPlugin`] installed, it also extracts incoming W3C `traceparent` headers to continue a distributed trace; requests with no upstream context start a fresh trace. |
 //! | `tiktoken` | [`models::tokenizer::TiktokenCounter`], [`models::tokenizer::EncodingFamily`] | Adds [`Default`] for [`models::TokenizerPlugin`] and changes what [`models::TokenizerPlugin::default`] builds | [`models::TokenizerPlugin::default`] registers a global [`models::Tokenizer`] backed by [`models::tokenizer::TiktokenCounter`] |
-//! | `sessions-http` | [`sessions::http`], [`sessions::HttpPlugin`], [`sessions::http::models`] | Adds request/response model types and HTTP-facing session APIs under [`sessions`] | [`sessions::HttpPlugin`] registers routes through [`app::HttpRouter`] and depends on [`app::AppPlugin`] + [`sessions::SessionsPlugin`] |
+//! | `sessions-http` | [`sessions::http`], [`sessions::HttpPlugin`], [`sessions::http::models`] | Adds HTTP routing; session records, history, uptime, and channel IO are available without this feature | [`sessions::HttpPlugin`] registers routes through [`app::HttpRouter`] and depends on [`app::AppPlugin`] + [`sessions::SessionsPlugin`] |
 //! | `file-store` *(default)* | [`sessions::FileStore`] | Pulls `tokio/fs` into the dep graph | Lets [`sessions::SessionsPlugin`] use a filesystem-backed [`sessions::SessionStore`] |
 //! | `dashboard` | [`tools::dashboard::ToolsSnapshot`], [`models::dashboard::ModelsSnapshot`] | Activates the per-crate `dashboard` features on [`tools::ToolsPlugin`] and [`models::ModelsPlugin`] so each host plugin mounts its dashboard HTTP surface | [`tools::ToolsPlugin`] mounts a frozen-snapshot `/v1/tools` endpoint, and [`models::ModelsPlugin`] mounts `/v1/models/providers` |
 //! | `typegen` | None at runtime | Enables `ts-rs` derives on canonical session wire types (`SessionMetadata`, `SessionStatus`, …) | Running `cargo test --features typegen` regenerates the TypeScript bindings under `bindings/ts/src/` |

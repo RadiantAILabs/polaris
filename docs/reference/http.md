@@ -99,16 +99,21 @@ Use `add_routes` for stateless fragments (`/healthz`, static content) and `add_r
 
 **Note:** builders are drained once during `AppPlugin::ready()`. Calling `add_routes` or `add_routes_with` *from* a builder closure has no effect — register everything for your plugin before returning the `Router`.
 
-## HttpIOProvider: Bridging HTTP to Agent IO
+## ChannelIOProvider: Bridging a Caller's Channels to Agent IO
 
-`HttpIOProvider` connects an HTTP handler to the agent's `UserIO` abstraction via tokio channels. The handler pre-loads user input and collects agent output.
+`ChannelIOProvider` is available as `polaris_sessions::ChannelIOProvider` without
+`sessions-http`. The historical `HttpIOProvider` name remains a compatibility
+alias at the crate root and under `io`; `http::HttpIOProvider` also remains
+available when `sessions-http` is enabled. The provider connects any caller to
+the agent's `UserIO` abstraction via tokio channels. An HTTP handler, for
+example, can pre-load user input and collect agent output.
 
 ```rust
-use polaris_sessions::http::HttpIOProvider;
+use polaris_sessions::ChannelIOProvider;
 use polaris_core_plugins::{IOMessage, UserIO};
 
 // 1. Create channels
-let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, 64);
+let (provider, input_tx, mut output_rx) = ChannelIOProvider::new(1, 64);
 let provider = Arc::new(provider);
 
 // 2. Send user message, then close input
@@ -226,14 +231,14 @@ Here is the complete flow from the sessions `HttpPlugin` handler:
 HTTP POST /v1/sessions/{id}/turns
   │
   ├── 1. Extract State<SessionsAPI> (injected at router-build time)
-  ├── 2. Create HttpIOProvider (input_tx, output_rx)
+  ├── 2. Create ChannelIOProvider (input_tx, output_rx)
   ├── 3. Send user message via input_tx, drop sender
   ├── 4. Call sessions.try_process_turn_with()
   │       ├── Lock session context (or return 409 SessionBusy)
   │       ├── Inject SessionInfo (session_id, turn_number)
   │       ├── Call setup closure → ctx.insert(UserIO::new(provider))
   │       ├── Execute graph (systems read UserIO via Res<UserIO>)
-  │       ├── Auto-checkpoint (if enabled)
+  │       ├── Auto-checkpoint (if enabled; synchronous, still under the lock)
   │       └── Return ExecutionResult
   ├── 5. Drain output_rx → collect IOMessages
   └── 6. Return JSON response with messages + execution metadata
@@ -252,7 +257,7 @@ pub(crate) async fn process_turn(
 ) -> Result<Json<ProcessTurnResponse>, ApiError> {
     let session_id = SessionId::from_string(id);
 
-    let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, 64);
+    let (provider, input_tx, mut output_rx) = ChannelIOProvider::new(1, 64);
     let provider = Arc::new(provider);
 
     input_tx.send(IOMessage::user_text(body.message)).await
@@ -416,7 +421,7 @@ server
 |------|---------|
 | `polaris_app/src/plugin.rs` | `AppPlugin` lifecycle, `ServerHandle` |
 | `polaris_app/src/router.rs` | `HttpRouter` API for route registration |
-| `polaris_sessions/src/http/io.rs` | `HttpIOProvider` channel bridging |
+| `polaris_sessions/src/io.rs` | `ChannelIOProvider` channel bridging |
 | `polaris_app/src/auth.rs` | `AuthProvider` trait |
 | `polaris_app/src/config.rs` | `AppConfig` (bind address, CORS) |
 | `polaris_app/src/request_context.rs` | `RequestContext`, `HttpHeaders`, `RequestContextPlugin` |

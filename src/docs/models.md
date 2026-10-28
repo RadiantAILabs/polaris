@@ -80,6 +80,17 @@ reported separately on [`Usage`](crate::models::llm::Usage)
 (`cache_read_tokens` / `cache_creation_tokens`) and billed at the cache tiers in
 [`ModelPricing`](crate::models::llm::ModelPricing).
 
+# Pricing
+
+The built-in providers report per-model token prices (used for the
+`gen_ai.usage.cost` span attribute) from a
+[`PriceStore`](crate::models::pricing::PriceStore). The default,
+[`PriceStore::builtin`](crate::models::pricing::PriceStore::builtin), uses only
+built-in prices and never touches the network or disk. Opt in to prices
+fetched from the web and cached on disk with
+`with_pricing_store(PriceStore::live())` on a provider plugin. A custom
+provider can hold a `PriceStore` too and answer `pricing()` from it.
+
 # Adding a Custom Provider
 
 1. Implement `LlmProvider` (the `name()` becomes the prefix in model identifiers)
@@ -108,7 +119,7 @@ impl LlmProvider for MyProvider {
 |----------|-------------|--------------------|----------------|
 | Anthropic Claude | `anthropic` | [`anthropic`](crate::models::anthropic), [`AnthropicPlugin`](crate::models::AnthropicPlugin) | Registers the `anthropic/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
 | `OpenAI` | `openai` | [`openai`](crate::models::openai), [`OpenAiPlugin`](crate::models::OpenAiPlugin) | Registers the `openai/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
-| AWS Bedrock | `bedrock` | [`bedrock`](crate::models::bedrock), [`BedrockPlugin`](crate::models::BedrockPlugin) | Registers the `bedrock/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
+| AWS Bedrock | `bedrock` (also enables `openai`) | [`bedrock`](crate::models::bedrock), [`BedrockPlugin`](crate::models::BedrockPlugin) | Registers the `bedrock/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
 
 # Feature-Gated Tokenization
 

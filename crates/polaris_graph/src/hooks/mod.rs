@@ -50,12 +50,12 @@
 //!
 //! // Provider that injects SystemInfo resource via return value
 //! # use polaris_system::resource::LocalResource;
-//! # struct SystemInfo { node_id: polaris_graph::node::NodeId, name: &'static str }
-//! # impl SystemInfo { fn new(n: polaris_graph::node::NodeId, s: &'static str) -> Self { Self { node_id: n, name: s } } }
+//! # struct SystemInfo { node_id: polaris_graph::node::NodeId, name: polaris_graph::node::NodeName }
+//! # impl SystemInfo { fn new(n: polaris_graph::node::NodeId, s: polaris_graph::node::NodeName) -> Self { Self { node_id: n, name: s } } }
 //! # impl LocalResource for SystemInfo {}
 //! hooks.register_provider::<OnSystemStart, SystemInfo, _>("devtools", |event: &GraphEvent| {
 //!     if let GraphEvent::SystemStart { node_id, node_name, .. } = event {
-//!         Some(SystemInfo::new(node_id.clone(), node_name))
+//!         Some(SystemInfo::new(node_id.clone(), node_name.clone()))
 //!     } else {
 //!         None
 //!     }

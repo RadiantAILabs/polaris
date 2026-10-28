@@ -163,10 +163,70 @@ async fn normalize(payload: Res<RequestPayload>) -> String {
 }
 ```
 
+# Interrupting a Turn
+
+`interrupt_turn` stops the turn a session is currently running. It is
+synchronous and never touches the session's context lock — the running turn
+holds that lock for its whole duration — so it does not wait for the turn it is
+stopping. It does take two short internal locks (the session registry and the
+turn's cancellation slot), so it is not safe to call from a raw OS signal
+handler: a signal that arrives while the interrupted thread holds one of those
+locks would deadlock. Call it from an ordinary task, a UI callback, or an HTTP
+handler.
+
+To stop a turn on `SIGINT`, let the runtime deliver the signal to a task
+(`tokio::signal::ctrl_c()` does this) and have that task call `interrupt_turn`.
+The turn runs on its own task:
+
+```no_run
+# use polaris_ai::sessions::{SessionError, SessionsAPI, SessionId};
+# async fn example(sessions: SessionsAPI, session_id: SessionId) {
+// Task 1: runs the turn and sees how it ended.
+match sessions.process_turn(&session_id).await {
+    Err(SessionError::Interrupted { turn, .. }) => {
+        // Recorded as interrupted, session idle, `turn_number` advanced.
+        // A checkpoint was attempted, subject to the checkpoint policy.
+    }
+    Ok(_) | Err(_) => {}
+}
+# }
+```
+
+```no_run
+# use polaris_ai::sessions::{SessionsAPI, SessionId};
+# async fn ctrl_c() { /* in Tokio: `tokio::signal::ctrl_c().await` */ }
+# async fn example(sessions: SessionsAPI, session_id: SessionId) -> Result<(), Box<dyn std::error::Error>> {
+// Task 2: waits for the signal, then raises it for the turn.
+ctrl_c().await;
+let was_running = sessions.interrupt_turn(&session_id)?;  // Ok(false) when idle
+# Ok(())
+# }
+```
+
+`Ok(true)` means only that a turn was in flight. A raise while idle is not
+latched into the next turn, an unknown session is `SessionNotFound`, and
+escalation policy ("a second press quits") belongs to the host.
+
+An interrupted turn is deliberately **not** a failed one: it is recorded
+`Interrupted`, `turn_number` advances, a checkpoint is attempted, and the
+error is `SessionError::Interrupted` — never
+`SessionError::Execution(ExecutionError::Interrupted { .. })`. The checkpoint
+is *attempted*, not guaranteed: it is skipped when auto-checkpoint is disabled,
+and a refusal for capacity is logged rather than returned, so use
+`checkpoints().current` to see whether a point was retained. How promptly the
+turn ends is the agent's business; see
+[cancellation](crate::graph::CancellationSource) in the graph layer.
+
 # Checkpointing
 
-Auto-checkpoint is enabled by default (after every successful turn).
-Manual checkpoint and rollback:
+Auto-checkpoint is enabled by default. It captures at session creation, at
+[`resume_session`](crate::sessions::SessionsAPI::resume_session), and after
+every completed or interrupted turn. A failed turn is not captured. Capture is
+synchronous: it runs while the turn still holds the session's context lock, so
+its serialization cost adds to turn latency. A capture that fails, including a
+refusal for capacity, is logged at `warn` and never fails the turn. The
+retained points are durable: `save_session` writes them to the configured store
+and `resume_session` reads them back. Manual checkpoint and rollback:
 
 ```no_run
 # use polaris_ai::sessions::{SessionsAPI, SessionId};
@@ -178,6 +238,19 @@ sessions.rollback(&session_id, target_turn).await?;
 # Ok(())
 # }
 ```
+
+For restore, pinning and retention bounds, use the `checkpoints()` handle. When a
+bound is reached, a capture evicts the oldest unpinned point, and is refused with
+`SessionError::CheckpointCapacity` if nothing can be evicted. The current point,
+both ends of an unfinished restore and pinned points are never evicted. The one
+exception is `restore`: its snapshot of the state being left may replace the
+previous current point, unless that point is pinned. Dropping a `CheckpointPin`
+never waits on checkpoint encoding or eviction.
+
+If a restore fails partway, the session context is incoherent. Turns, captures and
+`save_session` return `SessionError::RestoreFailed` until a restore succeeds, and
+`save_session` leaves the stored session unchanged. Retrying the restore reuses
+the snapshot taken before the failed attempt, so it needs no free slot.
 
 # Persistence
 
@@ -195,11 +268,26 @@ sessions.resume_session(ctx, &session_id).await?; // resume
 
 Backends: `InMemoryStore` (default), `FileStore` (with `file-store` feature).
 
+`FileStore` limits what it writes as well as what it reads: by default 64 MiB per
+file, 1024 checkpoints and 1024 tombstones. `save` refuses a session over a limit
+with `FileStoreError::SaveTooLarge`, `SaveTooManyCheckpoints` or
+`SaveTooManyTombstones` and writes nothing, so a stored session can always be
+resumed. With unbounded checkpoint retention a long-lived session can reach the
+limits; raise them with `FileStore::with_load_limits`.
+
+# History and Channel IO
+
+Turn history (`turn_history`, `turn`, `record_turn_messages`), uptime queries,
+[`models`](crate::sessions::models), and [`ChannelIOProvider`](crate::sessions::HttpIOProvider)
+are available without `sessions-http`, including with default features disabled.
+History is bounded and in memory; programmatic callers attach captured messages
+with `record_turn_messages`. Existing HTTP type paths remain compatible re-exports.
+
 # Feature-Gated HTTP Surface
 
 | Feature | Adds public items | Existing surface it uses | Runtime effect |
 |---------|-------------------|--------------------------|----------------|
-| `sessions-http` | [`HttpPlugin`](crate::sessions::HttpPlugin), [`http`](crate::sessions::http), [`http::routes`](crate::sessions::http::routes), [`http::models`](crate::sessions::http::models) | Integrates with [`crate::app::HttpRouter`] and requires [`HttpPlugin`](crate::sessions::HttpPlugin) to be registered alongside [`crate::app::AppPlugin`] | Registers REST routes, handlers, and request/response models for session management |
+| `sessions-http` | [`HttpPlugin`](crate::sessions::HttpPlugin), [`http`](crate::sessions::http), [`http::routes`](crate::sessions::http::routes), [`http::models`](crate::sessions::http::models) | Integrates with [`crate::app::HttpRouter`] and requires [`HttpPlugin`](crate::sessions::HttpPlugin) to be registered alongside [`crate::app::AppPlugin`] | Registers REST routes and handlers for session management; models and channel IO do not require this feature |
 
 # Related
 

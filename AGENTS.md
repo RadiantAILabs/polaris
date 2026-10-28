@@ -77,7 +77,7 @@ Custom rules in `.clippy.toml`:
 - `docs/reference/graph.md` - Graph construction, execution, error handling, hooks, middleware
 - `docs/reference/agents.md` - Agent trait and pattern implementations
 - `docs/reference/sessions.md` - SessionsAPI, turn execution, checkpoints, persistence
-- `docs/reference/http.md` - HTTP handler integration, deferred router construction, HttpIOProvider
+- `docs/reference/http.md` - HTTP handler integration, deferred router construction, ChannelIOProvider
 - `docs/reference/scheduling.md` - Server lifecycle, tick scheduling, plugin update ordering
 - `docs/reference/data-flow.md` - Decision guide for `Res<T>` vs `ResMut<T>` vs `Out<T>`
 - `docs/reference/tools.md` - Tool definitions, `ToolRegistry`, permission model
@@ -108,7 +108,7 @@ Before reading the entire file, read the first 100 lines when navigating to thes
 | App HTTP runtime | `crates/polaris_app/src/plugin.rs` | `AppPlugin` lifecycle, `ServerHandle` global resource |
 | Route registration | `crates/polaris_app/src/router.rs` | `HttpRouter` API for plugin-based route composition |
 | Auth extension | `crates/polaris_app/src/auth.rs` | `AuthProvider` trait for pluggable authentication |
-| HTTP IO bridging | `crates/polaris_sessions/src/http/io.rs` | `HttpIOProvider` - channels bridging HTTP to `UserIO` |
+| Channel IO bridging | `crates/polaris_sessions/src/io.rs` | `ChannelIOProvider` - caller-owned channels bridging to `UserIO` |
 | Sessions API | `crates/polaris_sessions/src/api.rs` | `SessionsAPI`, turn execution, checkpoints |
 | Sessions plugin | `crates/polaris_sessions/src/lib.rs` | `SessionsPlugin`, re-exports |
 | Session RAII guard | `crates/polaris_sessions/src/guard.rs` | `SessionGuard` - auto-cleanup on drop |
@@ -128,7 +128,7 @@ For per-thing documentation standards (every plugin, API, and resource has requi
 - [`docs/reference/api.md#documentation-standard`](docs/reference/api.md#documentation-standard)
 - [`docs/reference/resources.md#documentation-standard`](docs/reference/resources.md#documentation-standard)
 
-The catalogs (every shipped plugin, API, and resource) live at [`src/docs/plugins.md`](src/docs/plugins.md), [`src/docs/apis.md`](src/docs/apis.md), and [`src/docs/resources.md`](src/docs/resources.md). Each has a CI drift guard under `tests/`. The `/review-docs` skill checks PRs against the standards.
+The catalogs (every shipped plugin, API, and resource) live at [`src/docs/plugins.md`](src/docs/plugins.md), [`src/docs/apis.md`](src/docs/apis.md), and [`src/docs/resources.md`](src/docs/resources.md). Each has a CI drift guard under `tests/`.
 
 ## Common Integration Patterns
 
@@ -138,7 +138,7 @@ These map high-level goals to the files and patterns needed:
 |------|---------|-----------|---------------|
 | **Run one-shot agent** | `sessions.run_oneshot::<T>(&agent_type, \|ctx\| { ctx.insert(...); })` | `polaris_sessions/src/api.rs` | [Sessions - One-Shot](docs/reference/sessions.md#one-shot-execution) |
 | **Multi-turn with cleanup** | `sessions.scoped_session(&agent_type, \|ctx\| { ... })` -> `guard.process_turn()` | `polaris_sessions/src/guard.rs` | [Sessions - Scoped Sessions](docs/reference/sessions.md#scoped-sessions-raii-guard) |
-| **Execute agent from HTTP** | `add_routes_with` -> `State<SessionsAPI>` -> `HttpIOProvider` -> `process_turn` | `polaris_sessions/src/http/handlers.rs`, `polaris_sessions/src/http/io.rs` | [HTTP Integration](docs/reference/http.md) |
+| **Execute agent from HTTP** | `add_routes_with` -> `State<SessionsAPI>` -> `ChannelIOProvider` -> `process_turn` | `polaris_sessions/src/http/handlers.rs`, `polaris_sessions/src/io.rs` | [HTTP Integration](docs/reference/http.md) |
 | **Register HTTP routes from a plugin** | `server.api::<HttpRouter>().add_routes(router)` (stateless) or `add_routes_with(\|server\| ...)` (needs another plugin's API) in `build()`; use protected variants for private metadata/admin routes | `polaris_app/src/router.rs` | [HTTP Integration](docs/reference/http.md) |
 | **Access Polaris APIs from HTTP handlers** | `add_routes_with` closure resolves APIs against `&Server` during `AppPlugin::ready()`, then `.with_state(api)` on the returned `Router` | `polaris_sessions/src/http/mod.rs` | [HTTP Integration - Deferred Router Construction](docs/reference/http.md#deferred-router-construction) |
 | **Create contexts outside the server** | `ContextFactory` from `server.context_factory()` in `ready()` | `polaris_system/src/server.rs` | [Execution Context - ContextFactory](docs/reference/context.md#via-contextfactory) |
@@ -146,14 +146,24 @@ These map high-level goals to the files and patterns needed:
 | **Advertise or discover agent capabilities** | `sessions.register_contract(name, GraphSignature)` - satisfying agents advertise the name via `agent_type_infos()` / authenticated `GET /v1/sessions/agent-types/details` | `polaris_sessions/src/api.rs` | [Sessions - Capability Contracts](docs/reference/sessions.md#capability-contracts) |
 | **Mount the canonical sessions REST routes on your own router** | `polaris_sessions::http::routes(sessions)` - mount-point-relative public `Router`; carries no auth and excludes private graph-signature metadata | `polaris_sessions/src/http/mod.rs` | [HTTP Integration - Session HTTP Endpoints](docs/reference/http.md#session-http-endpoints) |
 | **Inject per-turn resources** | Setup closure in `process_turn_with(\|ctx\| { ctx.insert(...); })` | `polaris_sessions/src/api.rs` | [Sessions - Turn Execution](docs/reference/sessions.md#turn-execution) |
-| **Bridge HTTP IO to agent** | `HttpIOProvider::new()` -> send input -> inject `UserIO` -> drain output | `polaris_sessions/src/http/io.rs` | [HTTP Integration - HttpIOProvider](docs/reference/http.md#httpioprovider-bridging-http-to-agent-io) |
+| **Bridge caller channels to agent** | `ChannelIOProvider::new()` -> send input -> inject `UserIO` -> drain output | `polaris_sessions/src/io.rs` | [HTTP Integration - ChannelIOProvider](docs/reference/http.md#channelioprovider-bridging-a-callers-channels-to-agent-io) |
 | **Understand context flow per node** | Parallel creates children; Loop shares context; Scope has 3 modes; Dynamic runs its selected candidate through a Scope-like boundary | `polaris_graph/src/executor/run.rs` | [Execution Context - Graph Flow](docs/reference/context.md#context-flow-through-graph-execution) |
+| **Build a graph whose shape is known only at runtime** | Owned names and keys -> `NodeName`; pre-register `BoxedPredicate` / `BoxedDiscriminator`; assemble with `add_conditional_branch_boxed`, `add_loop_boxed`, or `add_switch_boxed`; use `.named(...)` for per-system runtime names | `polaris_graph/src/predicate.rs`, `polaris_graph/src/graph/builder.rs`, `polaris_graph/src/node.rs` | [Graph — Building Graphs from Runtime Data](docs/reference/graph.md#building-graphs-from-runtime-data) |
+| **Compose an isolated subgraph without erasing its interface** | `add_scope_with_contract(name, graph, policy, contract)` — include eager `forward`/`fork` inputs in `GraphSignature`; declared scopes cannot express `forward_fresh` factory requirements | `polaris_graph/src/graph/builder.rs`, `polaris_graph/src/graph/signature.rs` | [Graph — Declared scope contracts](docs/reference/graph.md#declared-scope-contracts) |
+| **Run an escalation ladder behind one dynamic slot** | `DynamicSlot::new(contract, policy).with_matching(MatchingMode::Substitutable)` — contravariant inputs, covariant outputs, so a rung consuming *less* than the contract is admitted; `Exact` is the default. On a registry-backed slot the *registry's* mode is the only gate — mirror it. Extra candidate outputs are dropped at the boundary (`validate()` warns for inline candidates) | `polaris_graph/src/graph/signature.rs`, `polaris_graph/src/node.rs`, `polaris_graph/src/registry.rs` | [Graph — Dynamic](docs/reference/graph.md#dynamic) |
+| **Read one producer's `T` when several systems return `T`** | `graph.system(reader).read_from::<T>(producer_id)`, or `graph.read_from::<T>(reader_id, producer_id)` for a loop back-wire (read as `Option<Out<T>>`); `validate()` rejects wires it cannot honor | `polaris_graph/src/graph/builder.rs`, `polaris_graph/src/graph/validation.rs`, `polaris_system/src/param/read_from.rs` | [Graph — `read_from`](docs/reference/graph.md#reading-a-specific-producer-read_from) |
+| **Control how many earlier loop iterations stay readable** | `set_loop_retention(loop_id, n)` / `set_loop_retention_for_type::<T>(loop_id, n)` (per-type wins); default 1, 0 keeps none; only the newest iteration leaves the loop; a failed or dropped loop discards all its iterations | `polaris_graph/src/graph/builder.rs`, `polaris_graph/src/executor/run.rs`, `polaris_system/src/param/output_layers.rs` | [Graph — Loop output retention](docs/reference/graph.md#loop-output-retention) |
+| **See which node wrote each same-typed output** | `OutAll<T>` -> `ProducerInfo::of(entry.producer())` (node, name, run id, path, loop iteration; `None` for caller-seeded outputs); `ProducerKey` itself is opaque | `polaris_system/src/param/out_all.rs`, `polaris_graph/src/producer.rs` | [Context — Producer Keys](docs/reference/context.md#producer-keys) |
+| **Accept caller-supplied systems without system/marker generics** | `erase(system)` at call site -> `TypedSystem<O>` helper parameter -> `graph.system_boxed(stage).with_schedules(Role)` | `polaris_system/src/system/mod.rs`, `polaris_graph/src/graph/builder.rs` | [System - Typed Erasure](docs/reference/system.md#typed-erasure-for-composition) |
 | **Add middleware to graph execution** | `MiddlewareAPI::register_system()` in plugin `build()` | `polaris_graph/src/middleware/` | [Graph - Middleware](docs/reference/graph.md#middleware) |
 | **Handle system errors in graph** | Fallible system + error edge + `ErrOut<CaughtError>` handler | `polaris_graph/src/executor/error.rs` | [Graph - Error Handling](docs/reference/graph.md#error-handling) |
 | **Capture system parameter values for observability** | `#[system(inspect(a, b, return))]` selects at compile time; `InspectionPlugin` delivers - enable via `InspectionAPI`, listen via `Extends<InspectionSinkRegistry>`; per-deployment start policy via `InspectionPlugin::with_policy_from_env` (app-named env var; unset stays off) | `polaris_core_plugins/src/inspection.rs`, `polaris_system/src/param/inspect.rs` | [System - Parameter Inspection](docs/reference/system.md#parameter-inspection) |
 | **Keep credentials out of captured values and telemetry export** | `RedactionRules` rules by binding name or type (covered values arrive `Redacted`, `Debug` never run) - `InspectionPlugin::with_redactions` at build (or `with_redactions_from_env` — adds, never drops), `InspectionAPI::add_redacted_param` / `add_redacted_type` at run time; `disable_listener(INSPECTION_TRACING_LISTENER)` cuts export alone | `polaris_core_plugins/src/inspection.rs` | [System - Parameter Inspection](docs/reference/system.md#parameter-inspection) |
 | **Chain an inspection sink onto one already installed** | `ctx.inspection_arc()` -> wrap -> `ctx.replace_inspection(wrapper)`; guard re-application with `Arc::ptr_eq` on the handle you installed | `polaris_system/src/param/mod.rs` | [Execution Context - Chaining onto an Installed Sink](docs/reference/context.md#chaining-onto-an-installed-sink) |
 | **Schedule plugin updates** | `tick_schedules()` + `update()` + `server.tick::<S>()` | `polaris_system/src/server.rs` | [Scheduling](docs/reference/scheduling.md) |
+| **Set an output token limit** | Ceiling at registration: `AnthropicPlugin` / `BedrockPlugin::with_max_tokens` (default 4096); `LlmRequestBuilder::max_output_tokens` lowers it for one call, never raises it; OpenAI sends the request value as given | `polaris_model_providers/src/anthropic/`, `polaris_model_providers/src/bedrock/`, `polaris_models/src/llm/builder.rs` | [Model Providers — Output token limits](docs/reference/model-providers.md#output-token-limits) |
+| **Price token usage** | Providers default to `PriceStore::builtin()` (no network, no disk); opt in with `with_pricing_store(PriceStore::live())`; `with_pricing_override` for one provider's rate | `polaris_model_providers/src/pricing.rs` | [Model Providers — Pricing](docs/reference/model-providers.md#pricing) |
+| **Use `openai.*` or model-specific fields on Bedrock** | `BedrockPlugin` (passes the SDK config the Responses endpoint needs) + `with_additional_model_request_fields(json)` | `polaris_model_providers/src/bedrock/provider.rs` | [Model Providers — AWS Bedrock](docs/reference/model-providers.md#aws-bedrock) |
 
 ## Quick Reference: Common Modifications
 
@@ -242,16 +252,15 @@ When planning and implementing new features, refer to `docs/philosophy.md` and `
 
 | Layer | Crates | Rule |
 |-------|--------|------|
-| **1 - System Framework** | `polaris_system`, `system_macros` | Own dedicated ticket. Changes affect everything. |
-| **2 - Graph Execution** | `polaris_graph`, `polaris_agent` | Own dedicated ticket. Changes affect all agents. |
+| **1 - System Framework** | `polaris_system`, `system_macros` | Own dedicated PR. Changes affect everything. |
+| **2 - Graph Execution** | `polaris_graph`, `polaris_agent` | Own dedicated PR. Changes affect all agents. |
 | **3 - Plugins** | `polaris_core_plugins`, `polaris_models`, `polaris_model_providers`, `polaris_tools`, `polaris_shell`, `polaris_app` | Must not modify Layer 1 or 2. Isolated changes. |
 
-Re-export crates (`polaris`, `polaris_internal`) are updated in the same ticket as the change they re-export. Tickets should touch 1 crate only (2 acceptable for wide-scale refactors).
+Re-export crates (`polaris`, `polaris_internal`) are updated in the same PR as the change they re-export. PRs should touch 1 crate only (2 acceptable for wide-scale refactors).
 
 ### Branch Naming
 
-- With Shortcut story: `sc-{id}/{short-description}` (for example `sc-3154/add-session-plugin`)
-- Without story: `feat/`, `fix/`, `refactor/`, `docs/`, `chore/` prefix
+- Use a `feat/`, `fix/`, `refactor/`, `docs/`, `chore/` prefix
 
 ### Commit Messages
 
@@ -260,16 +269,9 @@ Conventional commit style: `<type>: <short summary>`. Types: `feat`, `fix`, `ref
 ### Pull Requests
 
 - Title: imperative, under 70 chars, typed (for example `feat: add ...`)
-- Description: explain why, link Shortcut story
+- Description: explain why, link the related issue
 - One logical change per PR
 - Tests required for features and fixes
-
-### Available Skills
-
-- `/create-ticket` — create a well-scoped Shortcut story
-- `/evaluate-ticket` — evaluate tickets against quality checklist
-- `/roadmap` — decompose an initiative into sequenced tickets
-- `/review-pr` — review a PR against contribution standards
 
 ## Ignored Files
 

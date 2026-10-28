@@ -1,6 +1,8 @@
 //! AWS Bedrock provider backend.
 //!
-//! Uses the AWS Bedrock Converse API.
+//! Uses the AWS Bedrock Converse API. Models whose id contains `openai.`
+//! are sent to Bedrock's `OpenAI` Responses endpoint instead, which needs
+//! the AWS SDK config ([`BedrockPlugin`] passes it).
 //!
 //! # Examples
 //!
@@ -26,7 +28,9 @@ mod plugin;
 mod provider;
 mod request;
 mod response;
+mod responses;
 mod types;
 
 pub use plugin::BedrockPlugin;
-pub use provider::BedrockProvider;
+pub use provider::{BedrockProvider, DEFAULT_MAX_TOKENS};
+pub use types::normalize_bedrock_model_id;

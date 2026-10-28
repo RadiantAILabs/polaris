@@ -12,8 +12,9 @@
 mod test_utils;
 
 use polaris_graph::CaughtError;
+use polaris_graph::edge::Edge;
 use polaris_graph::executor::{GraphExecutor, ResourceValidationError};
-use polaris_graph::graph::{Graph, GraphSignature, ValidationError, ValidationWarning};
+use polaris_graph::graph::{Graph, GraphSignature, RouteKind, ValidationError, ValidationWarning};
 use polaris_graph::hooks::HooksAPI;
 use polaris_graph::hooks::schedule::OnGraphStart;
 use polaris_graph::node::{ContextPolicy, DynamicSlot, NodeId};
@@ -23,8 +24,18 @@ use polaris_system::param::{
 use polaris_system::resource::LocalResource;
 use polaris_system::system::{BoxFuture, System, SystemError};
 use std::any::TypeId;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use test_utils::{ReadConfigSystem, SuccessSystem, TestConfig, WriteConfigSystem, branch};
+use std::time::Duration;
+use test_utils::{
+    FailingSystem, ReadConfigSystem, SuccessSystem, TestConfig, WriteConfigSystem, branch,
+};
+
+impl polaris_system::resource::ForkStrategy for TestConfig {
+    fn fork(&self) -> Self {
+        self.clone()
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Systems
@@ -169,10 +180,50 @@ fn validation_error_invalid_entry_point_display() {
 }
 
 #[test]
+fn validation_error_disconnected_nodes_display() {
+    let cases = [
+        (Vec::new(), "graph has 0 node(s) unreachable from entry"),
+        (
+            vec![NodeId::from_string("1")],
+            "graph has 1 node(s) unreachable from entry: node_1",
+        ),
+        (
+            vec![NodeId::from_string("1"), NodeId::from_string("2")],
+            "graph has 2 node(s) unreachable from entry: node_1, node_2",
+        ),
+        (
+            vec![
+                NodeId::from_string("1"),
+                NodeId::from_string("2"),
+                NodeId::from_string("3"),
+            ],
+            "graph has 3 node(s) unreachable from entry: node_1, node_2, node_3",
+        ),
+        (
+            vec![
+                NodeId::from_string("1"),
+                NodeId::from_string("2"),
+                NodeId::from_string("3"),
+                NodeId::from_string("4"),
+            ],
+            "graph has 4 node(s) unreachable from entry: node_1, node_2, node_3, ...",
+        ),
+    ];
+
+    for (orphans, expected) in cases {
+        let err = ValidationError::DisconnectedNodes {
+            orphan_count: orphans.len(),
+            orphans,
+        };
+        assert_eq!(err.to_string(), expected);
+    }
+}
+
+#[test]
 fn validation_error_missing_predicate_display() {
     let err = ValidationError::MissingPredicate {
         node: NodeId::from_string("3"),
-        name: "decision",
+        name: "decision".into(),
     };
     let msg = format!("{err}");
     assert!(msg.contains("decision"));
@@ -183,7 +234,7 @@ fn validation_error_missing_predicate_display() {
 fn validation_error_missing_branch_display() {
     let err = ValidationError::MissingBranch {
         node: NodeId::from_string("2"),
-        name: "choice",
+        name: "choice".into(),
         branch: "true",
     };
     let msg = format!("{err}");
@@ -195,7 +246,7 @@ fn validation_error_missing_branch_display() {
 fn validation_error_no_termination_condition_display() {
     let err = ValidationError::NoTerminationCondition {
         node: NodeId::from_string("1"),
-        name: "infinite_loop",
+        name: "infinite_loop".into(),
     };
     let msg = format!("{err}");
     assert!(msg.contains("termination condition"));
@@ -329,6 +380,116 @@ fn validate_loop_predicate_output_produced() {
 
     let result = graph.validate();
     assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn validate_loop_predicate_output_produced_by_declared_scope() {
+    #[derive(Debug)]
+    struct LoopState {
+        done: bool,
+    }
+
+    async fn produce_loop_state() -> LoopState {
+        LoopState { done: true }
+    }
+
+    // The boundary's contract guarantees that each completed body iteration
+    // returns LoopState, even though the producer is not a direct system node
+    // in the loop body.
+    let mut graph = Graph::new();
+    graph.add_loop::<LoopState, _, _>(
+        "scoped_loop",
+        |state| state.done,
+        |body| {
+            let mut inner = Graph::new();
+            inner.add_system(produce_loop_state);
+            body.add_scope_with_contract(
+                "step",
+                inner,
+                ContextPolicy::shared(),
+                GraphSignature::new().produce::<LoopState>(),
+            );
+        },
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[test]
+fn validate_loop_predicate_output_produced_by_dynamic_contract() {
+    #[derive(Debug)]
+    struct LoopState {
+        done: bool,
+    }
+
+    async fn produce_loop_state() -> LoopState {
+        LoopState { done: true }
+    }
+
+    let mut candidate = Graph::new();
+    candidate.add_system(produce_loop_state);
+
+    let mut graph = Graph::new();
+    graph.add_loop::<LoopState, _, _>(
+        "dynamic_loop",
+        |state| state.done,
+        |body| {
+            body.add_dynamic(
+                "step",
+                |_ctx| "candidate",
+                [("candidate", candidate)],
+                DynamicSlot::new(
+                    GraphSignature::new().produce::<LoopState>(),
+                    ContextPolicy::shared(),
+                ),
+            );
+        },
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "Validation failed: {:?}", result.errors);
+}
+
+#[tokio::test]
+async fn loop_body_boundary_production_does_not_seed_the_first_predicate_check() {
+    #[derive(Debug)]
+    struct LoopState {
+        done: bool,
+    }
+
+    async fn produce_loop_state() -> LoopState {
+        LoopState { done: true }
+    }
+
+    let mut graph = Graph::new();
+    graph.add_loop::<LoopState, _, _>(
+        "scoped_loop",
+        |state| state.done,
+        |body| {
+            let mut inner = Graph::new();
+            inner.add_system(produce_loop_state);
+            body.add_scope_with_contract(
+                "step",
+                inner,
+                ContextPolicy::shared(),
+                GraphSignature::new().produce::<LoopState>(),
+            );
+        },
+    );
+    assert!(graph.validate().is_ok(), "{}", graph.validate());
+
+    let mut ctx = SystemContext::new();
+    let result = GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, None)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(polaris_graph::executor::ExecutionError::LoopPredicateInputMissingOnEntry { .. })
+        ),
+        "the loop body cannot seed its first predicate check: {result:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1274,13 +1435,13 @@ fn validate_output_reachability_flags_unseeded_loop_predicate_input() {
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ResourceValidationError::MissingOutput {
-                system_name: "entry_loop",
+            ResourceValidationError::LoopMissingOutput {
+                name,
                 output_type,
                 ..
-            } if output_type.contains("EntryLoopState")
+            } if *name == "entry_loop" && output_type.contains("EntryLoopState")
         )),
-        "expected MissingOutput for the loop's predicate input, got: {errors:?}"
+        "expected LoopMissingOutput for the loop's predicate input, got: {errors:?}"
     );
 }
 
@@ -1454,13 +1615,13 @@ fn validate_flags_isolated_scope_inner_loop_missing_input() {
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ResourceValidationError::MissingOutput {
-                system_name: "inner_loop",
+            ResourceValidationError::LoopMissingOutput {
+                name,
                 output_type,
                 ..
-            } if output_type.contains("EntryLoopState")
+            } if *name == "inner_loop" && output_type.contains("EntryLoopState")
         )),
-        "expected MissingOutput for the isolated inner loop, got: {errors:?}"
+        "expected LoopMissingOutput for the isolated inner loop, got: {errors:?}"
     );
 }
 
@@ -1577,13 +1738,13 @@ fn validate_flags_isolated_inline_dynamic_candidate_inner_loop() {
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ResourceValidationError::MissingOutput {
-                system_name: "isolated_refine",
+            ResourceValidationError::LoopMissingOutput {
+                name,
                 output_type,
                 ..
-            } if output_type.contains("EntryLoopState")
+            } if *name == "isolated_refine" && output_type.contains("EntryLoopState")
         )),
-        "expected MissingOutput for the isolated candidate's inner loop, got: {errors:?}"
+        "expected LoopMissingOutput for the isolated candidate's inner loop, got: {errors:?}"
     );
 }
 
@@ -1624,13 +1785,13 @@ fn validate_flags_hook_provided_resource_for_loop_predicate_input() {
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ResourceValidationError::MissingOutput {
-                system_name: "gated",
+            ResourceValidationError::LoopMissingOutput {
+                name,
                 output_type,
                 ..
-            } if output_type.contains("HookProvidedResource")
+            } if *name == "gated" && output_type.contains("HookProvidedResource")
         )),
-        "expected MissingOutput for the loop's predicate input, got: {errors:?}"
+        "expected LoopMissingOutput for the loop's predicate input, got: {errors:?}"
     );
 }
 
@@ -1650,5 +1811,927 @@ fn validate_accepts_caller_seeded_output_for_system_read() {
         result.is_ok(),
         "caller-seeded output should satisfy a system's Out<T> read, got: {:?}",
         result.unwrap_err()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Declared Scope Contract Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Declares a free `Out<u64>` read (`Output = ()` keeps the produces axis
+/// empty), so a contract can carry `require_output::<u64>()` without drift.
+struct ReadsFreeU64;
+
+impl System for ReadsFreeU64 {
+    type Output = ();
+
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a SystemContext<'_>,
+    ) -> BoxFuture<'a, Result<Self::Output, SystemError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn name(&self) -> &'static str {
+        "reads_free_u64"
+    }
+
+    fn access(&self) -> SystemAccess {
+        SystemAccess::new().with_output::<u64>()
+    }
+}
+
+/// An interior producing `i32` unconditionally.
+fn produces_i32_interior() -> Graph {
+    let mut inner = Graph::new();
+    inner.add_system(first_step);
+    inner
+}
+
+#[test]
+fn declared_contract_drift_fails_validation_with_the_diff() {
+    // The interior produces i32, not String, so the declared produce is
+    // unbacked — drift, since crediting it downstream would be unsound. The
+    // interior's own i32 is simply undeclared, not drift: `produces` is a
+    // subset check, so a scope may guarantee more than it declares and keep
+    // the rest private (see `declared_contract_hides_an_undeclared_guaranteed_produce`
+    // below for that case validating and staying hidden end to end).
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "worker",
+        produces_i32_interior(),
+        ContextPolicy::shared(),
+        GraphSignature::new().produce::<String>(),
+    );
+
+    let result = graph.validate();
+    let diff = result
+        .errors
+        .iter()
+        .find_map(|err| match err {
+            ValidationError::ScopeContractViolated { diff, .. } => Some(diff),
+            _ => None,
+        })
+        .expect("expected ScopeContractViolated");
+    assert_eq!(diff.missing_produces().len(), 1, "contract claims String");
+    assert!(
+        diff.extra_produces().is_empty(),
+        "the interior's undeclared i32 is not drift, it stays private"
+    );
+    assert_eq!(diff.missing_produces()[0].type_id, TypeId::of::<String>());
+    assert!(diff.missing_requires().is_empty());
+    assert!(diff.extra_requires().is_empty());
+    assert!(diff.missing_requires_outputs().is_empty());
+    assert!(diff.extra_requires_outputs().is_empty());
+}
+
+#[test]
+fn declared_contract_may_be_a_subset_of_guaranteed_production() {
+    // The interior guarantees i32 unconditionally; the contract declares no
+    // produces at all. That is a legitimate subset (the empty set), so
+    // validation accepts it and the parent signature advertises nothing.
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "worker",
+        produces_i32_interior(),
+        ContextPolicy::shared(),
+        GraphSignature::new(),
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "{result}");
+    assert_eq!(graph.signature(), GraphSignature::new());
+}
+
+#[test]
+fn declared_contract_satisfied_interior_passes() {
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "worker",
+        produces_i32_interior(),
+        ContextPolicy::shared(),
+        GraphSignature::new().produce::<i32>(),
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "{result}");
+}
+
+#[test]
+fn declared_contract_every_arm_production_is_guaranteed() {
+    // One decision arm executes, but every arm produces i32 before the scope
+    // completes, so the declared output is guaranteed to its parent.
+    let mut inner = Graph::new();
+    inner.add_conditional_branch::<(), _, _, _>(
+        "choice",
+        |_unit| true,
+        |true_branch| {
+            true_branch.add_system(branch_a);
+        },
+        |false_branch| {
+            false_branch.add_system(branch_b);
+        },
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "worker",
+        inner,
+        ContextPolicy::shared(),
+        GraphSignature::new().produce::<i32>(),
+    );
+
+    let result = graph.validate();
+    assert!(
+        result.is_ok(),
+        "every decision arm backs the declared produce: {result}"
+    );
+}
+
+#[test]
+fn declared_contract_over_nested_plain_scope_is_uncheckable() {
+    // A nested *undeclared* boundary hides IO from the interior's derived
+    // signature, so no drift check against it is meaningful.
+    let mut hidden = Graph::new();
+    hidden.add_scope("hidden", produces_i32_interior(), ContextPolicy::shared());
+
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "worker",
+        hidden,
+        ContextPolicy::shared(),
+        GraphSignature::new(),
+    );
+
+    let result = graph.validate();
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|err| matches!(err, ValidationError::ScopeContractNested { .. })),
+        "expected ScopeContractNested: {result}"
+    );
+}
+
+#[test]
+fn declared_contract_over_nested_declared_scope_is_checkable() {
+    // A nested *declared* scope folds its contract into the interior's derived
+    // signature and is validated recursively, so the outer declaration checks.
+    let mut interior = Graph::new();
+    interior.add_scope_with_contract(
+        "inner",
+        produces_i32_interior(),
+        ContextPolicy::shared(),
+        GraphSignature::new().produce::<i32>(),
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "worker",
+        interior,
+        ContextPolicy::shared(),
+        GraphSignature::new().produce::<i32>(),
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "{result}");
+}
+
+#[test]
+fn declared_contract_over_nested_dynamic_is_checkable() {
+    let mut candidate = Graph::new();
+    candidate.add_system(first_step);
+
+    let mut interior = Graph::new();
+    interior.add_dynamic(
+        "slot",
+        |_ctx| "candidate",
+        [("candidate", candidate)],
+        DynamicSlot::new(
+            GraphSignature::new().produce::<i32>(),
+            ContextPolicy::shared(),
+        ),
+    );
+
+    let mut graph = Graph::new();
+    graph.add_scope_with_contract(
+        "worker",
+        interior,
+        ContextPolicy::shared(),
+        GraphSignature::new().produce::<i32>(),
+    );
+
+    let result = graph.validate();
+    assert!(result.is_ok(), "{result}");
+}
+
+#[test]
+fn declared_contract_require_read_blocked_by_isolated_policy() {
+    // The contract requires Res<TestConfig>, but a pure-isolation policy lets
+    // nothing cross, so the requirement could never resolve at runtime.
+    let build = |policy: ContextPolicy| {
+        let mut inner = Graph::new();
+        inner.add_boxed_system(Box::new(ReadConfigSystem));
+        let mut graph = Graph::new();
+        graph.add_scope_with_contract(
+            "worker",
+            inner,
+            policy,
+            GraphSignature::new().require_read::<TestConfig>(),
+        );
+        graph
+    };
+
+    let blocked = build(ContextPolicy::new()).validate();
+    assert!(
+        blocked.errors.iter().any(|err| matches!(
+            err,
+            ValidationError::ScopeContractRequireBlocked {
+                mode: AccessMode::Read,
+                ..
+            }
+        )),
+        "expected ScopeContractRequireBlocked: {blocked}"
+    );
+
+    for policy in [
+        ContextPolicy::new().share::<TestConfig>(),
+        ContextPolicy::new().share_rest(),
+        ContextPolicy::new()
+            .share_rest()
+            .exclude::<TestConfig>()
+            .share::<TestConfig>(),
+    ] {
+        let result = build(policy).validate();
+        assert!(result.is_ok(), "{result}");
+    }
+    let excluded = build(ContextPolicy::new().share_rest().exclude::<TestConfig>()).validate();
+    assert!(
+        matches!(excluded.errors.as_slice(), [
+        ValidationError::ScopeContractRequireBlocked { resource, mode: AccessMode::Read, .. }
+    ] if *resource == std::any::type_name::<TestConfig>()),
+        "{excluded}"
+    );
+}
+
+#[test]
+fn declared_contract_require_write_needs_a_copy_verb() {
+    // ResMut operates on the current scope only, so sharing (chain reads)
+    // cannot satisfy a declared write across the boundary — a copy verb can.
+    let build = |policy: ContextPolicy| {
+        let mut inner = Graph::new();
+        inner.add_boxed_system(Box::new(WriteConfigSystem));
+        let mut graph = Graph::new();
+        graph.add_scope_with_contract(
+            "worker",
+            inner,
+            policy,
+            GraphSignature::new().require_write::<TestConfig>(),
+        );
+        graph
+    };
+
+    for policy in [
+        ContextPolicy::new().share::<TestConfig>(),
+        ContextPolicy::new().share_rest(),
+    ] {
+        let blocked = build(policy).validate();
+        assert!(
+            matches!(blocked.errors.as_slice(), [
+            ValidationError::ScopeContractRequireBlocked { resource, mode: AccessMode::Write, .. }
+        ] if *resource == std::any::type_name::<TestConfig>()),
+            "{blocked}"
+        );
+    }
+    for policy in [
+        ContextPolicy::new().forward::<TestConfig>(),
+        ContextPolicy::new().fork::<TestConfig>(),
+    ] {
+        let graph = build(policy);
+        let result = graph.validate();
+        assert!(result.is_ok(), "{result}");
+        assert_eq!(
+            graph.signature(),
+            GraphSignature::new().require_write::<TestConfig>()
+        );
+    }
+}
+
+#[test]
+fn declared_contract_free_outputs_blocked_on_non_shared_policy() {
+    // Free outputs never cross a non-shared boundary inward, so a contract
+    // requiring one is statically unsatisfiable under an isolated policy.
+    let build = |policy: ContextPolicy| {
+        let mut inner = Graph::new();
+        inner.add_boxed_system(Box::new(ReadsFreeU64));
+        let mut graph = Graph::new();
+        graph.add_scope_with_contract(
+            "worker",
+            inner,
+            policy,
+            GraphSignature::new().require_output::<u64>(),
+        );
+        graph
+    };
+
+    let blocked = build(ContextPolicy::new()).validate();
+    assert!(
+        blocked
+            .errors
+            .iter()
+            .any(|err| matches!(err, ValidationError::ScopeContractOutputsBlocked { .. })),
+        "expected ScopeContractOutputsBlocked: {blocked}"
+    );
+
+    let shared = build(ContextPolicy::shared()).validate();
+    assert!(shared.is_ok(), "{shared}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ambiguous Routes
+//
+// A node has at most one route per outcome — sequential, error, or timeout:
+// traversal is first-match, so a second edge to a different node declares work
+// that can never run. The check is only sound if no legitimate construction
+// produces the shape, so the bulk of this section is the negative sweep — one
+// case per builder path that wires a sequential, error, or timeout edge, plus
+// the composition and duplication paths.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn risky_step() -> Result<i32, String> {
+    Ok(1)
+}
+
+async fn handler_step() -> String {
+    "handled".to_string()
+}
+
+async fn produce_flag() -> bool {
+    true
+}
+
+async fn produce_byte() -> u8 {
+    7
+}
+
+/// Returns every `AmbiguousRoute` message in a result, unwrapping the
+/// scope and dynamic-candidate envelopes so nested graphs count too.
+fn ambiguity_reports(errors: &[ValidationError]) -> Vec<String> {
+    let mut found = Vec::new();
+    for err in errors {
+        match err {
+            ValidationError::AmbiguousRoute { .. } => found.push(err.to_string()),
+            ValidationError::ScopeGraphInvalid { inner, .. }
+            | ValidationError::DynamicCandidateInvalid { inner, .. } => {
+                found.extend(ambiguity_reports(std::slice::from_ref(inner.as_ref())));
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Asserts that `graph` gives no node two distinct routes for one outcome —
+/// structurally, by reading the edges back, and through `validate()`.
+fn assert_unambiguous(graph: &Graph, what: &str) {
+    let mut routes: HashMap<(&str, NodeId), HashSet<NodeId>> = HashMap::new();
+    for edge in graph.edges() {
+        let (outcome, from, to) = match edge {
+            Edge::Sequential(seq) => ("sequential", &seq.from, &seq.to),
+            Edge::Error(err) => ("error", &err.from, &err.to),
+            Edge::Timeout(timeout) => ("timeout", &timeout.from, &timeout.to),
+            _ => continue,
+        };
+        routes
+            .entry((outcome, from.clone()))
+            .or_default()
+            .insert(to.clone());
+    }
+    for ((outcome, from), targets) in &routes {
+        assert!(
+            targets.len() <= 1,
+            "{what}: node {from} has {} distinct {outcome} routes: {targets:?}",
+            targets.len(),
+        );
+    }
+
+    let result = graph.validate();
+    assert!(
+        ambiguity_reports(&result.errors).is_empty(),
+        "{what}: builder output must never be ambiguous, got: {:?}",
+        result.errors,
+    );
+    assert!(
+        result.is_ok(),
+        "{what}: builder output should validate, got: {:?}",
+        result.errors,
+    );
+}
+
+#[test]
+fn plain_chain_is_unambiguous() {
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .add_system(second_step)
+        .add_system(produce_flag);
+
+    assert_unambiguous(&graph, "chain");
+}
+
+/// A decision leaves `last_node` on the decision node, and both branch
+/// interiors are flattened into the same edge list. Chaining afterwards must
+/// extend the decision, not a branch tail.
+#[test]
+fn decision_and_its_continuation_are_unambiguous() {
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .add_conditional_branch::<i32, _, _, _>(
+            "decide",
+            |value| *value > 0,
+            |g| {
+                g.add_system(true_path_system).add_system(produce_flag);
+            },
+            |g| {
+                g.add_system(false_path_system);
+            },
+        )
+        .add_system(produce_byte);
+
+    assert_unambiguous(&graph, "decision");
+}
+
+#[test]
+fn switch_with_and_without_default_is_unambiguous() {
+    for with_default in [false, true] {
+        let default = with_default.then(|| {
+            branch(|g: &mut Graph| {
+                g.add_system(produce_byte);
+            })
+        });
+
+        let mut graph = Graph::new();
+        graph
+            .add_system(first_step)
+            .add_switch::<i32, _, _, _>(
+                "route",
+                |_| "a",
+                vec![
+                    (
+                        "a",
+                        branch(|g: &mut Graph| {
+                            g.add_system(true_path_system);
+                        }),
+                    ),
+                    (
+                        "b",
+                        branch(|g: &mut Graph| {
+                            g.add_system(false_path_system).add_system(produce_flag);
+                        }),
+                    ),
+                ],
+                default,
+            )
+            .add_system(second_step);
+
+        assert_unambiguous(
+            &graph,
+            if with_default {
+                "switch with default"
+            } else {
+                "switch"
+            },
+        );
+    }
+}
+
+#[test]
+fn loops_are_unambiguous() {
+    let mut predicate_loop = Graph::new();
+    predicate_loop
+        .add_system(first_step)
+        .add_loop::<i32, _, _>(
+            "bounded",
+            |value| *value > 5,
+            |g| {
+                g.add_system(loop_body).add_system(produce_flag);
+            },
+        )
+        .add_system(produce_byte);
+    assert_unambiguous(&predicate_loop, "add_loop");
+
+    let mut counted_loop = Graph::new();
+    counted_loop
+        .add_system(first_step)
+        .add_loop_n("retry", 3, |g| {
+            g.add_system(loop_body).add_system(produce_flag);
+        })
+        .add_system(produce_byte);
+    assert_unambiguous(&counted_loop, "add_loop_n");
+}
+
+#[test]
+fn parallel_branches_are_unambiguous() {
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .add_parallel(
+            "fan_out",
+            vec![
+                branch(|g: &mut Graph| {
+                    g.add_system(true_path_system);
+                }),
+                branch(|g: &mut Graph| {
+                    g.add_system(produce_flag).add_system(produce_byte);
+                }),
+            ],
+        )
+        .add_system(second_step);
+
+    assert_unambiguous(&graph, "parallel");
+}
+
+#[test]
+fn scope_and_its_embedded_graph_are_unambiguous() {
+    let mut inner = Graph::new();
+    inner.add_system(true_path_system).add_system(produce_flag);
+
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .add_scope("inner", inner, ContextPolicy::shared())
+        .add_system(second_step);
+
+    assert_unambiguous(&graph, "scope");
+}
+
+#[test]
+fn dynamic_nodes_and_their_candidates_are_unambiguous() {
+    let mut candidate = Graph::new();
+    candidate
+        .add_system(true_path_system)
+        .add_system(produce_flag);
+    let contract = GraphSignature::new().produce::<String>().produce::<bool>();
+
+    let mut inline = Graph::new();
+    inline
+        .add_system(first_step)
+        .add_dynamic(
+            "route",
+            |_ctx| "only",
+            [("only", candidate)],
+            DynamicSlot::new(contract.clone(), ContextPolicy::shared()),
+        )
+        .add_system(produce_byte);
+    assert_unambiguous(&inline, "inline dynamic");
+
+    let mut registry = Graph::new();
+    registry
+        .add_system(first_step)
+        .add_dynamic_registry(
+            "planner",
+            |_ctx| "current",
+            DynamicSlot::new(contract, ContextPolicy::shared()),
+        )
+        .add_system(produce_byte);
+    assert_unambiguous(&registry, "registry dynamic");
+}
+
+/// Handler subgraphs hang off error and timeout edges. They are merged into the
+/// parent's flat edge list but must never claim the source node's single
+/// sequential successor, which continued chaining still owns.
+#[test]
+fn error_and_timeout_handlers_are_unambiguous() {
+    // `FailingSystem` reports `is_fallible()`, so the blanket wiring finds a
+    // real target instead of quietly matching nothing.
+    let mut blanket = Graph::new();
+    blanket.add_boxed_system(Box::new(FailingSystem));
+    blanket
+        .add_error_handler(|g| {
+            g.add_system(handler_step);
+        })
+        .add_system(produce_flag);
+    assert_unambiguous(&blanket, "add_error_handler");
+
+    let mut targeted = Graph::new();
+    let risky = targeted.add_system_node(risky_step);
+    targeted
+        .add_error_handler_for([risky], |g| {
+            g.add_system(handler_step);
+        })
+        .add_system(produce_flag);
+    assert_unambiguous(&targeted, "add_error_handler_for");
+
+    let mut fluent = Graph::new();
+    fluent
+        .system(risky_step)
+        .with_timeout(Duration::from_millis(50))
+        .on_error(|g: &mut Graph| {
+            g.add_system(handler_step);
+        })
+        .on_timeout(|g: &mut Graph| {
+            g.add_system(produce_byte);
+        })
+        .done()
+        .add_system(produce_flag);
+    assert_unambiguous(&fluent, "on_error/on_timeout");
+
+    let mut closure = Graph::new();
+    closure.add_boxed_system(Box::new(FailingSystem));
+    closure
+        .add_error_handler_fn(|error: &CaughtError| error.message.to_string())
+        .add_system(produce_flag);
+    assert_unambiguous(&closure, "add_error_handler_fn");
+
+    // The documented "specific first, then global" pattern: the blanket call
+    // fills only nodes that have no handler yet, so it skips `risky` and the
+    // graph keeps exactly one error route per node.
+    let mut specific_then_blanket = Graph::new();
+    let risky = specific_then_blanket.add_boxed_system(Box::new(FailingSystem));
+    specific_then_blanket
+        .add_error_handler_for([risky], |g| {
+            g.add_system(handler_step);
+        })
+        .add_error_handler(|g| {
+            g.add_system(produce_byte);
+        })
+        .add_system(produce_flag);
+    assert_unambiguous(
+        &specific_then_blanket,
+        "add_error_handler_for then add_error_handler",
+    );
+
+    // Multi-source fan-in: `[a, b]` sharing one handler is the documented form
+    // (`add_error_handler_for`'s own rustdoc example) and produces fan-in on
+    // the handler node, not a second route on either source — the untested
+    // false-positive direction this whole check exists to rule out.
+    let mut multi_source_error = Graph::new();
+    let a = multi_source_error.add_system_node(risky_step);
+    let b = multi_source_error.add_boxed_system(Box::new(FailingSystem));
+    multi_source_error
+        .add_error_handler_for([a, b], |g| {
+            g.add_system(handler_step);
+        })
+        .add_system(produce_flag);
+    assert_unambiguous(&multi_source_error, "add_error_handler_for([a, b], ..)");
+
+    let mut multi_source_timeout = Graph::new();
+    let c = multi_source_timeout.add_system_node(first_step);
+    let d = multi_source_timeout.add_system_node(second_step);
+    multi_source_timeout
+        .add_timeout_handler([c, d], |g| {
+            g.add_system(handler_step);
+        })
+        .add_system(produce_flag);
+    assert_unambiguous(&multi_source_timeout, "add_timeout_handler([c, d], ..)");
+}
+
+/// `append` joins on `self.last_node`, and `pipe` mutates the graph in place.
+/// Both must leave a single successor per node, including when the receiving
+/// graph ends on a control-flow node.
+#[test]
+fn append_and_pipe_compositions_are_unambiguous() {
+    let mut tail = Graph::new();
+    tail.add_system(produce_flag).add_system(produce_byte);
+
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .add_conditional_branch::<i32, _, _, _>(
+            "decide",
+            |value| *value > 0,
+            |g| {
+                g.add_system(true_path_system);
+            },
+            |g| {
+                g.add_system(false_path_system);
+            },
+        )
+        .append(tail)
+        .expect("append should succeed")
+        .pipe(|g| {
+            g.add_system(second_step);
+        })
+        .add_system(loop_body);
+
+    assert_unambiguous(&graph, "append + pipe");
+}
+
+#[test]
+fn appending_into_an_empty_graph_is_unambiguous() {
+    let mut source = Graph::new();
+    source.add_system(first_step).add_system(second_step);
+
+    let mut graph = Graph::new();
+    graph
+        .append(source)
+        .expect("append into an empty graph should succeed")
+        .add_system(produce_flag);
+
+    assert_unambiguous(&graph, "append into empty");
+}
+
+/// A graph built from every construct at once, then duplicated: the ID remap
+/// must not collapse two nodes onto one source and so invent an ambiguity.
+#[test]
+fn duplicated_graph_is_unambiguous() {
+    let mut inner = Graph::new();
+    inner.add_system(true_path_system);
+
+    let mut candidate = Graph::new();
+    candidate.add_system(produce_flag);
+
+    let mut graph = Graph::new();
+    graph
+        .add_system(first_step)
+        .add_conditional_branch::<i32, _, _, _>(
+            "decide",
+            |value| *value > 0,
+            |g| {
+                g.add_system(true_path_system);
+            },
+            |g| {
+                g.add_system(false_path_system);
+            },
+        )
+        .add_switch::<i32, _, _, _>(
+            "route",
+            |_| "a",
+            vec![(
+                "a",
+                branch(|g: &mut Graph| {
+                    g.add_system(produce_byte);
+                }),
+            )],
+            None::<Box<dyn FnOnce(&mut Graph)>>,
+        )
+        .add_parallel(
+            "fan_out",
+            vec![branch(|g: &mut Graph| {
+                g.add_system(loop_body);
+            })],
+        )
+        .add_loop_n("retry", 2, |g| {
+            g.add_system(second_step);
+        })
+        .add_scope("inner", inner, ContextPolicy::shared())
+        .add_dynamic(
+            "slot",
+            |_ctx| "only",
+            [("only", candidate)],
+            DynamicSlot::new(
+                GraphSignature::new().produce::<bool>(),
+                ContextPolicy::shared(),
+            ),
+        )
+        .add_boxed_system(Box::new(FailingSystem));
+    graph.add_error_handler(|g| {
+        g.add_system(handler_step);
+    });
+
+    assert_unambiguous(&graph, "every construct");
+    assert_unambiguous(&graph.duplicate(), "duplicated graph");
+}
+
+/// The five builders that reach a sequential edge only by delegation —
+/// `system_boxed` -> `add_boxed_system`, both `add_dynamic*_boxed` ->
+/// `push_dynamic`, `add_error_handler_fn_for` -> `add_error_handler_for`, and
+/// `on_error_fn` -> `add_error_handler_fn_for` (so, two delegation hops deep).
+/// Their coverage otherwise rests on that delegation holding rather than on a
+/// case of their own.
+#[test]
+fn delegating_builders_are_unambiguous() {
+    use polaris_graph::predicate::PredicateError;
+    use polaris_graph::selector::{BoxedSelector, ErasedSelector};
+    use std::sync::Arc;
+
+    struct PickOnly;
+    impl ErasedSelector for PickOnly {
+        fn select(&self, _ctx: &SystemContext<'_>) -> Result<Arc<str>, PredicateError> {
+            Ok(Arc::from("only"))
+        }
+        fn input_type_name(&self) -> &'static str {
+            "Route"
+        }
+    }
+
+    let mut boxed_system = Graph::new();
+    boxed_system
+        .system_boxed(Box::new(FailingSystem))
+        .done()
+        .add_system(produce_flag);
+    assert_unambiguous(&boxed_system, "system_boxed");
+
+    let mut candidate = Graph::new();
+    candidate
+        .add_system(true_path_system)
+        .add_system(produce_flag);
+    let contract = GraphSignature::new().produce::<String>().produce::<bool>();
+
+    let mut inline = Graph::new();
+    inline
+        .add_system(first_step)
+        .add_dynamic_boxed(
+            "route",
+            Box::new(PickOnly) as BoxedSelector,
+            [("only", candidate)],
+            DynamicSlot::new(contract.clone(), ContextPolicy::shared()),
+        )
+        .add_system(produce_byte);
+    assert_unambiguous(&inline, "add_dynamic_boxed");
+
+    let mut registry = Graph::new();
+    registry
+        .add_system(first_step)
+        .add_dynamic_registry_boxed(
+            "planner",
+            Box::new(PickOnly) as BoxedSelector,
+            DynamicSlot::new(contract, ContextPolicy::shared()),
+        )
+        .add_system(produce_byte);
+    assert_unambiguous(&registry, "add_dynamic_registry_boxed");
+
+    let mut targeted_fn = Graph::new();
+    let risky = targeted_fn.add_system_node(risky_step);
+    targeted_fn
+        .add_error_handler_fn_for([risky], |error: &CaughtError| error.message.to_string())
+        .add_system(produce_flag);
+    assert_unambiguous(&targeted_fn, "add_error_handler_fn_for");
+
+    let mut fluent_fn = Graph::new();
+    fluent_fn
+        .system(risky_step)
+        .on_error_fn(|error: &CaughtError| error.message.to_string())
+        .done()
+        .add_system(produce_flag);
+    assert_unambiguous(&fluent_fn, "on_error_fn");
+}
+
+/// The reverse of the documented order is the one shape that now fails through
+/// the public builder: the blanket call has already given the node a handler,
+/// so a specific handler added afterwards is dead. Pinned because — unlike the
+/// sequential outcome — this conflict *is* reachable without `pub(crate)`.
+#[test]
+fn a_blanket_error_handler_followed_by_a_specific_one_is_reported() {
+    let mut graph = Graph::new();
+    let risky = graph.add_boxed_system(Box::new(FailingSystem));
+    graph
+        .add_error_handler(|g| {
+            g.add_system(produce_byte);
+        })
+        .add_error_handler_for([risky], |g| {
+            g.add_system(handler_step);
+        })
+        .add_system(produce_flag);
+
+    let result = graph.validate();
+    let reports = ambiguity_reports(&result.errors);
+    assert_eq!(
+        reports.len(),
+        1,
+        "the dead specific handler is reported exactly once, got: {:?}",
+        result.errors,
+    );
+    assert!(
+        reports[0].contains("distinct error route"),
+        "the report names the error outcome, got: {}",
+        reports[0],
+    );
+    assert!(
+        reports[0].contains("wire the specific one first"),
+        "the report states the ordering remedy, got: {}",
+        reports[0],
+    );
+}
+
+#[test]
+fn validation_error_ambiguous_route_display() {
+    let err = ValidationError::AmbiguousRoute {
+        kind: RouteKind::Sequential,
+        node: NodeId::from_string("1"),
+        name: "reason".into(),
+        followed: NodeId::from_string("2"),
+        followed_name: "act".into(),
+        skipped: NodeId::from_string("3"),
+        skipped_name: "respond".into(),
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("node 'reason' (node_1)"),
+        "the message names the offending node, got: {msg}"
+    );
+    // Ordered on purpose: an unordered `contains` per node would still pass if
+    // `followed` and `skipped` were swapped in the `Display` arm, which would
+    // claim the graph follows the skipped successor.
+    assert!(
+        msg.contains(
+            "it follows 'act' (node_2) and the route to 'respond' (node_3) is never followed"
+        ),
+        "the message must name the followed successor and the skipped edge, in that order, got: {msg}"
+    );
+    assert!(
+        msg.contains("decision, switch, or parallel"),
+        "the message should state the remedy, got: {msg}"
     );
 }

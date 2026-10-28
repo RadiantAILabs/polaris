@@ -4,7 +4,7 @@ min_version = "0.37.0"
 
 [tasks.test]
 description = "Run all testing steps (format, clippy, markdown lint, test)"
-dependencies = ["test-format", "test-clippy", "test-markdown", "test-rustdoc", "test-doc", "test-workspace", "test-bindings"]
+dependencies = ["test-format", "test-clippy", "test-markdown", "test-rustdoc", "test-doc", "test-workspace", "test-sessions-default-features", "test-bindings"]
 
 [tasks.build]
 description = "Build the project"
@@ -46,6 +46,17 @@ args = ["test", "--verbose", "--workspace", "--all-targets", "--all-features"]
 
 [tasks.test-workspace.env]
 TRYBUILD = "overwrite"
+
+[tasks.test-sessions-default-features]
+description = "Run the polaris_sessions tests with default features, where sessions-http is off"
+# `test-workspace` enables every feature, so it can never notice an API that
+# `sessions-http` newly gates: the "without HTTP" tests (history, uptime,
+# `ChannelIOProvider`, interrupts) would still compile there. This run leaves
+# `sessions-http` off, and the `http_*` test targets drop out through their
+# `#![cfg(feature = "sessions-http")]` gate.
+workspace = false
+command = "cargo"
+args = ["test", "-p", "polaris_sessions", "--tests"]
 
 [tasks.test-doc]
 description = "Run doc tests"

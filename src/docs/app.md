@@ -98,20 +98,19 @@ administrative routes; `AppPlugin` mounts those fragments only when an
 `AuthProvider` is configured and the protected auth check ignores public-path
 allowlist exemptions.
 
-# `HttpIOProvider`
+# `ChannelIOProvider`
 
-Bridges HTTP requests to the agent's `UserIO` abstraction via tokio
-channels:
+Bridges a caller's input and output channels to the agent's `UserIO`
+abstraction. HTTP handlers are one consumer, but the provider is available
+without the `sessions-http` feature:
 
 ```no_run
-# #[cfg(feature = "sessions-http")] {
-use polaris_ai::sessions::http::HttpIOProvider;
+use polaris_ai::sessions::ChannelIOProvider;
 # use polaris_ai::plugins::IOMessage;
 use std::sync::Arc;
 
-let (provider, input_tx, mut output_rx) = HttpIOProvider::new(1, 64);
+let (provider, input_tx, mut output_rx) = ChannelIOProvider::new(1, 64);
 let provider = Arc::new(provider);
-# }
 ```
 
 # `RequestContext`

@@ -2074,7 +2074,7 @@ impl Plugin for InspectionPlugin {
         // every graph execution.
         //
         // Chaining is a live option rather than an impossible one:
-        // `SystemContext::inspection_arc()` (SC-3307, already landed) hands
+        // `SystemContext::inspection_arc()` hands
         // back an owned `Arc` the fan-out could keep, where `inspection()` only
         // lends a borrow. If this plugin is ever moved onto it, **the identity
         // guard below has to move with it**. It compares the installed sink against `sink` itself, which

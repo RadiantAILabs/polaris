@@ -1,5 +1,6 @@
 //! Core types for LLM generation requests and responses.
 
+use core::num::NonZeroU32;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +30,14 @@ pub struct LlmRequest {
     /// When provided, the model will generate output conforming to this schema.
     /// This is set automatically by `Llm::generate_structured()`.
     pub output_schema: Option<Value>,
+    /// Maximum number of tokens the model may generate, when supported.
+    ///
+    /// `None` leaves the provider's existing output limit unchanged. A response
+    /// stopped at this limit reports [`StopReason::MaxOutputTokens`].
+    ///
+    /// The limit is non-zero by type: a request for zero output tokens has no
+    /// useful meaning, and providers reject it. Deserializing a `0` fails.
+    pub max_output_tokens: Option<NonZeroU32>,
     /// Prompt-cache breakpoint markers for this request.
     ///
     /// Provider-agnostic: a provider that supports prompt caching (e.g.

@@ -59,13 +59,20 @@
 
 mod access;
 pub mod inspect;
+mod out_all;
+mod output_layers;
+mod read_from;
 
 use crate::resource::{
-    LocalResource, Output, OutputRef, Outputs, Resource, ResourceRef, ResourceRefMut, Resources,
+    LocalResource, Output, OutputRef, Outputs, ProducerKey, Resource, ResourceRef, ResourceRefMut,
+    Resources,
 };
 pub use access::{Access, AccessMode, SystemAccess};
 use hashbrown::HashSet;
 use inspect::InspectionSink;
+pub use out_all::{OutAll, OutAllEntry};
+pub use output_layers::OutputLayerScope;
+pub use read_from::{ReadFromBindings, ReadFromScope};
 use std::any::{Any, TypeId, type_name};
 use std::sync::{Arc, OnceLock};
 use variadics_please::all_tuples;
@@ -230,6 +237,15 @@ pub struct SystemContext<'parent> {
     /// Cloned into child contexts, so installing a sink on a root context
     /// covers every scope, branch, and loop iteration beneath it.
     inspection: Option<Arc<dyn InspectionSink>>,
+    /// `read_from` producer bindings installed by the executor for the
+    /// duration of one system's `run` call — see
+    /// [`read_from_scope`](Self::read_from_scope). `None` in the common
+    /// case (no wiring on the current node), so [`Out::fetch`] pays only an
+    /// `Option` check. Never propagated into a child context: a system never
+    /// itself creates one, so this is reset (not inherited) by
+    /// [`child`](Self::child) and [`child_filtered`](Self::child_filtered) for
+    /// hygiene.
+    read_from: Option<Arc<ReadFromBindings>>,
 }
 
 /// Returns the process-wide shared unrestricted [`ParentFilter`].
@@ -355,6 +371,7 @@ impl<'parent> SystemContext<'parent> {
             outputs: Outputs::new(),
             parent_filter: unrestricted_parent_filter(),
             inspection: None,
+            read_from: None,
         }
     }
 
@@ -372,6 +389,7 @@ impl<'parent> SystemContext<'parent> {
             outputs: Outputs::new(),
             parent_filter: unrestricted_parent_filter(),
             inspection: None,
+            read_from: None,
         }
     }
 
@@ -411,6 +429,7 @@ impl<'parent> SystemContext<'parent> {
             outputs: Outputs::new(),
             parent_filter: unrestricted_parent_filter(),
             inspection: self.inspection.clone(),
+            read_from: None,
         }
     }
 
@@ -459,6 +478,7 @@ impl<'parent> SystemContext<'parent> {
             outputs: Outputs::new(),
             parent_filter: parent_filter.into(),
             inspection: self.inspection.clone(),
+            read_from: None,
         }
     }
 
@@ -1112,6 +1132,49 @@ impl<'parent> SystemContext<'parent> {
         self.outputs.insert_boxed(type_id, output)
     }
 
+    /// Inserts a system output, naming the producer that wrote it.
+    ///
+    /// Called by the executor after a system returns a value. If an entry
+    /// from an equal [`ProducerKey`] already exists for this type, it is
+    /// replaced and returned; a write from a different producer keeps both.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when the displaced entry holds a type other
+    /// than `O` — see [`insert_output`](Self::insert_output).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_system::param::SystemContext;
+    /// use polaris_system::resource::ProducerKey;
+    ///
+    /// let mut ctx = SystemContext::new();
+    /// assert_eq!(ctx.insert_output_from(ProducerKey::new("planner"), 1_u32), None);
+    /// assert_eq!(ctx.insert_output_from(ProducerKey::new("critic"), 2_u32), None);
+    /// // The same producer again replaces its own entry.
+    /// assert_eq!(ctx.insert_output_from(ProducerKey::new("planner"), 3_u32), Some(1));
+    /// assert_eq!(ctx.outputs().entries::<u32>().unwrap().len(), 2);
+    /// ```
+    pub fn insert_output_from<O: Output>(&mut self, producer: ProducerKey, output: O) -> Option<O> {
+        self.outputs.insert_from(producer, output)
+    }
+
+    /// Inserts a type-erased system output, naming the producer that wrote it.
+    ///
+    /// Called by the executor when the concrete output type is not known at
+    /// compile time. The `type_id` must match the correct type of the value.
+    /// Returns the displaced output still boxed, since the concrete type is
+    /// not known here.
+    pub fn insert_output_boxed_from(
+        &mut self,
+        producer: ProducerKey,
+        type_id: TypeId,
+        output: Box<dyn Any + Send + Sync>,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        self.outputs.insert_boxed_from(producer, type_id, output)
+    }
+
     /// Returns `true` if an output of type `O` exists.
     #[must_use]
     pub fn contains_output<O: Output>(&self) -> bool {
@@ -1137,6 +1200,80 @@ impl<'parent> SystemContext<'parent> {
             crate::resource::OutputError::NotFound(name) => ParamError::OutputNotFound(name),
             crate::resource::OutputError::Busy(name) => ParamError::BorrowConflict(name),
         })
+    }
+
+    /// Gets an immutable reference to the newest output of type `O` written
+    /// under a key equal to `producer`.
+    ///
+    /// This is the graph-level `read_from` wiring's read primitive: a system
+    /// still declares a plain [`Out<O>`], but the executor opens a
+    /// [`read_from_scope`](Self::read_from_scope) that redirects
+    /// [`Out::fetch`] here instead of [`get_output`](Self::get_output).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `producer` has no entry of `O`, or if it is
+    /// currently being written.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_system::param::SystemContext;
+    /// use polaris_system::resource::ProducerKey;
+    ///
+    /// let mut ctx = SystemContext::new();
+    /// ctx.insert_output_from(ProducerKey::new("planner"), 1_u32);
+    /// ctx.insert_output_from(ProducerKey::new("critic"), 2_u32);
+    ///
+    /// assert_eq!(*ctx.get_output::<u32>().unwrap(), 2);
+    /// assert_eq!(*ctx.get_output_from::<u32>(&ProducerKey::new("planner")).unwrap(), 1);
+    /// assert!(ctx.get_output_from::<u32>(&ProducerKey::new("unknown")).is_err());
+    /// ```
+    pub fn get_output_from<O: Output>(
+        &self,
+        producer: &ProducerKey,
+    ) -> Result<OutputRef<O>, ParamError> {
+        self.outputs
+            .by_producer::<O>(producer)
+            .map_err(|err| match err {
+                crate::resource::OutputError::NotFound(name) => ParamError::OutputNotFound(name),
+                crate::resource::OutputError::Busy(name) => ParamError::BorrowConflict(name),
+            })
+    }
+
+    /// Installs `read_from` bindings until the returned scope is dropped,
+    /// then restores whatever was installed before.
+    ///
+    /// The executor opens one around each reader node's system run, so a
+    /// binding is visible only for that one run — even if the future running
+    /// it is dropped part-way. `None` installs no bindings for the scope, so
+    /// a node with no wiring never sees an enclosing node's bindings. This
+    /// never changes the output store or copies a producer's value into a
+    /// type slot; it only changes which entry [`Out<T>`] resolves to. See
+    /// [`ReadFromBindings`] for an example.
+    pub fn read_from_scope(
+        &mut self,
+        bindings: Option<Arc<ReadFromBindings>>,
+    ) -> ReadFromScope<'_, 'parent> {
+        ReadFromScope::new(self, bindings)
+    }
+
+    /// Opens a region of output layers that is discarded when the returned
+    /// scope is dropped, unless it is promoted first.
+    ///
+    /// Loops and output boundaries in `polaris_graph` use this to keep each
+    /// iteration's (or each boundary's) writes apart until they finish. See
+    /// [`OutputLayerScope`] for the rules and an example.
+    pub fn output_layer_scope(&mut self) -> OutputLayerScope<'_, 'parent> {
+        OutputLayerScope::new(self)
+    }
+
+    /// The producer bound to `type_id` by the currently installed
+    /// `read_from` bindings, if any.
+    fn read_from_producer(&self, type_id: TypeId) -> Option<&ProducerKey> {
+        self.read_from
+            .as_deref()
+            .and_then(|bindings| bindings.producer_for(type_id))
     }
 
     /// Clears all outputs.
@@ -1342,7 +1479,14 @@ impl<'a, T: Output> SystemParam for Out<'a, T> {
     type Item<'w> = Out<'w, T>;
 
     fn fetch<'w>(ctx: &'w SystemContext<'_>) -> Result<Self::Item<'w>, ParamError> {
-        let inner = ctx.get_output::<T>()?;
+        // A `read_from` wire installed for the duration of this node's `run`
+        // call redirects the read to that one producer's entry; otherwise
+        // this reads the newest entry from any producer, exactly as before
+        // graph wiring existed.
+        let inner = match ctx.read_from_producer(TypeId::of::<T>()) {
+            Some(producer) => ctx.get_output_from::<T>(producer)?,
+            None => ctx.get_output::<T>()?,
+        };
         Ok(Out { inner })
     }
 
@@ -1351,6 +1495,7 @@ impl<'a, T: Output> SystemParam for Out<'a, T> {
         // We track this as output read access
         let mut access = SystemAccess::new();
         access.outputs.push(Access::read::<T>());
+        access.add_bindable_output::<T>(false);
         access
     }
 }
@@ -1394,6 +1539,13 @@ pub trait ErrorContext: Output {}
 /// - **`Out<T>`**: Reading a previous system's return value (normal path)
 /// - **`ErrOut<T>`**: Reading error context that is only available after
 ///   a system failure
+///
+/// `ErrOut<T>` does not participate in graph-level `read_from` binding: it
+/// always reads the newest entry of `T`, ignoring any installed binding, so
+/// wiring `read_from` onto a type read only through `ErrOut<T>` would have
+/// no effect. `polaris_graph` rejects that at `validate()` time
+/// (`ValidationError::ReadFromUnread`) rather than silently accepting a
+/// binding that cannot do anything.
 ///
 /// # Example
 ///
@@ -1456,7 +1608,16 @@ impl<'a, T: Output> SystemParam for Option<Out<'a, T>> {
     }
 
     fn access() -> SystemAccess {
-        <Out<'a, T> as SystemParam>::access()
+        // Same access as `Out<T>` — including conflict detection and the
+        // `outputs` read — except the bindable-output entry is marked
+        // optional. `read_from` backward-wire validation requires that flag
+        // to admit a loop's backward wire; ordinary resource/output
+        // conflict detection does not distinguish it from a required read.
+        let mut access = <Out<'a, T> as SystemParam>::access();
+        for bound in &mut access.bindable_outputs {
+            bound.optional = true;
+        }
+        access
     }
 }
 
@@ -1985,6 +2146,24 @@ mod tests {
         assert_eq!(access.outputs.len(), 1);
         assert_eq!(access.outputs[0].mode, AccessMode::Read);
         assert!(access.outputs[0].type_name.contains("ReasoningResult"));
+
+        assert_eq!(access.bindable_outputs.len(), 1);
+        assert_eq!(
+            access.bindable_outputs[0].type_id,
+            TypeId::of::<ReasoningResult>()
+        );
+        assert!(!access.bindable_outputs[0].optional);
+    }
+
+    #[test]
+    fn option_out_declares_optional_bindable_output() {
+        let access = <Option<Out<ReasoningResult>>>::access();
+        assert_eq!(access.outputs.len(), 1, "same outputs read as Out<T>");
+        assert_eq!(access.bindable_outputs.len(), 1);
+        assert!(
+            access.bindable_outputs[0].optional,
+            "Option<Out<T>> marks its read_from binding as optional, unlike Out<T>"
+        );
     }
 
     #[test]
@@ -2077,6 +2256,12 @@ mod tests {
         assert_eq!(access.outputs[0].mode, AccessMode::Read);
         assert!(access.outputs[0].type_name.contains("TestError"));
         assert_eq!(access.context_requirements, vec![ERROR_CONTEXT]);
+        assert!(
+            access.bindable_outputs.is_empty(),
+            "ErrOut<T> always reads the newest entry regardless of any \
+             installed read_from binding, so it must not claim the type as \
+             bindable — see ErrOut's doc comment"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2378,7 +2563,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Displaced-value returns (SC-3307)
+    // Displaced-value returns
     //
     // Every context write hands back what it overwrote, so an overwrite is
     // observable at the boundary users touch instead of silent.
@@ -2574,8 +2759,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn insert_output_from_keeps_entries_from_different_producers() {
+        use crate::resource::ProducerKey;
+
+        let mut ctx = SystemContext::new();
+        let planner = ProducerKey::new("planner_node");
+        let actor = ProducerKey::new("actor_node");
+
+        assert_eq!(
+            ctx.insert_output_from(
+                planner,
+                ReasoningResult {
+                    action: "plan".into(),
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            ctx.insert_output_from(
+                actor,
+                ReasoningResult {
+                    action: "act".into(),
+                }
+            ),
+            None,
+            "a different producer does not displace the planner's entry"
+        );
+        assert_eq!(ctx.get_output::<ReasoningResult>().unwrap().action, "act");
+        assert_eq!(ctx.outputs().entries::<ReasoningResult>().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn insert_output_boxed_from_returns_displaced_output_boxed() {
+        use crate::resource::ProducerKey;
+
+        let type_id = TypeId::of::<ReasoningResult>();
+        let mut ctx = SystemContext::new();
+        let node = ProducerKey::new("node_a");
+
+        let first: Box<dyn Any + Send + Sync> = Box::new(ReasoningResult {
+            action: "first".into(),
+        });
+        assert!(
+            ctx.insert_output_boxed_from(node.clone(), type_id, first)
+                .is_none()
+        );
+
+        let second: Box<dyn Any + Send + Sync> = Box::new(ReasoningResult {
+            action: "second".into(),
+        });
+        let displaced = ctx
+            .insert_output_boxed_from(node, type_id, second)
+            .expect("same producer should hand back its previous entry");
+        assert_eq!(
+            displaced.downcast::<ReasoningResult>().unwrap().action,
+            "first"
+        );
+        assert_eq!(
+            ctx.get_output::<ReasoningResult>().unwrap().action,
+            "second"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
-    // Inspection-sink composition (SC-3307)
+    // Inspection-sink composition
     // ─────────────────────────────────────────────────────────────────────
 
     /// Records the names of the parameters it is offered.

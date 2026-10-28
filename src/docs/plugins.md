@@ -92,8 +92,8 @@ Session lifecycle, turn execution, and (optional) HTTP/dashboard surfaces.
 
 | Plugin | What it enables |
 |--------|-----------------|
-| [`SessionsPlugin`](crate::sessions::SessionsPlugin) | The [`SessionsAPI`](crate::sessions::SessionsAPI) — agent-type registration, session creation, scoped sessions ([`SessionGuard`](crate::sessions::SessionGuard)), turn execution, checkpointing, and persistence via a pluggable [`SessionStore`](crate::sessions::SessionStore). |
-| [`HttpPlugin`](crate::sessions::HttpPlugin) *(feature `sessions-http`)* | Registers REST endpoints for sessions and an `HttpIOProvider` that bridges HTTP request/response (and SSE) to in-process [`UserIO`](crate::plugins::UserIO). Requires [`AppPlugin`](crate::app::AppPlugin). |
+| [`SessionsPlugin`](crate::sessions::SessionsPlugin) | The [`SessionsAPI`](crate::sessions::SessionsAPI) — agent-type registration, session creation, scoped sessions ([`SessionGuard`](crate::sessions::SessionGuard)), turn execution, bounded turn history and uptime (without HTTP), checkpointing, and persistence via a pluggable [`SessionStore`](crate::sessions::SessionStore). |
+| [`HttpPlugin`](crate::sessions::HttpPlugin) *(feature `sessions-http`)* | Registers REST endpoints for sessions, using the always-available [`ChannelIOProvider`](crate::sessions::HttpIOProvider) to bridge HTTP request/response (and SSE) to in-process [`UserIO`](crate::plugins::UserIO). Requires [`AppPlugin`](crate::app::AppPlugin). |
 
 ## Layer 3 — HTTP App Runtime
 
@@ -110,7 +110,7 @@ Shell command execution behind the project permission model.
 
 | Plugin | What it enables |
 |--------|-----------------|
-| [`ShellPlugin`](crate::shell::ShellPlugin) | A configured [`ShellExecutor`](crate::shell::ShellExecutor) resource and shell-execution tools, gated by [`ShellPermission`](crate::shell::ShellPermission). |
+| [`ShellPlugin`](crate::shell::ShellPlugin) | A configured [`ShellExecutor`](crate::shell::ShellExecutor) resource for permission-gated foreground commands and managed process start, streaming, status, stop, and wait operations, plus LLM shell tools. |
 
 ## Layer 3 — Dashboard
 

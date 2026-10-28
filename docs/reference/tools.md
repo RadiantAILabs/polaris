@@ -161,6 +161,67 @@ impl Plugin for SearchPlugin {
 - Registration happens during `build()`. After `ready()`, the registry is a `GlobalResource` and cannot be mutated.
 - Tool names are taken from the function identifier (snake_case).
 
+## Per-invocation shell observation
+
+Tool context values carry host-only shell observation without changing the
+`run_command` JSON schema. A host can insert a
+`ShellSinkHandle` and `ShellCancel`, then use `execute_with`; callers using
+`execute` receive the existing foreground behavior with neither value present.
+
+```no_run
+use polaris_shell::{ChannelSink, ShellCancel, ShellEvent, ShellSinkHandle};
+use polaris_tools::{ToolContext, ToolError, ToolRegistry};
+use serde_json::{Value, json};
+use std::num::NonZeroUsize;
+
+async fn run_observed(
+    registry: &ToolRegistry,
+    stop_receiver: tokio::sync::watch::Receiver<bool>,
+    mut on_event: impl FnMut(ShellEvent),
+) -> Result<Value, ToolError> {
+    let (sink, mut events) = ChannelSink::new(NonZeroUsize::new(32).unwrap());
+    let context = ToolContext::new()
+        .with(ShellSinkHandle::new(sink))
+        .with(ShellCancel::from_watch(stop_receiver));
+    let arguments = json!({"command": "cargo test"});
+    let execution = registry.execute_with("run_command", &arguments, &context);
+    tokio::pin!(execution);
+    let mut events_open = true;
+    loop {
+        tokio::select! {
+            result = &mut execution => {
+                let response = result?; // Propagate permission and execution errors.
+                if response["status"] == "confirmation_required" {
+                    // Return the prompt to the host for approval; no run started.
+                    return Ok(response);
+                }
+                // Completion published Finished; drain any remaining events.
+                while let Some(event) = events.recv().await {
+                    on_event(event);
+                }
+                return Ok(response);
+            }
+            event = events.recv(), if events_open => {
+                if let Some(event) = event {
+                    on_event(event);
+                } else {
+                    events_open = false;
+                }
+            }
+        }
+    }
+}
+```
+
+The sink callback is synchronous and non-blocking so a slow consumer cannot
+fill an operating-system pipe and stall the child. `ChannelSink` bounds queued
+data and reports drops in the final execution result while reserving lifecycle
+delivery. Use a fresh channel for each run: clones share a single reservation.
+The host must keep the watch sender alive until completion; dropping it requests
+cancellation. A confirmation response has no process events. After the host
+obtains approval, it can pass a reconstructed request to
+`ShellExecutor::execute_confirmed`, with a fresh observation channel.
+
 ## Permission Model
 
 Every tool has a declared permission level:
