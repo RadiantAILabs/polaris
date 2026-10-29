@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-29
+
+### Fixed
+
+- **Process-group cleanup on macOS** (`polaris_shell`) — stopping a command whose leader had already exited now reports cleanup as complete. macOS returns `EPERM` instead of `ESRCH` when signalling a group whose only member is the exited, not-yet-reaped leader; this was treated as a failed signal, so `cleanup_completed` was `false` after timeouts, cancellations and normal exits.
+
 ## [0.7.0] - 2026-10-28
 
 ### Added

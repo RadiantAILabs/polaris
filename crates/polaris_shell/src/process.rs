@@ -1518,12 +1518,37 @@ fn signal_group(pid: u32, signal: libc::c_int) -> bool {
         return true;
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
+    // macOS reports EPERM rather than ESRCH when the group's only member is
+    // the exited leader we keep unreaped, so an exited leader means the group
+    // is gone either way.
+    let gone = match error.raw_os_error() {
+        Some(libc::ESRCH) => true,
+        Some(libc::EPERM) => leader_exited(pid),
+        _ => false,
+    };
+    if gone {
         true
     } else {
         tracing::warn!(pid, signal, %error, "failed to signal shell process group");
         false
     }
+}
+
+/// Whether our child `pid` has exited, without reaping it.
+#[cfg(unix)]
+fn leader_exited(pid: libc::pid_t) -> bool {
+    let Ok(id) = libc::id_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `siginfo_t` is plain integer data, so all-zero is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    // SAFETY: `info` is a valid, writable `siginfo_t`. `WNOWAIT` leaves the
+    // child waitable, so the later `reap` still collects it.
+    let result = unsafe { libc::waitid(libc::P_PID, id, &raw mut info, options) };
+    // SAFETY: `waitid` succeeded, so `info` holds the child fields; `si_pid`
+    // stays zero when `WNOHANG` found no exited child.
+    result == 0 && unsafe { info.si_pid() } == pid
 }
 
 pub(crate) fn processes(inner: &ExecutorInner) -> Vec<ShellProcessStatus> {
@@ -1630,6 +1655,50 @@ mod tests {
         let mut request = ShellRequest::new("true");
         request.sink = sink;
         ProcessEntry::new(process, Some(4242), &request, PathBuf::from("/tmp"), false)
+    }
+
+    // -- Process-group signalling --
+
+    #[cfg(unix)]
+    fn spawn_group_leader(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .process_group(0)
+            .spawn()
+            .expect("test shell must spawn")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signalling_the_group_of_an_exited_unreaped_leader_succeeds() {
+        let mut child = spawn_group_leader("exit 0");
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !leader_exited(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader {pid} did not exit within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            signal_group(child.id(), libc::SIGKILL),
+            "a group whose only member is the exited leader must count as gone"
+        );
+        let status = child.wait().expect("leader must still be reapable");
+        assert!(status.success(), "leader exit status: {status}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_leader_has_not_exited() {
+        let mut child = spawn_group_leader("sleep 30");
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
+        let exited = leader_exited(pid);
+        child.kill().expect("test leader must be killable");
+        child.wait().expect("test leader must be reapable");
+        assert!(!exited, "a running leader {pid} was reported as exited");
     }
 
     // -- ShellEventReceiver ordering --
