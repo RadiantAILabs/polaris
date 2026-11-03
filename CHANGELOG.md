@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-03
+
 ### Added
 
 - **`GraphExecutor::absent_optional_globals`** (`polaris_graph`) — lists every `Option<Res<T>>` read in a graph that will be `None` for a context, as `AbsentOptionalGlobal` entries (node, system name, resource type). It never fails, so a missing approval or backend plugin can be logged or rejected before a run instead of silently turning a feature off. Walks system nodes, scope interiors whatever their policy, and inline dynamic candidates; registry-backed candidates are not known before the run and are not listed. See [Execution Context — Resource Validation](docs/reference/context.md#resource-validation).
