@@ -20,7 +20,7 @@ use polaris_system::param::inspect::{Inspection, InspectionSink, ParamKind, Para
 use polaris_system::param::{Out, Res, ResMut, SystemContext};
 use polaris_system::plugin;
 use polaris_system::plugin::{Extends, Plugin};
-use polaris_system::resource::LocalResource;
+use polaris_system::resource::{GlobalResource, LocalResource};
 use polaris_system::server::Server;
 use polaris_system::system;
 use polaris_system::system::{BoxFuture, System, SystemError};
@@ -635,6 +635,114 @@ async fn a_redacted_value_arrives_as_redacted_and_its_debug_never_runs() {
         0,
         "the covered value's Debug must never run — the secret must not reach a String"
     );
+}
+
+/// A global whose `Debug` would expose a secret, read through `Option<Res<..>>`.
+struct SigningKey {
+    key: String,
+    renders: Arc<AtomicUsize>,
+}
+
+impl GlobalResource for SigningKey {}
+
+impl std::fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.renders.fetch_add(1, Ordering::SeqCst);
+        f.debug_struct("SigningKey")
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
+#[system(inspect(signing_key))]
+async fn sign_if_keyed(signing_key: Option<Res<SigningKey>>) {
+    let _ = signing_key.map(|signing_key| signing_key.key.len());
+}
+
+/// Runs `sign_if_keyed` once and returns the record of its `signing_key`
+/// parameter. `key` is the global to install, or `None` to leave it absent.
+async fn run_sign_if_keyed(
+    rules: RedactionRules,
+    key: Option<SigningKey>,
+) -> (ParamMeta, Inspection) {
+    let listener = CollectingListener::default();
+    let mut server = Server::new();
+    if let Some(key) = key {
+        server.insert_global(key);
+    }
+    server.add_plugins(
+        InspectionPlugin::new()
+            .with_policy(InspectionPolicy::All)
+            .with_redactions(rules)
+            .without_tracing_sink(),
+    );
+    server.add_plugins(ListenerPlugin(listener.clone()));
+    server.finish().await.expect("server must build");
+
+    let middleware = server
+        .api::<MiddlewareAPI>()
+        .expect("InspectionPlugin must provide MiddlewareAPI");
+    let mut graph = Graph::new();
+    graph.add_boxed_system(Box::new(sign_if_keyed()));
+    assert!(
+        graph.validate().is_ok(),
+        "the graph under test must be well-formed"
+    );
+
+    let mut ctx = server.create_context();
+    GraphExecutor::new()
+        .execute(&graph, &mut ctx, None, Some(middleware))
+        .await
+        .expect("graph execution should succeed");
+
+    listener
+        .find("sign_if_keyed", "signing_key")
+        .expect("the optional parameter must be recorded")
+}
+
+#[tokio::test]
+async fn a_type_rule_covers_an_optional_global_read() {
+    // The macro records `Option<Res<'_, SigningKey>>` under the inner type name,
+    // so a rule on "SigningKey" must cover the optional form too.
+    let renders = Arc::new(AtomicUsize::new(0));
+    let key = SigningKey {
+        key: "sk-optional".to_owned(),
+        renders: Arc::clone(&renders),
+    };
+
+    let (meta, value) =
+        run_sign_if_keyed(RedactionRules::new().redact_type("SigningKey"), Some(key)).await;
+
+    assert_eq!(meta.type_name, "SigningKey");
+    assert_eq!(
+        value,
+        Inspection::Redacted,
+        "a present optional global covered by a type rule must arrive redacted"
+    );
+    assert_eq!(
+        renders.load(Ordering::SeqCst),
+        0,
+        "the covered value's Debug must never run"
+    );
+}
+
+#[tokio::test]
+async fn without_a_rule_an_optional_global_read_is_rendered_or_marked_absent() {
+    // Control for the test above: with no rule the same key is rendered, and an
+    // absent global records as opaque. Without this, "Redacted" could be an
+    // artifact of the fixture rather than of the rule.
+    let key = SigningKey {
+        key: "sk-optional".to_owned(),
+        renders: Arc::new(AtomicUsize::new(0)),
+    };
+    let (_, present) = run_sign_if_keyed(RedactionRules::new(), Some(key)).await;
+    assert!(
+        text_of(&present).contains("sk-optional"),
+        "without a rule the present key is rendered — got {present:?}"
+    );
+
+    let (_, absent) = run_sign_if_keyed(RedactionRules::new(), None).await;
+    assert_eq!(absent, Inspection::Opaque("resource absent"));
 }
 
 /// A second, independently registered consumer plugin.

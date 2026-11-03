@@ -17,8 +17,11 @@ Polaris systems declare their dependencies as typed parameters, and the framewor
 | Immutable per-request input (HTTP body, auth claims, correlation ID) | **`Res<T>`** via `ctx.insert(T)` in setup closure | `ResMut<WorkingState>` with `.input.clone()` |
 | Accumulated cross-cutting state (issue list, conversation history, counters) | **`ResMut<T>`** — local resource mutated across systems | `Out<T>` — outputs are per-system, not accumulated |
 | Shared server-wide config (model registry, tool registry) | **`Res<T>`** — global resource via `server.insert_global(T)` | `ResMut<T>` — compile error on `GlobalResource` |
+| A server-wide capability a plugin may or may not register (approval handler, optional backend) | **`Option<Res<T>>`** — `T: GlobalResource`; `None` when absent ([System — Parameters](system.md#parameters)) | A "no-op" plugin registered only so a required `Res<T>` resolves |
 | Error context inside an error handler | **`ErrOut<CaughtError>`** — injected by the executor on error edges | Reading from a custom `ResMut<LastError>` |
 | Per-system lifecycle metadata (node ID, system name) | **`Res<SystemInfo>`** provided by `DevToolsPlugin` | Manual tagging in each system |
+
+`Option<Res<T>>` also yields `None` for a context with no globals (`SystemContext::new()`); for security controls (access, approval, limits), `None` must take the restrictive path.
 
 ## The Three Mechanisms
 
@@ -36,7 +39,7 @@ A system's return type is inserted into the context's output store under its con
 
 ### `Res<T>` — immutable shared data
 
-`Res<T>` resolves up the hierarchy: current locals → parent locals → globals. Good for data that's set once and read many times.
+`Res<T>` resolves up the hierarchy: current locals → parent locals → globals. Good for data that's set once and read many times. For a global capability that may be absent, `Option<Res<T>>` reads server globals only and returns `None` when missing; it is never a pre-run requirement.
 
 - **Lifetime:** resource's owning scope (usually the session or the server).
 - **Resolution:** first match wins (child shadows parent).
@@ -100,7 +103,7 @@ In a loop, each iteration writes a new copy into its own layer, and only the las
 
 | Data lives… | Use |
 |-------------|-----|
-| For the lifetime of the server | `GlobalResource` + `Res<T>` |
+| For the lifetime of the server | `GlobalResource` + `Res<T>` (or `Option<Res<T>>` if optional) |
 | For the lifetime of a session | `LocalResource` inserted in `create_session_with` + `Res<T>` or `ResMut<T>` |
 | For a single turn | `LocalResource` inserted in `process_turn_with` + `Res<T>` or `ResMut<T>` |
 | Between two adjacent systems | Return value + `Out<T>` |

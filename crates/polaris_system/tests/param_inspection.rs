@@ -10,7 +10,7 @@ use polaris_system::param::inspect::{
 use polaris_system::param::{
     ErrOut, ErrorContext, Out, ParamError, ParentFilter, Res, ResMut, SystemContext, SystemParam,
 };
-use polaris_system::resource::LocalResource;
+use polaris_system::resource::{GlobalResource, LocalResource, Resources};
 use polaris_system::system;
 use polaris_system::system::{System, SystemError};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1224,6 +1224,71 @@ async fn present_optional_output_records_the_value() {
 
     let recorded = sink.text("upstream").expect("upstream must be recorded");
     assert!(recorded.contains('9'), "got {recorded:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `Option<Res<T>>` (optional global read)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct Approver {
+    name: &'static str,
+}
+
+impl GlobalResource for Approver {}
+
+#[system(inspect(approver))]
+async fn optional_approver(approver: Option<Res<Approver>>) -> &'static str {
+    approver.map_or("nobody", |approver| approver.name)
+}
+
+#[tokio::test]
+async fn absent_optional_global_records_as_opaque() {
+    let sink = Arc::new(Collecting::default());
+
+    let mut ctx = SystemContext::with_globals(Arc::new(Resources::new()));
+    let _ = ctx.replace_inspection(sink.clone());
+
+    let name = optional_approver()
+        .run(&ctx)
+        .await
+        .expect("an absent optional global must not fail the system");
+    assert_eq!(name, "nobody");
+
+    let records = sink.records();
+    let (meta, inspection) = records.first().expect("approver must be recorded");
+    assert_eq!(meta.kind, ParamKind::Res);
+    assert_eq!(meta.type_name, "Approver");
+    assert_eq!(*inspection, Inspection::Opaque("resource absent"));
+}
+
+#[tokio::test]
+async fn present_optional_global_records_the_value() {
+    let sink = Arc::new(Collecting::default());
+
+    let mut globals = Resources::new();
+    globals.insert(Approver { name: "ops-lead" });
+    let mut ctx = SystemContext::with_globals(Arc::new(globals));
+    let _ = ctx.replace_inspection(sink.clone());
+
+    let name = optional_approver()
+        .run(&ctx)
+        .await
+        .expect("system must succeed");
+    assert_eq!(name, "ops-lead");
+
+    let recorded = sink.text("approver").expect("approver must be recorded");
+    assert!(recorded.contains("ops-lead"), "got {recorded:?}");
+}
+
+#[test]
+fn optional_global_system_declares_no_required_resources() {
+    let system = optional_approver();
+    let access = System::access(&system);
+
+    assert!(access.resources.is_empty());
+    assert_eq!(access.optional_globals.len(), 1);
+    assert!(access.optional_globals[0].type_name.contains("Approver"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

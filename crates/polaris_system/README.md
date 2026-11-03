@@ -78,6 +78,7 @@ impl LocalResource for Memory {}
 | `Res<T>` | Read shared state | Immutable, concurrent |
 | `ResMut<T>` | Modify local state | Exclusive (requires `LocalResource`) |
 | `Out<T>` | Read previous system output | Immutable, concurrent |
+| `Option<Res<T>>` | Read a global resource that may be absent (`None`) | Immutable, concurrent (requires `GlobalResource`) |
 
 ### The `#[system]` Macro
 

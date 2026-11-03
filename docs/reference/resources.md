@@ -40,7 +40,7 @@ impl LocalResource for AgentMemory {}
 
 | Trait | Scope | Lifetime | Mutability from systems | Typical use |
 |-------|-------|----------|-------------------------|-------------|
-| [`GlobalResource`](crate::system::resource::GlobalResource) | Server | From `insert_global` until shutdown | `Res<T>` only (read-only) | Registries, LLM provider handles, configuration |
+| [`GlobalResource`](crate::system::resource::GlobalResource) | Server | From `insert_global` until shutdown | `Res<T>` or `Option<Res<T>>` (read-only) | Registries, LLM provider handles, configuration |
 | [`LocalResource`](crate::system::resource::LocalResource) | Agent context | Per-context (session, scoped session, or one-shot) | `Res<T>` (read), `ResMut<T>` (exclusive write) | Conversation history, working state, per-turn input |
 
 ### Why two scopes (and not one)
@@ -119,7 +119,7 @@ documentation-standard conformance itself is checked in code review.
 | **Purpose + when-to-use** | What capability the resource exposes from a *system author's* perspective. *"Use this when your system needs to send messages to an LLM"*, not *"wraps an HTTP client"*. The "when" is the load-bearing part — it's what makes the resource discoverable. |
 | **Scope + why** | One of `Global` or `Local`, with one sentence justifying the choice. Global resources should explain why they're safe to share across contexts; locals should explain why they need per-context isolation. |
 | **Provided by** | The plugin that calls `insert_global` / `register_local` for this type. Include the plugin's feature gate if any. If the resource is consumer-supplied (no plugin registers it by default), say so. |
-| **Access pattern** | Which parameter types are valid (`Res<T>` only, or `Res<T>` + `ResMut<T>`), and the mutation contract — *"every push is observed by the next system"*, *"reads see a consistent snapshot for the duration of one system call"*, etc. For globals, also note any interior mutability that bypasses `&T` (`Arc<Mutex<_>>` inside, etc.). |
+| **Access pattern** | Which parameter types are valid (`Res<T>` or `Option<Res<T>>` for globals, `Res<T>` + `ResMut<T>` for locals), and the mutation contract — *"every push is observed by the next system"*, *"reads see a consistent snapshot for the duration of one system call"*, etc. For globals, also note any interior mutability that bypasses `&T` (`Arc<Mutex<_>>` inside, etc.). |
 | **Alternatives** | Related or variant resources that consumers might also be looking for: trait alternatives ([`LlmProvider`](crate::models::llm::LlmProvider) implementations), scope alternatives (a Global registry vs. a per-session Local override), or upstream substitutes (`MockClock` for `Clock` in tests). Empty `_none_` row is fine if there are no alternatives. |
 | **Example system** | Rustdoc code block showing a real-shape `#[system]` that consumes the resource. Not a `let _ = ctx.get_resource::<T>()` snippet — an actual parameter-typed system, since that's the consumption pattern systems use. |
 

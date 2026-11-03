@@ -1,0 +1,30 @@
+error[E0277]: the trait bound `Option<polaris_system::param::ResMut<'_, Memory>>: SystemParam` is not satisfied
+  --> tests/compile_fail/option_res_mut.rs:11:40
+   |
+11 | async fn writes_optional_local(memory: Option<ResMut<Memory>>) {
+   |                                        ^^^^^^^^^^^^^^^^^^^^^^ the trait `SystemParam` is not implemented for `Option<polaris_system::param::ResMut<'_, Memory>>`
+   |
+help: the following other types implement trait `SystemParam`
+  --> src/param/mod.rs
+   |
+   | impl<'a, T: Output> SystemParam for Option<Out<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Out<'_, T>>`
+...
+   | impl<'a, T: GlobalResource> SystemParam for Option<Res<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Res<'_, T>>`
+
+error[E0277]: the trait bound `Option<polaris_system::param::ResMut<'_, Memory>>: SystemParam` is not satisfied
+  --> tests/compile_fail/option_res_mut.rs:10:1
+   |
+10 | #[system]
+   | ^^^^^^^^^ the trait `SystemParam` is not implemented for `Option<polaris_system::param::ResMut<'_, Memory>>`
+   |
+help: the following other types implement trait `SystemParam`
+  --> src/param/mod.rs
+   |
+   | impl<'a, T: Output> SystemParam for Option<Out<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Out<'_, T>>`
+...
+   | impl<'a, T: GlobalResource> SystemParam for Option<Res<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Res<'_, T>>`
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -14,6 +14,7 @@
 //! |------|--------|-------|---------|
 //! | [`Res<T>`] | Read-only | Walks context hierarchy | Read resources from any ancestor or global scope |
 //! | [`ResMut<T>`] | Read-write | Current scope only | Mutate resources owned by this context |
+//! | [`Option<Res<T>>`](Res#optional-reads) | Read-only | Server globals only | Read a [`GlobalResource`] that may be absent (`None`). `T` must be a [`GlobalResource`] |
 //! | [`Out<T>`] | Read-only | Current context | Read the return value of a preceding system |
 //! | [`ErrOut<T>`] | Read-only | Current context | Read error context from a failed system on an
 //! error edge. The system must be reachable through an error edge from a fallible system |
@@ -64,8 +65,8 @@ mod output_layers;
 mod read_from;
 
 use crate::resource::{
-    LocalResource, Output, OutputRef, Outputs, ProducerKey, Resource, ResourceRef, ResourceRefMut,
-    Resources,
+    GlobalResource, LocalResource, Output, OutputRef, Outputs, ProducerKey, Resource, ResourceRef,
+    ResourceRefMut, Resources,
 };
 pub use access::{Access, AccessMode, SystemAccess};
 use hashbrown::HashSet;
@@ -152,10 +153,8 @@ pub enum ParamError {
 ///
 /// Each `SystemContext` holds:
 ///
-/// - **Resources** — long-lived state. Resources may be
-///   [`GlobalResource`](crate::resource::GlobalResource) (server-level,
-///   read-only) or [`LocalResource`]
-///   (per-context, mutable).
+/// - **Resources** — long-lived state. Resources may be [`GlobalResource`]
+///   (server-level, read-only) or [`LocalResource`] (per-context, mutable).
 /// - **Outputs** — ephemeral return values produced by preceding systems in
 ///   the current execution, cleared between agent runs.
 /// - **Parent chain** — an optional reference to a parent context, forming a
@@ -1310,11 +1309,17 @@ impl<'parent> SystemContext<'parent> {
 ///
 /// `Res<T>` resolves `T` by walking the full
 /// [context hierarchy](SystemContext#resource-lookup-order), making it
-/// suitable to access both [`GlobalResource`](crate::resource::GlobalResource) and
-/// [`LocalResource`] types. Multiple systems
-/// may hold `Res<T>` to the same resource simultaneously.
+/// suitable to access both [`GlobalResource`] and [`LocalResource`] types.
+/// Multiple systems may hold `Res<T>` to the same resource simultaneously.
 ///
 /// Implements [`Deref<Target = T>`](core::ops::Deref).
+///
+/// # Optional reads
+///
+/// To read a [`GlobalResource`] that the server may not have, use
+/// `Option<Res<T>>` instead. It yields `None` rather than failing with
+/// [`ParamError::ResourceNotFound`], and looks in server globals only. See the
+/// [`SystemParam`] implementation for `Option<Res<T>>` below.
 ///
 /// # Example
 ///
@@ -1367,10 +1372,9 @@ impl<'a, T: Resource> SystemParam for Res<'a, T> {
 /// hierarchy — only resources owned by the current scope can be mutated.
 ///
 /// The `T: LocalResource` bound is enforced at compile time.
-/// [`GlobalResource`](crate::resource::GlobalResource) types cannot be used
-/// with `ResMut<T>`, which guarantees that server-level shared state remains
-/// read-only. See [`GlobalResource`](crate::resource::GlobalResource) for a
-/// `compile_fail` example demonstrating this invariant.
+/// [`GlobalResource`] types cannot be used with `ResMut<T>`, which guarantees
+/// that server-level shared state remains read-only. See [`GlobalResource`] for
+/// a `compile_fail` example demonstrating this invariant.
 ///
 /// Borrows are tracked at runtime via an internal `RwLock`. If the resource
 /// is already borrowed (by [`Res<T>`] or another `ResMut<T>`), fetching
@@ -1617,6 +1621,92 @@ impl<'a, T: Output> SystemParam for Option<Out<'a, T>> {
         for bound in &mut access.bindable_outputs {
             bound.optional = true;
         }
+        access
+    }
+}
+
+/// Optional read of a server-level [`GlobalResource`].
+///
+/// Returns `None` when the server has no global `T`, instead of failing with
+/// [`ParamError::ResourceNotFound`]. Use it when a plugin may or may not be
+/// registered and the system has a sensible fallback without it.
+///
+/// If the global guards a security control (access, approval, limits), treat
+/// `None` as the restrictive path (deny), not as "skip the check".
+///
+/// # Globals only
+///
+/// The lookup reads **only** the server's global resources. It never looks
+/// in the local scope or the parent chain, even when `T` also implements
+/// [`LocalResource`]. A context with no globals container at all (for example
+/// one made by [`SystemContext::new()`]) also yields `None`. Global resources
+/// cannot change once the first [`SystemContext`] has been created, so whether
+/// this parameter is `Some` or `None` depends on server setup alone, and is
+/// already known before a graph runs.
+///
+/// Optional reads of local resources (and `Option<ResMut<T>>`) are not
+/// supported: a local resource can appear mid-run (provider hooks, earlier
+/// systems, scope crossings), so a pre-run check could not tell a resource
+/// that is absent on purpose from one that is missing by mistake. The
+/// `T: GlobalResource` bound enforces this at compile time.
+///
+/// # Access
+///
+/// The read is recorded in [`SystemAccess::optional_globals`], not in
+/// [`SystemAccess::resources`], so pre-run resource checks and graph
+/// signatures never treat it as a requirement.
+///
+/// # Errors
+///
+/// Fetching returns [`ParamError::BorrowConflict`] if the global is currently
+/// borrowed mutably. Absence is never an error.
+///
+/// # Example
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use polaris_system::param::{Res, SystemContext, SystemParam};
+/// use polaris_system::resource::{GlobalResource, Resources};
+/// use std::sync::Arc;
+///
+/// struct Approval {
+///     approver: &'static str,
+/// }
+/// impl GlobalResource for Approval {}
+///
+/// // A context whose server registered no `Approval`.
+/// let ctx = SystemContext::with_globals(Arc::new(Resources::new()));
+/// let approval = <Option<Res<Approval>> as SystemParam>::fetch(&ctx)?;
+/// assert!(approval.is_none());
+///
+/// // A context whose server registered one.
+/// let mut globals = Resources::new();
+/// globals.insert(Approval { approver: "ops" });
+/// let ctx = SystemContext::with_globals(Arc::new(globals));
+/// let approval = <Option<Res<Approval>> as SystemParam>::fetch(&ctx)?;
+/// assert_eq!(approval.map(|a| a.approver), Some("ops"));
+/// # Ok(())
+/// # }
+/// ```
+impl<'a, T: GlobalResource> SystemParam for Option<Res<'a, T>> {
+    type Item<'w> = Option<Res<'w, T>>;
+
+    fn fetch<'w>(ctx: &'w SystemContext<'_>) -> Result<Self::Item<'w>, ParamError> {
+        let Some(globals) = ctx.globals() else {
+            return Ok(None);
+        };
+        match globals.get::<T>() {
+            Ok(inner) => Ok(Some(Res { inner })),
+            Err(crate::resource::ResourceError::NotFound(_)) => Ok(None),
+            Err(crate::resource::ResourceError::BorrowConflict(name)) => {
+                Err(ParamError::BorrowConflict(name))
+            }
+        }
+    }
+
+    fn access() -> SystemAccess {
+        let mut access = SystemAccess::new();
+        access.add_optional_global::<T>();
         access
     }
 }
@@ -2164,6 +2254,210 @@ mod tests {
             access.bindable_outputs[0].optional,
             "Option<Out<T>> marks its read_from binding as optional, unlike Out<T>"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Option<Res<T>> (optional global read) tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(Debug, PartialEq)]
+    struct Approval {
+        approver: &'static str,
+    }
+
+    impl GlobalResource for Approval {}
+
+    /// Implements both markers, so it can live in globals *and* in a local
+    /// scope. `Option<Res<T>>` must only ever see the global copy.
+    #[derive(Debug, PartialEq)]
+    struct DualScoped {
+        origin: &'static str,
+    }
+
+    impl GlobalResource for DualScoped {}
+    impl LocalResource for DualScoped {}
+
+    fn ctx_with_global<T: Resource>(value: T) -> SystemContext<'static> {
+        let mut globals = Resources::new();
+        globals.insert(value);
+        SystemContext::with_globals(Arc::new(globals))
+    }
+
+    #[test]
+    fn option_res_returns_some_when_global_present() {
+        let ctx = ctx_with_global(Approval { approver: "ops" });
+
+        let fetched = <Option<Res<Approval>>>::fetch(&ctx).expect("absence is never an error");
+
+        assert_eq!(fetched.as_deref(), Some(&Approval { approver: "ops" }));
+    }
+
+    #[test]
+    fn option_res_returns_none_when_global_absent() {
+        let ctx = SystemContext::with_globals(Arc::new(Resources::new()));
+
+        let fetched = <Option<Res<Approval>>>::fetch(&ctx).expect("absence is never an error");
+
+        assert!(fetched.is_none());
+        // The required form fails for the same context, so `None` is not
+        // masking a lookup bug.
+        assert!(matches!(
+            <Res<Approval>>::fetch(&ctx),
+            Err(ParamError::ResourceNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn option_res_returns_none_for_context_without_globals() {
+        let ctx = SystemContext::new();
+
+        let fetched = <Option<Res<Approval>>>::fetch(&ctx).expect("absence is never an error");
+
+        assert!(fetched.is_none());
+    }
+
+    #[test]
+    fn option_res_reports_borrow_conflict_as_error() {
+        let ctx = ctx_with_global(Approval { approver: "ops" });
+        let globals = ctx.globals().expect("context has globals");
+        let _writer = globals
+            .get_mut::<Approval>()
+            .expect("first mutable borrow succeeds");
+
+        let result = <Option<Res<Approval>>>::fetch(&ctx);
+
+        match result {
+            Err(ParamError::BorrowConflict(name)) => assert!(name.contains("Approval")),
+            Ok(fetched) => panic!(
+                "a borrow conflict must not turn into an absent resource, got {:?}",
+                fetched.as_deref()
+            ),
+            Err(other) => panic!("expected BorrowConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn option_res_ignores_local_and_parent_copies() {
+        let mut parent = SystemContext::with_globals(Arc::new(Resources::new()));
+        parent.insert(DualScoped { origin: "parent" });
+        let mut child = parent.child();
+        child.insert(DualScoped { origin: "local" });
+
+        // `Res<T>` walks the hierarchy and finds the local copy...
+        assert_eq!(
+            <Res<DualScoped>>::fetch(&child).expect("local copy").origin,
+            "local"
+        );
+        // ...but the optional global read sees only server globals.
+        assert!(
+            <Option<Res<DualScoped>>>::fetch(&child)
+                .expect("absence is never an error")
+                .is_none()
+        );
+        assert!(
+            <Option<Res<DualScoped>>>::fetch(&parent)
+                .expect("absence is never an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn option_res_reads_global_from_child_context() {
+        let parent = ctx_with_global(DualScoped { origin: "global" });
+        let mut child = parent.child();
+        child.insert(DualScoped { origin: "local" });
+
+        let fetched = <Option<Res<DualScoped>>>::fetch(&child)
+            .expect("absence is never an error")
+            .expect("global is visible from a child context");
+
+        assert_eq!(fetched.origin, "global", "local copy must be ignored");
+    }
+
+    #[test]
+    fn option_res_declares_optional_global_not_requirement() {
+        let access = <Option<Res<Approval>>>::access();
+
+        assert!(
+            access.resources.is_empty(),
+            "an optional read must not be listed as a required resource"
+        );
+        assert!(access.outputs.is_empty());
+        assert_eq!(access.optional_globals.len(), 1);
+        let entry = &access.optional_globals[0];
+        assert_eq!(entry.type_id, TypeId::of::<Approval>());
+        assert!(entry.type_name.contains("Approval"));
+        assert_eq!(entry.mode, AccessMode::Read);
+        assert!(entry.is_global);
+        assert!(!access.is_empty());
+    }
+
+    #[test]
+    fn option_res_access_differs_from_res_access() {
+        assert_ne!(
+            <Option<Res<Approval>>>::access(),
+            <Res<Approval>>::access(),
+            "optional and required reads must not compare equal"
+        );
+    }
+
+    /// These descriptors differ in `optional_globals` and nothing else, so
+    /// they only compare unequal if `SystemAccess::eq` looks at that field.
+    #[test]
+    fn option_res_access_equality_depends_on_optional_globals_alone() {
+        let optional = <Option<Res<Approval>>>::access();
+        let empty = SystemAccess::new();
+        assert_eq!(optional.resources, empty.resources);
+        assert_eq!(optional.outputs, empty.outputs);
+        assert_eq!(optional.context_requirements, empty.context_requirements);
+        assert_ne!(
+            optional, empty,
+            "an optional read is not the same access as no access"
+        );
+
+        let other_type = <Option<Res<DualScoped>>>::access();
+        assert_eq!(optional.resources, other_type.resources);
+        assert_ne!(
+            optional, other_type,
+            "optional reads of different types must not compare equal"
+        );
+
+        assert_eq!(optional, <Option<Res<Approval>>>::access());
+    }
+
+    #[test]
+    fn tuple_access_keeps_required_and_optional_reads_apart() {
+        let access = <(Res<Approval>, Option<Res<Approval>>)>::access();
+
+        assert_eq!(
+            access.resources.len(),
+            1,
+            "required read is still a requirement"
+        );
+        assert_eq!(access.resources[0].type_id, TypeId::of::<Approval>());
+        assert_eq!(access.optional_globals.len(), 1);
+    }
+
+    #[test]
+    fn tuple_access_keeps_every_optional_global() {
+        let access = <(Option<Res<Approval>>, Option<Res<DualScoped>>)>::access();
+
+        assert!(access.resources.is_empty());
+        let types: Vec<TypeId> = access.optional_globals.iter().map(|a| a.type_id).collect();
+        assert_eq!(
+            types,
+            [TypeId::of::<Approval>(), TypeId::of::<DualScoped>()]
+        );
+    }
+
+    #[test]
+    fn option_res_never_conflicts_with_writers() {
+        let optional = <Option<Res<DualScoped>>>::access();
+        let writer = <ResMut<DualScoped>>::access();
+
+        assert!(!optional.conflicts_with(&writer));
+        assert!(!writer.conflicts_with(&optional));
+        assert!(optional.find_conflicts(&writer).is_empty());
     }
 
     #[test]

@@ -139,6 +139,8 @@ impl Plugin for AnthropicPlugin {
 | `requires::<T>(req)` | **Reads** `T` to do its own work. | many requirers per `T` |
 | `optionally_requires::<T>(req)` | Reads `T` when present; degrades gracefully when no provider exists. | many |
 
+Inside systems, read an optional global capability at run time with [`Option<Res<T>>`](system.md#parameters).
+
 A provider declares its half, e.g.:
 
 ```rust
@@ -246,6 +248,8 @@ The build parameters mirror the three relationships:
 | `Requires<T>` | `&T` | `requires::<T>(caret(T::CONTRACT_VERSION))` |
 | `Extends<T>` | `&mut T` | `extends::<T>(caret(T::CONTRACT_VERSION))` |
 | `Optional<T>` | `Option<&T>` (`.get()` / `.is_present()`) | `optionally_requires::<T>(...)` |
+
+For the run-time read inside systems, use [`Option<Res<T>>`](system.md#parameters) when `T: GlobalResource`.
 
 Each `T` must implement `Contract`. Because you can only obtain a reference to a capability you declared as a parameter, a plugin **cannot touch an undeclared capability** — the declaration and usage can no longer drift.
 
