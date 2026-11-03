@@ -27,7 +27,7 @@ use std::any::{Any, TypeId, type_name};
 ///
 /// To use a type with `ResMut<T>`, it must also implement [`LocalResource`].
 /// Types marked with [`GlobalResource`] are read-only and can only be accessed
-/// via `Res<T>`.
+/// via `Res<T>` or `Option<Res<T>>`.
 ///
 /// # Example
 ///
@@ -57,7 +57,8 @@ impl<T: Send + Sync + 'static> Resource for T {}
 /// Global resources are:
 /// - Stored at the server level (server lifetime)
 /// - Shared across all execution contexts (agents, sessions, turns)
-/// - Read-only (accessible via `Res<T>`, not `ResMut<T>`)
+/// - Read-only (accessible via [`Res<T>`](crate::param::Res) or
+///   [`Option<Res<T>>`](crate::param::Res#optional-reads), not `ResMut<T>`)
 ///
 /// Use this for configuration, tool registries, and other shared state
 /// that should not be modified during agent execution.
@@ -102,6 +103,11 @@ impl<T: Send + Sync + 'static> Resource for T {}
 ///     // GlobalResource cannot be mutated
 /// }
 /// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `GlobalResource`",
+    label = "`{Self}` does not implement `GlobalResource`",
+    note = "`Option<Res<T>>` and `Server::insert_global` require `impl GlobalResource for {Self}`; optional reads of local resources are not supported"
+)]
 pub trait GlobalResource: Resource {}
 
 /// Marker trait for local, per-context resources.

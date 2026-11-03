@@ -70,7 +70,7 @@ use std::fmt::{self, Debug, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::{ErrOut, ErrorContext, Out, OutAll, OutAllEntry, Res, ResMut};
-use crate::resource::{LocalResource, Output, Resource};
+use crate::resource::{GlobalResource, LocalResource, Output, Resource};
 
 /// Default byte ceiling applied by [`Inspection::debug`].
 ///
@@ -437,11 +437,11 @@ pub trait InspectionSink: Send + Sync {
 
 /// A system parameter that can render the value it resolved to.
 ///
-/// Implemented by this crate for [`Res`], [`ResMut`], [`Out`], [`OutAll`] and [`ErrOut`]
-/// whenever the wrapped type is [`Debug`]. These are blanket impls over
-/// Polaris's *own* wrapper types, which is why opting in needs no trait impl
-/// from the caller and works on types they do not own — the orphan rule never
-/// enters into it.
+/// Implemented by this crate for [`Res`], [`ResMut`], [`Out`], [`OutAll`] and
+/// [`ErrOut`] (and for `Option<Out<T>>` and `Option<Res<T>>`) whenever the
+/// wrapped type is [`Debug`]. These are blanket impls over Polaris's *own*
+/// wrapper types, which is why opting in needs no trait impl from the caller
+/// and works on types they do not own — the orphan rule never enters into it.
 ///
 /// Implementing this by hand is not expected. It exists as a trait so the
 /// generated code can name a single function across all four wrappers.
@@ -496,6 +496,20 @@ impl<T: Output + Debug> InspectParam for Option<Out<'_, T>> {
         match this {
             Some(output) => InspectParam::inspect(output),
             None => Inspection::Opaque("output absent"),
+        }
+    }
+}
+
+/// `Option<Res<T>>` (an optional read of a global resource) is a supported
+/// parameter type, so it is inspectable too.
+///
+/// A `None` renders as [`Opaque`](Inspection::Opaque) rather than being dropped:
+/// "the server has no `T`" is itself the observation worth having.
+impl<T: GlobalResource + Debug> InspectParam for Option<Res<'_, T>> {
+    fn inspect(this: &Self) -> Inspection {
+        match this {
+            Some(resource) => InspectParam::inspect(resource),
+            None => Inspection::Opaque("resource absent"),
         }
     }
 }

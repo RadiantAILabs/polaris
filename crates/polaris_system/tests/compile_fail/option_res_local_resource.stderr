@@ -1,0 +1,44 @@
+error[E0277]: `Memory` is not a `GlobalResource`
+  --> tests/compile_fail/option_res_local_resource.rs:11:1
+   |
+11 | #[system]
+   | ^^^^^^^^^ `Memory` does not implement `GlobalResource`
+   |
+help: the trait `GlobalResource` is not implemented for `Memory`
+  --> tests/compile_fail/option_res_local_resource.rs:8:1
+   |
+ 8 | struct Memory;
+   | ^^^^^^^^^^^^^
+   = note: `Option<Res<T>>` and `Server::insert_global` require `impl GlobalResource for Memory`; optional reads of local resources are not supported
+help: the following other types implement trait `SystemParam`
+  --> src/param/mod.rs
+   |
+   | impl<'a, T: Output> SystemParam for Option<Out<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Out<'_, T>>`
+...
+   | impl<'a, T: GlobalResource> SystemParam for Option<Res<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Res<'_, T>>`
+   = note: required for `Option<polaris_system::param::Res<'_, Memory>>` to implement `SystemParam`
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Memory` is not a `GlobalResource`
+  --> tests/compile_fail/option_res_local_resource.rs:12:39
+   |
+12 | async fn reads_optional_local(memory: Option<Res<Memory>>) {
+   |                                       ^^^^^^^^^^^^^^^^^^^ `Memory` does not implement `GlobalResource`
+   |
+help: the trait `GlobalResource` is not implemented for `Memory`
+  --> tests/compile_fail/option_res_local_resource.rs:8:1
+   |
+ 8 | struct Memory;
+   | ^^^^^^^^^^^^^
+   = note: `Option<Res<T>>` and `Server::insert_global` require `impl GlobalResource for Memory`; optional reads of local resources are not supported
+help: the following other types implement trait `SystemParam`
+  --> src/param/mod.rs
+   |
+   | impl<'a, T: Output> SystemParam for Option<Out<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Out<'_, T>>`
+...
+   | impl<'a, T: GlobalResource> SystemParam for Option<Res<'a, T>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<polaris_system::param::Res<'_, T>>`
+   = note: required for `Option<polaris_system::param::Res<'_, Memory>>` to implement `SystemParam`

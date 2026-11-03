@@ -205,12 +205,13 @@ When a system executes, the framework passes the current `SystemContext` to the 
 
 Any type implementing `SystemParam` may be declared as a system parameter.
 
-There are five built-in parameter types:
+There are six built-in parameter types:
 
 | Type | Resolution Scope | Access | Concurrent Borrows |
 |------|------------------|--------|-------------------|
 | `Res<T>` | Hierarchy (local → parents → global) | Immutable | Permitted |
 | `ResMut<T>` | Current context only | Exclusive | None |
+| `Option<Res<T>>` | Server globals only | Immutable | Permitted |
 | `Out<T>` | Current context outputs | Immutable | Permitted |
 | `OutAll<T>` | Current context outputs | Immutable | Permitted |
 | `ErrOut<T>` | Current context outputs (error-edge only) | Immutable | Permitted |
@@ -273,6 +274,24 @@ async fn handle_error(error: ErrOut<CaughtError>) -> RecoveryState {
 
 `ErrOut<T>` is populated only on the error path. See [Graph — Error Handling](graph.md#error-handling) for how error edges route to handler subgraphs.
 
+**`Option<Res<T>>`** reads a global resource that may be absent. It is `None` when the server has no global `T`, instead of failing with `ParamError::ResourceNotFound`. Use it when a plugin may or may not be registered and the system has a safe fallback without it. `T` must implement `GlobalResource`; using a local resource is a compile error. A context with no globals (`SystemContext::new()`) also yields `None`; for security controls (access, approval, limits), `None` must take the restrictive path.
+
+```rust
+#[system]
+async fn ask_human(call: Out<PendingCall>, approval: Option<Res<HumanApproval>>) -> Decision {
+    match approval {
+        Some(approval) => approval.ask(&call).await,
+        None => Decision::Deny, // no approval plugin registered
+    }
+}
+```
+
+The lookup reads only the server's global resources. It never looks in the local scope or the parent chain, even when `T` also implements `LocalResource`. Global resources cannot change once the first context exists, so whether the read is `Some` or `None` is fixed by server setup and known before a graph runs. A borrow conflict is still returned as `ParamError::BorrowConflict`.
+
+The read is recorded in `SystemAccess::optional_globals`, not `SystemAccess::resources`. Pre-run resource checks, graph signatures, scope contracts and dynamic-slot matching therefore never treat it as a requirement.
+
+Optional reads of local resources and `Option<ResMut<T>>` are not supported. A local resource can appear mid-run (provider hooks, earlier systems, scope crossings), so a pre-run check could not tell a resource that is absent on purpose from one that is missing by mistake.
+
 ### Outputs
 
 Outputs are the return values of systems. A system's return type is automatically inserted into the context's output store, and downstream systems read the newest value via `Out<T>` or every value of a type via `OutAll<T>`.
@@ -307,6 +326,8 @@ async fn plan(
 ```
 
 A type becomes renderable by deriving `Debug` — there is nothing to implement, so this works on resource types from crates you do not own. Naming a parameter whose type is not `Debug` is a compile error **at that parameter**, not a silent omission. Bare `#[system(inspect)]` selects every parameter, which requires all of them to be `Debug` — but not the return value, which is not a parameter and must be named explicitly (`inspect(.., return)`). `OutAll<T>` is supported and records its ordered values as `ParamKind::OutAll`. `return` selects the system's own return value: for a fallible system (one whose return type is spelled literally `Result<T, SystemError>` — fallibility detection is syntactic) the recorded value is the extracted success value and a failure records nothing, while a `Result` with any other error type is an ordinary output value, so its `Err` arm is recorded like any other value.
+
+`Option<Res<T>>` is also inspectable when `T: Debug`; `None` records `Opaque("resource absent")`.
 
 Parameters selected with `inspect(..)` are captured at `Phase::Before`, meaning "this value went in" — those records survive a later fetch failure or a body failure. Only the `return` record implies the system succeeded; a sink must not infer success from the presence of parameter records.
 

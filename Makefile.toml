@@ -4,6 +4,11 @@ min_version = "0.37.0"
 
 [tasks.test]
 description = "Run all testing steps (format, clippy, markdown lint, test)"
+# `workspace = false` keeps cargo-make from first running `cargo test` inside
+# every member crate (each with its own feature set, so dependencies rebuild
+# per crate) before the root tasks below run. The dependencies already cover
+# the whole workspace.
+workspace = false
 dependencies = ["test-format", "test-clippy", "test-markdown", "test-rustdoc", "test-doc", "test-workspace", "test-sessions-default-features", "test-bindings"]
 
 [tasks.build]

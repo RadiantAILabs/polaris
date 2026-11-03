@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  # PR runs can only restore caches saved on main, so main must save one.
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
     paths:
@@ -25,7 +28,10 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # In polar-rs, runs on the AWS runners from radiant-platform
+    # (docs/ci-runners.md) when CI_RUNNER_LARGE is set. The public polaris
+    # shares this file and must stay on GitHub-hosted runners.
+    runs-on: ${{ github.repository == 'RadiantAILabs/polar-rs' && vars.CI_RUNNER_LARGE && fromJSON(vars.CI_RUNNER_LARGE) || 'ubuntu-latest' }}
     steps:
       - name: Free up disk space
         run: |
@@ -47,6 +53,10 @@ jobs:
           components: rustfmt, clippy, rust-src
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Save only from main; PR caches can't be shared and would push the
+          # main cache out of the 10GB repo limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-make
         uses: taiki-e/install-action@cargo-make
@@ -82,7 +92,10 @@ jobs:
 
   feature-matrix:
     name: Feature matrix
-    runs-on: ubuntu-latest
+    # In polar-rs, runs on the AWS runners from radiant-platform
+    # (docs/ci-runners.md) when CI_RUNNER_LARGE is set. The public polaris
+    # shares this file and must stay on GitHub-hosted runners.
+    runs-on: ${{ github.repository == 'RadiantAILabs/polar-rs' && vars.CI_RUNNER_LARGE && fromJSON(vars.CI_RUNNER_LARGE) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -91,6 +104,10 @@ jobs:
           toolchain: "1.97.0"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Save only from main; PR caches can't be shared and would push the
+          # main cache out of the 10GB repo limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@cargo-hack

@@ -25,9 +25,11 @@
 //! ```
 
 mod error;
+mod report;
 mod run;
 
 pub use error::{CaughtError, ErrorKind, ExecutionError, ResourceValidationError};
+pub use report::AbsentOptionalGlobal;
 pub use run::DEFAULT_SWITCH_CASE;
 
 use crate::cancel::RunCancellation;
@@ -511,6 +513,145 @@ impl GraphExecutor {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    /// Lists the optional global reads (`Option<Res<T>>`) in a graph that will
+    /// be `None` for `ctx`, because the server has no global `T`.
+    ///
+    /// This never fails and is separate from
+    /// [`validate_resources`](Self::validate_resources), which ignores
+    /// optional reads: absence is allowed. Use the report to make a plugin
+    /// someone forgot to register visible before a run — log it at startup,
+    /// show it in a dashboard, or reject it in a strict mode of your own.
+    ///
+    /// The report names the plugins and types the server is missing, so it is
+    /// meant for operators. If you expose it over HTTP, keep it behind
+    /// authentication.
+    ///
+    /// `Option<Res<T>>` reads server globals only, and globals cannot change
+    /// once the first context exists. So every entry is a fact about the
+    /// server setup, and scope policies do not matter: a global is visible
+    /// from every context.
+    ///
+    /// # Coverage
+    ///
+    /// Walks the same nodes as `validate_resources`: every system node
+    /// (branch, loop and error-handler interiors included), scope interiors
+    /// whatever their [`ContextPolicy`], and inline [`Dynamic`](Node::Dynamic)
+    /// candidates. Candidates of a registry-backed dynamic node are not known
+    /// before the run and are not listed.
+    ///
+    /// # Depth limit
+    ///
+    /// Scope and inline-candidate nesting deeper than the executor's
+    /// [recursion limit](Self::with_max_recursion_depth) is not walked. This
+    /// method never fails, so past that depth it returns what it found so
+    /// far. An empty report therefore does not prove absence for such a graph.
+    ///
+    /// A graph nested that deep fails with
+    /// [`ExecutionError::RecursionLimitExceeded`] if the run reaches the
+    /// over-deep level, and `validate_resources` reports it as
+    /// [`ResourceValidationError::ValidationDepthExceeded`]. If you rely on an
+    /// empty report, run `validate_resources` first.
+    ///
+    /// # Order
+    ///
+    /// Entries come in graph walk order. A system that reads the same absent
+    /// type through more than one optional parameter is listed once per read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_graph::{Graph, GraphExecutor};
+    /// use polaris_system::param::{Res, SystemContext};
+    /// use polaris_system::resource::{GlobalResource, Resources};
+    /// use polaris_system::system;
+    /// use std::sync::Arc;
+    ///
+    /// struct Approval;
+    /// impl GlobalResource for Approval {}
+    ///
+    /// #[system]
+    /// async fn ask_human(approval: Option<Res<Approval>>) -> bool {
+    ///     approval.is_some()
+    /// }
+    ///
+    /// let mut graph = Graph::new();
+    /// graph.add_system(ask_human);
+    /// let executor = GraphExecutor::new();
+    ///
+    /// // No approval plugin: the read is reported, and validation still passes.
+    /// let ctx = SystemContext::with_globals(Arc::new(Resources::new()));
+    /// assert_eq!(executor.absent_optional_globals(&graph, &ctx).len(), 1);
+    /// assert!(executor.validate_resources(&graph, &ctx, None).is_ok());
+    ///
+    /// // With the plugin's global registered, nothing is reported.
+    /// let mut globals = Resources::new();
+    /// globals.insert(Approval);
+    /// let ctx = SystemContext::with_globals(Arc::new(globals));
+    /// assert!(executor.absent_optional_globals(&graph, &ctx).is_empty());
+    /// ```
+    #[must_use]
+    pub fn absent_optional_globals(
+        &self,
+        graph: &Graph,
+        ctx: &SystemContext<'_>,
+    ) -> Vec<AbsentOptionalGlobal> {
+        let mut absent = Vec::new();
+        self.collect_absent_optional_globals(graph, ctx, &mut absent, 0);
+        absent
+    }
+
+    /// Recursive walk behind
+    /// [`absent_optional_globals`](Self::absent_optional_globals).
+    fn collect_absent_optional_globals(
+        &self,
+        graph: &Graph,
+        ctx: &SystemContext<'_>,
+        absent: &mut Vec<AbsentOptionalGlobal>,
+        depth: usize,
+    ) {
+        if depth > self.max_recursion_depth {
+            return;
+        }
+
+        for node in graph.nodes() {
+            match node {
+                Node::System(sys) => {
+                    for read in &sys.system.access().optional_globals {
+                        let present = ctx
+                            .globals()
+                            .is_some_and(|globals| globals.contains_by_type_id(read.type_id));
+                        if !present {
+                            absent.push(AbsentOptionalGlobal {
+                                node: sys.id.clone(),
+                                system_name: sys.system.name(),
+                                resource_type: read.type_name,
+                                type_id: read.type_id,
+                            });
+                        }
+                    }
+                }
+                // Globals are visible through every boundary, so the interior
+                // is checked against the same context whatever the policy.
+                Node::Scope(scope) => {
+                    self.collect_absent_optional_globals(&scope.graph, ctx, absent, depth + 1);
+                }
+                Node::Dynamic(dynamic) => {
+                    if let CandidateSource::Inline(candidates) = &dynamic.source {
+                        for (_key, candidate) in candidates {
+                            self.collect_absent_optional_globals(
+                                candidate.as_ref(),
+                                ctx,
+                                absent,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

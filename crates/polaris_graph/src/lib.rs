@@ -82,8 +82,8 @@ pub mod prelude {
         TimeoutEdge,
     };
     pub use crate::executor::{
-        CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor,
-        ResourceValidationError,
+        AbsentOptionalGlobal, CaughtError, ErrorKind, ExecutionError, ExecutionResult,
+        GraphExecutor, ResourceValidationError,
     };
     pub use crate::graph::{
         Graph, GraphSignature, MatchingMode, MergeError, RenderedSignature, RouteKind,
@@ -108,7 +108,8 @@ pub mod prelude {
 pub use cancel::{CancellationSource, RunCancellation};
 pub use dev::{DevToolsPlugin, SystemInfo};
 pub use executor::{
-    CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor, ResourceValidationError,
+    AbsentOptionalGlobal, CaughtError, ErrorKind, ExecutionError, ExecutionResult, GraphExecutor,
+    ResourceValidationError,
 };
 pub use graph::{
     Graph, GraphSignature, MatchingMode, MergeError, RenderedSignature, RouteKind, SignatureDiff,

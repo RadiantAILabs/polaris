@@ -9,6 +9,8 @@
 //! - `Res<T>` declares read access to resources
 //! - `ResMut<T>` declares write access to resources
 //! - `Out<T>` declares read access to outputs (previous system's return value)
+//! - `Option<Res<T>>` declares an optional read of a global resource, recorded
+//!   in [`SystemAccess::optional_globals`] rather than as a requirement
 //!
 //! Systems aggregate their parameter accesses into a [`SystemAccess`] descriptor,
 //! which can be checked for conflicts with other systems.
@@ -23,6 +25,7 @@
 //! Systems in different contexts (different agents) never conflict on
 //! [`LocalResource`](crate::resource::LocalResource), because each context has its own instance.
 
+use crate::resource::GlobalResource;
 use std::any::{TypeId, type_name};
 
 /// The mode of access to a resource.
@@ -129,9 +132,9 @@ pub struct BindableOutput {
 /// Rust's borrowing rules at the resource level.
 ///
 /// `PartialEq`/`Eq` are implemented by hand (below) to compare only
-/// `resources`, `outputs` and `context_requirements` — the fields that
-/// describe scheduling/conflict behavior, which is what "two systems have
-/// the same access" has always meant here. `bindable_outputs` is
+/// `resources`, `outputs`, `context_requirements` and `optional_globals` — the
+/// fields that describe scheduling/conflict behavior, which is what "two
+/// systems have the same access" has always meant here. `bindable_outputs` is
 /// `read_from`-validation metadata layered on top of an existing `outputs`
 /// read, not an independent access, so two descriptors that read the same
 /// outputs through different bindable-ness (`Out<T>` vs `OutAll<T>`, say)
@@ -152,6 +155,34 @@ pub struct SystemAccess {
     /// here has a matching `outputs` entry, but not every `outputs` entry
     /// has a match here (`OutAll<T>`, `ErrOut<T>`).
     pub bindable_outputs: Vec<BindableOutput>,
+    /// Global resources read through `Option<Res<T>>`.
+    ///
+    /// Kept apart from [`resources`](Self::resources) on purpose: these reads
+    /// allow the resource to be absent, so they are not requirements. Pre-run
+    /// resource checks, graph signatures, scope contracts and dynamic-slot
+    /// matching all read `resources` only, and so never treat an optional
+    /// global read as something the context must provide.
+    ///
+    /// They also never take part in [`conflicts_with`](Self::conflicts_with):
+    /// global resources are read-only, and read + read never conflicts.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_system::param::{Res, SystemParam};
+    /// use polaris_system::resource::GlobalResource;
+    /// use std::any::TypeId;
+    ///
+    /// struct Approval;
+    /// impl GlobalResource for Approval {}
+    ///
+    /// let access = <Option<Res<Approval>> as SystemParam>::access();
+    /// assert!(access.resources.is_empty());
+    /// assert_eq!(access.optional_globals.len(), 1);
+    /// assert_eq!(access.optional_globals[0].type_id, TypeId::of::<Approval>());
+    /// assert!(access.optional_globals[0].is_global);
+    /// ```
+    pub optional_globals: Vec<Access>,
 }
 
 impl PartialEq for SystemAccess {
@@ -159,6 +190,7 @@ impl PartialEq for SystemAccess {
         self.resources == other.resources
             && self.outputs == other.outputs
             && self.context_requirements == other.context_requirements
+            && self.optional_globals == other.optional_globals
     }
 }
 
@@ -216,6 +248,32 @@ impl SystemAccess {
         });
     }
 
+    /// Records an optional read of a global resource (`Option<Res<T>>`).
+    ///
+    /// The entry goes to [`optional_globals`](Self::optional_globals), not to
+    /// [`resources`](Self::resources), so it is never treated as a
+    /// requirement. A hand-written [`SystemParam`](super::SystemParam) that
+    /// reads a global through `Option<Res<T>>` calls this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_system::param::SystemAccess;
+    /// use polaris_system::resource::GlobalResource;
+    ///
+    /// struct Approval;
+    /// impl GlobalResource for Approval {}
+    ///
+    /// let mut access = SystemAccess::new();
+    /// access.add_optional_global::<Approval>();
+    ///
+    /// assert!(access.resources.is_empty());
+    /// assert_eq!(access.optional_globals.len(), 1);
+    /// ```
+    pub fn add_optional_global<T: GlobalResource>(&mut self) {
+        self.optional_globals.push(Access::read::<T>().global());
+    }
+
     /// Creates access for a read-only resource.
     #[must_use]
     pub fn with_read<T: 'static>(mut self) -> Self {
@@ -237,6 +295,17 @@ impl SystemAccess {
         self
     }
 
+    /// Creates access for an optional read of a global resource.
+    ///
+    /// The entry goes to [`optional_globals`](Self::optional_globals), not to
+    /// [`resources`](Self::resources). See
+    /// [`add_optional_global`](Self::add_optional_global).
+    #[must_use]
+    pub fn with_optional_global<T: GlobalResource>(mut self) -> Self {
+        self.add_optional_global::<T>();
+        self
+    }
+
     /// Adds a context requirement tag.
     pub fn require_context(&mut self, tag: &'static str) {
         if !self.context_requirements.contains(&tag) {
@@ -252,6 +321,8 @@ impl SystemAccess {
         self.outputs.extend(other.outputs.iter().cloned());
         self.bindable_outputs
             .extend(other.bindable_outputs.iter().copied());
+        self.optional_globals
+            .extend(other.optional_globals.iter().cloned());
         for &tag in &other.context_requirements {
             self.require_context(tag);
         }
@@ -329,7 +400,10 @@ impl SystemAccess {
     /// Returns `true` if this descriptor has no accesses.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.resources.is_empty() && self.outputs.is_empty() && self.context_requirements.is_empty()
+        self.resources.is_empty()
+            && self.outputs.is_empty()
+            && self.context_requirements.is_empty()
+            && self.optional_globals.is_empty()
     }
 }
 
@@ -405,6 +479,63 @@ mod tests {
 
         let merged = a.merged(&b);
         assert_eq!(merged.resources.len(), 2);
+    }
+
+    struct Approval;
+    impl GlobalResource for Approval {}
+
+    struct Limits;
+    impl GlobalResource for Limits {}
+
+    #[test]
+    fn with_optional_global_matches_add_optional_global() {
+        let built = SystemAccess::new().with_optional_global::<Approval>();
+        let mut added = SystemAccess::new();
+        added.add_optional_global::<Approval>();
+
+        assert_eq!(built, added);
+        assert!(built.resources.is_empty());
+        assert_eq!(built.optional_globals.len(), 1);
+        assert_eq!(
+            built.optional_globals[0],
+            Access::read::<Approval>().global()
+        );
+    }
+
+    #[test]
+    fn equality_distinguishes_optional_globals_alone() {
+        let empty = SystemAccess::new();
+        let approval = SystemAccess::new().with_optional_global::<Approval>();
+        let limits = SystemAccess::new().with_optional_global::<Limits>();
+
+        assert_ne!(approval, empty);
+        assert_ne!(approval, limits);
+        assert_eq!(
+            approval,
+            SystemAccess::new().with_optional_global::<Approval>()
+        );
+    }
+
+    #[test]
+    fn merge_keeps_optional_globals_from_both_sides() {
+        let a = SystemAccess::new().with_optional_global::<Approval>();
+        let b = SystemAccess::new().with_optional_global::<Limits>();
+
+        let merged = a.merged(&b);
+
+        let types: Vec<TypeId> = merged.optional_globals.iter().map(|g| g.type_id).collect();
+        assert_eq!(types, [TypeId::of::<Approval>(), TypeId::of::<Limits>()]);
+        assert!(merged.resources.is_empty());
+    }
+
+    #[test]
+    fn optional_globals_do_not_conflict_and_make_access_non_empty() {
+        let optional = SystemAccess::new().with_optional_global::<Approval>();
+        let writer = SystemAccess::new().with_write::<Approval>();
+
+        assert!(!optional.conflicts_with(&writer));
+        assert!(!writer.conflicts_with(&optional));
+        assert!(!optional.is_empty());
     }
 
     #[test]

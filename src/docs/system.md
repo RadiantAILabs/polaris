@@ -47,6 +47,7 @@ fallibility rides alongside it as
 | Type | Resolution | Access | Use for |
 |------|------------|--------|---------|
 | [`Res<T>`](crate::system::param::Res) | Hierarchy (local -> parent -> global) | Immutable | Config, registries, per-request input |
+| `Option<Res<T>>` | Server globals only; `None` when absent; never a pre-run requirement | Immutable | Optional capability |
 | [`ResMut<T>`](crate::system::param::ResMut) | Current context only | Exclusive | Accumulated state (history, counters) |
 | [`Out<T>`](crate::system::param::Out) | Previous system output | Immutable | System-to-system data handoff |
 | [`OutAll<T>`](crate::system::param::OutAll) | Current context outputs | Immutable | Collect same-typed outputs and their producer keys |
@@ -102,7 +103,7 @@ second inspection sink onto one already installed, live in the repository's
 
 | Scope | Registered via | Access | Lifetime | Mutation |
 |-------|---------------|--------|----------|----------|
-| [`GlobalResource`](crate::system::resource::GlobalResource) | `server.insert_global(T)` | `Res<T>` only | Server lifetime | Compile-time rejected |
+| [`GlobalResource`](crate::system::resource::GlobalResource) | `server.insert_global(T)` | `Res<T>` or `Option<Res<T>>` | Server lifetime | Compile-time rejected |
 | [`LocalResource`](crate::system::resource::LocalResource) | `server.register_local(\|\| T)` | `Res<T>` or `ResMut<T>` | Per-context | Allowed via `ResMut<T>` |
 
 # Plugins

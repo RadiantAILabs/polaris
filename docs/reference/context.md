@@ -53,6 +53,8 @@ When a system declares `Res<T>`, the context searches:
 
 `ResMut<T>` skips the hierarchy entirely — it only accesses resources in the current scope. This is enforced at compile time: `ResMut<T>` requires `T: LocalResource`.
 
+`Option<Res<T>>` reads **global resources only** and returns `None` when the server has no `T`. It skips the local scope and the parent chain, even when `T` also implements `LocalResource`. This is enforced at compile time: `Option<Res<T>>` requires `T: GlobalResource`.
+
 ```rust
 // Res<T>: walks hierarchy (local → parent → globals)
 pub fn get_resource<R: Resource>(&self) -> Result<ResourceRef<R>, ParamError> {
@@ -159,7 +161,7 @@ Neither hazard is bounded by the framework: nothing checks chain depth, deduplic
 | Property | `GlobalResource` | `LocalResource` |
 |----------|-------------------|-----------------|
 | Registered via | `server.insert_global(T)` | `server.register_local(\|\| T)` |
-| Access | `Res<T>` (read-only) | `Res<T>` or `ResMut<T>` |
+| Access | `Res<T>` or `Option<Res<T>>` (read-only) | `Res<T>` or `ResMut<T>` |
 | Lifetime | Server lifetime | Per-context (fresh from factory) |
 | Storage | `Arc<Resources>` (shared) | `Resources` (owned per context) |
 | Mutation | Compile-time rejected | Allowed via `ResMut<T>` |
@@ -414,6 +416,7 @@ Before execution, `GraphExecutor::validate_resources()` checks that all resource
 
 - `Res<T>` — checked against the full hierarchy (local + parents + globals)
 - `ResMut<T>` — checked against local scope only
+- `Option<Res<T>>` — never checked: absence is allowed. The read is kept in `SystemAccess::optional_globals`, outside the required `resources` list
 - Hook-provided resources (`OnGraphStart`, `OnSystemStart`) are considered available
 - `Out<T>` — validated along the linear (sequential) chain. Each system's declared output dependencies are checked against outputs produced by preceding nodes plus outputs already present in the context (callers may seed via `insert_output`), and each loop's termination predicate input is checked the same way (the predicate is evaluated before the first iteration, so the loop body cannot satisfy it). Hook-provided resource types never count: provider hooks insert resources, while `Out<T>`, predicates, and dynamic `requires_outputs` read the separate output channel. The pre-flight/run-start model is optimistic: Decision, Switch, Loop, and Parallel contribute every output type their subgraphs may deposit, including outputs behind nested Scope boundaries, handler paths, and Dynamic contracts. A non-`shared()` Scope carrying a declared contract is the one narrower case: it contributes exactly the contract's `produces`, not the full interior, because that is all the runtime merge-back filter actually lets through — crediting more here would pass this check for a read the boundary then drops. This is wider than pessimistic composition signatures, which credit only what every execution deposits — a preceding system, a parallel node, a scope, or the intersection of every decision/switch arm. Production in only some decision/switch arms, a loop body, or a dynamic candidate remains conditional. Shared-boundary embedded graphs (scope graphs, inline dynamic candidates) are validated recursively against the outputs available at their chain position; non-shared ones against an empty output set, since outputs never cross a non-shared boundary inward. Conditional and parallel branch interiors are not individually validated because their execution paths are dynamic.
 - Scope nodes are validated recursively with synthetic child contexts matching runtime behavior
@@ -422,13 +425,23 @@ Before execution, `GraphExecutor::validate_resources()` checks that all resource
 executor.validate_resources(&graph, &ctx, Some(&hooks))?;
 ```
 
-This pass is run-start analysis performed ahead of time, and it credits no more than the executor's mandatory run-start checks do — a graph that passes `validate_resources` is never refused at run start by the same analysis. See [Graph — Verification Phases](graph.md#verification-phases) for the phase rules that bind it.
+Because `validate_resources` ignores optional reads, a plugin someone forgot to register would pass silently. `GraphExecutor::absent_optional_globals(&graph, &ctx)` lists every `Option<Res<T>>` read that will be `None` for the context, as `AbsentOptionalGlobal` entries (node, system name, resource type). It never fails: log it at startup or reject it in a strict mode of your own. Globals cannot change once a context exists, so each entry is certain. Entries name the plugins and types the server is missing, so show them to operators, and keep them behind authentication if you expose them over HTTP. The report walks the same nodes as `validate_resources`, except candidates of a registry-backed dynamic node, which are unknown before the run.
+
+```rust
+for absent in executor.absent_optional_globals(&graph, &ctx) {
+    tracing::info!("{absent}");
+}
+```
+
+An empty report does not prove absence for a graph whose scopes or inline dynamic candidates nest deeper than `max_recursion_depth`. The report never fails, so past that depth it stops walking and returns what it found so far. Such a graph fails with `ExecutionError::RecursionLimitExceeded` if the run reaches the over-deep level, and `validate_resources` reports it as `ValidationDepthExceeded`. If you rely on an empty report, run `validate_resources` first.
+
+`validate_resources` is run-start analysis performed ahead of time, and it credits no more than the executor's mandatory run-start checks do — a graph that passes it is never refused at run start by the same analysis. `absent_optional_globals` is advisory and rejects nothing, so it cannot contradict a run-start check. See [Graph — Verification Phases](graph.md#verification-phases) for the phase rules that bind both.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `polaris_system/src/param/mod.rs` | `SystemContext` struct, `Res<T>`, `ResMut<T>`, `Out<T>`, `OutAll<T>`, `ErrOut<T>` |
+| `polaris_system/src/param/mod.rs` | `SystemContext` struct, `Res<T>`, `Option<Res<T>>`, `ResMut<T>`, `Out<T>`, `OutAll<T>`, `ErrOut<T>` |
 | `polaris_system/src/resource/resource.rs` | `Resources` container, `GlobalResource`, `LocalResource`, RAII guards |
 | `polaris_system/src/resource/output.rs` | `Outputs` container, output merging |
 | `polaris_system/src/server.rs` | `Server::create_context()`, `ContextFactory`, deferred binding |
