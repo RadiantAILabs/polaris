@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-06
+
+### Added
+
+- **Per-call executors for one-shot and scoped sessions: `SessionsAPI::run_oneshot_with_executor`, `SessionsAPI::scoped_session_with_executor`** (`polaris_sessions`) — run one call on its own `GraphExecutor`, for example to cap loop iterations for that call only. `scoped_session_with_executor` gives the full `ExecutionResult` and context access before the session is deleted. `run_oneshot` and `scoped_session` keep their signatures and use a default executor. See [Sessions — One-Shot Execution](docs/reference/sessions.md#one-shot-execution).
+
+- **`SessionGuard::delete`** (`polaris_sessions`) — deletes the guarded session now and waits for the store deletion, returning any store error; the guard's drop cleanup then does nothing.
+
+### Fixed
+
+- **One-shot calls no longer leave a live session when their future is dropped** (`polaris_sessions`) — `run_oneshot` and `run_oneshot_preserved` deleted their session only after the turn returned, so a call cut off mid-turn (a losing `select!` arm, a timeout, or a sibling branch failing in a parallel graph node) left its session in the live set until the server exited. Both now hold a `SessionGuard` for the turn. `SessionGuard`'s drop also removes the live entry synchronously, so cleanup no longer depends on a tokio runtime being available; the stored copy is still deleted on a spawned task.
+
 ## [0.8.0] - 2026-11-03
 
 ### Added

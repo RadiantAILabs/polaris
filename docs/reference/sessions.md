@@ -220,11 +220,24 @@ let output: NormalizedResult = sessions
 
 The setup closure runs before the first (and only) turn — use it to inject per-request resources via `ctx.insert()`. The type parameter `T` is the output type of the agent's terminal system, extracted from `ExecutionResult::output::<T>()` internally. If the graph completes but doesn't produce `T`, `SessionError::OutputNotFound` is returned.
 
-Session cleanup is guaranteed in all exit paths (success and error). The ephemeral session is never persisted to the backing store.
+Session cleanup is guaranteed in all exit paths: success, error, and a future that is dropped before it completes (a losing `select!` arm, a timeout, or a sibling branch failing in a parallel graph node). The ephemeral session is never persisted to the backing store.
+
+To run the call on its own `GraphExecutor` — for example to cap loop iterations for this call only — use `run_oneshot_with_executor`. A turn that reaches the cap returns `SessionError::Execution(ExecutionError::MaxIterationsExceeded { .. })`:
+
+```rust
+let executor = GraphExecutor::new().with_default_max_iterations(20);
+let output: NormalizedResult = sessions
+    .run_oneshot_with_executor(&agent_type, executor, |ctx| {
+        ctx.insert(InputPayload { /* ... */ });
+    })
+    .await?;
+```
+
+When one call needs more than the terminal output — the full `ExecutionResult`, or resources read from the context after the turn — use [`scoped_session_with_executor`](#scoped-sessions-raii-guard) instead.
 
 #### Manual pattern
 
-For cases that need a custom `GraphExecutor` or fine-grained control, compose the primitives directly. Note that `ExecutionResult` now carries the terminal output — use `result.output::<T>()` to extract it:
+For cases that need fine-grained control, compose the primitives directly. Note that `ExecutionResult` now carries the terminal output — use `result.output::<T>()` to extract it:
 
 ```rust
 let session_id = SessionId::default();
@@ -304,7 +317,20 @@ let state = guard.with_context(|ctx| {
 // Session is automatically deleted when `guard` drops
 ```
 
-The guard delegates `process_turn`, `process_turn_with`, and `with_context` to the inner `SessionsAPI`. Cleanup is asynchronous via `tokio::spawn` — the `Drop` impl schedules deletion rather than blocking.
+The guard delegates `process_turn`, `process_turn_with`, and `with_context` to the inner `SessionsAPI`. On drop, the session leaves the live set at once — even when the guard is dropped mid-turn or outside a tokio runtime — and the stored copy is deleted on a spawned task (outside a runtime, the stored copy is left in place). To wait for that deletion and see a store error, call `guard.delete().await` instead of dropping the guard.
+
+`scoped_session_with_executor` takes a `GraphExecutor` that every turn of the session uses:
+
+```rust
+let executor = GraphExecutor::new().with_default_max_iterations(20);
+let guard = sessions.scoped_session_with_executor(&agent_type, executor, |ctx| {
+    ctx.insert(AgentConfig::new("claude-sonnet-4-6"));
+})?;
+
+let result = guard.process_turn().await?; // full ExecutionResult
+let usage = guard.with_context(|ctx| ctx.get_resource::<Usage>().unwrap().clone()).await?;
+guard.delete().await?;
+```
 
 Use `scoped_session` when you need multi-step control (multiple turns, context inspection between turns) with cleanup guarantees. For single-turn request→response, prefer `run_oneshot` which is simpler.
 

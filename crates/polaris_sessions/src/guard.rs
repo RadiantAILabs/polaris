@@ -8,8 +8,16 @@ use polaris_system::param::SystemContext;
 
 /// RAII guard that deletes its session on drop.
 ///
-/// Use [`SessionsAPI::scoped_session`] to create a guard. When the guard
-/// is dropped, the session is deleted asynchronously via [`tokio::spawn`].
+/// Use [`SessionsAPI::scoped_session`] or
+/// [`SessionsAPI::scoped_session_with_executor`] to create a guard. When the
+/// guard is dropped, the session is removed from the live set at once, and its
+/// stored copy is deleted asynchronously via [`tokio::spawn`]. Removal from the
+/// live set happens even when the guard is dropped mid-turn — for example when
+/// the future holding it is cancelled — or outside a tokio runtime. Outside a
+/// runtime the stored copy is not deleted.
+///
+/// Call [`delete`](Self::delete) instead of dropping when the caller needs to
+/// wait for the stored copy to be deleted and see any store error.
 ///
 /// # Example
 ///
@@ -38,6 +46,9 @@ use polaris_system::param::SystemContext;
 pub struct SessionGuard {
     sessions: SessionsAPI,
     id: SessionId,
+    /// `false` once the session has been deleted or handed back to the
+    /// caller; the `Drop` impl then does nothing.
+    armed: bool,
 }
 
 impl std::fmt::Debug for SessionGuard {
@@ -51,7 +62,37 @@ impl std::fmt::Debug for SessionGuard {
 impl SessionGuard {
     /// Creates a new guard. Called by [`SessionsAPI::scoped_session`].
     pub(crate) fn new(sessions: SessionsAPI, id: SessionId) -> Self {
-        Self { sessions, id }
+        Self {
+            sessions,
+            id,
+            armed: true,
+        }
+    }
+
+    /// Releases the session without deleting it and returns its ID.
+    ///
+    /// Used by [`SessionsAPI::run_oneshot_preserved`] to keep a finished
+    /// session alive.
+    pub(crate) fn keep(mut self) -> SessionId {
+        self.armed = false;
+        self.id.clone()
+    }
+
+    /// Deletes the session now and waits for the store deletion to finish.
+    ///
+    /// Equivalent to [`SessionsAPI::delete_session`] on this guard's ID. The
+    /// guard is consumed, so the `Drop` cleanup does not run a second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if deleting the stored copy fails. The session
+    /// is removed from the live set either way.
+    pub async fn delete(mut self) -> Result<(), SessionError> {
+        let result = self.sessions.delete_session(&self.id).await;
+        // Disarm only once the deletion finished, so a cancelled `delete`
+        // still falls back to the `Drop` cleanup.
+        self.armed = false;
+        result
     }
 
     /// Returns the session ID managed by this guard.
@@ -102,7 +143,15 @@ impl SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Remove the live entry synchronously, so the session is gone as
+        // soon as the guard is, even if no runtime is available to run the
+        // store deletion below.
+        self.sessions.remove_live(&self.id);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(session = %self.id, "no tokio runtime; stored copy not deleted");
             return;
         };
         let sessions = self.sessions.clone();
