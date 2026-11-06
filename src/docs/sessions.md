@@ -120,8 +120,11 @@ let output: String = sessions
 # }
 ```
 
-Session cleanup is guaranteed in all exit paths. The ephemeral session is
-never persisted.
+Session cleanup is guaranteed in all exit paths, including a future that
+is dropped before it completes. The ephemeral session is never persisted.
+Use [`run_oneshot_with_executor`](crate::sessions::SessionsAPI::run_oneshot_with_executor)
+to run the call on its own [`GraphExecutor`](crate::graph::GraphExecutor),
+for example to cap loop iterations.
 
 ## Scoped Sessions (RAII Guard)
 
@@ -142,6 +145,11 @@ guard.process_turn_with(|ctx| {
 # Ok(())
 # }
 ```
+
+[`scoped_session_with_executor`](crate::sessions::SessionsAPI::scoped_session_with_executor)
+does the same with a custom [`GraphExecutor`](crate::graph::GraphExecutor).
+Call [`SessionGuard::delete`](crate::sessions::SessionGuard::delete) to wait
+for the deletion instead of dropping the guard.
 
 ## Per-Request Input Injection
 

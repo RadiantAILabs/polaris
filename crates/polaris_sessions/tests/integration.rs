@@ -380,10 +380,8 @@ async fn scoped_session_cleans_up_on_drop() {
         guard.id().clone()
     };
 
-    // The guard spawns deletion onto the tokio runtime — yield until it has
-    // run rather than sleeping a fixed duration. `yield_now` lets the
-    // spawned task make progress; bound the wait to fail loudly if the
-    // cleanup task never runs instead of hanging the test suite.
+    // The guard removes the live entry synchronously on drop; the bounded
+    // wait only makes a regression fail loudly instead of hanging.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while sessions.list_live_sessions().contains(&id) {
         assert!(

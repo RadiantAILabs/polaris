@@ -2352,14 +2352,27 @@ impl SessionsAPI {
     /// # }
     /// ```
     pub async fn delete_session(&self, id: &SessionId) -> Result<(), SessionError> {
-        let removed = self.inner.sessions.write().remove(id).is_some();
+        self.remove_live(id);
+        self.inner.store.delete(id).await
+    }
+
+    /// Removes the session from the live set without touching the store.
+    ///
+    /// Synchronous, so a [`SessionGuard`] can call it from `Drop`. Returns
+    /// whether a live session was removed.
+    pub(crate) fn remove_live(&self, id: &SessionId) -> bool {
+        // Drop the removed state only after the write lock is released: its
+        // resources may hold another `SessionGuard`, whose `Drop` takes this lock.
+        let state = self.inner.sessions.write().remove(id);
+        let removed = state.is_some();
+        drop(state);
         if removed {
             // Record the terminal transition before forgetting the
             // session so any in-flight uptime query sees the final state.
             self.inner.uptime.record(id, LifecycleKind::Terminated);
             self.inner.uptime.forget(id);
         }
-        self.inner.store.delete(id).await
+        removed
     }
 
     /// Lists all session IDs known to the backing store.
@@ -2527,9 +2540,49 @@ impl SessionsAPI {
         agent_type: &AgentTypeId,
         setup: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<SessionGuard, SessionError> {
+        self.scoped_session_with_executor(agent_type, GraphExecutor::new(), setup)
+    }
+
+    /// Creates a scoped session that runs its turns with a custom
+    /// [`GraphExecutor`].
+    ///
+    /// Same as [`scoped_session`](Self::scoped_session), but every turn of
+    /// the session uses `executor`, for example to cap loop iterations per
+    /// call. Use it when one turn needs more than
+    /// [`run_oneshot_with_executor`](Self::run_oneshot_with_executor) gives:
+    /// the full [`ExecutionResult`] from [`SessionGuard::process_turn`], or
+    /// resources read from the context with [`SessionGuard::with_context`]
+    /// before the session is deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::AgentNotFound`] if the agent type has not
+    /// been registered, or [`SessionError::Setup`] if agent setup fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, AgentTypeId};
+    /// # use polaris_graph::GraphExecutor;
+    /// # async fn example(sessions: &SessionsAPI) -> Result<(), Box<dyn std::error::Error>> {
+    /// let agent_type = AgentTypeId::from_name("MyAgent");
+    /// let executor = GraphExecutor::new().with_default_max_iterations(20);
+    /// let guard = sessions.scoped_session_with_executor(&agent_type, executor, |_| {})?;
+    /// let result = guard.process_turn().await?;
+    /// # let _ = result;
+    /// guard.delete().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scoped_session_with_executor(
+        &self,
+        agent_type: &AgentTypeId,
+        executor: GraphExecutor,
+        setup: impl FnOnce(&mut SystemContext<'static>),
+    ) -> Result<SessionGuard, SessionError> {
         let id = SessionId::default();
         let ctx = self.create_context();
-        self.create_session_with(ctx, &id, agent_type, setup)?;
+        self.create_session_with_executor(ctx, &id, agent_type, executor, setup)?;
         Ok(SessionGuard::new(self.clone(), id))
     }
 
@@ -2542,7 +2595,11 @@ impl SessionsAPI {
     /// This is the convenience method for the common "request → response"
     /// pattern: create a transient session, execute one turn, extract the
     /// output, and clean up. Session cleanup is guaranteed in all exit
-    /// paths (success or execution error).
+    /// paths: success, execution error, and a returned future that is
+    /// dropped before it completes.
+    ///
+    /// To cap loop iterations for this call, use
+    /// [`run_oneshot_with_executor`](Self::run_oneshot_with_executor).
     ///
     /// # Type Parameters
     ///
@@ -2580,15 +2637,56 @@ impl SessionsAPI {
         agent_type: &AgentTypeId,
         setup: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<T, SessionError> {
-        let id = SessionId::default();
-        let ctx = self.create_context();
+        self.run_oneshot_with_executor(agent_type, GraphExecutor::new(), setup)
+            .await
+    }
+
+    /// Executes a one-shot agent turn with a custom [`GraphExecutor`] and
+    /// returns the typed output.
+    ///
+    /// Same as [`run_oneshot`](Self::run_oneshot), but the turn runs on
+    /// `executor`, for example to cap loop iterations for this call only. A
+    /// turn that reaches the cap returns [`SessionError::Execution`].
+    ///
+    /// Cleanup is guaranteed in every exit path, including when the returned
+    /// future is dropped before it completes (a losing `select!` arm, a
+    /// timeout, or a failing sibling branch of a parallel graph node): the
+    /// session is removed from the live set at once.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`run_oneshot`](Self::run_oneshot).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polaris_sessions::{SessionsAPI, AgentTypeId};
+    /// # use polaris_graph::GraphExecutor;
+    /// # #[derive(Clone)] struct MyOutput;
+    /// # async fn example(sessions: &SessionsAPI) -> Result<(), Box<dyn std::error::Error>> {
+    /// let agent_type = AgentTypeId::from_name("MyAgent");
+    /// let executor = GraphExecutor::new().with_default_max_iterations(20);
+    /// let output: MyOutput = sessions
+    ///     .run_oneshot_with_executor(&agent_type, executor, |_| {})
+    ///     .await?;
+    /// # let _ = output;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_oneshot_with_executor<T: Output + Clone>(
+        &self,
+        agent_type: &AgentTypeId,
+        executor: GraphExecutor,
+        setup: impl FnOnce(&mut SystemContext<'static>),
+    ) -> Result<T, SessionError> {
         // If session creation fails, no session exists — propagate immediately.
-        self.create_session_with(ctx, &id, agent_type, setup)?;
+        // From here on the guard removes the session if this future is dropped.
+        let guard = self.scoped_session_with_executor(agent_type, executor, setup)?;
 
         // Execute turn and extract output. Capture the result so we can
         // guarantee cleanup before propagating errors.
         let result = async {
-            let exec_result = self.process_turn(&id).await?;
+            let exec_result = guard.process_turn().await?;
 
             let output = exec_result
                 .output::<T>()
@@ -2600,7 +2698,7 @@ impl SessionsAPI {
         .await;
 
         // Always clean up the ephemeral session.
-        let _ = self.delete_session(&id).await;
+        let _ = guard.delete().await;
 
         result
     }
@@ -2623,7 +2721,8 @@ impl SessionsAPI {
     /// [`delete_session`](Self::delete_session). Any method that mutates
     /// session state returns [`SessionError::ReadOnly`].
     ///
-    /// On execution failure, the session is deleted (matching
+    /// On execution failure, or when the returned future is dropped before
+    /// it completes, the session is deleted (matching
     /// [`run_oneshot`](Self::run_oneshot) cleanup semantics — there is no useful read-only
     /// state to preserve).
     ///
@@ -2659,12 +2758,11 @@ impl SessionsAPI {
         agent_type: &AgentTypeId,
         setup: impl FnOnce(&mut SystemContext<'static>),
     ) -> Result<(SessionId, T), SessionError> {
-        let id = SessionId::default();
-        let ctx = self.create_context();
-        self.create_session_with(ctx, &id, agent_type, setup)?;
+        // The guard removes the session if this future is dropped mid-turn.
+        let guard = self.scoped_session(agent_type, setup)?;
 
         let outcome = async {
-            let exec_result = self.process_turn(&id).await?;
+            let exec_result = guard.process_turn().await?;
             exec_result
                 .output::<T>()
                 .cloned()
@@ -2674,6 +2772,7 @@ impl SessionsAPI {
 
         match outcome {
             Ok(output) => {
+                let id = guard.keep();
                 // Flip the session to read-only. Subsequent mutation
                 // attempts return SessionError::ReadOnly.
                 if let Ok(state) = self.get_state(&id) {
@@ -2683,7 +2782,7 @@ impl SessionsAPI {
             }
             Err(err) => {
                 // Match run_oneshot cleanup semantics on failure.
-                let _ = self.delete_session(&id).await;
+                let _ = guard.delete().await;
                 Err(err)
             }
         }
