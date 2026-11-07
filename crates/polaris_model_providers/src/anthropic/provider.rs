@@ -501,13 +501,16 @@ fn convert_request(
 /// to switch reasoning off or to ask for less than `low` through effort, and
 /// it rejects any other value, so those requests fail here instead of being
 /// sent at a different effort than the caller asked for.
+///
+/// The level's text decides, so `Other("low")` is accepted like `Low` and
+/// `Other("none")` is rejected like `None`.
 fn convert_reasoning_effort(effort: &ReasoningEffort) -> Result<&'static str, GenerationError> {
-    match effort {
-        ReasoningEffort::Low => Ok("low"),
-        ReasoningEffort::Medium => Ok("medium"),
-        ReasoningEffort::High => Ok("high"),
-        ReasoningEffort::XHigh => Ok("xhigh"),
-        ReasoningEffort::Max => Ok("max"),
+    match effort.as_str() {
+        "low" => Ok("low"),
+        "medium" => Ok("medium"),
+        "high" => Ok("high"),
+        "xhigh" => Ok("xhigh"),
+        "max" => Ok("max"),
         other => Err(GenerationError::UnsupportedOperation(format!(
             "the Anthropic provider cannot send reasoning effort `{other}`; \
              it accepts low, medium, high, xhigh and max"
@@ -1220,8 +1223,20 @@ mod tests {
         assert!(json.get("output_config").is_none(), "{json}");
     }
 
+    /// The `anthropic-beta` header the client would send for `request`.
+    fn beta_header(request: &LlmRequest) -> Option<String> {
+        let wire = AnthropicProvider::new("test-key")
+            .build_request("claude-sonnet-4-6", request)
+            .unwrap();
+        AnthropicClient::new("test-key")
+            .build_headers(&wire)
+            .unwrap()
+            .get("anthropic-beta")
+            .map(|value| value.to_str().unwrap().to_owned())
+    }
+
     #[test]
-    fn effort_does_not_change_the_structured_output_or_strict_tool_beta() {
+    fn effort_alone_sends_no_structured_output_beta() {
         // Effort is generally available: it needs no beta header, so it must
         // not switch the structured-outputs beta on by itself.
         let request = request_with_effort(Some(ReasoningEffort::High));
@@ -1230,6 +1245,54 @@ mod tests {
             .unwrap();
         assert!(wire.output_format.is_none());
         assert!(wire.output_config.is_some());
+        assert_eq!(beta_header(&request), None);
+    }
+
+    #[test]
+    fn effort_with_structured_output_keeps_the_structured_output_beta() {
+        let request = LlmRequest {
+            output_schema: Some(serde_json::json!({"type": "object", "properties": {}})),
+            ..request_with_effort(Some(ReasoningEffort::High))
+        };
+        assert_eq!(
+            beta_header(&request).as_deref(),
+            Some("structured-outputs-2025-11-13")
+        );
+    }
+
+    #[test]
+    fn effort_with_strict_tools_keeps_the_structured_output_beta() {
+        // `ToolDefinition::new` makes the tool strict.
+        let request = LlmRequest {
+            tools: Some(vec![tool_def("lookup")]),
+            ..request_with_effort(Some(ReasoningEffort::High))
+        };
+        assert_eq!(
+            beta_header(&request).as_deref(),
+            Some("structured-outputs-2025-11-13")
+        );
+    }
+
+    #[test]
+    fn other_effort_is_accepted_or_rejected_by_its_text() {
+        // `Other("low")` is the same level as `Low` for Anthropic.
+        let json = request_json(&request_with_effort(Some(ReasoningEffort::Other(
+            "low".to_owned(),
+        ))));
+        assert_eq!(json["output_config"], serde_json::json!({"effort": "low"}));
+
+        // `Other("none")` is rejected like `None`.
+        let error = AnthropicProvider::new("test-key")
+            .build_request(
+                "claude-sonnet-4-6",
+                &request_with_effort(Some(ReasoningEffort::Other("none".to_owned()))),
+            )
+            .expect_err("`none` is not an Anthropic effort");
+        assert!(
+            matches!(&error, GenerationError::UnsupportedOperation(message)
+                if message.contains("`none`")),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

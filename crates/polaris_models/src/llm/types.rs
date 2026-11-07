@@ -40,10 +40,13 @@ pub struct LlmRequest {
     pub max_output_tokens: Option<NonZeroU32>,
     /// How much effort the model should spend reasoning, when supported.
     ///
-    /// `None` leaves the provider's and the model's own default in place. A
+    /// `None` leaves the provider's and the model's own default in place, while
+    /// `Some(ReasoningEffort::None)` asks the model to turn reasoning off. A
     /// provider that cannot honour a requested effort fails the request with
     /// [`GenerationError::UnsupportedOperation`](super::GenerationError::UnsupportedOperation)
-    /// before sending anything; it never ignores the setting silently. See
+    /// before sending anything; Polaris never drops the setting silently, but a
+    /// server may still ignore a level it does not know. Check
+    /// [`Usage::reasoning_output_tokens`] when that matters. See
     /// [`ReasoningEffort`] for the levels and how each provider maps them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -190,7 +193,17 @@ pub enum ReasoningEffort {
     /// The most reasoning a model offers.
     Max,
     /// A level this enum does not name, sent as written to providers that take
-    /// free-form levels. Providers with a fixed list of levels reject it.
+    /// free-form levels.
+    ///
+    /// Use it for names that are not one of the named levels. Providers decide
+    /// by the level's text, so `Other("low")` is sent like [`Low`](Self::Low)
+    /// and `Other("none")` is rejected like [`None`](Self::None) where a
+    /// provider has a fixed list of levels. Serializing `Other` with empty or
+    /// whitespace-only text is an error.
+    ///
+    /// `Other("high")` sends the same text as [`High`](Self::High) but does not
+    /// compare equal to it, and reading the text back always gives the named
+    /// variant.
     Other(String),
 }
 
@@ -248,6 +261,11 @@ impl core::str::FromStr for ReasoningEffort {
 
 impl Serialize for ReasoningEffort {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.as_str().trim().is_empty() {
+            return Err(serde::ser::Error::custom(
+                "a reasoning effort cannot be empty",
+            ));
+        }
         serializer.serialize_str(self.as_str())
     }
 }
@@ -1350,6 +1368,33 @@ mod tests {
         assert_eq!(read, ReasoningEffort::High);
         assert!(serde_json::from_value::<ReasoningEffort>(serde_json::json!("")).is_err());
         assert!(serde_json::from_value::<ReasoningEffort>(serde_json::json!(3)).is_err());
+    }
+
+    #[test]
+    fn serializing_an_empty_other_effort_is_an_error() {
+        for text in ["", " ", " \t\n"] {
+            let effort = ReasoningEffort::Other(text.to_owned());
+            assert!(serde_json::to_value(&effort).is_err(), "{text:?}");
+            let request = LlmRequest {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            };
+            assert!(serde_json::to_value(&request).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn other_with_a_named_level_text_sends_that_text_but_reads_back_as_the_named_level() {
+        let other = ReasoningEffort::Other("high".to_owned());
+        assert_ne!(other, ReasoningEffort::High);
+        assert_eq!(other.as_str(), ReasoningEffort::High.as_str());
+        assert_eq!(
+            serde_json::to_value(&other).unwrap(),
+            serde_json::to_value(ReasoningEffort::High).unwrap()
+        );
+        let read: ReasoningEffort =
+            serde_json::from_value(serde_json::to_value(&other).unwrap()).unwrap();
+        assert_eq!(read, ReasoningEffort::High);
     }
 
     #[test]
