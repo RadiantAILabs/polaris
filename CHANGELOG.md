@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Chat Completions provider: `ChatCompletionsPlugin`, `ChatCompletionsProvider`, `MaxTokensField`, `ReasoningReplay`** (`polaris_model_providers`, new feature `chat-completions`, which adds no dependency) — reaches any server that implements `POST {base_url}/chat/completions`: the Hugging Face inference router, vLLM, SGLang, Ollama, DeepInfra, Z.ai, DeepSeek, OpenAI. Models are `chat_completions/<model>` with the model string sent as written, so `chat_completions/zai-org/GLM-5.3-Flash:zai` works. It supports streaming and non-streaming generation; sends tools, tool choice, tool results, images and structured output; reads reasoning from `reasoning_content` or `reasoning` as reasoning blocks and sends it back on assistant messages (`ReasoningReplay`); reports input, output, cached and reasoning tokens; maps `length` to `StopReason::MaxOutputTokens`; and reads responses leniently, so a server that leaves out tool call ids, usage, `finish_reason` or `[DONE]` still works. `with_base_url`, `with_extra_body`, `with_max_tokens_field`, `with_strict_tools` and the pricing methods configure it. It is a separate plugin from `OpenAiPlugin` (Responses API) so both can be registered. See [Model Providers — Chat Completions servers](docs/reference/model-providers.md#chat-completions-servers).
+
+- **Provider-neutral reasoning effort: `ReasoningEffort`, `LlmRequest::reasoning_effort`, `LlmRequestBuilder::reasoning_effort`** (`polaris_models`) — ask for a reasoning level on any provider with `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max` or `Other(String)`. Chat Completions sends `reasoning_effort`; OpenAI Responses and Bedrock `openai.*` models send `reasoning.effort`; Anthropic sends `output_config.effort` for `Low` to `Max`. A provider that cannot send the requested level returns `GenerationError::UnsupportedOperation` before it sends anything, so a request never runs at a different effort silently: Anthropic for `None`, `Minimal` and `Other`, and Bedrock Converse for every level (keep using `with_additional_model_request_fields` there). `ReasoningEffort` converts to and from its lower-case name (`Display`, `FromStr`, serde). See [Model Providers — Reasoning effort](docs/reference/model-providers.md#reasoning-effort).
+
+### Changed
+
+- **Source-breaking: `LlmRequest` gains the public `reasoning_effort` field** (`polaris_models`) — because `LlmRequest` is not `#[non_exhaustive]`, downstream struct literals that list every field must now include the optional `ReasoningEffort`. **Migration:** add `reasoning_effort: None`, use `..Default::default()`, or construct requests with `LlmRequestBuilder`. A serialized request without the field still deserializes.
+
+- **The OpenAI Responses provider builds its request as JSON** (`polaris_model_providers`) — the body is the same as before, except that `reasoning.effort` can now carry `max` and other levels that `async_openai`'s effort type lacks.
+
 ## [0.8.2] - 2026-11-07
 
 ### Added

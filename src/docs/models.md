@@ -13,6 +13,7 @@ Systems                              Res<ModelRegistry>
 ModelRegistry (GlobalResource)       indexed by provider name
   +-- "anthropic" -> AnthropicProvider
   +-- "openai"    -> OpenAiProvider
+  +-- "chat_completions" -> ChatCompletionsProvider
   +-- "bedrock"   -> BedrockProvider
                 |
                 v  LlmProvider::generate(model, request)
@@ -119,6 +120,7 @@ impl LlmProvider for MyProvider {
 |----------|-------------|--------------------|----------------|
 | Anthropic Claude | `anthropic` | [`anthropic`](crate::models::anthropic), [`AnthropicPlugin`](crate::models::AnthropicPlugin) | Registers the `anthropic/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
 | `OpenAI` | `openai` | [`openai`](crate::models::openai), [`OpenAiPlugin`](crate::models::OpenAiPlugin) | Registers the `openai/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
+| Chat Completions servers | `chat-completions` | [`chat_completions`](crate::models::chat_completions), [`ChatCompletionsPlugin`](crate::models::ChatCompletionsPlugin) | Registers the `chat_completions/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
 | AWS Bedrock | `bedrock` (also enables `openai`) | [`bedrock`](crate::models::bedrock), [`BedrockPlugin`](crate::models::BedrockPlugin) | Registers the `bedrock/...` provider family in [`ModelRegistry`](crate::models::ModelRegistry) |
 
 # Feature-Gated Tokenization

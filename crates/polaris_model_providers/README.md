@@ -7,7 +7,8 @@ LLM provider plugins for Polaris.
 | Provider | Plugin | Feature Flag | Model ID Format |
 |----------|--------|--------------|-----------------|
 | Anthropic | `AnthropicPlugin` | `anthropic` (default) | `anthropic/*` |
-| OpenAI | `OpenAiPlugin` | `openai` | `openai/*` |
+| OpenAI (Responses API) | `OpenAiPlugin` | `openai` | `openai/*` |
+| Chat Completions servers (Hugging Face router, vLLM, Ollama, DeepInfra, Z.ai, DeepSeek, OpenAI) | `ChatCompletionsPlugin` | `chat-completions` | `chat_completions/<model string as the server expects it>` |
 | AWS Bedrock | `BedrockPlugin` | `bedrock` (also enables `openai`) | `bedrock/*` |
 
 ## Feature Flags
@@ -65,6 +66,33 @@ server.add_plugins(BedrockPlugin::from_env());
 instead of Converse. `BedrockPlugin` passes the AWS SDK config that path needs.
 Use `with_max_tokens` for the output ceiling (default 4096) and
 `with_additional_model_request_fields` for model-specific fields.
+
+For a server that speaks the OpenAI Chat Completions API (the `chat-completions`
+feature adds no dependency), give the server's base URL:
+
+```rust
+use polaris_model_providers::ChatCompletionsPlugin;
+use polaris_models::ModelsPlugin;
+use polaris_system::server::Server;
+
+let mut server = Server::new();
+server.add_plugins(ModelsPlugin);
+server.add_plugins(
+    ChatCompletionsPlugin::from_env("HF_TOKEN")
+        .with_base_url("https://router.huggingface.co/v1"),
+);
+// registry.llm("chat_completions/zai-org/GLM-5.3-Flash:zai")
+```
+
+## Reasoning effort
+
+`LlmRequest::reasoning_effort` (set with `LlmRequestBuilder::reasoning_effort`)
+asks for a reasoning level on any provider. Chat Completions, OpenAI Responses
+and Bedrock `openai.*` models send it as written, Anthropic sends it as
+`output_config.effort` (`low` to `max`), and Bedrock Converse does not support
+it. A provider that cannot send the requested level returns
+`GenerationError::UnsupportedOperation` before sending anything. See
+`docs/reference/model-providers.md` (Reasoning effort).
 
 ## Pricing
 

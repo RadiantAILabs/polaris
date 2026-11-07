@@ -241,6 +241,7 @@
 //! |---------|---------------|---------------|
 //! | `anthropic` | [`models::AnthropicPlugin`] | [`models`] |
 //! | `openai` | [`models::OpenAiPlugin`] | [`models`] |
+//! | `chat-completions` | [`models::ChatCompletionsPlugin`] | [`models`] |
 //! | `bedrock` | [`models::BedrockPlugin`], [`models::OpenAiPlugin`] | [`models`] |
 //!
 //! ## Observability
@@ -293,6 +294,7 @@
 //! |---------|-------------------|--------------|-----------------|
 //! | `anthropic` | [`models::anthropic`], [`models::AnthropicPlugin`] | Makes the `anthropic/...` provider family available through [`models::ModelRegistry`] once registered | [`models::AnthropicPlugin`] registers the Anthropic provider |
 //! | `openai` | [`models::openai`], [`models::OpenAiPlugin`] | Makes the `openai/...` provider family available through [`models::ModelRegistry`] once registered | [`models::OpenAiPlugin`] registers the `OpenAI` provider |
+//! | `chat-completions` | [`models::chat_completions`], [`models::ChatCompletionsPlugin`] | Makes the `chat_completions/...` provider family available through [`models::ModelRegistry`] once registered; adds no dependency | [`models::ChatCompletionsPlugin`] registers the Chat Completions provider |
 //! | `bedrock` | [`models::bedrock`], [`models::BedrockPlugin`], [`models::openai`], [`models::OpenAiPlugin`] | Also enables `openai`, making both provider implementations available | [`models::BedrockPlugin`] registers the Bedrock provider; [`models::OpenAiPlugin`] is also exposed and can be registered separately |
 //! | `otel` | [`plugins::OpenTelemetryPlugin`] | Integrates with [`plugins::TracingPlugin`] / [`plugins::TracingLayers`] and switches HTTP request spans in [`app`] to `OTel` HTTP semantic-convention field names | [`plugins::OpenTelemetryPlugin`] pushes an OTLP export layer into the tracing subscriber; [`app::AppPlugin`] emits spans with `http.request.method` / `url.path` / `http.response.status_code` fields (plus `otel.name` / `otel.kind`) instead of the `polaris.http.*` defaults. With [`plugins::OpenTelemetryPlugin`] installed, it also extracts incoming W3C `traceparent` headers to continue a distributed trace; requests with no upstream context start a fresh trace. |
 //! | `tiktoken` | [`models::tokenizer::TiktokenCounter`], [`models::tokenizer::EncodingFamily`] | Adds [`Default`] for [`models::TokenizerPlugin`] and changes what [`models::TokenizerPlugin::default`] builds | [`models::TokenizerPlugin::default`] registers a global [`models::Tokenizer`] backed by [`models::tokenizer::TiktokenCounter`] |

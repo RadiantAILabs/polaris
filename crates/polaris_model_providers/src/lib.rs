@@ -10,6 +10,7 @@
 //! |----------|--------------|-------------|
 //! | Anthropic | `anthropic` (default) | Direct Anthropic API access |
 //! | `OpenAI` | `openai` | `OpenAI` Responses API |
+//! | Chat Completions | `chat-completions` | Any server that implements the `OpenAI` Chat Completions API (Hugging Face router, vLLM, Ollama, `DeepInfra`, Z.ai, `DeepSeek`, `OpenAI`); no extra dependency |
 //! | AWS Bedrock | `bedrock` (also enables `openai`) | AWS Bedrock Converse API; `openai.*` models use Bedrock's `OpenAI` Responses endpoint |
 //!
 //! # Feature Flags
@@ -84,6 +85,34 @@
 //! server.add_plugins(OpenAiPlugin::from_env("OPENAI_API_KEY"));
 //! # }
 //! ```
+//!
+//! For a server that speaks the Chat Completions API, give the server's base URL:
+//!
+//! ```no_run
+//! # #[cfg(feature = "chat-completions")]
+//! # {
+//! use polaris_model_providers::ChatCompletionsPlugin;
+//! use polaris_models::ModelsPlugin;
+//! use polaris_system::server::Server;
+//!
+//! let mut server = Server::new();
+//! server.add_plugins(ModelsPlugin);
+//! server.add_plugins(
+//!     ChatCompletionsPlugin::from_env("HF_TOKEN")
+//!         .with_base_url("https://router.huggingface.co/v1"),
+//! );
+//! # }
+//! ```
+//!
+//! # Reasoning Effort
+//!
+//! [`LlmRequest::reasoning_effort`](polaris_models::llm::LlmRequest::reasoning_effort)
+//! asks for a reasoning level on any provider. Chat Completions, `OpenAI`
+//! Responses and Bedrock `openai.*` models send it as written, Anthropic sends
+//! it as `output_config.effort` (`low` to `max`), and Bedrock Converse does not
+//! support it. A provider that cannot send the requested level returns
+//! [`GenerationError::UnsupportedOperation`](polaris_models::llm::GenerationError::UnsupportedOperation)
+//! before it sends anything.
 //!
 //! # See Also
 //!

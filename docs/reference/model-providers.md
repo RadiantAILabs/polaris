@@ -5,7 +5,7 @@ title: Model Providers
 
 # Model Providers
 
-`polaris_models` defines the provider-agnostic LLM interface, and `polaris_model_providers` implements it for specific vendors (Anthropic, OpenAI, AWS Bedrock). This document covers how to *extend* the framework with a new provider. For end-user usage of the registry, see the `polaris_models` README.
+`polaris_models` defines the provider-agnostic LLM interface, and `polaris_model_providers` implements it for specific vendors (Anthropic, OpenAI, AWS Bedrock) and for servers that speak the OpenAI Chat Completions API. This document covers how to *extend* the framework with a new provider. For end-user usage of the registry, see the `polaris_models` README.
 
 ## Architecture
 
@@ -210,6 +210,7 @@ The limit that is sent is `min(request limit, registration ceiling)`.
 | Anthropic | `AnthropicPlugin::with_max_tokens` | 4096 | lowers the ceiling |
 | Bedrock | `BedrockPlugin::with_max_tokens` / `BedrockProvider::with_max_tokens` | 4096 (`bedrock::DEFAULT_MAX_TOKENS`) | lowers the ceiling |
 | OpenAI | none | none sent | sent as given |
+| Chat Completions | none | none sent | sent as given, as `max_completion_tokens` (or `max_tokens`, see [Chat Completions servers](#chat-completions-servers)) |
 
 To raise the ceiling for long responses or extended thinking, set it at
 registration:
@@ -241,9 +242,42 @@ reports the error.
 On Bedrock, model-specific settings that `LlmRequest` does not cover go in
 `with_additional_model_request_fields` — see [AWS Bedrock](#aws-bedrock).
 
+## Reasoning effort
+
+`LlmRequest::reasoning_effort` (an `Option<ReasoningEffort>`, also set with `LlmRequestBuilder::reasoning_effort`) asks the model to spend a given amount of reasoning on a request. `None` leaves the provider's and the model's own default in place. Set it on every request you build if a run must stay at one effort: there is no registration-level default, so a decorator that wraps a provider can set it on each call.
+
+```rust
+use polaris_models::llm::ReasoningEffort;
+
+let response = llm
+    .builder()
+    .reasoning_effort(ReasoningEffort::High)
+    .user("Why is the sky blue?")
+    .generate()
+    .await?;
+```
+
+`ReasoningEffort` is `#[non_exhaustive]`: `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, and `Other(String)` for a level only some servers define. It writes and reads its lower-case name (`Display`, `FromStr`, serde), so `"high".parse::<ReasoningEffort>()` works for a setting read from an environment variable. `FromStr` knows the named levels in any case, turns other non-empty text into `Other`, and fails on empty text.
+
+Each provider sends it in its own way:
+
+| Provider | Sent as | Levels it honours |
+|----------|---------|-------------------|
+| Chat Completions | `reasoning_effort` | every level, as the level's name |
+| OpenAI (Responses) | `reasoning.effort` | every level, as the level's name |
+| Anthropic | `output_config.effort` | `Low`, `Medium`, `High`, `XHigh`, `Max` |
+| Bedrock, `openai.*` models | `reasoning.effort` | every level, as the level's name |
+| Bedrock, Converse | not supported | none |
+
+**Nothing is dropped silently.** A run that pins an effort must not run at another one without saying so, so a provider that cannot send the requested level returns `GenerationError::UnsupportedOperation` **before it sends anything**: Anthropic for `None`, `Minimal` and `Other` (it has no such levels, and it cannot turn thinking off through effort), Bedrock Converse for every level (the Converse API has no effort setting, and the model-specific field that carries one differs per model). On Bedrock Converse, keep using `with_additional_model_request_fields` with the model's own field and leave the request field unset.
+
+**The server decides which levels a model has.** Providers that take every level send the name as written (`xhigh`, `max`, or an `Other` string); a server that does not know the level rejects the request, and its error message reaches the caller as `GenerationError::Provider`. OpenAI's own `reasoning` object keeps other settings such as `summary` when an effort is added. For Bedrock `openai.*` models, a provider-wide field from `with_additional_model_request_fields` replaces the request's `reasoning` key, like any other key it sets.
+
+**Implementing a provider.** Read `request.reasoning_effort` in `generate` and `stream`, put it in the request the vendor expects, and return `GenerationError::UnsupportedOperation` (with the level in the message) when the vendor has no way to take it. Do not ignore it.
+
 ## Pricing
 
-The built-in providers (Anthropic, OpenAI, Bedrock) answer `LlmProvider::pricing()` from a `PriceStore` in `polaris_model_providers::pricing`. The tracing decorator uses it to record `gen_ai.usage.cost`.
+The built-in providers (Anthropic, OpenAI, Chat Completions, Bedrock) answer `LlmProvider::pricing()` from a `PriceStore` in `polaris_model_providers::pricing`. The tracing decorator uses it to record `gen_ai.usage.cost`.
 
 A store looks up a model in this order, each by longest model-id prefix:
 
@@ -306,6 +340,56 @@ let reply = Message::tool_result_for(&call, ToolResultContent::Text("Sunny".into
 ```
 
 The older `UserBlock::tool_result` / `tool_error` and `Message::tool_result` / `tool_error` set only `id`, so these providers reject them (a missing or empty `call_id` fails with "Tool result is missing a call_id"); they are deprecated. If you have only the two ids and not the `ToolCall`, use `UserBlock::tool_result_with_call_id` / `tool_error_with_call_id` or `Message::tool_result_with_call_id` / `tool_error_with_call_id`.
+
+The Chat Completions provider is different: it links a result to its call by the call's `call_id` when that is set and by `id` otherwise, and it sets both to the server's id on the calls it returns. Results built from the call work there as well, and so do the older constructors.
+
+## Chat Completions servers
+
+`ChatCompletionsPlugin` (feature `chat-completions`, no extra dependency) reaches any server that implements `POST {base_url}/chat/completions`: the Hugging Face inference router, vLLM, SGLang, Ollama, DeepInfra, Z.ai, DeepSeek, OpenAI's own Chat Completions endpoint and others. Models are `chat_completions/<model>`, where `<model>` is the exact string the server expects in its `model` field. It may contain `/` and `:`, as in `chat_completions/zai-org/GLM-5.3-Flash:zai`; the registry splits only at the first `/`.
+
+```rust
+server.add_plugins(ModelsPlugin);
+server.add_plugins(
+    ChatCompletionsPlugin::from_env("HF_TOKEN")
+        .with_base_url("https://router.huggingface.co/v1"),
+);
+let llm = registry.llm("chat_completions/zai-org/GLM-5.3-Flash:zai")?;
+```
+
+**A separate plugin, not a mode of `OpenAiPlugin`.** The two speak different protocols with different failure modes. A mode switch would make `openai/<model>` mean one protocol or the other depending on configuration, and a server could not use both. Separate plugins register under different provider names (`openai`, `chat_completions`), so both can be added and each model id says which protocol it uses. Only one `ChatCompletionsPlugin` can be registered, because the provider name is the registry key; to reach two servers, wrap two `ChatCompletionsProvider`s in a provider of your own.
+
+**Configuration.** The key is sent as `Authorization: Bearer <key>`; `without_api_key()` sends no header for local servers. No environment variable is read except by `from_env(var)`, which names the variable that holds the key.
+
+| Method | Meaning |
+|--------|---------|
+| `with_base_url(url)` | Server root; `/chat/completions` is appended. Default `https://api.openai.com/v1`. A trailing `/` is ignored. |
+| `with_extra_body(json)` | Top-level keys added to every body, replacing a key Polaris set. Must be a JSON object; anything else fails every request with `GenerationError::InvalidRequest`. For settings with no request type: Z.ai's `thinking`, vLLM's `chat_template_kwargs`, `top_k`. |
+| `with_max_tokens_field(MaxTokensField)` | `MaxCompletionTokens` (default) or `MaxTokens`: the key that carries `LlmRequest::max_output_tokens`. OpenAI rejects `max_tokens` for reasoning models; many other servers read only `max_tokens`. |
+| `with_reasoning_replay(ReasoningReplay)` | How earlier reasoning is sent back: `ReasoningContent` (default), `Reasoning`, or `Omit`. See below. |
+| `with_strict_tools(bool)` | Default `false`: tools are sent without `strict` and with their schema as given, because `strict` is an OpenAI field that other servers may reject. `true` sends each `ToolDefinition::strict` and normalizes strict schemas like the Responses provider does. |
+| `with_pricing_store`, `with_pricing_override` | As on the other providers. Most models served this way are not in the built-in price table, so set a rate with `with_pricing_override(prefix, ModelPricing)` to get `gen_ai.usage.cost`. |
+
+**What is sent.** The system prompt becomes a first `system` message. User text goes as a string (several text blocks are joined with newlines); with images, as `text` and `image_url` parts with a base64 data URL (JPEG, PNG, GIF and WebP). Each tool result becomes its own `tool` message, placed before any text that shared its user message, because `tool` messages must directly follow the assistant message that made the calls. A failed result's text gets an `Error: ` prefix. Tools go as `tools`, `tool_choice` as `auto`, `required`, `none` or a named function, and an output schema as `response_format` of type `json_schema`. Streaming adds `stream: true` and `stream_options.include_usage: true`; without the second, OpenAI-style servers send no usage in a stream. Audio and document blocks, and images in tool results, fail with `GenerationError::UnsupportedContent`. A tool call and its result go by the call's `call_id` when it has one (calls that came from the Responses API have both) and by `id` otherwise, so a conversation can move between providers.
+
+**Reasoning from the model.** Servers return it next to the answer, as `reasoning_content` or, on newer servers, `reasoning`. The provider reads either (`reasoning_content` first) into an `AssistantBlock::Reasoning` placed before the text and tool calls, and streams it as a reasoning block. Sending it back is where servers differ, so `ReasoningReplay` chooses:
+
+- **`ReasoningContent` (default)** sends it on the assistant message as `reasoning_content`. DeepSeek's thinking mode needs this on every later request that carries tools: without tools the field is ignored, with tools a request that omits the earlier `reasoning_content` is answered with `400` ([DeepSeek thinking mode](https://api-docs.deepseek.com/guides/thinking_mode)). Z.ai's Preserved Thinking needs the complete, unmodified and correctly ordered `reasoning_content` of earlier turns, with `thinking.clear_thinking` set to `false` ([Z.ai thinking mode](https://docs.z.ai/guides/capabilities/thinking-mode), [chat completion reference](https://docs.z.ai/api-reference/llm/chat-completion)); set that with `with_extra_body`.
+- **`Reasoning`** sends it as `reasoning`, the name newer vLLM versions use in responses ([vLLM reasoning outputs](https://docs.vllm.ai/en/latest/features/reasoning_outputs/)). Use it only for a server that is known to read that name on input.
+- **`Omit`** sends no earlier reasoning, for servers that reject the unknown field.
+
+Reasoning blocks from other providers are sent the same way (their signatures are dropped). Several reasoning blocks in one assistant message are joined with newlines. Reasoning written inline in `content` between `<think>` tags, by a server that has no reasoning parser, is not split out.
+
+**What is read.** Responses and stream chunks are read as raw JSON, so a server that leaves fields out still works:
+
+- `content` may be a string, `null` or a list of parts; the first choice (index 0) is read; a `refusal` with no other content is a `GenerationError::Refusal`.
+- A tool call without an `id` gets `<response id>_call_<position>`. `arguments` may be a JSON string, an object or empty (no arguments). Arguments that are not valid JSON fail the response with `GenerationError::InvalidResponse`, as the stream collector does. A call with no function name fails the same way. In a stream, argument fragments that arrive before the name are held until it does; calls are told apart by `index`, or by `id` when a server sends no `index`.
+- Stop reasons: `length` is `MaxOutputTokens` (even when a tool call was cut off), `tool_calls` is `ToolUse`, `content_filter` is `ContentFilter`, `stop` is `EndTurn` (or `ToolUse` when the message has tool calls, because some servers say `stop` after a tool call), a missing reason is inferred the same way, and any other value is `StopReason::Other`.
+- Usage: `input_tokens` is `prompt_tokens` without the cached part (`prompt_tokens_details.cached_tokens`, or DeepSeek's `prompt_cache_hit_tokens`), `cache_read_tokens` is the cached part, `reasoning_output_tokens` is `completion_tokens_details.reasoning_tokens`, `output_tokens` is `completion_tokens` as the server counts it. A count a server leaves out stays `None`.
+- A stream ends at `data: [DONE]`, or when the connection closes after a finish reason. The usage chunk that servers send after the finish chunk is included in the final `MessageStop`. A stream that closes before any finish reason fails with `InvalidResponse`, and an `error` object in a chunk fails it with `Provider`.
+
+**Errors.** `401` and `403` are `Auth`, `429` is `RateLimited` (with `Retry-After` when it is a number of seconds), anything else is `Provider` with the status and the server's message, read from `{"error": {"message": ..}}`, `{"error": ".."}`, `{"message": ..}` or `{"detail": ..}`. A `200` response whose body is an error object is also `Provider`.
+
+**Not supported:** `n` greater than 1 (only the first choice is read), the legacy `function_call` field, audio and document input, and image tool results.
 
 ## AWS Bedrock
 
@@ -397,6 +481,8 @@ Strict mode is best-effort schema enforcement, not a correctness requirement: a 
 | `polaris_models/src/plugin.rs` | `ModelsPlugin` (two-phase init) |
 | `polaris_model_providers/src/anthropic/` | Reference impl — Anthropic |
 | `polaris_model_providers/src/openai/` | Reference impl — OpenAI |
+| `polaris_model_providers/src/chat_completions/` | Reference impl — Chat Completions servers (raw JSON, SSE) |
+| `polaris_model_providers/src/sse.rs` | Server-sent event framing (LF and CRLF) used by the Chat Completions provider |
 | `polaris_model_providers/src/bedrock/` | Reference impl — AWS Bedrock |
 | `polaris_model_providers/src/pricing.rs` | `PriceStore`, `PricingTable`, live price fetching |
 
