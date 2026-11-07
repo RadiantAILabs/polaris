@@ -19,7 +19,7 @@ use futures_core::Stream;
 use polaris_models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, ImageMediaType,
     LlmProvider, LlmRequest, LlmResponse, LlmStream, Message, ModelPricing, ReasoningBlock,
-    StopReason, StreamEvent, TextBlock, ToolCall, ToolChoice, ToolFunction,
+    ReasoningEffort, StopReason, StreamEvent, TextBlock, ToolCall, ToolChoice, ToolFunction,
     ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 use std::collections::{HashMap, VecDeque};
@@ -107,13 +107,13 @@ impl LlmProvider for OpenAiProvider {
         model: &str,
         request: LlmRequest,
     ) -> Result<LlmResponse, GenerationError> {
-        let create_response = convert_request(model, &request)?;
+        let body = request_body(model, &request, false)?;
         // Parse the raw JSON leniently, so servers other than `OpenAI` that
         // leave out optional-in-practice fields still work.
         let raw: serde_json::Value = self
             .client
             .responses()
-            .create_byot(create_response)
+            .create_byot(body)
             .await
             .map_err(convert_error)?;
         convert_response(compat::parse_response(raw)?)
@@ -136,13 +136,12 @@ impl LlmProvider for OpenAiProvider {
     /// function calls whose identity is still missing when the item or response ends.
     /// Returns [`GenerationError::Json`] if required event fields cannot be parsed.
     async fn stream(&self, model: &str, request: LlmRequest) -> Result<LlmStream, GenerationError> {
-        let mut create_response = convert_request(model, &request)?;
         // The raw-JSON (`byot`) call does not set the stream flag itself.
-        create_response.stream = Some(true);
+        let body = request_body(model, &request, true)?;
         let raw_stream = self
             .client
             .responses()
-            .create_stream_byot::<_, serde_json::Value>(create_response)
+            .create_stream_byot::<_, serde_json::Value>(body)
             .await
             .map_err(convert_error)?;
 
@@ -164,6 +163,40 @@ impl LlmProvider for OpenAiProvider {
 // ---------------------------------------------------------------------------
 // Request conversion (Polaris -> OpenAI)
 // ---------------------------------------------------------------------------
+
+/// The JSON body sent to the Responses endpoint for `request`.
+///
+/// Built from [`convert_request`], then the reasoning effort is set on the
+/// JSON itself: `async_openai`'s own effort type has no `max` and no free-form
+/// level, and servers other than `OpenAI` accept both.
+fn request_body(
+    model: &str,
+    request: &LlmRequest,
+    stream: bool,
+) -> Result<serde_json::Value, GenerationError> {
+    let mut create_response = convert_request(model, request)?;
+    if stream {
+        create_response.stream = Some(true);
+    }
+    let mut body = serde_json::to_value(create_response)?;
+    apply_reasoning_effort(&mut body, request.reasoning_effort.as_ref());
+    Ok(body)
+}
+
+/// Sets `reasoning.effort` on a serialized Responses request body, keeping
+/// any other `reasoning` setting already there. Does nothing for `None`.
+pub(crate) fn apply_reasoning_effort(
+    body: &mut serde_json::Value,
+    effort: Option<&ReasoningEffort>,
+) {
+    let Some(effort) = effort else {
+        return;
+    };
+    if !body["reasoning"].is_object() {
+        body["reasoning"] = serde_json::json!({});
+    }
+    body["reasoning"]["effort"] = effort.as_str().into();
+}
 
 pub(crate) fn convert_request(
     model: &str,
@@ -1193,6 +1226,39 @@ mod tests {
             "output_tokens_details": { "reasoning_tokens": 0 }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn apply_reasoning_effort_sets_the_level_and_keeps_other_reasoning_settings() {
+        let mut body = serde_json::json!({"model": "m", "reasoning": {"summary": "auto"}});
+        apply_reasoning_effort(&mut body, Some(&ReasoningEffort::High));
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"summary": "auto", "effort": "high"})
+        );
+
+        let mut absent = serde_json::json!({"model": "m"});
+        apply_reasoning_effort(&mut absent, None);
+        assert_eq!(absent, serde_json::json!({"model": "m"}));
+
+        let mut replaced = serde_json::json!({"reasoning": "not an object"});
+        apply_reasoning_effort(&mut replaced, Some(&ReasoningEffort::Low));
+        assert_eq!(replaced["reasoning"], serde_json::json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn request_body_carries_effort_and_the_stream_flag() {
+        let request = LlmRequest {
+            messages: vec![Message::user("hi")],
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let plain = request_body("gpt-5.5", &request, false).unwrap();
+        assert_eq!(plain["reasoning"]["effort"], "medium");
+        assert!(plain.get("stream").is_none(), "{plain}");
+        let streaming = request_body("gpt-5.5", &request, true).unwrap();
+        assert_eq!(streaming["reasoning"]["effort"], "medium");
+        assert_eq!(streaming["stream"], true);
     }
 
     #[test]

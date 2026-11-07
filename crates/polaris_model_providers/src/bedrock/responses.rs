@@ -4,7 +4,7 @@
 //! Responses API prompt cache. Keep the same Polaris request and response types
 //! while using the endpoint on which that cache is available.
 
-use crate::openai::provider::{convert_request, convert_response};
+use crate::openai::provider::{apply_reasoning_effort, convert_request, convert_response};
 use async_openai::types::responses::Response;
 use aws_config::retry::RetryConfig;
 use aws_sdk_bedrockruntime::config::ProvideCredentials;
@@ -136,6 +136,7 @@ fn payload(model: &str, request: &LlmRequest) -> Result<serde_json::Value, Gener
     let mut body = serde_json::to_value(convert_request(model, &compatible)?)
         .map_err(|err| invalid(format!("failed to encode Responses request: {err}")))?;
     body["store"] = serde_json::Value::Bool(false);
+    apply_reasoning_effort(&mut body, request.reasoning_effort.as_ref());
 
     if request.cache.is_disabled() {
         body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
@@ -808,6 +809,38 @@ mod tests {
             !body.to_string().contains("prompt_cache_breakpoint"),
             "no content block is marked when caching is off: {body}"
         );
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_as_reasoning_effort_and_extra_fields_replace_it() {
+        let request = LlmRequest {
+            messages: vec![Message::user("Hello")],
+            reasoning_effort: Some(polaris_models::llm::ReasoningEffort::Max),
+            ..Default::default()
+        };
+
+        let body = payload("openai.gpt-oss-120b", &request).unwrap();
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"effort": "max"}),
+            "{body}"
+        );
+
+        // A provider-wide field for the same key wins, as it does for any key.
+        let fields = serde_json::json!({"reasoning": {"effort": "low", "summary": "auto"}});
+        let body = request_body("openai.gpt-oss-120b", &request, Some(&fields)).unwrap();
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"effort": "low", "summary": "auto"}),
+            "{body}"
+        );
+
+        let plain = LlmRequest {
+            messages: vec![Message::user("Hello")],
+            ..Default::default()
+        };
+        let body = payload("openai.gpt-oss-120b", &plain).unwrap();
+        assert!(body.get("reasoning").is_none(), "{body}");
     }
 
     #[test]

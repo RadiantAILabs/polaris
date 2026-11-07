@@ -141,7 +141,7 @@ impl CacheControl {
 /// | Provider | Sent as | Levels it accepts |
 /// |----------|---------|-------------------|
 /// | Chat Completions | `reasoning_effort` | every level, as the level's name; the server accepts or rejects it |
-/// | OpenAI (Responses) | `reasoning.effort` | every level, as the level's name |
+/// | `OpenAI` (Responses) | `reasoning.effort` | every level, as the level's name |
 /// | Anthropic | `output_config.effort` | [`Low`](Self::Low) to [`Max`](Self::Max) |
 /// | Bedrock, `openai.*` models | `reasoning.effort` | every level, as the level's name |
 /// | Bedrock, Converse | not supported | none |

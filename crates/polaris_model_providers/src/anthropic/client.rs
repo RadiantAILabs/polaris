@@ -717,6 +717,7 @@ mod tests {
             temperature: None,
             stop_sequences: None,
             output_format: None,
+            output_config: None,
             stream: None,
         };
 
