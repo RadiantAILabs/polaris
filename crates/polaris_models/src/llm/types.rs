@@ -413,7 +413,29 @@ impl Message {
     /// Creates a user message with the successful result of `call`.
     ///
     /// Copies both identifiers from the call, so every provider can link the
-    /// result back to it. See [`ToolCall::result`].
+    /// result back to it. See [`ToolCall::result`]. If you have only the two
+    /// identifiers and not the call, use [`Message::tool_result_with_call_id`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::{Message, ToolCall, ToolResultContent, ToolResultStatus, UserBlock};
+    /// use serde_json::json;
+    ///
+    /// let mut call = ToolCall::new("fc_1", "get_weather", json!({}));
+    /// call.call_id = Some("call_1".to_owned());
+    ///
+    /// let message = Message::tool_result_for(&call, ToolResultContent::Text("Sunny".into()));
+    /// let Message::User { content } = message else {
+    ///     unreachable!("tool_result_for builds a user message");
+    /// };
+    /// let [UserBlock::ToolResult(result)] = content.as_slice() else {
+    ///     unreachable!("the message holds one tool result");
+    /// };
+    /// assert_eq!(result.id, "fc_1");
+    /// assert_eq!(result.call_id.as_deref(), Some("call_1"));
+    /// assert_eq!(result.status, ToolResultStatus::Success);
+    /// ```
     #[must_use]
     pub fn tool_result_for(call: &ToolCall, content: ToolResultContent) -> Self {
         Self::User {
@@ -424,7 +446,29 @@ impl Message {
     /// Creates a user message with the error result of `call`.
     ///
     /// Copies both identifiers from the call, so every provider can link the
-    /// result back to it. See [`ToolCall::error`].
+    /// result back to it. See [`ToolCall::error`]. If you have only the two
+    /// identifiers and not the call, use [`Message::tool_error_with_call_id`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::{Message, ToolCall, ToolResultContent, ToolResultStatus, UserBlock};
+    /// use serde_json::json;
+    ///
+    /// let mut call = ToolCall::new("fc_1", "get_weather", json!({}));
+    /// call.call_id = Some("call_1".to_owned());
+    ///
+    /// let message = Message::tool_error_for(&call, ToolResultContent::Text("timed out".into()));
+    /// let Message::User { content } = message else {
+    ///     unreachable!("tool_error_for builds a user message");
+    /// };
+    /// let [UserBlock::ToolResult(result)] = content.as_slice() else {
+    ///     unreachable!("the message holds one tool result");
+    /// };
+    /// assert_eq!(result.id, "fc_1");
+    /// assert_eq!(result.call_id.as_deref(), Some("call_1"));
+    /// assert_eq!(result.status, ToolResultStatus::Error);
+    /// ```
     #[must_use]
     pub fn tool_error_for(call: &ToolCall, content: ToolResultContent) -> Self {
         Self::User {
@@ -876,7 +920,8 @@ impl ToolCall {
     /// result. Providers link a result to its call by different fields:
     /// Anthropic and Bedrock use `id`, while `OpenAI` uses `call_id`. Building
     /// the result from the call keeps both, so the conversation works with
-    /// every provider.
+    /// every provider. If you have only the two identifiers and not the call,
+    /// use [`UserBlock::tool_result_with_call_id`].
     ///
     /// # Examples
     ///
@@ -902,7 +947,26 @@ impl ToolCall {
     /// Builds the error result block for this call.
     ///
     /// Copies both identifiers, like [`ToolCall::result`], and marks the
-    /// result as an error.
+    /// result as an error. If you have only the two identifiers and not the
+    /// call, use [`UserBlock::tool_error_with_call_id`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::{ToolCall, ToolResultContent, ToolResultStatus, UserBlock};
+    /// use serde_json::json;
+    ///
+    /// let mut call = ToolCall::new("fc_1", "get_weather", json!({}));
+    /// call.call_id = Some("call_1".to_owned());
+    ///
+    /// let UserBlock::ToolResult(result) = call.error(ToolResultContent::Text("timed out".into()))
+    /// else {
+    ///     unreachable!("error builds a tool result block");
+    /// };
+    /// assert_eq!(result.id, "fc_1");
+    /// assert_eq!(result.call_id.as_deref(), Some("call_1"));
+    /// assert_eq!(result.status, ToolResultStatus::Error);
+    /// ```
     #[must_use]
     pub fn error(&self, content: ToolResultContent) -> UserBlock {
         self.result_block(content, ToolResultStatus::Error)
@@ -1151,5 +1215,90 @@ mod tests {
             !back.strict,
             "explicit strict = false survives a round-trip"
         );
+    }
+
+    /// A call whose `id` and `call_id` differ, like an `OpenAI` function call
+    /// (`fc_...` item id, `call_...` call id). A constructor that copies the
+    /// wrong field, or only one of them, fails the tests below.
+    fn call_with_distinct_ids() -> ToolCall {
+        let mut call = ToolCall::new("fc_1", "get_weather", serde_json::json!({"city": "Tokyo"}));
+        call.call_id = Some("call_1".to_owned());
+        call
+    }
+
+    fn into_tool_result(block: UserBlock) -> ToolResult {
+        match block {
+            UserBlock::ToolResult(result) => result,
+            other => panic!("expected a tool result block, got {other:?}"),
+        }
+    }
+
+    fn into_only_tool_result(message: Message) -> ToolResult {
+        match message {
+            Message::User { mut content } if content.len() == 1 => {
+                into_tool_result(content.remove(0))
+            }
+            other => panic!("expected a user message with one block, got {other:?}"),
+        }
+    }
+
+    fn assert_result(result: &ToolResult, expected_status: ToolResultStatus, expected_text: &str) {
+        assert_eq!(result.id, "fc_1", "`id` is copied from the call");
+        assert_eq!(
+            result.call_id.as_deref(),
+            Some("call_1"),
+            "`call_id` is copied from the call"
+        );
+        assert_eq!(result.status, expected_status);
+        match &result.content {
+            ToolResultContent::Text(text) => assert_eq!(text, expected_text),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_result_copies_both_ids_and_marks_success() {
+        let call = call_with_distinct_ids();
+        let result = into_tool_result(call.result(ToolResultContent::Text("Sunny".into())));
+        assert_result(&result, ToolResultStatus::Success, "Sunny");
+    }
+
+    #[test]
+    fn tool_call_error_copies_both_ids_and_marks_error() {
+        let call = call_with_distinct_ids();
+        let result = into_tool_result(call.error(ToolResultContent::Text("timed out".into())));
+        assert_result(&result, ToolResultStatus::Error, "timed out");
+    }
+
+    #[test]
+    fn message_tool_result_for_copies_both_ids_and_marks_success() {
+        let call = call_with_distinct_ids();
+        let message = Message::tool_result_for(&call, ToolResultContent::Text("Sunny".into()));
+        assert_result(
+            &into_only_tool_result(message),
+            ToolResultStatus::Success,
+            "Sunny",
+        );
+    }
+
+    #[test]
+    fn message_tool_error_for_copies_both_ids_and_marks_error() {
+        let call = call_with_distinct_ids();
+        let message = Message::tool_error_for(&call, ToolResultContent::Text("timed out".into()));
+        assert_result(
+            &into_only_tool_result(message),
+            ToolResultStatus::Error,
+            "timed out",
+        );
+    }
+
+    #[test]
+    fn tool_call_result_without_call_id_keeps_it_none() {
+        // Providers that link by `id` (Anthropic, Bedrock Converse) set no
+        // `call_id`; the result must not invent one.
+        let call = ToolCall::new("toolu_1", "get_weather", serde_json::json!({}));
+        let result = into_tool_result(call.result(ToolResultContent::Text("Sunny".into())));
+        assert_eq!(result.id, "toolu_1");
+        assert_eq!(result.call_id, None);
     }
 }
