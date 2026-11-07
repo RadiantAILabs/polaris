@@ -1065,6 +1065,9 @@ pub(crate) fn convert_error(err: OpenAIError) -> GenerationError {
 }
 
 #[cfg(test)]
+mod server_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use async_openai::types::responses::{
