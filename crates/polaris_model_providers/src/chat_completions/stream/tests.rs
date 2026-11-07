@@ -315,3 +315,209 @@ async fn the_response_id_and_model_are_taken_from_the_first_chunks_that_have_the
         "{events:?}"
     );
 }
+
+const MIB: usize = 1024 * 1024;
+
+fn tool_call_chunk(call: Value) -> Value {
+    delta(json!({ "tool_calls": [call] }))
+}
+
+fn named_call(index: usize) -> Value {
+    tool_call_chunk(
+        json!({ "index": index, "id": format!("c{index}"), "function": { "name": "f" } }),
+    )
+}
+
+/// Asserts that the stream ended with an `InvalidResponse` error whose message
+/// has `needle`, with no `MessageStop` and no later read content.
+fn assert_fails_with(events: &Events, needle: &str) {
+    let (last, before) = events.split_last().expect("the stream has items");
+    assert!(
+        matches!(last, Err(GenerationError::InvalidResponse(message)) if message.contains(needle)),
+        "{last:?}"
+    );
+    assert!(
+        before.iter().all(
+            |event| matches!(event, Ok(event) if !matches!(event, StreamEvent::MessageStop { .. }))
+        ),
+        "only events come before the error"
+    );
+    assert!(
+        events.iter().flatten().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockDelta { delta: ContentBlockDelta::Text(text), .. } if text == "never read"
+        )),
+        "nothing after the error is read"
+    );
+}
+
+#[tokio::test]
+async fn arguments_kept_before_a_tool_name_are_capped_across_events_and_calls() {
+    let fragment = "x".repeat(MIB);
+    // Seventeen events of 1 MiB each, for two calls that never get a name.
+    let mut payloads: Vec<Value> = (0..17)
+        .map(|n| tool_call_chunk(json!({ "index": n % 2, "function": { "arguments": fragment } })))
+        .collect();
+    payloads.push(delta(json!({ "content": "never read" })));
+    let events = run(payloads, true).await;
+    assert_fails_with(&events, "before the function name");
+    assert_eq!(events.len(), 1, "nothing was sent before the error");
+}
+
+#[tokio::test]
+async fn arguments_kept_before_a_tool_name_are_released_when_the_call_starts() {
+    let fragment = "x".repeat(MIB);
+    let mut payloads: Vec<Value> = (0..16)
+        .map(|_| tool_call_chunk(json!({ "index": 0, "function": { "arguments": fragment } })))
+        .collect();
+    // Exactly 16 MiB is held when the name arrives, and is sent after the start.
+    payloads.push(tool_call_chunk(
+        json!({ "index": 0, "id": "a", "function": { "name": "f" } }),
+    ));
+    // The start released it, so another call may hold more.
+    payloads.push(tool_call_chunk(
+        json!({ "index": 1, "function": { "arguments": fragment } }),
+    ));
+    payloads.push(tool_call_chunk(
+        json!({ "index": 1, "id": "b", "function": { "name": "g" } }),
+    ));
+    payloads.push(finish("tool_calls"));
+    let events = ok(run(payloads, true).await);
+    let sent: Vec<usize> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::ToolCall { arguments },
+                ..
+            } => Some(arguments.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, [16 * MIB, MIB]);
+    assert_eq!(starts(&events).len(), 2);
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn refusal_text_is_capped_across_events() {
+    let fragment = "x".repeat(MIB);
+    let mut payloads: Vec<Value> = (0..17)
+        .map(|_| delta(json!({ "refusal": fragment })))
+        .collect();
+    payloads.push(delta(json!({ "content": "never read" })));
+    let events = run(payloads, true).await;
+    assert_fails_with(&events, "refusal");
+    assert_eq!(events.len(), 1, "nothing was sent before the error");
+}
+
+#[tokio::test]
+async fn refusal_text_at_the_limit_is_still_reported_as_a_refusal() {
+    let fragment = "x".repeat(MIB);
+    let payloads: Vec<Value> = (0..16)
+        .map(|_| delta(json!({ "refusal": fragment })))
+        .collect();
+    let events = run(payloads, true).await;
+    assert!(
+        matches!(events.as_slice(), [Err(GenerationError::Refusal(text))] if text.len() == 16 * MIB),
+        "the refusal is the only item"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_may_not_open_more_tool_calls_than_the_limit() {
+    let mut payloads: Vec<Value> = (0..=MAX_TOOL_SLOTS).map(named_call).collect();
+    payloads.push(delta(json!({ "content": "never read" })));
+    let events = run(payloads, true).await;
+    assert_fails_with(&events, "more than 1024 tool calls");
+    let started = events
+        .iter()
+        .flatten()
+        .filter(|event| matches!(event, StreamEvent::ContentBlockStart { .. }))
+        .count();
+    assert_eq!(started, MAX_TOOL_SLOTS);
+}
+
+#[tokio::test]
+async fn tool_calls_up_to_the_limit_are_accepted_and_open_calls_still_continue() {
+    let mut payloads: Vec<Value> = (0..MAX_TOOL_SLOTS).map(named_call).collect();
+    // A chunk for a call that is already open does not need a new slot.
+    payloads.push(tool_call_chunk(
+        json!({ "index": 0, "function": { "arguments": "{}" } }),
+    ));
+    payloads.push(finish("tool_calls"));
+    let events = ok(run(payloads, true).await);
+    assert_eq!(starts(&events).len(), MAX_TOOL_SLOTS);
+    assert!(
+        events.contains(&StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::ToolCall {
+                arguments: "{}".to_owned()
+            },
+        }),
+        "the continuation is sent"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::MessageStop { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_call_after_the_largest_index_fails_instead_of_overflowing() {
+    let events = run(
+        vec![
+            tool_call_chunk(json!({ "index": u64::MAX, "id": "a", "function": { "name": "f" } })),
+            // No index and a new id: the next number would be `u64::MAX + 1`.
+            tool_call_chunk(json!({ "id": "b", "function": { "name": "g" } })),
+            delta(json!({ "content": "never read" })),
+        ],
+        true,
+    )
+    .await;
+    assert_fails_with(&events, "too large");
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(
+        matches!(
+            &events[0],
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStartData::ToolCall { id, .. },
+            }) if id == "a"
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_largest_index_works_when_no_further_call_needs_a_number() {
+    let events = ok(run(
+        vec![
+            tool_call_chunk(
+                json!({ "index": u64::MAX, "id": "a", "function": { "name": "f", "arguments": "{" } }),
+            ),
+            // A known id continues its call, so nothing is added to the index.
+            tool_call_chunk(json!({ "id": "a", "function": { "arguments": "}" } })),
+            finish("tool_calls"),
+        ],
+        true,
+    )
+    .await);
+    assert_eq!(starts(&events).len(), 1);
+    let argument_text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::ToolCall { arguments },
+                ..
+            } => Some(arguments.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(argument_text, "{}");
+}

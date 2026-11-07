@@ -262,4 +262,78 @@ mod tests {
             "{items:?}"
         );
     }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A `data:` line that is `len` bytes long, without the line break.
+    fn data_line(len: usize) -> String {
+        format!("data: {}", "a".repeat(len - "data: ".len()))
+    }
+
+    /// `text` as chunks of 1 MiB or less.
+    fn in_chunks(text: &str) -> Vec<Chunk> {
+        text.as_bytes()
+            .chunks(MIB)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect()
+    }
+
+    const LINE_LIMIT_MESSAGE: &str = "an SSE line is larger than the 16 MiB limit";
+    const EVENT_LIMIT_MESSAGE: &str = "an SSE event is larger than the 16 MiB limit";
+
+    #[tokio::test]
+    async fn a_line_at_the_size_limit_is_accepted() {
+        let line = data_line(MAX_EVENT_BYTES);
+        let items = read(in_chunks(&format!("{line}\n\ndata: after\n\n"))).await;
+        let payloads = payloads(items);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].len(), MAX_EVENT_BYTES - "data: ".len());
+        assert_eq!(payloads[1], "after");
+    }
+
+    #[tokio::test]
+    async fn a_line_over_the_size_limit_fails_the_stream() {
+        // One byte over the limit, in chunks, with no line break yet.
+        let line = data_line(MAX_EVENT_BYTES + 1);
+        let mut chunks = vec![ok("data: before\n\n")];
+        chunks.extend(in_chunks(&line));
+        chunks.push(ok("\ndata: after\n\n"));
+        let items = read(chunks).await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_ref().unwrap(), "before");
+        assert!(
+            matches!(&items[1], Err(GenerationError::InvalidResponse(message)) if message == LINE_LIMIT_MESSAGE),
+            "{items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_at_the_size_limit_is_accepted() {
+        // Two lines of 8 MiB + 6 bytes and 8 MiB + 5 bytes: the payload has the
+        // two texts and the `\n` between them, which is exactly the limit.
+        let first = data_line(8 * MIB + "data: ".len());
+        let second = data_line(8 * MIB - 1 + "data: ".len());
+        let items = read(in_chunks(&format!("{first}\n{second}\n\ndata: after\n\n"))).await;
+        let payloads = payloads(items);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].len(), MAX_EVENT_BYTES);
+        assert_eq!(payloads[1], "after");
+    }
+
+    #[tokio::test]
+    async fn an_event_over_the_size_limit_fails_the_stream() {
+        // One byte more than the accepted event: each line is under the line
+        // limit, only the event they make up is over.
+        let first = data_line(8 * MIB + "data: ".len());
+        let second = data_line(8 * MIB + "data: ".len());
+        let mut chunks = vec![ok("data: before\n\n")];
+        chunks.extend(in_chunks(&format!("{first}\n{second}\n\ndata: after\n\n")));
+        let items = read(chunks).await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_ref().unwrap(), "before");
+        assert!(
+            matches!(&items[1], Err(GenerationError::InvalidResponse(message)) if message == EVENT_LIMIT_MESSAGE),
+            "{items:?}"
+        );
+    }
 }

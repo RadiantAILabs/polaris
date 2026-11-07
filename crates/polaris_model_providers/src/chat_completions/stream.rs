@@ -21,6 +21,14 @@ use polaris_models::llm::{
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 
+/// The most bytes the adapter keeps across events: tool call arguments that
+/// arrive before the call's name (all calls together), and refusal text. The
+/// SSE limit bounds one event, so this bounds what many small events add up to.
+const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most tool calls one stream may open.
+const MAX_TOOL_SLOTS: usize = 1024;
+
 /// Text, as opposed to tool calls, that can fill an open block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockKind {
@@ -56,6 +64,8 @@ pub(super) struct ChatStreamAdapter<S> {
     next_block: u32,
     open: Option<OpenBlock>,
     tools: BTreeMap<u64, ToolSlot>,
+    /// Bytes held in the `buffered` text of all tool slots.
+    buffered_bytes: usize,
     last_tool: Option<u64>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
@@ -80,6 +90,7 @@ impl<S> ChatStreamAdapter<S> {
             next_block: 0,
             open: None,
             tools: BTreeMap::new(),
+            buffered_bytes: 0,
             last_tool: None,
             finish_reason: None,
             usage: None,
@@ -148,9 +159,11 @@ impl<S> ChatStreamAdapter<S> {
     /// Servers number calls with `index`. One that does not is read as: a chunk
     /// with an id we know continues that call, a chunk with a new id starts the
     /// next call, and a chunk with no id continues the latest call.
-    fn tool_index(&self, position: usize, call: &Value) -> u64 {
+    ///
+    /// Returns `None` when the next call would need an index past `u64::MAX`.
+    fn tool_index(&self, position: usize, call: &Value) -> Option<u64> {
         if let Some(index) = call.get("index").and_then(Value::as_u64) {
-            return index;
+            return Some(index);
         }
         let id = call
             .get("id")
@@ -162,13 +175,29 @@ impl<S> ChatStreamAdapter<S> {
                 .iter()
                 .find(|(_, slot)| slot.id == id)
                 .map(|(index, _)| *index)
-                .unwrap_or_else(|| self.tools.keys().next_back().map_or(0, |last| last + 1)),
-            None => self.last_tool.unwrap_or(position as u64),
+                .or_else(|| {
+                    self.tools
+                        .keys()
+                        .next_back()
+                        .map_or(Some(0), |last| last.checked_add(1))
+                }),
+            None => Some(self.last_tool.unwrap_or(position as u64)),
         }
     }
 
     fn handle_tool_call(&mut self, position: usize, call: &Value) {
-        let index = self.tool_index(position, call);
+        let Some(index) = self.tool_index(position, call) else {
+            self.fail(GenerationError::InvalidResponse(
+                "a tool call index is too large to number the next call".to_owned(),
+            ));
+            return;
+        };
+        if self.tools.len() >= MAX_TOOL_SLOTS && !self.tools.contains_key(&index) {
+            self.fail(GenerationError::InvalidResponse(format!(
+                "the stream opens more than {MAX_TOOL_SLOTS} tool calls"
+            )));
+            return;
+        }
         self.last_tool = Some(index);
         let function = call.get("function").unwrap_or(&Value::Null);
         let arguments = match function.get("arguments") {
@@ -207,12 +236,21 @@ impl<S> ChatStreamAdapter<S> {
 
         // The call cannot start before its name is known. Arguments that
         // arrive first are kept and sent right after the start.
+        if self.buffered_bytes + arguments.len() > MAX_BUFFERED_BYTES {
+            self.fail(GenerationError::InvalidResponse(
+                "tool call arguments received before the function name are larger than the 16 MiB limit"
+                    .to_owned(),
+            ));
+            return;
+        }
+        self.buffered_bytes += arguments.len();
         slot.buffered.push_str(&arguments);
         if slot.name.is_empty() {
             return;
         }
         let (mut id, name) = (slot.id.clone(), slot.name.clone());
         let buffered = core::mem::take(&mut slot.buffered);
+        self.buffered_bytes -= buffered.len();
 
         self.close_open();
         let block = self.take_block_index();
@@ -257,11 +295,21 @@ impl<S> ChatStreamAdapter<S> {
             self.push_text(BlockKind::Text, text);
         }
         if let Some(refusal) = delta.get("refusal").and_then(Value::as_str) {
+            if self.refusal.len() + refusal.len() > MAX_BUFFERED_BYTES {
+                self.fail(GenerationError::InvalidResponse(
+                    "the refusal text is larger than the 16 MiB limit".to_owned(),
+                ));
+                return;
+            }
             self.refusal.push_str(refusal);
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for (position, call) in calls.iter().enumerate() {
                 self.handle_tool_call(position, call);
+                // Nothing is queued after the error.
+                if self.stopped {
+                    return;
+                }
             }
         }
     }
