@@ -260,3 +260,6 @@ pub(super) fn error_message(body: &Value) -> Option<String> {
         .and_then(text)
         .or_else(|| body.get("detail").and_then(text))
 }
+
+#[cfg(test)]
+mod tests;

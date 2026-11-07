@@ -311,3 +311,6 @@ fn image_data_url(image: &ImageBlock) -> Result<String, GenerationError> {
     let DocumentSource::Base64(data) = &image.data;
     Ok(format!("data:{mime};base64,{data}"))
 }
+
+#[cfg(test)]
+mod tests;
