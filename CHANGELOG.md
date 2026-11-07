@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-07
+
 ### Added
 
 - **`ToolCall::result`, `ToolCall::error`, `Message::tool_result_for`, `Message::tool_error_for`** (`polaris_models`) — build a tool result from its call, copying both `id` and `call_id`. Anthropic and Bedrock Converse link results by `id`; the OpenAI Responses path, including Bedrock `openai.*` models, links them by `call_id`. See [Model Providers — Tool results need the call's `call_id`](docs/reference/model-providers.md#tool-results-need-the-calls-call_id).
