@@ -1,8 +1,8 @@
 //! Server-Sent Events framing for streaming responses.
 //!
 //! Turns a stream of raw response bytes into the `data` payload of each event.
-//! Follows the SSE line rules: lines end in `\n`, `\r\n` or a lone `\r` is not
-//! used by any server we talk to, a blank line ends an event, lines that start
+//! Follows the SSE line rules: lines end in `\n` or `\r\n` (a lone `\r` as a
+//! line ending is not supported), a blank line ends an event, lines that start
 //! with `:` are comments, and several `data` lines in one event are joined with
 //! `\n`. The `event`, `id` and `retry` fields are ignored: the JSON payload says
 //! what an event is.

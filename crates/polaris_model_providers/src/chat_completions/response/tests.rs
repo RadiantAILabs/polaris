@@ -4,6 +4,28 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn ids_made_for_responses_with_no_id_do_not_repeat_between_turns() {
+    let first = synthesized_call_id(None, 0);
+    let second = synthesized_call_id(None, 0);
+    assert_ne!(first, second);
+    assert!(first.ends_with("_call_0"), "{first}");
+    assert_eq!(synthesized_call_id(Some("r1"), 2), "r1_call_2");
+}
+
+#[test]
+fn the_reasoning_field_of_a_response_is_reported() {
+    let used =
+        |message: Value| response_reasoning_field(&json!({ "choices": [{ "message": message }] }));
+    assert_eq!(used(json!({ "reasoning": "a" })), Some("reasoning"));
+    assert_eq!(
+        used(json!({ "reasoning_content": "a" })),
+        Some("reasoning_content")
+    );
+    assert_eq!(used(json!({ "content": "a" })), None);
+    assert_eq!(response_reasoning_field(&json!({})), None);
+}
+
+#[test]
 fn finish_reasons_map_to_stop_reasons() {
     let cases = [
         (Some("stop"), false, StopReason::EndTurn),

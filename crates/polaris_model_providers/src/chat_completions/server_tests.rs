@@ -49,6 +49,12 @@ struct Reply {
     extra_headers: String,
     /// Written in order, with a pause and a flush between pieces.
     pieces: Vec<Vec<u8>>,
+    /// Send nothing at all after reading the request.
+    silent: bool,
+    /// The pause after each piece.
+    pause: Duration,
+    /// Keep the connection open and silent after the last piece.
+    stall: bool,
 }
 
 impl Reply {
@@ -62,6 +68,9 @@ impl Reply {
             content_type,
             extra_headers: String::new(),
             pieces: vec![body.into_bytes()],
+            silent: false,
+            pause: Duration::from_millis(5),
+            stall: false,
         }
     }
 
@@ -98,6 +107,10 @@ impl Server {
         let task = tokio::spawn(within(async move {
             let (mut socket, _) = listener.accept().await.expect("should accept a connection");
             let recorded = read_request(&mut socket).await;
+            if reply.silent {
+                tokio::time::sleep(TIMEOUT).await;
+                return recorded;
+            }
             let head = format!(
                 "HTTP/1.1 {}\r\nContent-Type: {}\r\n{}Connection: close\r\n\r\n",
                 reply.status, reply.content_type, reply.extra_headers
@@ -112,7 +125,11 @@ impl Server {
                     .await
                     .expect("should write a response piece");
                 socket.flush().await.expect("should flush");
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(reply.pause).await;
+            }
+            if reply.stall {
+                tokio::time::sleep(TIMEOUT).await;
+                return recorded;
             }
             socket.shutdown().await.expect("should close the socket");
             recorded
@@ -127,6 +144,12 @@ impl Server {
         ChatCompletionsProvider::new("test-key")
             .with_base_url(&self.base_url)
             .with_http_client(no_proxy_client())
+    }
+
+    fn provider_with(&self, timeouts: Timeouts) -> ChatCompletionsProvider {
+        ChatCompletionsProvider::new("test-key")
+            .with_base_url(&self.base_url)
+            .with_http_client(no_proxy_client_with(timeouts))
     }
 
     async fn recorded(&mut self) -> Recorded {
@@ -145,7 +168,11 @@ impl Drop for Server {
 /// A client that ignores proxies named in the environment, which would
 /// otherwise carry a loopback request away from the test server.
 fn no_proxy_client() -> reqwest::Client {
-    provider::client_builder()
+    no_proxy_client_with(Timeouts::default())
+}
+
+fn no_proxy_client_with(timeouts: Timeouts) -> reqwest::Client {
+    provider::client_builder(timeouts)
         .no_proxy()
         .build()
         .expect("a client without proxies should build")
@@ -569,8 +596,12 @@ async fn generate_accepts_a_response_that_leaves_most_fields_out() {
     assert_eq!(response.usage, Usage::default());
     let calls = response.tool_calls();
     assert_eq!(calls.len(), 1, "{:?}", response.content);
-    assert_eq!(calls[0].id, "chatcmpl_call_0");
-    assert_eq!(calls[0].call_id.as_deref(), Some("chatcmpl_call_0"));
+    assert!(
+        calls[0].id.starts_with("chatcmpl-") && calls[0].id.ends_with("_call_0"),
+        "{}",
+        calls[0].id
+    );
+    assert_eq!(calls[0].call_id.as_deref(), Some(calls[0].id.as_str()));
     assert_eq!(calls[0].function.arguments, json!({ "city": "Oslo" }));
 }
 
@@ -764,14 +795,15 @@ async fn a_server_that_cannot_be_reached_is_an_http_error() {
 
 // ── tool results and reasoning, across turns ──────────────────────────
 
-/// A tool-calling turn as the server sent it, read back through the provider.
-async fn first_turn() -> Vec<AssistantBlock> {
-    let server = Server::start(Reply::json(&json!({
+/// The first, tool-calling turn as a server sends it, with its reasoning in
+/// `field` (`reasoning_content` or `reasoning`).
+fn first_turn_reply(field: &str) -> Reply {
+    Reply::json(&json!({
         "id": "chatcmpl-turn1",
         "choices": [{
             "message": {
                 "content": null,
-                "reasoning_content": "I should look the weather up.",
+                field: "I should look the weather up.",
                 "tool_calls": [{
                     "id": "call_weather",
                     "type": "function",
@@ -780,12 +812,21 @@ async fn first_turn() -> Vec<AssistantBlock> {
             },
             "finish_reason": "tool_calls",
         }],
-    })))
-    .await;
-    within(server.provider().generate("m", hello()))
-        .await
-        .expect("the first turn should succeed")
-        .content
+    }))
+}
+
+/// The same turn as a stream.
+fn first_turn_stream_reply(field: &str) -> Reply {
+    Reply::sse(
+        &[
+            chunk(json!({ field: "I should look the weather up." })),
+            chunk(
+                json!({ "tool_calls": [{ "index": 0, "id": "call_weather", "function": { "name": "get_weather", "arguments": "{\"city\":\"Oslo\"}" } }] }),
+            ),
+            finish_chunk("tool_calls"),
+        ],
+        true,
+    )
 }
 
 fn second_turn_request(content: Vec<AssistantBlock>) -> LlmRequest {
@@ -807,23 +848,64 @@ fn second_turn_request(content: Vec<AssistantBlock>) -> LlmRequest {
     }
 }
 
-async fn send_second_turn(provider_for: impl FnOnce(&Server) -> ChatCompletionsProvider) -> Value {
-    let content = first_turn().await;
-    let mut server = Server::start(Reply::json(&json!({
+/// How the first turn is fetched.
+#[derive(Clone, Copy)]
+enum FirstTurn {
+    Generate,
+    Stream,
+}
+
+/// Runs a tool turn against one loopback server whose reasoning is in `field`,
+/// then the next turn against a second server through the *same* provider
+/// (reconfigured by `configure`), and returns the second request's body.
+async fn two_turns(
+    field: &str,
+    how: FirstTurn,
+    configure: impl FnOnce(ChatCompletionsProvider) -> ChatCompletionsProvider,
+) -> Value {
+    let first = match how {
+        FirstTurn::Generate => Server::start(first_turn_reply(field)).await,
+        FirstTurn::Stream => Server::start(first_turn_stream_reply(field)).await,
+    };
+    let provider = configure(first.provider());
+    let content = match how {
+        FirstTurn::Generate => {
+            within(provider.generate("m", hello()))
+                .await
+                .expect("the first turn should succeed")
+                .content
+        }
+        FirstTurn::Stream => {
+            let stream = within(provider.stream("m", hello()))
+                .await
+                .expect("the first stream should start");
+            within(stream.collect_response())
+                .await
+                .expect("the first stream should assemble")
+                .content
+        }
+    };
+
+    let mut second = Server::start(Reply::json(&json!({
         "choices": [{ "message": { "content": "Sunny in Oslo." }, "finish_reason": "stop" }],
     })))
     .await;
-    let provider = provider_for(&server);
+    // A clone shares what the provider has learned about the server.
+    let provider = provider.clone().with_base_url(&second.base_url);
     let response = within(provider.generate("m", second_turn_request(content)))
         .await
         .expect("the second turn should succeed");
     assert_eq!(response.text(), "Sunny in Oslo.");
-    server.recorded().await.body
+    second.recorded().await.body
+}
+
+fn assistant_message(body: &Value) -> &Value {
+    &body["messages"][1]
 }
 
 #[tokio::test]
 async fn reasoning_and_tool_results_are_sent_back_the_way_the_server_expects() {
-    let body = send_second_turn(Server::provider).await;
+    let body = two_turns("reasoning_content", FirstTurn::Generate, |p| p).await;
     assert_eq!(
         body["messages"],
         json!([
@@ -844,27 +926,208 @@ async fn reasoning_and_tool_results_are_sent_back_the_way_the_server_expects() {
 }
 
 #[tokio::test]
-async fn reasoning_can_be_sent_back_as_reasoning_or_left_out() {
-    let body = send_second_turn(|server| {
+async fn by_default_reasoning_goes_back_under_the_field_the_server_used() {
+    for how in [FirstTurn::Generate, FirstTurn::Stream] {
+        // A server that answers under `reasoning`, like the Hugging Face router.
+        let body = two_turns("reasoning", how, |p| p).await;
+        let assistant = assistant_message(&body);
+        assert_eq!(assistant["reasoning"], "I should look the weather up.");
+        assert!(assistant.get("reasoning_content").is_none(), "{assistant}");
+
+        // A server that answers under `reasoning_content`, like `DeepSeek`.
+        let body = two_turns("reasoning_content", how, |p| p).await;
+        let assistant = assistant_message(&body);
+        assert_eq!(
+            assistant["reasoning_content"],
+            "I should look the weather up."
+        );
+        assert!(assistant.get("reasoning").is_none(), "{assistant}");
+    }
+}
+
+#[tokio::test]
+async fn without_any_reply_to_learn_from_reasoning_goes_back_as_reasoning_content() {
+    // History that did not come from this provider, such as a restored session.
+    let content = vec![
+        AssistantBlock::reasoning("I should look the weather up."),
+        AssistantBlock::ToolCall({
+            let mut call = polaris_models::llm::ToolCall::new(
+                "call_weather",
+                "get_weather",
+                json!({ "city": "Oslo" }),
+            );
+            call.call_id = Some("call_weather".to_owned());
+            call
+        }),
+    ];
+    let mut server = Server::start(Reply::json(&json!({
+        "choices": [{ "message": { "content": "Sunny in Oslo." } }],
+    })))
+    .await;
+    within(
         server
             .provider()
-            .with_reasoning_replay(ReasoningReplay::Reasoning)
+            .generate("m", second_turn_request(content)),
+    )
+    .await
+    .expect("the request should succeed");
+    let body = server.recorded().await.body;
+    assert_eq!(
+        assistant_message(&body)["reasoning_content"],
+        "I should look the weather up."
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_replay_field_overrides_what_the_server_used() {
+    // The server answers under `reasoning` but is told to read `reasoning_content`.
+    let body = two_turns("reasoning", FirstTurn::Generate, |p| {
+        p.with_reasoning_replay(ReasoningReplay::ReasoningContent)
     })
     .await;
-    let assistant = &body["messages"][1];
+    let assistant = assistant_message(&body);
+    assert_eq!(
+        assistant["reasoning_content"],
+        "I should look the weather up."
+    );
+    assert!(assistant.get("reasoning").is_none(), "{assistant}");
+
+    // And the other way round.
+    let body = two_turns("reasoning_content", FirstTurn::Generate, |p| {
+        p.with_reasoning_replay(ReasoningReplay::Reasoning)
+    })
+    .await;
+    let assistant = assistant_message(&body);
     assert_eq!(assistant["reasoning"], "I should look the weather up.");
     assert!(assistant.get("reasoning_content").is_none(), "{assistant}");
+}
 
-    let body = send_second_turn(|server| {
-        server
-            .provider()
-            .with_reasoning_replay(ReasoningReplay::Omit)
+#[tokio::test]
+async fn reasoning_can_be_left_out_of_the_replay() {
+    let body = two_turns("reasoning_content", FirstTurn::Generate, |p| {
+        p.with_reasoning_replay(ReasoningReplay::Omit)
     })
     .await;
-    let assistant = &body["messages"][1];
+    let assistant = assistant_message(&body);
     assert!(assistant.get("reasoning").is_none(), "{assistant}");
     assert!(assistant.get("reasoning_content").is_none(), "{assistant}");
     assert_eq!(assistant["tool_calls"][0]["id"], "call_weather");
+}
+
+// ── timeouts and size limits ──────────────────────────────────────────
+
+fn short_timeouts() -> Timeouts {
+    Timeouts::new(Duration::from_secs(5), Duration::from_millis(300))
+}
+
+#[tokio::test]
+async fn a_server_that_never_answers_fails_after_the_idle_timeout() {
+    let server = Server::start(Reply {
+        silent: true,
+        ..Reply::json(&json!({}))
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let error = within(
+        server
+            .provider_with(short_timeouts())
+            .generate("m", hello()),
+    )
+    .await
+    .expect_err("a silent server must not hang the call");
+    assert!(matches!(error, GenerationError::Http(_)), "{error:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_stalls_fails_after_the_idle_timeout_keeping_what_arrived() {
+    let server = Server::start(Reply {
+        stall: true,
+        ..Reply::sse(&[chunk(json!({ "content": "Partial" }))], false)
+    })
+    .await;
+    let stream = within(server.provider_with(short_timeouts()).stream("m", hello()))
+        .await
+        .expect("the stream request should succeed");
+    let events = collect(stream).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::ContentBlockDelta { delta: ContentBlockDelta::Text(text), .. }) if text == "Partial"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(Err(GenerationError::Http(_)))),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_long_stream_is_not_cut_off_while_data_keeps_arriving() {
+    // Six events 150 ms apart take longer than the 300 ms idle timeout in
+    // total, but no single wait does.
+    let mut chunks: Vec<Value> = (0..6)
+        .map(|i| chunk(json!({ "content": format!("{i}") })))
+        .collect();
+    chunks.push(finish_chunk("stop"));
+    let mut reply = Reply::sse(&chunks, true);
+    let body = reply.pieces.remove(0);
+    reply.pieces = String::from_utf8(body)
+        .expect("SSE text is UTF-8")
+        .split_inclusive("\n\n")
+        .map(|event| event.as_bytes().to_vec())
+        .collect();
+    reply.pause = Duration::from_millis(150);
+    let server = Server::start(reply).await;
+    let stream = within(server.provider_with(short_timeouts()).stream("m", hello()))
+        .await
+        .expect("the stream request should succeed");
+    let response = within(stream.collect_response())
+        .await
+        .expect("a slow but live stream should finish");
+    assert_eq!(response.text(), "012345");
+}
+
+#[tokio::test]
+async fn a_response_body_over_the_size_limit_is_refused() {
+    let server = Server::start(Reply::json(&json!({
+        "choices": [{ "message": { "content": "x".repeat(500) } }],
+    })))
+    .await;
+    let error = within(
+        server
+            .provider()
+            .with_max_body_bytes(100)
+            .generate("m", hello()),
+    )
+    .await
+    .expect_err("the body is over the limit");
+    assert!(
+        matches!(&error, GenerationError::InvalidResponse(message) if message.contains("100 byte limit")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_long_error_body_is_cut_off_but_its_status_is_kept() {
+    let server = Server::start(Reply::with_status(
+        "502 Bad Gateway",
+        "text/html",
+        "y".repeat(3 * 1024 * 1024),
+    ))
+    .await;
+    let error = within(server.provider().generate("m", hello()))
+        .await
+        .expect_err("502 is an error");
+    assert!(
+        matches!(&error, GenerationError::Provider { status: Some(502), message, .. } if message.len() < 4_000),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -1204,6 +1467,9 @@ async fn stream_reads_events_split_across_writes_and_inside_a_character() {
         content_type: "text/event-stream",
         extra_headers: String::new(),
         pieces,
+        silent: false,
+        pause: Duration::from_millis(5),
+        stall: false,
     })
     .await;
     let stream = within(server.provider().stream("m", hello()))

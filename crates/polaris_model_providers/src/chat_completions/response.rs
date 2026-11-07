@@ -11,6 +11,7 @@ use polaris_models::llm::{
     ToolFunction, Usage,
 };
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Reads a non-streaming response body.
 pub(super) fn parse_response(raw: &Value) -> Result<LlmResponse, GenerationError> {
@@ -105,6 +106,11 @@ pub(super) fn first_choice(choices: &[Value]) -> &Value {
 /// The reasoning text of a message or delta: `reasoning_content`, else
 /// `reasoning` (the name newer servers use). Empty text counts as none.
 pub(super) fn reasoning_text(message: &Value) -> Option<&str> {
+    reasoning_field_and_text(message).map(|(_, text)| text)
+}
+
+/// Like [`reasoning_text`], with the name of the field the text was in.
+pub(super) fn reasoning_field_and_text(message: &Value) -> Option<(&'static str, &str)> {
     ["reasoning_content", "reasoning"]
         .into_iter()
         .find_map(|key| {
@@ -112,7 +118,15 @@ pub(super) fn reasoning_text(message: &Value) -> Option<&str> {
                 .get(key)
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
+                .map(|text| (key, text))
         })
+}
+
+/// The reasoning field a non-streaming response used, if it carried reasoning.
+pub(super) fn response_reasoning_field(raw: &Value) -> Option<&'static str> {
+    let choices = raw.get("choices")?.as_array().filter(|c| !c.is_empty())?;
+    let message = first_choice(choices).get("message")?;
+    reasoning_field_and_text(message).map(|(field, _)| field)
 }
 
 /// The text of `content`, which is a string, `null`, or a list of parts.
@@ -178,9 +192,18 @@ fn parse_arguments(text: &str) -> Result<Value, serde_json::Error> {
 }
 
 /// An id for a tool call whose server sent none. Built from the response id
-/// and the call's position, so it is stable and unique within a conversation.
+/// and the call's position. A response with no id gets a number from a
+/// process-wide counter instead, so ids do not repeat from one turn to the
+/// next within a conversation.
 pub(super) fn synthesized_call_id(response_id: Option<&str>, index: u64) -> String {
-    format!("{}_call_{index}", response_id.unwrap_or("chatcmpl"))
+    static NEXT_RESPONSE: AtomicU64 = AtomicU64::new(0);
+    match response_id {
+        Some(id) => format!("{id}_call_{index}"),
+        None => {
+            let number = NEXT_RESPONSE.fetch_add(1, Ordering::Relaxed);
+            format!("chatcmpl-{number}_call_{index}")
+        }
+    }
 }
 
 /// Maps a `finish_reason` to a [`StopReason`].

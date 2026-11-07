@@ -237,7 +237,7 @@ fn a_call_with_null_arguments_is_sent_as_an_empty_object() {
 }
 
 #[test]
-fn an_assistant_message_joins_its_text_and_its_reasoning_blocks() {
+fn an_assistant_message_joins_its_text_and_reasoning_blocks_in_order_with_no_separator() {
     let request = LlmRequest {
         messages: vec![assistant(vec![
             AssistantBlock::Reasoning(ReasoningBlock {
@@ -256,7 +256,7 @@ fn an_assistant_message_joins_its_text_and_its_reasoning_blocks() {
         vec![json!({
             "role": "assistant",
             "content": "Hello, world",
-            "reasoning_content": "first\nsecond\nthird",
+            "reasoning_content": "firstsecondthird",
         })]
     );
 }

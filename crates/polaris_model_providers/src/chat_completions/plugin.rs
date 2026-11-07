@@ -1,7 +1,7 @@
 //! Chat Completions provider plugin.
 
 use super::provider::ChatCompletionsProvider;
-use super::{MaxTokensField, ReasoningReplay};
+use super::{MaxTokensField, ReasoningReplay, Timeouts};
 use crate::pricing::PriceStore;
 use polaris_models::ModelRegistry;
 use polaris_system::plugin;
@@ -164,11 +164,20 @@ impl ChatCompletionsPlugin {
         self
     }
 
-    /// Chooses how reasoning from earlier turns is sent back (default
-    /// `reasoning_content`). See [`ReasoningReplay`].
+    /// Chooses how reasoning from earlier turns is sent back (default:
+    /// the field the server used). See [`ReasoningReplay`].
     #[must_use]
     pub fn with_reasoning_replay(mut self, replay: ReasoningReplay) -> Self {
         self.provider = self.provider.with_reasoning_replay(replay);
+        self
+    }
+
+    /// Sets the connect and idle timeouts (default: 30 seconds and 5 minutes).
+    /// There is no limit on the whole request, so long streams still work. See
+    /// [`Timeouts`].
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.provider = self.provider.with_timeouts(timeouts);
         self
     }
 

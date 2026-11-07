@@ -7,8 +7,10 @@
 //! the connection ends, never at `finish_reason`, because servers send the
 //! final `usage` in a chunk after the one that carries `finish_reason`.
 
+use super::SeenReasoningField;
 use super::response::{
-    error_message, first_choice, parse_usage, reasoning_text, stop_reason, synthesized_call_id,
+    error_message, first_choice, parse_usage, reasoning_field_and_text, stop_reason,
+    synthesized_call_id,
 };
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -66,6 +68,8 @@ pub(super) struct ChatStreamAdapter<S> {
     done_marker: bool,
     /// The stream is over: `MessageStop` or an error has been queued.
     stopped: bool,
+    /// Where to note which reasoning field the server used.
+    seen_reasoning: Option<SeenReasoningField>,
 }
 
 impl<S> ChatStreamAdapter<S> {
@@ -85,7 +89,14 @@ impl<S> ChatStreamAdapter<S> {
             emitted: false,
             done_marker: false,
             stopped: false,
+            seen_reasoning: None,
         }
+    }
+
+    /// Notes the reasoning field the server uses in `seen`.
+    pub(super) fn recording_reasoning_field(mut self, seen: SeenReasoningField) -> Self {
+        self.seen_reasoning = Some(seen);
+        self
     }
 
     fn fail(&mut self, error: GenerationError) {
@@ -232,7 +243,10 @@ impl<S> ChatStreamAdapter<S> {
     }
 
     fn handle_delta(&mut self, delta: &Value) {
-        if let Some(text) = reasoning_text(delta) {
+        if let Some((field, text)) = reasoning_field_and_text(delta) {
+            if let Some(seen) = &self.seen_reasoning {
+                seen.record(field);
+            }
             self.push_text(BlockKind::Reasoning, text);
         }
         if let Some(text) = delta

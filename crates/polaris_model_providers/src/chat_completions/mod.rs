@@ -17,6 +17,9 @@
 //! because servers differ in which fields they send. See
 //! [`ChatCompletionsProvider`] for what is read and what is sent.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 mod plugin;
 mod provider;
 mod request;
@@ -24,22 +27,23 @@ mod response;
 mod stream;
 
 pub use plugin::ChatCompletionsPlugin;
-pub use provider::ChatCompletionsProvider;
+pub use provider::{ChatCompletionsProvider, Timeouts};
 
 /// Which request key carries [`LlmRequest::max_output_tokens`](polaris_models::llm::LlmRequest::max_output_tokens).
 ///
 /// `OpenAI` replaced `max_tokens` with `max_completion_tokens`, and rejects
 /// `max_tokens` for its reasoning models. Many other servers still read only
-/// `max_tokens`, or do not enforce `max_completion_tokens`. Pick the key the
-/// server honours with
-/// [`ChatCompletionsProvider::with_max_tokens_field`].
+/// `max_tokens`, or do not enforce `max_completion_tokens`; the Hugging Face
+/// router's request schema lists only `max_tokens`. Pick the key the server
+/// honours with [`ChatCompletionsProvider::with_max_tokens_field`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MaxTokensField {
-    /// Send `max_completion_tokens` (the default).
+    /// Send `max_completion_tokens` (the default, right for `OpenAI`).
     #[default]
     MaxCompletionTokens,
-    /// Send `max_tokens`.
+    /// Send `max_tokens` (use this for the Hugging Face router and for
+    /// servers that read only that key).
     MaxTokens,
 }
 
@@ -60,28 +64,64 @@ impl MaxTokensField {
 /// it back on later turns (`DeepSeek`'s thinking mode requires it on every
 /// request that carries tools and answers `400` without it; Z.ai's preserved
 /// thinking needs it complete and in order), while others ignore it or reject
-/// the unknown field. Pick what the server expects with
-/// [`ChatCompletionsProvider::with_reasoning_replay`].
+/// the unknown field. Which name a server reads on input is a fact about that
+/// server, so the default sends the reasoning under the name the server itself
+/// used. Set another value with
+/// [`ChatCompletionsProvider::with_reasoning_replay`] when a server answers
+/// under one name and reads another.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReasoningReplay {
-    /// Send the reasoning as the assistant message's `reasoning_content`
-    /// field (the default; `DeepSeek` and Z.ai read this name).
+    /// Send the reasoning under the field the server used in its most recent
+    /// reply through this provider (the default). Before the provider has
+    /// received any reasoning it uses `reasoning_content`; that only matters
+    /// for history carried over from another process or provider.
     #[default]
+    AsReceived,
+    /// Always send the reasoning as the assistant message's `reasoning_content`
+    /// field (`DeepSeek`, Z.ai and `SGLang` read this name).
     ReasoningContent,
-    /// Send the reasoning as the assistant message's `reasoning` field.
+    /// Always send the reasoning as the assistant message's `reasoning` field.
     Reasoning,
     /// Do not send earlier reasoning.
     Omit,
 }
 
+const REASONING_CONTENT: &str = "reasoning_content";
+const REASONING: &str = "reasoning";
+
 impl ReasoningReplay {
     /// The assistant message field that carries the reasoning, if any.
-    pub(crate) fn field(self) -> Option<&'static str> {
+    pub(crate) fn field(self, seen: &SeenReasoningField) -> Option<&'static str> {
         match self {
-            Self::ReasoningContent => Some("reasoning_content"),
-            Self::Reasoning => Some("reasoning"),
+            Self::AsReceived => Some(seen.get()),
+            Self::ReasoningContent => Some(REASONING_CONTENT),
+            Self::Reasoning => Some(REASONING),
             Self::Omit => None,
+        }
+    }
+}
+
+/// The reasoning field a server used in its latest reply, shared by every
+/// clone of a provider.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SeenReasoningField(Arc<AtomicBool>);
+
+impl SeenReasoningField {
+    /// Records the field a reply used. Other names are ignored.
+    pub(crate) fn record(&self, field: &str) {
+        match field {
+            REASONING => self.0.store(true, Ordering::Relaxed),
+            REASONING_CONTENT => self.0.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+
+    fn get(&self) -> &'static str {
+        if self.0.load(Ordering::Relaxed) {
+            REASONING
+        } else {
+            REASONING_CONTENT
         }
     }
 }

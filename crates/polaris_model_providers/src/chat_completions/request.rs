@@ -1,6 +1,6 @@
 //! Building the Chat Completions request body (Polaris -> server).
 
-use super::{MaxTokensField, ReasoningReplay};
+use super::{MaxTokensField, ReasoningReplay, SeenReasoningField};
 use crate::schema::normalize_schema_for_strict_mode;
 use polaris_models::llm::{
     AssistantBlock, DocumentSource, GenerationError, ImageBlock, ImageMediaType, LlmRequest,
@@ -16,6 +16,8 @@ pub(super) struct BodySettings {
     pub(super) max_tokens_field: MaxTokensField,
     /// How earlier reasoning is sent back.
     pub(super) reasoning_replay: ReasoningReplay,
+    /// The reasoning field the server used in its latest reply.
+    pub(super) seen_reasoning: SeenReasoningField,
     /// Whether tool definitions carry `strict` and a normalized schema.
     pub(super) strict_tools: bool,
     /// Fields laid over the top level of every body.
@@ -33,7 +35,8 @@ pub(super) fn build_body(
     if let Some(system) = &request.system {
         messages.push(json!({ "role": "system", "content": system }));
     }
-    convert_messages(&request.messages, settings.reasoning_replay, &mut messages)?;
+    let reasoning_field = settings.reasoning_replay.field(&settings.seen_reasoning);
+    convert_messages(&request.messages, reasoning_field, &mut messages)?;
 
     let mut body = Map::new();
     body.insert("model".to_owned(), json!(model));
@@ -139,13 +142,15 @@ fn convert_tool_choice(choice: &ToolChoice) -> Value {
 
 fn convert_messages(
     messages: &[Message],
-    replay: ReasoningReplay,
+    reasoning_field: Option<&'static str>,
     out: &mut Vec<Value>,
 ) -> Result<(), GenerationError> {
     for message in messages {
         match message {
             Message::User { content } => convert_user_message(content, out)?,
-            Message::Assistant { content, .. } => convert_assistant_message(content, replay, out)?,
+            Message::Assistant { content, .. } => {
+                convert_assistant_message(content, reasoning_field, out)?;
+            }
         }
     }
     Ok(())
@@ -233,12 +238,12 @@ fn tool_call_id<'a>(call_id: Option<&'a str>, id: &'a str) -> Option<&'a str> {
 
 fn convert_assistant_message(
     blocks: &[AssistantBlock],
-    replay: ReasoningReplay,
+    reasoning_field: Option<&'static str>,
     out: &mut Vec<Value>,
 ) -> Result<(), GenerationError> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
-    let mut reasoning = Vec::new();
+    let mut reasoning = String::new();
 
     for block in blocks {
         match block {
@@ -250,8 +255,7 @@ fn convert_assistant_message(
         }
     }
 
-    let reasoning = reasoning.join("\n");
-    let reasoning_field = replay.field().filter(|_| !reasoning.is_empty());
+    let reasoning_field = reasoning_field.filter(|_| !reasoning.is_empty());
     if text.is_empty() && tool_calls.is_empty() && reasoning_field.is_none() {
         return Ok(());
     }

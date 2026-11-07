@@ -1,7 +1,7 @@
 //! The Chat Completions [`LlmProvider`].
 
 use super::request::{BodySettings, build_body};
-use super::response::{error_message, parse_response};
+use super::response::{error_message, parse_response, response_reasoning_field};
 use super::stream::ChatStreamAdapter;
 use super::{MaxTokensField, ReasoningReplay};
 use crate::pricing::PriceStore;
@@ -18,12 +18,65 @@ use serde_json::Value;
 /// another.
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// The largest non-streaming response body that is read. Streams have their
+/// own limit per event.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Time limits for requests to a server.
+///
+/// There is deliberately no limit on the whole request: a model that reasons
+/// for many minutes while it streams must not be cut off. Instead:
+///
+/// - `connect` bounds opening the connection;
+/// - `idle` bounds every wait for more data, so a server that accepts the
+///   request and then goes silent, or a stream that stalls, fails with
+///   [`GenerationError::Http`] after `idle`. For a **non-streaming** call the
+///   server sends nothing until the whole answer is ready, so `idle` must be
+///   longer than the longest answer you will wait for. A streaming call sends
+///   data as it goes and is not affected.
+///
+/// The defaults are 30 seconds to connect and 5 minutes of silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    connect: Duration,
+    idle: Duration,
+}
+
+impl Timeouts {
+    /// Creates limits from a connect timeout and an idle (per read) timeout.
+    #[must_use]
+    pub const fn new(connect: Duration, idle: Duration) -> Self {
+        Self { connect, idle }
+    }
+
+    /// The connect timeout.
+    #[must_use]
+    pub const fn connect(&self) -> Duration {
+        self.connect
+    }
+
+    /// The idle timeout.
+    #[must_use]
+    pub const fn idle(&self) -> Duration {
+        self.idle
+    }
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(30), Duration::from_secs(300))
+    }
+}
+
 /// The HTTP client settings every provider starts from.
 ///
 /// Some servers sit behind gateways that refuse a request with no
 /// `User-Agent`, so one that names the library is sent.
-pub(super) fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().user_agent(concat!("polaris-ai/", env!("CARGO_PKG_VERSION")))
+pub(super) fn client_builder(timeouts: Timeouts) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(concat!("polaris-ai/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.idle)
 }
 
 /// The longest part of an error body kept in an error message.
@@ -51,7 +104,7 @@ const MAX_ERROR_BODY_CHARS: usize = 2_000;
 /// | streaming | `stream: true` and `stream_options.include_usage: true` |
 ///
 /// A tool result's text gets an `Error: ` prefix when it reports a failure.
-/// Earlier reasoning is sent back on assistant messages as `reasoning_content`
+/// Earlier reasoning is sent back on assistant messages under the field the server used for it, `reasoning_content` or `reasoning`
 /// (see [`ReasoningReplay`]). Audio and document blocks, and images in tool
 /// results, fail with [`GenerationError::UnsupportedContent`].
 ///
@@ -112,6 +165,7 @@ const MAX_ERROR_BODY_CHARS: usize = 2_000;
 #[derive(Clone)]
 pub struct ChatCompletionsProvider {
     client: reqwest::Client,
+    max_body_bytes: usize,
     api_key: Option<String>,
     base_url: String,
     settings: BodySettings,
@@ -138,11 +192,12 @@ impl ChatCompletionsProvider {
     }
 
     fn build(api_key: Option<String>) -> Self {
-        let client = client_builder()
+        let client = client_builder(Timeouts::default())
             .build()
-            .expect("a client with only a user agent set should build");
+            .expect("a client with only a user agent and timeouts set should build");
         Self {
             client,
+            max_body_bytes: MAX_BODY_BYTES,
             api_key,
             base_url: DEFAULT_BASE_URL.to_owned(),
             settings: BodySettings::default(),
@@ -203,7 +258,7 @@ impl ChatCompletionsProvider {
     }
 
     /// Chooses how reasoning from earlier turns is sent back (default
-    /// [`ReasoningReplay::ReasoningContent`]).
+    /// [`ReasoningReplay::AsReceived`]).
     #[must_use]
     pub fn with_reasoning_replay(mut self, replay: ReasoningReplay) -> Self {
         self.settings.reasoning_replay = replay;
@@ -262,11 +317,45 @@ impl ChatCompletionsProvider {
         self
     }
 
+    /// Sets how long a connection may take to open and how long a response may
+    /// go silent (default: [`Timeouts::default`]). See [`Timeouts`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built, which does not happen for
+    /// any pair of durations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use polaris_model_providers::chat_completions::{ChatCompletionsProvider, Timeouts};
+    ///
+    /// let provider = ChatCompletionsProvider::without_api_key()
+    ///     .with_timeouts(Timeouts::new(Duration::from_secs(10), Duration::from_secs(90)));
+    /// # let _ = provider;
+    /// ```
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.client = client_builder(timeouts)
+            .build()
+            .expect("a client with only a user agent and timeouts set should build");
+        self
+    }
+
     /// Replaces the HTTP client, so tests can keep a loopback request from
     /// going through a proxy named in the environment.
     #[cfg(test)]
     pub(crate) fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self
+    }
+
+    /// Lowers the size limit of a non-streaming response body, so a test does
+    /// not need a 16 MiB body.
+    #[cfg(test)]
+    pub(crate) fn with_max_body_bytes(mut self, limit: usize) -> Self {
+        self.max_body_bytes = limit;
         self
     }
 
@@ -288,6 +377,8 @@ impl ChatCompletionsProvider {
 
     /// Sends `body` and returns the response if its status is a success.
     async fn post(&self, body: &Value) -> Result<reqwest::Response, GenerationError> {
+        // Error bodies are only read for a message, so a long one is cut off.
+        const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
         let response = self
             .client
             .post(self.url())
@@ -301,12 +392,42 @@ impl ChatCompletionsProvider {
             return Ok(response);
         }
         let headers = response.headers().clone();
-        let text = response
-            .text()
-            .await
-            .map_err(|err| GenerationError::Http(err.to_string()))?;
-        Err(status_error(status, &headers, &text))
+        let bytes = read_capped(response, MAX_ERROR_BODY_BYTES, false).await?;
+        Err(status_error(
+            status,
+            &headers,
+            &String::from_utf8_lossy(&bytes),
+        ))
     }
+}
+
+/// Reads a response body of at most `limit` bytes.
+///
+/// A longer body fails with [`GenerationError::InvalidResponse`] when
+/// `fail_when_over` is set, and is cut off at the limit otherwise.
+async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+    fail_when_over: bool,
+) -> Result<Vec<u8>, GenerationError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| GenerationError::Http(err.to_string()))?
+    {
+        if body.len() + chunk.len() > limit {
+            if fail_when_over {
+                return Err(GenerationError::InvalidResponse(format!(
+                    "the response body is larger than the {limit} byte limit"
+                )));
+            }
+            body.extend_from_slice(&chunk[..limit - body.len()]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 impl core::fmt::Debug for ChatCompletionsProvider {
@@ -331,25 +452,26 @@ impl LlmProvider for ChatCompletionsProvider {
     ) -> Result<LlmResponse, GenerationError> {
         let body = build_body(model, &request, false, &self.settings)?;
         let response = self.post(&body).await?;
-        let text = response
-            .text()
-            .await
-            .map_err(|err| GenerationError::Http(err.to_string()))?;
-        let raw: Value = serde_json::from_str(&text).map_err(|err| {
+        let bytes = read_capped(response, self.max_body_bytes, true).await?;
+        let raw: Value = serde_json::from_slice(&bytes).map_err(|err| {
             GenerationError::InvalidResponse(format!(
                 "the response is not valid JSON: {err}; it starts with: {}",
-                excerpt(&text)
+                excerpt(&String::from_utf8_lossy(&bytes))
             ))
         })?;
+        if let Some(field) = response_reasoning_field(&raw) {
+            self.settings.seen_reasoning.record(field);
+        }
         parse_response(&raw)
     }
 
     async fn stream(&self, model: &str, request: LlmRequest) -> Result<LlmStream, GenerationError> {
         let body = build_body(model, &request, true, &self.settings)?;
         let response = self.post(&body).await?;
-        Ok(Box::pin(ChatStreamAdapter::new(SseDataStream::new(
-            response.bytes_stream(),
-        ))))
+        Ok(Box::pin(
+            ChatStreamAdapter::new(SseDataStream::new(response.bytes_stream()))
+                .recording_reasoning_field(self.settings.seen_reasoning.clone()),
+        ))
     }
 
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
