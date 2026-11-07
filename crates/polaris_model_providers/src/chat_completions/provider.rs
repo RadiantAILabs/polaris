@@ -18,6 +18,14 @@ use serde_json::Value;
 /// another.
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// The HTTP client settings every provider starts from.
+///
+/// Some servers sit behind gateways that refuse a request with no
+/// `User-Agent`, so one that names the library is sent.
+pub(super) fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent(concat!("polaris-ai/", env!("CARGO_PKG_VERSION")))
+}
+
 /// The longest part of an error body kept in an error message.
 const MAX_ERROR_BODY_CHARS: usize = 2_000;
 
@@ -130,8 +138,11 @@ impl ChatCompletionsProvider {
     }
 
     fn build(api_key: Option<String>) -> Self {
+        let client = client_builder()
+            .build()
+            .expect("a client with only a user agent set should build");
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             base_url: DEFAULT_BASE_URL.to_owned(),
             settings: BodySettings::default(),

@@ -51,6 +51,11 @@ impl<S> SseDataStream<S> {
 
     fn push_bytes(&mut self, bytes: &[u8]) {
         for &byte in bytes {
+            // After a failure nothing more is read, so no event follows the
+            // error in the output.
+            if self.finished {
+                return;
+            }
             if byte == b'\n' {
                 let line = core::mem::take(&mut self.line);
                 self.handle_line(&line);
@@ -227,6 +232,20 @@ mod tests {
             matches!(&items[1], Err(GenerationError::InvalidResponse(message)) if message.contains("UTF-8")),
             "{items:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn nothing_follows_an_error_in_the_same_chunk() {
+        let items = read(vec![Ok(Bytes::from_static(
+            b"data: one\n\ndata: \xff\n\ndata: two\n\n",
+        ))])
+        .await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_ref().unwrap(), "one");
+        assert!(matches!(
+            &items[1],
+            Err(GenerationError::InvalidResponse(_))
+        ));
     }
 
     #[tokio::test]

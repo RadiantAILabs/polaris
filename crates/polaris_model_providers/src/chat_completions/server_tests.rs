@@ -145,7 +145,7 @@ impl Drop for Server {
 /// A client that ignores proxies named in the environment, which would
 /// otherwise carry a loopback request away from the test server.
 fn no_proxy_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    provider::client_builder()
         .no_proxy()
         .build()
         .expect("a client without proxies should build")
@@ -308,6 +308,20 @@ async fn a_keyless_provider_sends_no_authorization_header() {
         .expect("the request should succeed");
     let seen = server.recorded().await;
     assert_eq!(seen.header("authorization"), None, "{}", seen.head);
+}
+
+#[tokio::test]
+async fn requests_name_the_library_in_the_user_agent() {
+    let mut server = Server::start(Reply::json(&json!({
+        "choices": [{ "message": { "content": "ok" } }],
+    })))
+    .await;
+    within(server.provider().generate("m", hello()))
+        .await
+        .expect("the request should succeed");
+    let seen = server.recorded().await;
+    let agent = seen.header("user-agent").expect("a user agent is sent");
+    assert!(agent.starts_with("polaris-ai/"), "{agent}");
 }
 
 #[tokio::test]
