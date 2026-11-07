@@ -19,6 +19,9 @@ Each provider is gated behind a feature flag to avoid pulling in unnecessary dep
 # Enable only Anthropic (default)
 polaris_model_providers = { path = "../polaris_model_providers" }
 
+# Enable only Chat Completions
+polaris_model_providers = { path = "../polaris_model_providers", default-features = false, features = ["chat-completions"] }
+
 # Enable only Bedrock
 polaris_model_providers = { path = "../polaris_model_providers", default-features = false, features = ["bedrock"] }
 
@@ -71,7 +74,7 @@ For a server that speaks the OpenAI Chat Completions API (the `chat-completions`
 feature adds no dependency), give the server's base URL:
 
 ```rust
-use polaris_model_providers::ChatCompletionsPlugin;
+use polaris_model_providers::{ChatCompletionsPlugin, chat_completions::MaxTokensField};
 use polaris_models::ModelsPlugin;
 use polaris_system::server::Server;
 
@@ -79,7 +82,8 @@ let mut server = Server::new();
 server.add_plugins(ModelsPlugin);
 server.add_plugins(
     ChatCompletionsPlugin::from_env("HF_TOKEN")
-        .with_base_url("https://router.huggingface.co/v1"),
+        .with_base_url("https://router.huggingface.co/v1")
+        .with_max_tokens_field(MaxTokensField::MaxTokens),
 );
 // registry.llm("chat_completions/zai-org/GLM-5.3-Flash:zai")
 ```

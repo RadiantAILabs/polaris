@@ -265,13 +265,13 @@ Each provider sends it in its own way:
 |----------|---------|-------------------|
 | Chat Completions | `reasoning_effort` | every level, as the level's name |
 | OpenAI (Responses) | `reasoning.effort` | every level, as the level's name |
-| Anthropic | `output_config.effort` | `Low`, `Medium`, `High`, `XHigh`, `Max` |
+| Anthropic | `output_config.effort` | `low`, `medium`, `high`, `xhigh`, `max`, including matching `Other` text |
 | Bedrock, `openai.*` models | `reasoning.effort` | every level, as the level's name |
 | Bedrock, Converse | not supported | none |
 
-**Nothing is dropped silently.** A run that pins an effort must not run at another one without saying so, so a provider that cannot send the requested level returns `GenerationError::UnsupportedOperation` **before it sends anything**: Anthropic for `None`, `Minimal` and `Other` (it has no such levels, and it cannot turn thinking off through effort), Bedrock Converse for every level (the Converse API has no effort setting, and the model-specific field that carries one differs per model). On Bedrock Converse, keep using `with_additional_model_request_fields` with the model's own field and leave the request field unset.
+**Polaris never drops the setting.** A provider that cannot send the requested level returns `GenerationError::UnsupportedOperation` **before it sends anything**: Anthropic for names outside `low`, `medium`, `high`, `xhigh` and `max` (including `None` and `Minimal`; it cannot turn thinking off through effort), Bedrock Converse for every level (the Converse API has no effort setting, and the model-specific field that carries one differs per model). Anthropic checks the level's text, so `Other("low".into())` is accepted. On Bedrock Converse, keep using `with_additional_model_request_fields` with the model's own field and leave the request field unset.
 
-**The server decides which levels a model has.** Providers that take every level send the name as written (`xhigh`, `max`, or an `Other` string); a server that does not know the level rejects the request, and its error message reaches the caller as `GenerationError::Provider`. OpenAI's own `reasoning` object keeps other settings such as `summary` when an effort is added. For Bedrock `openai.*` models, a provider-wide field from `with_additional_model_request_fields` replaces the request's `reasoning` key, like any other key it sets.
+**The server decides which levels a model has.** Providers that take every level send the name as written (`xhigh`, `max`, or an `Other` string); a server may ignore an unknown level, so check `Usage::reasoning_output_tokens` when the effort matters. If the server rejects the level, its error message reaches the caller as `GenerationError::Provider`. OpenAI's own `reasoning` object keeps other settings such as `summary` when an effort is added. For Bedrock `openai.*` models, a provider-wide field from `with_additional_model_request_fields` replaces the request's `reasoning` key, like any other key it sets.
 
 **Implementing a provider.** Read `request.reasoning_effort` in `generate` and `stream`, put it in the request the vendor expects, and return `GenerationError::UnsupportedOperation` (with the level in the message) when the vendor has no way to take it. Do not ignore it.
 
@@ -348,22 +348,25 @@ The Chat Completions provider is different: it links a result to its call by the
 `ChatCompletionsPlugin` (feature `chat-completions`, no extra dependency) reaches any server that implements `POST {base_url}/chat/completions`: the Hugging Face inference router, vLLM, SGLang, Ollama, DeepInfra, Z.ai, DeepSeek, OpenAI's own Chat Completions endpoint and others. Models are `chat_completions/<model>`, where `<model>` is the exact string the server expects in its `model` field. It may contain `/` and `:`, as in `chat_completions/zai-org/GLM-5.3-Flash:zai`; the registry splits only at the first `/`.
 
 ```rust
+use polaris_model_providers::chat_completions::MaxTokensField;
+
 server.add_plugins(ModelsPlugin);
 server.add_plugins(
     ChatCompletionsPlugin::from_env("HF_TOKEN")
-        .with_base_url("https://router.huggingface.co/v1"),
+        .with_base_url("https://router.huggingface.co/v1")
+        .with_max_tokens_field(MaxTokensField::MaxTokens),
 );
 let llm = registry.llm("chat_completions/zai-org/GLM-5.3-Flash:zai")?;
 ```
 
-**A separate plugin, not a mode of `OpenAiPlugin`.** The two speak different protocols with different failure modes. A mode switch would make `openai/<model>` mean one protocol or the other depending on configuration, and a server could not use both. Separate plugins register under different provider names (`openai`, `chat_completions`), so both can be added and each model id says which protocol it uses. Only one `ChatCompletionsPlugin` can be registered, because the provider name is the registry key; to reach two servers, wrap two `ChatCompletionsProvider`s in a provider of your own.
+**A separate plugin, not a mode of `OpenAiPlugin`.** The two speak different protocols with different failure modes. A mode switch would make `openai/<model>` mean one protocol or the other depending on configuration, and a server could not use both. Separate plugins register under different provider names (`openai`, `chat_completions`), so both can be added and each model id says which protocol it uses. Only one `ChatCompletionsPlugin` can be registered, because the provider name is the registry key; registering a second panics during `build()`. To reach two servers, wrap two `ChatCompletionsProvider`s in a provider of your own.
 
 **Configuration.** The key is sent as `Authorization: Bearer <key>`; `without_api_key()` sends no header for local servers. No environment variable is read except by `from_env(var)`, which names the variable that holds the key.
 
 | Method | Meaning |
 |--------|---------|
 | `with_base_url(url)` | Server root; `/chat/completions` is appended. Default `https://api.openai.com/v1`. A trailing `/` is ignored. |
-| `with_extra_body(json)` | Top-level keys added to every body, replacing a key Polaris set. Must be a JSON object; anything else fails every request with `GenerationError::InvalidRequest`. For settings with no request type: Z.ai's `thinking`, vLLM's `chat_template_kwargs`, `top_k`. |
+| `with_extra_body(fields)` | Takes `serde_json::Map<String, Value>` for top-level fields such as Z.ai's `thinking`, vLLM's `chat_template_kwargs`, or `top_k`. Repeated calls merge fields; later values replace earlier ones. Requests fail with `GenerationError::InvalidRequest` for reserved keys `model`, `messages`, `stream`, `stream_options`, or for `reasoning_effort` when the request also sets it. Other keys replace any value Polaris set. |
 | `with_max_tokens_field(MaxTokensField)` | `MaxCompletionTokens` (default) or `MaxTokens`: the key that carries `LlmRequest::max_output_tokens`. OpenAI rejects `max_tokens` for reasoning models, so the default is right for OpenAI; many other servers read only `max_tokens`. **For the Hugging Face router use `MaxTokens`**: its request schema lists `max_tokens` only, and a backend that ignores `max_completion_tokens` would run without the cap you asked for. |
 | `with_reasoning_replay(ReasoningReplay)` | How earlier reasoning is sent back: `AsReceived` (default), `ReasoningContent`, `Reasoning`, or `Omit`. See below. |
 | `with_timeouts(Timeouts)` | Connect timeout (default 30 s) and idle timeout (default 5 min): the longest wait for more data. There is no limit on the whole request, so a long reasoning stream is never cut off while data keeps arriving. A server that accepts a request and goes silent, or a stream that stalls, fails with `GenerationError::Http` after the idle timeout. A non-streaming call receives nothing until the answer is complete, so raise the idle timeout above the longest answer you will wait for. |
@@ -374,7 +377,7 @@ let llm = registry.llm("chat_completions/zai-org/GLM-5.3-Flash:zai")?;
 
 **Reasoning from the model.** Servers return it next to the answer, as `reasoning_content` or, on newer servers, `reasoning`. The provider reads either (`reasoning_content` first) into an `AssistantBlock::Reasoning` placed before the text and tool calls, and streams it as a reasoning block. Sending it back is where servers differ, so `ReasoningReplay` chooses:
 
-- **`AsReceived` (default)** sends it under the field the server used in its latest reply through this provider (a router that answers with `reasoning` gets `reasoning` back; one that answers with `reasoning_content` gets that). The provider learns the field from the first reply that carries reasoning, so the choice only matters for history carried over from another process or provider, which is sent as `reasoning_content`. Set an explicit value below when a server answers under one name and reads another.
+- **`AsReceived` (default)** learns the field from the latest reply for the same model that carries reasoning through this provider (a router that answers with `reasoning` gets `reasoning` back; one that answers with `reasoning_content` gets that). This state is kept per model; before any such reply, including after a process restart, earlier reasoning is sent as `reasoning_content`. Set an explicit value below when a server answers under one name and reads another.
 - **`ReasoningContent`** always sends it on the assistant message as `reasoning_content`. DeepSeek's thinking mode needs this on every later request that carries tools: without tools the field is ignored, with tools a request that omits the earlier `reasoning_content` is answered with `400` ([DeepSeek thinking mode](https://api-docs.deepseek.com/guides/thinking_mode)). Z.ai's Preserved Thinking needs the complete, unmodified and correctly ordered `reasoning_content` of earlier turns, with `thinking.clear_thinking` set to `false` ([Z.ai thinking mode](https://docs.z.ai/guides/capabilities/thinking-mode), [chat completion reference](https://docs.z.ai/api-reference/llm/chat-completion)); set that with `with_extra_body`.
 - **`Reasoning`** always sends it as `reasoning`, the name newer vLLM versions use in responses ([vLLM reasoning outputs](https://docs.vllm.ai/en/latest/features/reasoning_outputs/)). Use it only for a server that is known to read that name on input.
 - **`Omit`** sends no earlier reasoning, for servers that reject the unknown field.
@@ -388,9 +391,10 @@ Reasoning blocks from other providers are sent the same way (their signatures ar
 - Stop reasons: `length` is `MaxOutputTokens` (even when a tool call was cut off), `tool_calls` is `ToolUse`, `content_filter` is `ContentFilter`, `stop` is `EndTurn` (or `ToolUse` when the message has tool calls, because some servers say `stop` after a tool call), a missing reason is inferred the same way, and any other value is `StopReason::Other`.
 - Usage: `input_tokens` is `prompt_tokens` without the cached part (`prompt_tokens_details.cached_tokens`, or DeepSeek's `prompt_cache_hit_tokens`), `cache_read_tokens` is the cached part, `reasoning_output_tokens` is `completion_tokens_details.reasoning_tokens`, `output_tokens` is `completion_tokens` as the server counts it. A count a server leaves out stays `None`.
 - A non-streaming body larger than 16 MiB fails with `InvalidResponse`; an error body is read up to 1 MiB and cut there.
+- Exceeding a limit on buffered tool arguments, refusal text or tool-slot count, or overflowing a tool index, terminates the stream with `InvalidResponse`.
 - A stream ends at `data: [DONE]`, or when the connection closes after a finish reason. The usage chunk that servers send after the finish chunk is included in the final `MessageStop`. A stream that closes before any finish reason fails with `InvalidResponse`, and an `error` object in a chunk fails it with `Provider`.
 
-**Errors.** `401` and `403` are `Auth`, `429` is `RateLimited` (with `Retry-After` when it is a number of seconds), anything else is `Provider` with the status and the server's message, read from `{"error": {"message": ..}}`, `{"error": ".."}`, `{"message": ..}` or `{"detail": ..}`. A `200` response whose body is an error object is also `Provider`.
+**Errors.** `401` and `403` are `Auth`, `429` is `RateLimited` (with `Retry-After` when it is a number of seconds), anything else is `Provider` with the status and the server's message, read from `{"error": {"message": ..}}`, `{"error": ".."}`, `{"message": ..}` or `{"detail": ..}`. An unreadable error body preserves the status classification, including `Auth` and `RateLimited`. A `200` response whose body is an error object is also `Provider`.
 
 **Not supported:** `n` greater than 1 (only the first choice is read), the legacy `function_call` field, audio and document input, and image tool results.
 

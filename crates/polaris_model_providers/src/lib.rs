@@ -27,6 +27,9 @@
 //! # Enable OpenAI
 //! polaris_model_providers = { path = "../polaris_model_providers", default-features = false, features = ["openai"] }
 //!
+//! # Enable only Chat Completions
+//! polaris_model_providers = { path = "../polaris_model_providers", default-features = false, features = ["chat-completions"] }
+//!
 //! # Enable multiple providers
 //! polaris_model_providers = { path = "../polaris_model_providers", features = ["openai", "bedrock"] }
 //! ```
@@ -91,7 +94,7 @@
 //! ```no_run
 //! # #[cfg(feature = "chat-completions")]
 //! # {
-//! use polaris_model_providers::ChatCompletionsPlugin;
+//! use polaris_model_providers::{ChatCompletionsPlugin, chat_completions::MaxTokensField};
 //! use polaris_models::ModelsPlugin;
 //! use polaris_system::server::Server;
 //!
@@ -99,7 +102,8 @@
 //! server.add_plugins(ModelsPlugin);
 //! server.add_plugins(
 //!     ChatCompletionsPlugin::from_env("HF_TOKEN")
-//!         .with_base_url("https://router.huggingface.co/v1"),
+//!         .with_base_url("https://router.huggingface.co/v1")
+//!         .with_max_tokens_field(MaxTokensField::MaxTokens),
 //! );
 //! # }
 //! ```
