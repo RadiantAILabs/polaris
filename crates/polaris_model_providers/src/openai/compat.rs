@@ -76,7 +76,7 @@ impl OutputIndexes {
     /// Records the `output_index` an event was given.
     fn record(&mut self, event_type: &str, event: &Map<String, Value>, index: u64) {
         if event_type == "response.output_item.added" {
-            self.items_added = self.items_added.max(index + 1);
+            self.items_added = self.items_added.max(index.saturating_add(1));
             if let Some(id) = event
                 .get("item")
                 .and_then(|item| item.get("id"))
@@ -97,9 +97,9 @@ fn parse_event(
     indexes: &mut OutputIndexes,
 ) -> Result<Option<ResponseStreamEvent>, GenerationError> {
     let Some(event) = raw.as_object_mut() else {
-        return Err(GenerationError::InvalidResponse(format!(
-            "stream event is not a JSON object: {raw}"
-        )));
+        return Err(GenerationError::InvalidResponse(
+            "stream event is not a JSON object".to_owned(),
+        ));
     };
     let Some(event_type) = event.get("type").and_then(Value::as_str).map(str::to_owned) else {
         return Err(GenerationError::InvalidResponse(
@@ -214,7 +214,7 @@ fn fill_item(item: &mut Value) {
     match fields.get("type").and_then(Value::as_str) {
         Some("function_call") => {
             // An empty `name` or `call_id` is resolved, or rejected, by the
-            // stream adapter when the item is done.
+            // response conversion or stream adapter when the item is done.
             fields.entry("name").or_insert(json!(""));
             fields.entry("call_id").or_insert(json!(""));
             fields.entry("arguments").or_insert(json!(""));
@@ -262,9 +262,9 @@ fn fill_usage(usage: &mut Value) {
     let output = fields.get("output_tokens").and_then(Value::as_u64);
     fields.entry("input_tokens").or_insert(json!(0));
     fields.entry("output_tokens").or_insert(json!(0));
-    fields
-        .entry("total_tokens")
-        .or_insert(json!(input.unwrap_or(0) + output.unwrap_or(0)));
+    fields.entry("total_tokens").or_insert(json!(
+        input.unwrap_or(0).saturating_add(output.unwrap_or(0))
+    ));
     for (details, count) in [
         ("input_tokens_details", "cached_tokens"),
         ("output_tokens_details", "reasoning_tokens"),
@@ -476,6 +476,85 @@ mod tests {
             }],
         }))
         .expect("response should parse");
-        assert_eq!(response.output.len(), 1);
+        assert_eq!(response.id, "resp_1");
+        assert_eq!(response.model, "m");
+        let [OutputItem::Message(message)] = response.output.as_slice() else {
+            panic!("expected one message, got {:?}", response.output);
+        };
+        let [async_openai::types::responses::OutputMessageContent::OutputText(text)] =
+            message.content.as_slice()
+        else {
+            panic!("expected one text part, got {:?}", message.content);
+        };
+        assert_eq!(text.text, "Hello");
+        assert!(text.annotations.is_empty());
+    }
+
+    #[test]
+    fn oversized_server_numbers_return_errors_without_panicking() {
+        let mut indexes = OutputIndexes::default();
+        let err = parse_event(
+            json!({
+                "type": "response.output_item.added",
+                "output_index": u64::MAX,
+                "item": { "type": "function_call", "name": "a", "call_id": "call_a" },
+            }),
+            &mut indexes,
+        )
+        .expect_err("an output index above u32::MAX is rejected");
+        assert!(matches!(err, GenerationError::Json(_)), "{err:?}");
+
+        let usage = json!({ "input_tokens": u64::MAX, "output_tokens": 1 });
+        let err = parse_event(
+            json!({ "type": "response.completed", "response": { "usage": usage } }),
+            &mut OutputIndexes::default(),
+        )
+        .expect_err("token counts above u32::MAX are rejected");
+        assert!(matches!(err, GenerationError::Json(_)), "{err:?}");
+        let err = parse_response(json!({ "usage": usage }))
+            .expect_err("non-streaming oversized counts are also rejected");
+        assert!(matches!(err, GenerationError::Json(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn lenient_events_propagates_parse_and_upstream_errors() {
+        use async_openai::error::ApiError;
+        use futures_util::StreamExt;
+
+        let inner = futures_util::stream::iter(vec![
+            Ok(json!({ "type": "response.output_text.delta" })),
+            Err(OpenAIError::ApiError(ApiError {
+                message: "upstream failure".to_owned(),
+                r#type: None,
+                param: None,
+                code: None,
+            })),
+            Ok(json!(["private event content"])),
+        ]);
+        let mut events = LenientEvents::new(inner);
+        let malformed = events.next().await.expect("malformed event");
+        assert!(
+            matches!(malformed, Err(GenerationError::Json(_))),
+            "{malformed:?}"
+        );
+        let upstream = events.next().await.expect("upstream error");
+        assert!(
+            matches!(
+                &upstream,
+                Err(GenerationError::Provider { message, source: Some(_), .. })
+                    if message == "upstream failure"
+            ),
+            "{upstream:?}"
+        );
+        let non_object = events.next().await.expect("non-object event");
+        assert!(
+            matches!(
+                &non_object,
+                Err(GenerationError::InvalidResponse(message))
+                    if message == "stream event is not a JSON object"
+            ),
+            "{non_object:?}"
+        );
+        assert!(events.next().await.is_none());
     }
 }
