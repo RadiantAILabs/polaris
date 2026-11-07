@@ -200,6 +200,56 @@ async fn generate_sends_tool_error_with_provider_call_id() {
 }
 
 #[tokio::test]
+async fn generate_sends_every_reasoning_effort_as_written() {
+    for (effort, wire) in [
+        (ReasoningEffort::Minimal, "minimal"),
+        (ReasoningEffort::XHigh, "xhigh"),
+        // `async_openai`'s own effort type has neither of these.
+        (ReasoningEffort::Max, "max"),
+        (ReasoningEffort::Other("ultra".to_owned()), "ultra"),
+    ] {
+        let mut server =
+            Server::start("application/json", sparse_text_response().to_string()).await;
+        let provider = server.provider();
+        within(provider.generate(
+            "compatible-model",
+            LlmRequest {
+                messages: vec![Message::user("Think hard.")],
+                reasoning_effort: Some(effort.clone()),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the request should succeed");
+
+        let body = server.request_body().await;
+        assert_eq!(
+            body["reasoning"],
+            json!({ "effort": wire }),
+            "{effort:?}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn generate_without_reasoning_effort_sends_no_reasoning_object() {
+    let mut server = Server::start("application/json", sparse_text_response().to_string()).await;
+    let provider = server.provider();
+    within(provider.generate(
+        "compatible-model",
+        LlmRequest {
+            messages: vec![Message::user("Hello")],
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("the request should succeed");
+
+    let body = server.request_body().await;
+    assert!(body.get("reasoning").is_none(), "{body}");
+}
+
+#[tokio::test]
 async fn generate_accepts_sparse_response_over_http() {
     let mut server = Server::start("application/json", sparse_text_response().to_string()).await;
     let provider = server.provider();

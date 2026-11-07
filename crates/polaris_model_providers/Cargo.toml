@@ -22,6 +22,9 @@ workspace = true
 default = ["anthropic"]
 anthropic = []
 openai = ["dep:async-openai"]
+# Chat Completions provider. Uses only the HTTP and JSON dependencies every
+# provider already has, so it adds no dependency.
+chat-completions = []
 bedrock = [
     "openai",
     "dep:aws-sdk-bedrockruntime",

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Chat Completions provider: `ChatCompletionsPlugin`, `ChatCompletionsProvider`** (`polaris_model_providers`, feature `chat-completions`, no new dependency) — reaches servers that implement `POST /chat/completions` (Hugging Face router, vLLM, SGLang, Ollama, DeepInfra, Z.ai, DeepSeek, OpenAI) as `chat_completions/<model>`. Supports streaming, tools, images, structured output and reasoning replay (`ReasoningReplay`). Separate from `OpenAiPlugin`, so both can be registered. See [Model Providers — Chat Completions servers](docs/reference/model-providers.md#chat-completions-servers).
+
+- **Reasoning effort: `ReasoningEffort`, `ParseReasoningEffortError`, `LlmRequest::reasoning_effort`, `LlmRequestBuilder::reasoning_effort`** (`polaris_models`) — set a reasoning level per request on any provider. A provider that cannot send the level returns `GenerationError::UnsupportedOperation` before sending anything. See [Model Providers — Reasoning effort](docs/reference/model-providers.md#reasoning-effort).
+
+### Changed
+
+- **Source-breaking: `LlmRequest` gains the public `reasoning_effort` field** (`polaris_models`). **Migration:** add `reasoning_effort: None` to struct literals, or use `..Default::default()` or `LlmRequestBuilder`. Serialized requests without the field still deserialize.
+
+- **The OpenAI Responses provider builds its request as JSON** (`polaris_model_providers`) — same body as before, except `reasoning.effort` can now carry levels `async_openai` lacks, such as `max`.
+
 ## [0.8.2] - 2026-11-07
 
 ### Added

@@ -113,6 +113,7 @@ default = ["file-store"]
 anthropic = ["polaris_internal/anthropic"]
 bedrock = ["polaris_internal/bedrock"]
 openai = ["polaris_internal/openai"]
+chat-completions = ["polaris_internal/chat-completions"]
 tiktoken = ["polaris_internal/tiktoken"]
 # Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s
 # HTTP request spans to OTel HTTP semantic-convention field names

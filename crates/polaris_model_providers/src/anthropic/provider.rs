@@ -3,9 +3,9 @@
 use super::client::AnthropicClient;
 use super::types::{
     self as anthropic_types, CacheControlMarker, ContentBlock, ContentBlockParam,
-    CreateMessageRequest, ImageMediaType, ImageSource, MessageParam, OutputFormat, RawStreamEvent,
-    Role, StreamContentBlock, StreamDelta, SystemBlock, SystemPrompt, ToolChoiceParam, ToolDef,
-    ToolResultBlock, ToolResultContent,
+    CreateMessageRequest, ImageMediaType, ImageSource, MessageParam, OutputConfig, OutputFormat,
+    RawStreamEvent, Role, StreamContentBlock, StreamDelta, SystemBlock, SystemPrompt,
+    ToolChoiceParam, ToolDef, ToolResultBlock, ToolResultContent,
 };
 use crate::pricing::PriceStore;
 use crate::schema::normalize_schema_for_strict_mode;
@@ -16,8 +16,8 @@ use futures_core::Stream;
 use polaris_models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, ImageBlock,
     ImageMediaType as PolarisImageMediaType, LlmProvider, LlmRequest, LlmResponse, LlmStream,
-    Message, ModelPricing, StopReason, StreamEvent, ToolCall, ToolChoice, ToolFunction,
-    ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
+    Message, ModelPricing, ReasoningEffort, StopReason, StreamEvent, ToolCall, ToolChoice,
+    ToolFunction, ToolResultContent as PolarisToolResult, ToolResultStatus, Usage, UserBlock,
 };
 
 /// Default maximum tokens for generation requests.
@@ -466,6 +466,13 @@ fn convert_request(
         .as_ref()
         .map(|schema| OutputFormat::new(schema.clone()));
 
+    let output_config = request
+        .reasoning_effort
+        .as_ref()
+        .map(convert_reasoning_effort)
+        .transpose()?
+        .map(|effort| OutputConfig { effort });
+
     let system = apply_cache_control(
         &request.cache,
         request.system.as_deref(),
@@ -483,8 +490,32 @@ fn convert_request(
         temperature: None,
         stop_sequences: None,
         output_format,
+        output_config,
         stream: None,
     })
+}
+
+/// The `output_config.effort` value for a requested reasoning effort.
+///
+/// Anthropic takes `low`, `medium`, `high`, `xhigh` and `max`. It has no way
+/// to switch reasoning off or to ask for less than `low` through effort, and
+/// it rejects any other value, so those requests fail here instead of being
+/// sent at a different effort than the caller asked for.
+///
+/// The level's text decides, so `Other("low")` is accepted like `Low` and
+/// `Other("none")` is rejected like `None`.
+fn convert_reasoning_effort(effort: &ReasoningEffort) -> Result<&'static str, GenerationError> {
+    match effort.as_str() {
+        "low" => Ok("low"),
+        "medium" => Ok("medium"),
+        "high" => Ok("high"),
+        "xhigh" => Ok("xhigh"),
+        "max" => Ok("max"),
+        other => Err(GenerationError::UnsupportedOperation(format!(
+            "the Anthropic provider cannot send reasoning effort `{other}`; \
+             it accepts low, medium, high, xhigh and max"
+        ))),
+    }
 }
 
 /// Anthropic honors at most four `cache_control` breakpoints per request.
@@ -1155,6 +1186,145 @@ mod tests {
 
     fn max_tokens(value: u32) -> NonZeroU32 {
         NonZeroU32::new(value).unwrap()
+    }
+
+    // ── reasoning effort: sent as `output_config.effort` ──
+
+    fn request_with_effort(effort: Option<ReasoningEffort>) -> LlmRequest {
+        LlmRequest {
+            messages: vec![Message::user("hi")],
+            reasoning_effort: effort,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_as_output_config_effort() {
+        let levels = [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ];
+        for (effort, wire) in levels {
+            let json = request_json(&request_with_effort(Some(effort.clone())));
+            assert_eq!(
+                json["output_config"],
+                serde_json::json!({"effort": wire}),
+                "{effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_reasoning_effort_sends_no_output_config() {
+        let json = request_json(&request_with_effort(None));
+        assert!(json.get("output_config").is_none(), "{json}");
+    }
+
+    /// The `anthropic-beta` header the client would send for `request`.
+    fn beta_header(request: &LlmRequest) -> Option<String> {
+        let wire = AnthropicProvider::new("test-key")
+            .build_request("claude-sonnet-4-6", request)
+            .unwrap();
+        AnthropicClient::new("test-key")
+            .build_headers(&wire)
+            .unwrap()
+            .get("anthropic-beta")
+            .map(|value| value.to_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn effort_alone_sends_no_structured_output_beta() {
+        // Effort is generally available: it needs no beta header, so it must
+        // not switch the structured-outputs beta on by itself.
+        let request = request_with_effort(Some(ReasoningEffort::High));
+        let wire = AnthropicProvider::new("test-key")
+            .build_request("claude-sonnet-4-6", &request)
+            .unwrap();
+        assert!(wire.output_format.is_none());
+        assert!(wire.output_config.is_some());
+        assert_eq!(beta_header(&request), None);
+    }
+
+    #[test]
+    fn effort_with_structured_output_keeps_the_structured_output_beta() {
+        let request = LlmRequest {
+            output_schema: Some(serde_json::json!({"type": "object", "properties": {}})),
+            ..request_with_effort(Some(ReasoningEffort::High))
+        };
+        assert_eq!(
+            beta_header(&request).as_deref(),
+            Some("structured-outputs-2025-11-13")
+        );
+    }
+
+    #[test]
+    fn effort_with_strict_tools_keeps_the_structured_output_beta() {
+        // `ToolDefinition::new` makes the tool strict.
+        let request = LlmRequest {
+            tools: Some(vec![tool_def("lookup")]),
+            ..request_with_effort(Some(ReasoningEffort::High))
+        };
+        assert_eq!(
+            beta_header(&request).as_deref(),
+            Some("structured-outputs-2025-11-13")
+        );
+    }
+
+    #[test]
+    fn other_effort_is_accepted_or_rejected_by_its_text() {
+        // `Other("low")` is the same level as `Low` for Anthropic.
+        let json = request_json(&request_with_effort(Some(ReasoningEffort::Other(
+            "low".to_owned(),
+        ))));
+        assert_eq!(json["output_config"], serde_json::json!({"effort": "low"}));
+
+        // `Other("none")` is rejected like `None`.
+        let error = AnthropicProvider::new("test-key")
+            .build_request(
+                "claude-sonnet-4-6",
+                &request_with_effort(Some(ReasoningEffort::Other("none".to_owned()))),
+            )
+            .expect_err("`none` is not an Anthropic effort");
+        assert!(
+            matches!(&error, GenerationError::UnsupportedOperation(message)
+                if message.contains("`none`")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn efforts_anthropic_cannot_send_fail_before_any_request() {
+        // The provider's base URL is the real API, so reaching the network
+        // here would be a different failure from the one asserted.
+        let provider = AnthropicProvider::new("test-key");
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Other("ultra".to_owned()),
+        ] {
+            let request = request_with_effort(Some(effort.clone()));
+            let error = provider
+                .generate("claude-sonnet-4-6", request.clone())
+                .await
+                .expect_err("an unsupported effort must fail");
+            assert!(
+                matches!(&error, GenerationError::UnsupportedOperation(message)
+                    if message.contains(&format!("`{effort}`"))),
+                "{effort:?}: {error:?}"
+            );
+            let stream_error = provider
+                .stream("claude-sonnet-4-6", request)
+                .await
+                .err()
+                .expect("an unsupported effort must fail the stream too");
+            assert!(
+                matches!(stream_error, GenerationError::UnsupportedOperation(_)),
+                "{effort:?}"
+            );
+        }
     }
 
     // ── max_tokens: configured at registration, sent on every request ──

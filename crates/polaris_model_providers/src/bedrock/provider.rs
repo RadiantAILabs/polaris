@@ -286,6 +286,16 @@ impl BedrockProvider {
         ),
         GenerationError,
     > {
+        // The Converse API has no reasoning-effort setting, and the model-specific
+        // fields that carry one differ per model. Fail instead of sending the
+        // request at a different effort than the caller asked for.
+        if let Some(effort) = &request.reasoning_effort {
+            return Err(GenerationError::UnsupportedOperation(format!(
+                "reasoning effort `{effort}` cannot be sent through Bedrock's Converse API; \
+                 set the model's own field with `with_additional_model_request_fields`, \
+                 or use an `openai.*` model, which takes the setting"
+            )));
+        }
         let mut tool_config = build_tool_config(request)?;
         let output_config = build_output_config(request)?;
         let inference_config = build_inference_config(self.effective_max_tokens(request).get());
@@ -619,6 +629,38 @@ mod tests {
             stream.as_input().get_additional_model_request_fields(),
             &expected
         );
+    }
+
+    #[test]
+    fn converse_calls_refuse_a_reasoning_effort_they_cannot_send() {
+        use polaris_models::llm::ReasoningEffort;
+
+        let provider = provider_with_region("us-east-1");
+        let mut request = hello();
+        request.reasoning_effort = Some(ReasoningEffort::High);
+
+        let error = provider
+            .converse_request(CONVERSE_MODEL, &request)
+            .expect_err("Converse has no effort setting");
+        assert!(
+            matches!(&error, GenerationError::UnsupportedOperation(message)
+                if message.contains("`high`")
+                    && message.contains("with_additional_model_request_fields")),
+            "{error:?}"
+        );
+        let error = provider
+            .converse_stream_request(CONVERSE_MODEL, &request)
+            .expect_err("Converse streaming has no effort setting either");
+        assert!(
+            matches!(error, GenerationError::UnsupportedOperation(_)),
+            "{error:?}"
+        );
+
+        // The provider-wide field path stays open, with no request effort set.
+        let provider = provider.with_additional_model_request_fields(
+            serde_json::json!({"reasoning": {"effort": "high"}}),
+        );
+        assert!(provider.converse_request(CONVERSE_MODEL, &hello()).is_ok());
     }
 
     #[test]

@@ -25,7 +25,8 @@ pub use provider::ModelPricing;
 pub use types::{
     AssistantBlock, AudioBlock, AudioMediaType, CacheControl, ContentBlockDelta,
     ContentBlockStartData, DocumentBlock, DocumentMediaType, DocumentSource, ImageBlock,
-    ImageMediaType, LlmRequest, LlmResponse, LlmStream, Message, ReasoningBlock, StopReason,
-    StreamEvent, TextBlock, ToolCall, ToolChoice, ToolDefinition, ToolFunction, ToolResult,
-    ToolResultContent, ToolResultStatus, Usage, UserBlock,
+    ImageMediaType, LlmRequest, LlmResponse, LlmStream, Message, ParseReasoningEffortError,
+    ReasoningBlock, ReasoningEffort, StopReason, StreamEvent, TextBlock, ToolCall, ToolChoice,
+    ToolDefinition, ToolFunction, ToolResult, ToolResultContent, ToolResultStatus, Usage,
+    UserBlock,
 };

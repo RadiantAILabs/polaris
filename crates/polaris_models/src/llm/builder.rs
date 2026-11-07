@@ -26,7 +26,8 @@
 use super::error::{ExtractionError, GenerationError};
 use super::model::Llm;
 use super::types::{
-    CacheControl, LlmRequest, LlmResponse, LlmStream, Message, ToolChoice, ToolDefinition,
+    CacheControl, LlmRequest, LlmResponse, LlmStream, Message, ReasoningEffort, ToolChoice,
+    ToolDefinition,
 };
 use core::num::NonZeroU32;
 use schemars::JsonSchema;
@@ -58,6 +59,7 @@ pub struct LlmRequestBuilder<'a, S = Empty> {
     messages: Vec<Message>,
     tool_choice: Option<ToolChoice>,
     max_output_tokens: Option<NonZeroU32>,
+    reasoning_effort: Option<ReasoningEffort>,
     cache: CacheControl,
     _state: PhantomData<S>,
 }
@@ -150,6 +152,36 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
         self
     }
 
+    /// Sets how much effort the model should spend reasoning.
+    ///
+    /// Every provider sends the level its own way, and one that cannot honour
+    /// it fails the call with
+    /// [`GenerationError::UnsupportedOperation`](super::GenerationError::UnsupportedOperation)
+    /// before sending anything. Without this call the provider's and the
+    /// model's default applies. See [`ReasoningEffort`] for the levels and how
+    /// each provider maps them.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use polaris_models::llm::{GenerationError, Llm, ReasoningEffort};
+    /// # async fn example(llm: &Llm) -> Result<(), GenerationError> {
+    /// let response = llm
+    ///     .builder()
+    ///     .reasoning_effort(ReasoningEffort::High)
+    ///     .user("Why is the sky blue?")
+    ///     .generate()
+    ///     .await?;
+    /// # let _ = response;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
     /// Requires the model to call at least one tool.
     ///
     /// Shorthand for `.tool_choice(ToolChoice::Required)`.
@@ -231,6 +263,7 @@ impl<'a, S> LlmRequestBuilder<'a, S> {
             messages: self.messages,
             tool_choice: self.tool_choice,
             max_output_tokens: self.max_output_tokens,
+            reasoning_effort: self.reasoning_effort,
             cache: self.cache,
             _state: PhantomData,
         }
@@ -285,6 +318,7 @@ impl<'a> LlmRequestBuilder<'a, Ready> {
             tool_choice: self.tool_choice,
             output_schema: None,
             max_output_tokens: self.max_output_tokens,
+            reasoning_effort: self.reasoning_effort,
             cache: self.cache,
         };
 
@@ -346,6 +380,7 @@ impl<'a> LlmRequestBuilder<'a, Empty> {
             messages: Vec::new(),
             tool_choice: None,
             max_output_tokens: None,
+            reasoning_effort: None,
             cache: CacheControl::default(),
             _state: PhantomData,
         }
@@ -403,6 +438,62 @@ mod tests {
             .with_definitions(vec![make_tool_def("b"), make_tool_def("c")]);
 
         assert_eq!(builder.tool_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_reaches_the_provider_request() {
+        use crate::llm::types::ReasoningEffort;
+
+        struct EffortAssertingProvider;
+
+        impl crate::llm::provider::LlmProvider for EffortAssertingProvider {
+            fn name(&self) -> &'static str {
+                "effort_mock"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                let effort = request
+                    .reasoning_effort
+                    .map_or_else(|| "unset".to_owned(), |effort| effort.to_string());
+                Ok(LlmResponse {
+                    content: vec![AssistantBlock::Text(effort.into())],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                    id: None,
+                    model: None,
+                })
+            }
+        }
+
+        let mut registry = crate::ModelRegistry::new();
+        registry.register_llm_provider(EffortAssertingProvider);
+        let llm = registry.llm("effort_mock/test").unwrap();
+
+        let set = llm
+            .builder()
+            .reasoning_effort(ReasoningEffort::XHigh)
+            .user("hi")
+            .generate()
+            .await
+            .unwrap();
+        assert_eq!(set.text(), "xhigh", "the verb sets the request field");
+
+        // The verb works before and after the first message is added.
+        let after = llm
+            .builder()
+            .user("hi")
+            .reasoning_effort(ReasoningEffort::Low)
+            .generate()
+            .await
+            .unwrap();
+        assert_eq!(after.text(), "low");
+
+        let unset = llm.builder().user("hi").generate().await.unwrap();
+        assert_eq!(unset.text(), "unset", "no verb leaves the field unset");
     }
 
     #[tokio::test]
@@ -775,6 +866,7 @@ mod tests {
             tool_choice: None,
             output_schema: None,
             max_output_tokens: None,
+            reasoning_effort: None,
             cache: CacheControl::default(),
         };
         let stream = llm.stream(request).await.unwrap();

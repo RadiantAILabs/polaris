@@ -16,7 +16,7 @@ server.add_plugins(ModelsPlugin);
 server.add_plugins(AnthropicPlugin::from_env("ANTHROPIC_API_KEY"));
 ```
 
-Other providers (OpenAI, AWS Bedrock) are available via feature flags in `polaris_model_providers`.
+Other providers (OpenAI, Chat Completions, AWS Bedrock) are available via feature flags in `polaris_model_providers`.
 
 ## Usage
 

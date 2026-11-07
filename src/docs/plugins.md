@@ -84,6 +84,7 @@ Provider-agnostic LLM access plus concrete provider plugins.
 | [`TokenizerPlugin`](crate::models::TokenizerPlugin) | Pluggable [`Tokenizer`](crate::models::Tokenizer) resource for token counting and prompt budgeting; backed by tiktoken when the `tiktoken` feature is on. |
 | [`AnthropicPlugin`](crate::models::AnthropicPlugin) *(feature `anthropic`)* | Registers the Anthropic provider (Messages API, including tool use and streaming) with [`ModelRegistry`](crate::models::ModelRegistry). |
 | [`OpenAiPlugin`](crate::models::OpenAiPlugin) *(feature `openai`)* | Registers the `OpenAI` provider (Responses API, tool use, streaming) with [`ModelRegistry`](crate::models::ModelRegistry). |
+| [`ChatCompletionsPlugin`](crate::models::ChatCompletionsPlugin) *(feature `chat-completions`)* | Registers the `chat_completions` provider (`OpenAI` Chat Completions API: streaming, tool use, reasoning text, reasoning effort) with [`ModelRegistry`](crate::models::ModelRegistry), for the Hugging Face router, vLLM, Ollama, `DeepInfra`, Z.ai, `DeepSeek` and other servers of that family. |
 | [`BedrockPlugin`](crate::models::BedrockPlugin) *(feature `bedrock`)* | Registers AWS Bedrock-hosted models (Anthropic, Meta, etc.) with [`ModelRegistry`](crate::models::ModelRegistry). |
 
 ## Layer 3 — Sessions

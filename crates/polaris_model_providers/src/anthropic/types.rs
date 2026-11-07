@@ -96,9 +96,20 @@ pub struct CreateMessageRequest {
     /// Structured output format (beta).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_format: Option<OutputFormat>,
+    /// Output settings: the reasoning effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
     /// Whether to stream the response via SSE.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+}
+
+/// The `output_config` request field. Only the reasoning effort is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutputConfig {
+    /// How much effort the model spends: `low`, `medium`, `high`, `xhigh` or
+    /// `max`.
+    pub effort: &'static str,
 }
 
 /// Message role.

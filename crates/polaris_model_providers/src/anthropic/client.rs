@@ -49,7 +49,10 @@ impl AnthropicClient {
     }
 
     /// Builds common headers for the Anthropic API.
-    fn build_headers(&self, request: &CreateMessageRequest) -> Result<HeaderMap, GenerationError> {
+    pub(super) fn build_headers(
+        &self,
+        request: &CreateMessageRequest,
+    ) -> Result<HeaderMap, GenerationError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
@@ -717,6 +720,7 @@ mod tests {
             temperature: None,
             stop_sequences: None,
             output_format: None,
+            output_config: None,
             stream: None,
         };
 
