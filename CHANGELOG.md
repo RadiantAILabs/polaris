@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-07
+
 ### Added
 
 - **Chat Completions provider: `ChatCompletionsPlugin`, `ChatCompletionsProvider`** (`polaris_model_providers`, feature `chat-completions`, no new dependency) — reaches servers that implement `POST /chat/completions` (Hugging Face router, vLLM, SGLang, Ollama, DeepInfra, Z.ai, DeepSeek, OpenAI) as `chat_completions/<model>`. Supports streaming, tools, images, structured output and reasoning replay (`ReasoningReplay`). Separate from `OpenAiPlugin`, so both can be registered. See [Model Providers — Chat Completions servers](docs/reference/model-providers.md#chat-completions-servers).
