@@ -23,6 +23,7 @@ rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
 default = ["file-store"]
 anthropic = ["polaris_model_providers/anthropic"]
 openai = ["polaris_model_providers/openai"]
+chat-completions = ["polaris_model_providers/chat-completions"]
 bedrock = ["polaris_model_providers/bedrock"]
 tiktoken = ["polaris_models/tiktoken"]
 # Enables the tracing-subscriber OTLP exporter and switches `polaris_app`'s

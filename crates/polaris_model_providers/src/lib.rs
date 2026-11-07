@@ -106,6 +106,15 @@ pub mod openai;
 #[cfg(feature = "openai")]
 pub use openai::OpenAiPlugin;
 
+#[cfg(feature = "chat-completions")]
+mod sse;
+
+#[cfg(feature = "chat-completions")]
+pub mod chat_completions;
+
+#[cfg(feature = "chat-completions")]
+pub use chat_completions::ChatCompletionsPlugin;
+
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 
