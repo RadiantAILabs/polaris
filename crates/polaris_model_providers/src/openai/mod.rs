@@ -2,6 +2,7 @@
 //!
 //! Uses the `OpenAI` Responses API.
 
+mod compat;
 mod plugin;
 pub(crate) mod provider;
 

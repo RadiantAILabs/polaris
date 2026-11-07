@@ -281,6 +281,18 @@ let provider = AnthropicProvider::new(api_key)
     .with_pricing_override("claude-sonnet-4-6", ModelPricing::new(1.0, 5.0));
 ```
 
+## OpenAI and compatible servers
+
+`OpenAiProvider` talks to the OpenAI Responses API. It also works with other servers that implement the same API, which often send slightly different events:
+
+- **Missing fields are filled in.** Each event is read as raw JSON first. Fields the provider does not use, or can work out, get a default: `sequence_number`, `item_id`, `annotations`, usage details, and `output_index` (taken from the item ID, or the most recent item). A field the provider needs and cannot work out, such as the text of a text delta, still fails with `GenerationError::Json`.
+- **Event types the provider does not use are skipped** before they are parsed, so an unknown or unusual event cannot fail the stream.
+- **Tool name and `call_id` may arrive late.** If `response.output_item.added` has no tool name or no `call_id`, the provider holds the tool call until `response.output_item.done` and takes them from there. If `call_id` is still missing then, the stream fails with `GenerationError::InvalidResponse`.
+
+### Tool results need the call's `call_id`
+
+OpenAI links a tool result to its call by `call_id`, not by `id`. Build results from the call so both are copied: `ToolCall::result` / `ToolCall::error`, or `Message::tool_result_for` / `Message::tool_error_for`. The older `UserBlock::tool_result` / `tool_error` and `Message::tool_result` / `tool_error` set only `id`, so the OpenAI provider rejects them; they are deprecated.
+
 ## AWS Bedrock
 
 `BedrockPlugin::from_env()` loads credentials from the default AWS chain; `BedrockPlugin::from_sdk_config(config)` uses a config you built. Model ids are `bedrock/<bedrock model id>`, for example `bedrock/us.anthropic.claude-sonnet-4-6`.

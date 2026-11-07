@@ -56,6 +56,7 @@ async-openai = { version = "0.33", optional = true, default-features = false, fe
     "rustls",
     "responses",
     "response-types",
+    "byot",
 ] }
 
 # AWS Bedrock dependencies

@@ -1,5 +1,6 @@
 //! `OpenAI` [`LlmProvider`] implementation using the Responses API.
 
+use super::compat;
 use crate::pricing::PriceStore;
 use crate::schema::normalize_schema_for_strict_mode;
 use async_openai::config::OpenAIConfig;
@@ -107,19 +108,23 @@ impl LlmProvider for OpenAiProvider {
         request: LlmRequest,
     ) -> Result<LlmResponse, GenerationError> {
         let create_response = convert_request(model, &request)?;
-        let response = self
+        // Parse the raw JSON leniently, so servers other than `OpenAI` that
+        // leave out optional-in-practice fields still work.
+        let raw: serde_json::Value = self
             .client
             .responses()
-            .create(create_response)
+            .create_byot(create_response)
             .await
             .map_err(convert_error)?;
-        convert_response(response)
+        convert_response(compat::parse_response(raw)?)
     }
 
     /// Streams a response from the `OpenAI` Responses API.
     ///
-    /// Uses `async_openai`'s built-in streaming support which handles SSE parsing
-    /// and deserialization. An `OpenAiStreamAdapter` (private) converts the library's
+    /// Uses `async_openai` for the HTTP request and SSE framing, but parses
+    /// each event leniently, so Responses API servers other than `OpenAI`
+    /// that leave out fields or send extra event types still work. An
+    /// `OpenAiStreamAdapter` (private) converts the parsed
     /// [`ResponseStreamEvent`]s into Polaris [`StreamEvent`]s.
     ///
     /// # Errors
@@ -128,15 +133,19 @@ impl LlmProvider for OpenAiProvider {
     /// or a non-2xx status code.
     /// Returns [`GenerationError::Refusal`] if the model refuses to respond.
     async fn stream(&self, model: &str, request: LlmRequest) -> Result<LlmStream, GenerationError> {
-        let create_response = convert_request(model, &request)?;
+        let mut create_response = convert_request(model, &request)?;
+        // The raw-JSON (`byot`) call does not set the stream flag itself.
+        create_response.stream = Some(true);
         let raw_stream = self
             .client
             .responses()
-            .create_stream(create_response)
+            .create_stream_byot::<_, serde_json::Value>(create_response)
             .await
             .map_err(convert_error)?;
 
-        Ok(Box::pin(OpenAiStreamAdapter::new(raw_stream)))
+        Ok(Box::pin(OpenAiStreamAdapter::new(
+            compat::LenientEvents::new(raw_stream),
+        )))
     }
 
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
@@ -624,6 +633,23 @@ struct OpenAiStreamAdapter<S> {
     pending: VecDeque<Result<StreamEvent, GenerationError>>,
     /// Accumulated refusal text.
     refusal: Option<String>,
+    /// Function calls whose `output_item.added` event had no name or no
+    /// `call_id`, by `output_index`. Some Responses API servers send the
+    /// identity only in `output_item.done`, so the block is held until then.
+    held_calls: HashMap<u32, HeldCall>,
+}
+
+/// A function call held until its `output_item.done` event.
+#[derive(Debug, Default)]
+struct HeldCall {
+    /// Item ID from the `added` event (may be empty).
+    id: String,
+    /// Name from the `added` event (may be empty).
+    name: String,
+    /// `call_id` from the `added` event (may be empty).
+    call_id: String,
+    /// Argument chunks received before the identity was known.
+    arguments: Vec<String>,
 }
 
 impl<S> OpenAiStreamAdapter<S> {
@@ -634,7 +660,60 @@ impl<S> OpenAiStreamAdapter<S> {
             block_indices: HashMap::new(),
             pending: VecDeque::new(),
             refusal: None,
+            held_calls: HashMap::new(),
         }
+    }
+
+    /// Emits a held function call once `output_item.done` supplies its
+    /// identity: the block start, the saved argument chunks, and the stop.
+    ///
+    /// Fails if the name or `call_id` is still missing, because a call
+    /// without them cannot be answered on the next request.
+    fn release_held_call(&mut self, held: HeldCall, done: &FunctionToolCall) {
+        let pick = |from_done: &str, from_added: String| {
+            if from_done.is_empty() {
+                from_added
+            } else {
+                from_done.to_owned()
+            }
+        };
+        let name = pick(&done.name, held.name);
+        let call_id = pick(&done.call_id, held.call_id);
+        let id = pick(done.id.as_deref().unwrap_or_default(), held.id);
+        if name.is_empty() || call_id.is_empty() {
+            let missing = if name.is_empty() { "name" } else { "call_id" };
+            self.pending
+                .push_back(Err(GenerationError::InvalidResponse(format!(
+                    "function call `{id}` has no {missing} in its output_item events"
+                ))));
+            return;
+        }
+
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        self.pending.push_back(Ok(StreamEvent::ContentBlockStart {
+            index,
+            block: ContentBlockStartData::ToolCall {
+                id,
+                call_id: Some(call_id),
+                name,
+            },
+        }));
+        // Prefer the saved chunks; fall back to the final arguments when the
+        // server sent none as deltas.
+        let arguments = if held.arguments.is_empty() && !done.arguments.is_empty() {
+            vec![done.arguments.clone()]
+        } else {
+            held.arguments
+        };
+        for arguments in arguments {
+            self.pending.push_back(Ok(StreamEvent::ContentBlockDelta {
+                index,
+                delta: ContentBlockDelta::ToolCall { arguments },
+            }));
+        }
+        self.pending
+            .push_back(Ok(StreamEvent::ContentBlockStop { index }));
     }
 
     /// Assigns the next block index for the given `(output_index, content_index)`.
@@ -698,6 +777,20 @@ impl<S> OpenAiStreamAdapter<S> {
             // ── Function calls ──────────────────────────────────────────
             ResponseStreamEvent::ResponseOutputItemAdded(event) => {
                 match event.item {
+                    OutputItem::FunctionCall(ref call)
+                        if call.name.is_empty() || call.call_id.is_empty() =>
+                    {
+                        self.held_calls.insert(
+                            event.output_index,
+                            HeldCall {
+                                id: call.id.clone().unwrap_or_default(),
+                                name: call.name.clone(),
+                                call_id: call.call_id.clone(),
+                                arguments: Vec::new(),
+                            },
+                        );
+                        false
+                    }
                     OutputItem::FunctionCall(ref call) => {
                         let index =
                             self.assign_block_index(event.output_index, FUNCTION_CALL_CONTENT_IDX);
@@ -719,7 +812,10 @@ impl<S> OpenAiStreamAdapter<S> {
                 }
             }
             ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event) => {
-                if let Some(index) =
+                if let Some(held) = self.held_calls.get_mut(&event.output_index) {
+                    held.arguments.push(event.delta);
+                    false
+                } else if let Some(index) =
                     self.get_block_index(event.output_index, FUNCTION_CALL_CONTENT_IDX)
                 {
                     self.pending.push_back(Ok(StreamEvent::ContentBlockDelta {
@@ -734,6 +830,12 @@ impl<S> OpenAiStreamAdapter<S> {
                 }
             }
             ResponseStreamEvent::ResponseOutputItemDone(event) => {
+                if let OutputItem::FunctionCall(ref call) = event.item
+                    && let Some(held) = self.held_calls.remove(&event.output_index)
+                {
+                    self.release_held_call(held, call);
+                    return true;
+                }
                 // Emit ContentBlockStop for function calls (which use FUNCTION_CALL_CONTENT_IDX).
                 if matches!(event.item, OutputItem::FunctionCall(_))
                     && let Some(index) =
@@ -898,7 +1000,7 @@ fn infer_stop_reason(response: &Response) -> StopReason {
 
 impl<S> Stream for OpenAiStreamAdapter<S>
 where
-    S: Stream<Item = Result<ResponseStreamEvent, OpenAIError>> + Unpin,
+    S: Stream<Item = Result<ResponseStreamEvent, GenerationError>> + Unpin,
 {
     type Item = Result<StreamEvent, GenerationError>;
 
@@ -918,9 +1020,7 @@ where
                     }
                     // Event was filtered — poll again.
                 }
-                Poll::Ready(Some(Err(err))) => {
-                    return Poll::Ready(Some(Err(convert_error(err))));
-                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
@@ -932,7 +1032,7 @@ where
 // Error conversion
 // ---------------------------------------------------------------------------
 
-fn convert_error(err: OpenAIError) -> GenerationError {
+pub(crate) fn convert_error(err: OpenAIError) -> GenerationError {
     match err {
         OpenAIError::ApiError(api_err) => GenerationError::Provider {
             status: None,
@@ -1372,6 +1472,216 @@ mod tests {
         assert!(matches!(
             converted[3].as_ref().unwrap(),
             StreamEvent::ContentBlockStop { index: 0 }
+        ));
+    }
+
+    fn function_call(id: &str, name: &str, call_id: &str, arguments: &str) -> OutputItem {
+        OutputItem::FunctionCall(FunctionToolCall {
+            arguments: arguments.to_string(),
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            id: Some(id.to_string()),
+            status: None,
+        })
+    }
+
+    fn arguments_delta(delta: &str) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
+            ResponseFunctionCallArgumentsDeltaEvent {
+                sequence_number: 0,
+                item_id: "fc_1".to_string(),
+                output_index: 0,
+                delta: delta.to_string(),
+            },
+        )
+    }
+
+    fn item_added(item: OutputItem) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
+            sequence_number: 0,
+            output_index: 0,
+            item,
+        })
+    }
+
+    fn item_done(item: OutputItem) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+            sequence_number: 0,
+            output_index: 0,
+            item,
+        })
+    }
+
+    /// Feeds `events` one at a time and returns what each one produced.
+    fn convert_each(
+        events: Vec<ResponseStreamEvent>,
+    ) -> Vec<Vec<Result<StreamEvent, GenerationError>>> {
+        let mut adapter = OpenAiStreamAdapter::new(());
+        events
+            .into_iter()
+            .map(|raw| {
+                adapter.convert_event(raw);
+                adapter.pending.drain(..).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn holds_tool_call_until_done_supplies_identity() {
+        let produced = convert_each(vec![
+            item_added(function_call("fc_1", "", "", "")),
+            arguments_delta(r#"{"city""#),
+            arguments_delta(r#":"London"}"#),
+            item_done(function_call(
+                "fc_1",
+                "get_weather",
+                "call_abc123",
+                r#"{"city":"London"}"#,
+            )),
+        ]);
+
+        // Nothing is emitted before the identity is known.
+        assert!(produced[..3].iter().all(Vec::is_empty), "{produced:?}");
+        let released = &produced[3];
+        assert_eq!(released.len(), 4, "{released:?}");
+        assert!(matches!(
+            released[0].as_ref().unwrap(),
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStartData::ToolCall { id, call_id, name }
+            } if id == "fc_1" && call_id.as_deref() == Some("call_abc123") && name == "get_weather"
+        ));
+        assert!(matches!(
+            released[1].as_ref().unwrap(),
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::ToolCall { arguments }
+            } if arguments == r#"{"city""#
+        ));
+        assert!(matches!(
+            released[2].as_ref().unwrap(),
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::ToolCall { arguments }
+            } if arguments == r#":"London"}"#
+        ));
+        assert!(matches!(
+            released[3].as_ref().unwrap(),
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn held_tool_call_uses_final_arguments_without_deltas() {
+        let produced = convert_each(vec![
+            item_added(function_call("fc_1", "get_weather", "", "")),
+            item_done(function_call(
+                "fc_1",
+                "",
+                "call_abc123",
+                r#"{"city":"Oslo"}"#,
+            )),
+        ]);
+
+        let released = &produced[1];
+        assert_eq!(released.len(), 3, "{released:?}");
+        // The name from `added` is kept when `done` leaves it empty.
+        assert!(matches!(
+            released[0].as_ref().unwrap(),
+            StreamEvent::ContentBlockStart {
+                block: ContentBlockStartData::ToolCall { call_id, name, .. },
+                ..
+            } if call_id.as_deref() == Some("call_abc123") && name == "get_weather"
+        ));
+        assert!(matches!(
+            released[1].as_ref().unwrap(),
+            StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::ToolCall { arguments },
+                ..
+            } if arguments == r#"{"city":"Oslo"}"#
+        ));
+    }
+
+    #[test]
+    fn held_tool_call_without_call_id_fails() {
+        let produced = convert_each(vec![
+            item_added(function_call("fc_1", "get_weather", "", "")),
+            arguments_delta("{}"),
+            item_done(function_call("fc_1", "get_weather", "", "{}")),
+        ]);
+
+        let released = &produced[2];
+        assert_eq!(released.len(), 1, "{released:?}");
+        let Err(GenerationError::InvalidResponse(message)) = &released[0] else {
+            panic!("expected an invalid-response error, got {released:?}");
+        };
+        assert!(message.contains("call_id"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn lenient_stream_handles_identity_only_in_done_event() {
+        use futures_util::StreamExt;
+
+        // Shaped like a server that leaves out `output_index`, `sequence_number`
+        // and the tool identity in `added`, and sends an extra event type.
+        let raw = vec![
+            serde_json::json!({ "type": "response.created", "response": {} }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "item": { "type": "function_call", "id": "fc_1" },
+            }),
+            serde_json::json!({ "type": "response.vendor.heartbeat" }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{}",
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "get_weather",
+                    "call_id": "call_abc123",
+                    "arguments": "{}",
+                },
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "model": "m",
+                    "output": [{
+                        "type": "function_call",
+                        "name": "get_weather",
+                        "call_id": "call_abc123",
+                        "arguments": "{}",
+                    }],
+                    "usage": { "input_tokens": 3, "output_tokens": 2 },
+                },
+            }),
+        ];
+        let inner = futures_util::stream::iter(raw.into_iter().map(Ok::<_, OpenAIError>));
+        let adapter = OpenAiStreamAdapter::new(compat::LenientEvents::new(inner));
+        let events: Vec<StreamEvent> = adapter
+            .map(|event| event.expect("stream event should convert"))
+            .collect()
+            .await;
+
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ContentBlockStart {
+                block: ContentBlockStartData::ToolCall { call_id, name, .. },
+                ..
+            } if call_id.as_deref() == Some("call_abc123") && name == "get_weather"
+        ));
+        assert!(matches!(
+            &events[4],
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+                ..
+            }
         ));
     }
 

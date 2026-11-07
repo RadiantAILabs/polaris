@@ -371,18 +371,64 @@ impl Message {
     }
 
     /// Creates a user message with a tool result.
+    ///
+    /// The result carries no provider call ID, so the `OpenAI` provider
+    /// rejects it. Use [`Message::tool_result_for`] instead.
     #[must_use]
+    #[deprecated(
+        since = "0.8.2",
+        note = "drops the provider call ID, which the OpenAI provider requires; use `Message::tool_result_for`"
+    )]
     pub fn tool_result(id: impl Into<String>, content: ToolResultContent) -> Self {
         Self::User {
-            content: vec![UserBlock::tool_result(id, content)],
+            content: vec![UserBlock::ToolResult(ToolResult {
+                id: id.into(),
+                call_id: None,
+                content,
+                status: ToolResultStatus::Success,
+            })],
         }
     }
 
     /// Creates a user message with a tool error result.
+    ///
+    /// The result carries no provider call ID, so the `OpenAI` provider
+    /// rejects it. Use [`Message::tool_error_for`] instead.
     #[must_use]
+    #[deprecated(
+        since = "0.8.2",
+        note = "drops the provider call ID, which the OpenAI provider requires; use `Message::tool_error_for`"
+    )]
     pub fn tool_error(id: impl Into<String>, content: ToolResultContent) -> Self {
         Self::User {
-            content: vec![UserBlock::tool_error(id, content)],
+            content: vec![UserBlock::ToolResult(ToolResult {
+                id: id.into(),
+                call_id: None,
+                content,
+                status: ToolResultStatus::Error,
+            })],
+        }
+    }
+
+    /// Creates a user message with the successful result of `call`.
+    ///
+    /// Copies both identifiers from the call, so every provider can link the
+    /// result back to it. See [`ToolCall::result`].
+    #[must_use]
+    pub fn tool_result_for(call: &ToolCall, content: ToolResultContent) -> Self {
+        Self::User {
+            content: vec![call.result(content)],
+        }
+    }
+
+    /// Creates a user message with the error result of `call`.
+    ///
+    /// Copies both identifiers from the call, so every provider can link the
+    /// result back to it. See [`ToolCall::error`].
+    #[must_use]
+    pub fn tool_error_for(call: &ToolCall, content: ToolResultContent) -> Self {
+        Self::User {
+            content: vec![call.error(content)],
         }
     }
 
@@ -495,7 +541,14 @@ impl UserBlock {
     }
 
     /// Creates a tool result content block.
+    ///
+    /// The block carries no provider call ID, so the `OpenAI` provider
+    /// rejects it. Use [`ToolCall::result`] instead.
     #[must_use]
+    #[deprecated(
+        since = "0.8.2",
+        note = "drops the provider call ID, which the OpenAI provider requires; build the result from the call with `ToolCall::result` or `ToolCall::error`"
+    )]
     pub fn tool_result(id: impl Into<String>, content: ToolResultContent) -> Self {
         Self::ToolResult(ToolResult {
             id: id.into(),
@@ -506,7 +559,14 @@ impl UserBlock {
     }
 
     /// Creates an error tool result content block.
+    ///
+    /// The block carries no provider call ID, so the `OpenAI` provider
+    /// rejects it. Use [`ToolCall::error`] instead.
     #[must_use]
+    #[deprecated(
+        since = "0.8.2",
+        note = "drops the provider call ID, which the OpenAI provider requires; build the result from the call with `ToolCall::result` or `ToolCall::error`"
+    )]
     pub fn tool_error(id: impl Into<String>, content: ToolResultContent) -> Self {
         Self::ToolResult(ToolResult {
             id: id.into(),
@@ -808,6 +868,53 @@ impl ToolCall {
             signature: None,
             additional_params: None,
         }
+    }
+
+    /// Builds the successful result block for this call.
+    ///
+    /// Copies [`id`](Self::id) and [`call_id`](Self::call_id) into the
+    /// result. Providers link a result to its call by different fields:
+    /// Anthropic and Bedrock use `id`, while `OpenAI` uses `call_id`. Building
+    /// the result from the call keeps both, so the conversation works with
+    /// every provider.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_models::llm::{ToolCall, ToolResultContent, UserBlock};
+    /// use serde_json::json;
+    ///
+    /// let mut call = ToolCall::new("fc_1", "get_weather", json!({}));
+    /// call.call_id = Some("call_1".to_owned());
+    ///
+    /// let UserBlock::ToolResult(result) = call.result(ToolResultContent::Text("Sunny".into()))
+    /// else {
+    ///     unreachable!("result builds a tool result block");
+    /// };
+    /// assert_eq!(result.id, "fc_1");
+    /// assert_eq!(result.call_id.as_deref(), Some("call_1"));
+    /// ```
+    #[must_use]
+    pub fn result(&self, content: ToolResultContent) -> UserBlock {
+        self.result_block(content, ToolResultStatus::Success)
+    }
+
+    /// Builds the error result block for this call.
+    ///
+    /// Copies both identifiers, like [`ToolCall::result`], and marks the
+    /// result as an error.
+    #[must_use]
+    pub fn error(&self, content: ToolResultContent) -> UserBlock {
+        self.result_block(content, ToolResultStatus::Error)
+    }
+
+    fn result_block(&self, content: ToolResultContent, status: ToolResultStatus) -> UserBlock {
+        UserBlock::ToolResult(ToolResult {
+            id: self.id.clone(),
+            call_id: self.call_id.clone(),
+            content,
+            status,
+        })
     }
 }
 
