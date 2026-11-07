@@ -21,7 +21,7 @@ use polaris_system::plugin::{Extends, Plugin};
 /// Use it for the Hugging Face inference router, vLLM, `SGLang`, Ollama,
 /// `DeepInfra`, Z.ai, `DeepSeek`, `OpenAI`'s own Chat Completions endpoint and other
 /// servers of this family. It is separate from
-/// [`OpenAiPlugin`](crate::openai::OpenAiPlugin), which speaks the Responses
+/// `OpenAiPlugin`, which speaks the Responses
 /// API; both can be added to one server, because their model ids start with
 /// different provider names.
 ///
@@ -31,7 +31,8 @@ use polaris_system::plugin::{Extends, Plugin};
 ///
 /// What the provider sends and reads, and how it maps errors, is described on
 /// [`ChatCompletionsProvider`]. A reasoning effort set on the request is sent as
-/// `reasoning_effort`.
+/// `reasoning_effort`. See
+/// [Chat Completions servers](https://github.com/RadiantAILabs/polaris/blob/main/docs/reference/model-providers.md#chat-completions-servers).
 ///
 /// # Resources Provided
 ///
@@ -52,6 +53,8 @@ use polaris_system::plugin::{Extends, Plugin};
 ///   (the provider) before this plugin regardless of `add_plugins` order.
 ///
 /// # Lifecycle
+///
+/// Registering two `ChatCompletionsPlugin`s panics in `build()` because the provider name is duplicated.
 ///
 /// - The plugin is gated behind the `chat-completions` feature, which adds no
 ///   dependency.
@@ -75,14 +78,15 @@ use polaris_system::plugin::{Extends, Plugin};
 /// # Example
 ///
 /// ```no_run
-/// # use polaris_model_providers::ChatCompletionsPlugin;
+/// # use polaris_model_providers::{ChatCompletionsPlugin, chat_completions::MaxTokensField};
 /// # use polaris_models::ModelsPlugin;
 /// # use polaris_system::server::Server;
 /// let mut server = Server::new();
 /// server.add_plugins(ModelsPlugin);
 /// server.add_plugins(
 ///     ChatCompletionsPlugin::from_env("HF_TOKEN")
-///         .with_base_url("https://router.huggingface.co/v1"),
+///         .with_base_url("https://router.huggingface.co/v1")
+///         .with_max_tokens_field(MaxTokensField::MaxTokens),
 /// );
 /// ```
 pub struct ChatCompletionsPlugin {
@@ -93,6 +97,10 @@ impl ChatCompletionsPlugin {
     /// Creates a plugin that sends `api_key` as a bearer token to
     /// `https://api.openai.com/v1`. Use [`with_base_url`](Self::with_base_url)
     /// for another server.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built, for example if the TLS backend fails to initialize.
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
@@ -105,7 +113,8 @@ impl ChatCompletionsPlugin {
     ///
     /// # Panics
     ///
-    /// Panics if the environment variable is not set.
+    /// Panics if the environment variable is not set or the HTTP client cannot be built
+    /// (for example if the TLS backend fails to initialize).
     #[must_use]
     pub fn from_env(env_var: &str) -> Self {
         let api_key = std::env::var(env_var).unwrap_or_else(|_| {
@@ -119,6 +128,10 @@ impl ChatCompletionsPlugin {
 
     /// Creates a plugin that sends no `Authorization` header, for local servers
     /// that need no key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built, for example if the TLS backend fails to initialize.
     #[must_use]
     pub fn without_api_key() -> Self {
         Self {
@@ -135,8 +148,8 @@ impl ChatCompletionsPlugin {
         self
     }
 
-    /// Adds fields to the top level of every request body, replacing a field
-    /// Polaris set for the same key. `fields` must be a JSON object. See
+    /// Adds fields to the top level of every request body. Repeated calls merge
+    /// fields, with later values winning. Reserved request keys are rejected; see
     /// [`ChatCompletionsProvider::with_extra_body`].
     ///
     /// # Examples
@@ -145,13 +158,14 @@ impl ChatCompletionsPlugin {
     /// # use polaris_model_providers::ChatCompletionsPlugin;
     /// let plugin = ChatCompletionsPlugin::from_env("ZAI_API_KEY")
     ///     .with_base_url("https://api.z.ai/api/paas/v4")
-    ///     .with_extra_body(serde_json::json!({
-    ///         "thinking": { "type": "enabled", "clear_thinking": false }
-    ///     }));
+    ///     .with_extra_body(serde_json::Map::from_iter([(
+    ///         "thinking".to_owned(),
+    ///         serde_json::json!({ "type": "enabled", "clear_thinking": false }),
+    ///     )]));
     /// # let _ = plugin;
     /// ```
     #[must_use]
-    pub fn with_extra_body(mut self, fields: serde_json::Value) -> Self {
+    pub fn with_extra_body(mut self, fields: serde_json::Map<String, serde_json::Value>) -> Self {
         self.provider = self.provider.with_extra_body(fields);
         self
     }
@@ -175,6 +189,10 @@ impl ChatCompletionsPlugin {
     /// Sets the connect and idle timeouts (default: 30 seconds and 5 minutes).
     /// There is no limit on the whole request, so long streams still work. See
     /// [`Timeouts`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built, for example if the TLS backend fails to initialize.
     #[must_use]
     pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
         self.provider = self.provider.with_timeouts(timeouts);

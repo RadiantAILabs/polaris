@@ -9,7 +9,7 @@
 //! the server expects in the request's `model` field (it may contain `/` and
 //! `:`, for example `zai-org/GLM-5.3-Flash:zai`).
 //!
-//! It is separate from [`OpenAiPlugin`](crate::openai::OpenAiPlugin), which
+//! It is separate from `OpenAiPlugin`, which
 //! speaks the Responses API, so one server can register both and each model id
 //! says which protocol it uses.
 //!
@@ -17,8 +17,8 @@
 //! because servers differ in which fields they send. See
 //! [`ChatCompletionsProvider`] for what is read and what is sent.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 mod plugin;
 mod provider;
@@ -36,7 +36,7 @@ pub use provider::{ChatCompletionsProvider, Timeouts};
 /// `max_tokens`, or do not enforce `max_completion_tokens`; the Hugging Face
 /// router's request schema lists only `max_tokens`. Pick the key the server
 /// honours with [`ChatCompletionsProvider::with_max_tokens_field`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MaxTokensField {
     /// Send `max_completion_tokens` (the default, right for `OpenAI`).
@@ -69,12 +69,12 @@ impl MaxTokensField {
 /// used. Set another value with
 /// [`ChatCompletionsProvider::with_reasoning_replay`] when a server answers
 /// under one name and reads another.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReasoningReplay {
-    /// Send the reasoning under the field the server used in its most recent
-    /// reply through this provider (the default). Before the provider has
-    /// received any reasoning it uses `reasoning_content`; that only matters
+    /// Send the reasoning under the field the server used in its latest reply
+    /// for the same model through this provider (the default). Before that model
+    /// has returned any reasoning it uses `reasoning_content`; that only matters
     /// for history carried over from another process or provider.
     #[default]
     AsReceived,
@@ -102,23 +102,44 @@ impl ReasoningReplay {
     }
 }
 
-/// The reasoning field a server used in its latest reply, shared by every
-/// clone of a provider.
+/// A per-model handle to reasoning fields shared by every clone of a provider.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SeenReasoningField(Arc<AtomicBool>);
+pub(crate) struct SeenReasoningField {
+    models: Arc<Mutex<HashMap<String, bool>>>,
+    model: String,
+}
 
 impl SeenReasoningField {
-    /// Records the field a reply used. Other names are ignored.
-    pub(crate) fn record(&self, field: &str) {
-        match field {
-            REASONING => self.0.store(true, Ordering::Relaxed),
-            REASONING_CONTENT => self.0.store(false, Ordering::Relaxed),
-            _ => {}
+    /// Selects a model while sharing the provider's records.
+    pub(crate) fn for_model(&self, model: &str) -> Self {
+        Self {
+            models: Arc::clone(&self.models),
+            model: model.to_owned(),
         }
     }
 
+    /// Records the field a reply used. Other names are ignored.
+    pub(crate) fn record(&self, field: &str) {
+        let reasoning = match field {
+            REASONING => true,
+            REASONING_CONTENT => false,
+            _ => return,
+        };
+        self.models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.model.clone(), reasoning);
+    }
+
     fn get(&self) -> &'static str {
-        if self.0.load(Ordering::Relaxed) {
+        if self
+            .models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.model)
+            .copied()
+            .unwrap_or(false)
+        {
             REASONING
         } else {
             REASONING_CONTENT

@@ -12,7 +12,7 @@ use polaris_models::llm::{
 };
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// The base URL used until [`ChatCompletionsProvider::with_base_url`] sets
 /// another.
@@ -36,7 +36,7 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 ///   data as it goes and is not affected.
 ///
 /// The defaults are 30 seconds to connect and 5 minutes of silence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Timeouts {
     connect: Duration,
     idle: Duration,
@@ -44,6 +44,7 @@ pub struct Timeouts {
 
 impl Timeouts {
     /// Creates limits from a connect timeout and an idle (per read) timeout.
+    /// Zero durations are accepted and passed to the HTTP client unchanged.
     #[must_use]
     pub const fn new(connect: Duration, idle: Duration) -> Self {
         Self { connect, idle }
@@ -73,10 +74,13 @@ impl Default for Timeouts {
 /// Some servers sit behind gateways that refuse a request with no
 /// `User-Agent`, so one that names the library is sent.
 pub(super) fn client_builder(timeouts: Timeouts) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(concat!("polaris-ai/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(timeouts.connect)
-        .read_timeout(timeouts.idle)
+        .read_timeout(timeouts.idle);
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder
 }
 
 /// The longest part of an error body kept in an error message.
@@ -107,6 +111,7 @@ const MAX_ERROR_BODY_CHARS: usize = 2_000;
 /// Earlier reasoning is sent back on assistant messages under the field the server used for it, `reasoning_content` or `reasoning`
 /// (see [`ReasoningReplay`]). Audio and document blocks, and images in tool
 /// results, fail with [`GenerationError::UnsupportedContent`].
+/// `LlmRequest::cache` markers are ignored by this provider.
 ///
 /// [`with_extra_body`](Self::with_extra_body) adds fields that Polaris has no
 /// request type for, such as `chat_template_kwargs`.
@@ -156,10 +161,11 @@ const MAX_ERROR_BODY_CHARS: usize = 2_000;
 /// # Examples
 ///
 /// ```no_run
-/// use polaris_model_providers::chat_completions::ChatCompletionsProvider;
+/// use polaris_model_providers::chat_completions::{ChatCompletionsProvider, MaxTokensField};
 ///
 /// let provider = ChatCompletionsProvider::new("api-key")
-///     .with_base_url("https://router.huggingface.co/v1");
+///     .with_base_url("https://router.huggingface.co/v1")
+///     .with_max_tokens_field(MaxTokensField::MaxTokens);
 /// # let _ = provider;
 /// ```
 #[derive(Clone)]
@@ -179,6 +185,10 @@ impl ChatCompletionsProvider {
     ///
     /// Pricing defaults to [`PriceStore::builtin`]: the built-in price table,
     /// with no network access and no files.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built, for example if the TLS backend fails to initialize.
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::build(Some(api_key.into()))
@@ -186,6 +196,10 @@ impl ChatCompletionsProvider {
 
     /// Creates a provider that sends no `Authorization` header, for local
     /// servers that need no key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built, for example if the TLS backend fails to initialize.
     #[must_use]
     pub fn without_api_key() -> Self {
         Self::build(None)
@@ -225,13 +239,15 @@ impl ChatCompletionsProvider {
         self
     }
 
-    /// Adds fields to the top level of every request body, replacing a field
-    /// Polaris set for the same key.
+    /// Adds fields to the top level of every request body. Repeated calls merge
+    /// fields, with later values replacing earlier values for the same key.
     ///
     /// This is the place for settings that Polaris has no request type for:
     /// Z.ai's `thinking`, vLLM's `chat_template_kwargs`, `top_k`, and so on.
-    /// `fields` must be a JSON object; any other value makes every request fail
-    /// with [`GenerationError::InvalidRequest`].
+    /// The keys `model`, `messages`, `stream` and `stream_options` are reserved;
+    /// setting one makes the request fail with [`GenerationError::InvalidRequest`].
+    /// So does `reasoning_effort` when the request also sets an effort.
+    /// Other keys replace any value Polaris set for the same key.
     ///
     /// # Examples
     ///
@@ -239,13 +255,16 @@ impl ChatCompletionsProvider {
     /// use polaris_model_providers::chat_completions::ChatCompletionsProvider;
     ///
     /// let provider = ChatCompletionsProvider::new("api-key").with_extra_body(
-    ///     serde_json::json!({ "thinking": { "type": "enabled", "clear_thinking": false } }),
+    ///     serde_json::Map::from_iter([(
+    ///         "thinking".to_owned(),
+    ///         serde_json::json!({ "type": "enabled", "clear_thinking": false }),
+    ///     )]),
     /// );
     /// # let _ = provider;
     /// ```
     #[must_use]
-    pub fn with_extra_body(mut self, fields: Value) -> Self {
-        self.settings.extra_body = Some(fields);
+    pub fn with_extra_body(mut self, fields: Map<String, Value>) -> Self {
+        self.settings.extra_body.extend(fields);
         self
     }
 
@@ -322,8 +341,7 @@ impl ChatCompletionsProvider {
     ///
     /// # Panics
     ///
-    /// Panics if the HTTP client cannot be built, which does not happen for
-    /// any pair of durations.
+    /// Panics if the HTTP client cannot be built, for example if the TLS backend fails to initialize.
     ///
     /// # Examples
     ///
@@ -392,7 +410,10 @@ impl ChatCompletionsProvider {
             return Ok(response);
         }
         let headers = response.headers().clone();
-        let bytes = read_capped(response, MAX_ERROR_BODY_BYTES, false).await?;
+        let error = status_error(status, &headers, "");
+        let Ok(bytes) = read_capped(response, MAX_ERROR_BODY_BYTES, false).await else {
+            return Err(error);
+        };
         Err(status_error(
             status,
             &headers,
@@ -460,7 +481,7 @@ impl LlmProvider for ChatCompletionsProvider {
             ))
         })?;
         if let Some(field) = response_reasoning_field(&raw) {
-            self.settings.seen_reasoning.record(field);
+            self.settings.seen_reasoning.for_model(model).record(field);
         }
         parse_response(&raw)
     }
@@ -470,7 +491,7 @@ impl LlmProvider for ChatCompletionsProvider {
         let response = self.post(&body).await?;
         Ok(Box::pin(
             ChatStreamAdapter::new(SseDataStream::new(response.bytes_stream()))
-                .recording_reasoning_field(self.settings.seen_reasoning.clone()),
+                .recording_reasoning_field(self.settings.seen_reasoning.for_model(model)),
         ))
     }
 

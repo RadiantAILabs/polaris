@@ -16,12 +16,12 @@ pub(super) struct BodySettings {
     pub(super) max_tokens_field: MaxTokensField,
     /// How earlier reasoning is sent back.
     pub(super) reasoning_replay: ReasoningReplay,
-    /// The reasoning field the server used in its latest reply.
+    /// The reasoning fields the server used, shared by model.
     pub(super) seen_reasoning: SeenReasoningField,
     /// Whether tool definitions carry `strict` and a normalized schema.
     pub(super) strict_tools: bool,
     /// Fields laid over the top level of every body.
-    pub(super) extra_body: Option<Value>,
+    pub(super) extra_body: Map<String, Value>,
 }
 
 /// Builds the JSON body of one `/chat/completions` call.
@@ -35,7 +35,9 @@ pub(super) fn build_body(
     if let Some(system) = &request.system {
         messages.push(json!({ "role": "system", "content": system }));
     }
-    let reasoning_field = settings.reasoning_replay.field(&settings.seen_reasoning);
+    let reasoning_field = settings
+        .reasoning_replay
+        .field(&settings.seen_reasoning.for_model(model));
     convert_messages(&request.messages, reasoning_field, &mut messages)?;
 
     let mut body = Map::new();
@@ -84,32 +86,19 @@ pub(super) fn build_body(
         );
     }
 
-    match &settings.extra_body {
-        None => {}
-        Some(Value::Object(fields)) => {
-            for (key, value) in fields {
-                body.insert(key.clone(), value.clone());
-            }
-        }
-        Some(other) => {
+    for (key, value) in &settings.extra_body {
+        if matches!(
+            key.as_str(),
+            "model" | "messages" | "stream" | "stream_options"
+        ) || (key == "reasoning_effort" && request.reasoning_effort.is_some())
+        {
             return Err(GenerationError::InvalidRequest(format!(
-                "the extra request body must be a JSON object, not {}",
-                json_kind(other)
+                "extra request body cannot override `{key}`"
             )));
         }
+        body.insert(key.clone(), value.clone());
     }
     Ok(Value::Object(body))
-}
-
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
 }
 
 fn convert_tool(tool: &ToolDefinition, strict_tools: bool) -> Value {
@@ -177,12 +166,12 @@ fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<()
             UserBlock::ToolResult(result) => tool_messages.push(convert_tool_result(result)?),
             UserBlock::Audio(_) => {
                 return Err(GenerationError::UnsupportedContent(
-                    "Audio content is not supported by the Chat Completions provider".to_owned(),
+                    "audio content is not supported by the Chat Completions provider".to_owned(),
                 ));
             }
             UserBlock::Document(_) => {
                 return Err(GenerationError::UnsupportedContent(
-                    "Document content is not supported by the Chat Completions provider".to_owned(),
+                    "document content is not supported by the Chat Completions provider".to_owned(),
                 ));
             }
         }
@@ -212,7 +201,7 @@ fn convert_tool_result(result: &ToolResult) -> Result<Value, GenerationError> {
         ToolResultContent::Text(text) => text.clone(),
         ToolResultContent::Image(_) => {
             return Err(GenerationError::UnsupportedContent(
-                "Image tool results are not supported by the Chat Completions provider".to_owned(),
+                "image tool results are not supported by the Chat Completions provider".to_owned(),
             ));
         }
     };
@@ -308,7 +297,7 @@ fn image_data_url(image: &ImageBlock) -> Result<String, GenerationError> {
         ImageMediaType::WEBP => "image/webp",
         ref other => {
             return Err(GenerationError::UnsupportedContent(format!(
-                "Unsupported image media type for Chat Completions: {other:?}"
+                "unsupported image media type for Chat Completions: {other:?}"
             )));
         }
     };

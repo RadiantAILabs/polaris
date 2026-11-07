@@ -149,7 +149,7 @@ impl Server {
     fn provider_with(&self, timeouts: Timeouts) -> ChatCompletionsProvider {
         ChatCompletionsProvider::new("test-key")
             .with_base_url(&self.base_url)
-            .with_http_client(no_proxy_client_with(timeouts))
+            .with_timeouts(timeouts)
     }
 
     async fn recorded(&mut self) -> Recorded {
@@ -371,17 +371,27 @@ async fn the_output_limit_goes_in_the_key_the_provider_was_told_to_use() {
 }
 
 #[tokio::test]
-async fn extra_body_fields_replace_the_provider_fields_with_the_same_key() {
+async fn extra_body_calls_merge_with_later_values_winning() {
     let mut server = Server::start(Reply::json(&json!({
         "choices": [{ "message": { "content": "ok" } }],
     })))
     .await;
-    let provider = server.provider().with_extra_body(json!({
-        "thinking": { "type": "enabled", "clear_thinking": false },
-        "reasoning_effort": "max",
-    }));
+    let provider = server
+        .provider()
+        .with_extra_body(
+            json!({
+                "thinking": { "type": "enabled", "clear_thinking": false },
+                "reasoning_effort": "max",
+                "top_k": 10,
+                "max_completion_tokens": 64,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .with_extra_body(json!({ "top_k": 20 }).as_object().unwrap().clone());
     let mut request = hello();
-    request.reasoning_effort = Some(ReasoningEffort::Low);
+    request.max_output_tokens = NonZeroU32::new(12);
     within(provider.generate("m", request))
         .await
         .expect("the request should succeed");
@@ -390,27 +400,45 @@ async fn extra_body_fields_replace_the_provider_fields_with_the_same_key() {
         seen.body["thinking"],
         json!({ "type": "enabled", "clear_thinking": false })
     );
-    assert_eq!(
-        seen.body["reasoning_effort"], "max",
-        "the extra field replaces the request's own"
-    );
+    assert_eq!(seen.body["reasoning_effort"], "max");
+    assert_eq!(seen.body["top_k"], 20);
+    assert_eq!(seen.body["max_completion_tokens"], 64);
     assert_eq!(seen.body["model"], "m");
 }
 
 #[tokio::test]
-async fn an_extra_body_that_is_not_an_object_fails_before_any_request() {
-    // Nothing listens here: reaching the network would be a different error.
-    let provider = ChatCompletionsProvider::without_api_key()
-        .with_base_url("http://127.0.0.1:9/v1")
-        .with_extra_body(json!(["not", "an", "object"]))
-        .with_http_client(no_proxy_client());
-    let error = within(provider.generate("m", hello()))
-        .await
-        .expect_err("a non-object extra body must fail");
-    assert!(
-        matches!(&error, GenerationError::InvalidRequest(message) if message.contains("an array")),
-        "{error:?}"
-    );
+async fn reserved_extra_body_keys_fail_before_any_request() {
+    for key in [
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        "reasoning_effort",
+    ] {
+        // Nothing listens here: reaching the network would be a different error.
+        let provider = ChatCompletionsProvider::without_api_key()
+            .with_base_url("http://127.0.0.1:9/v1")
+            .with_extra_body(serde_json::Map::from_iter([(
+                key.to_owned(),
+                json!("override"),
+            )]))
+            .with_http_client(no_proxy_client());
+        let mut request = hello();
+        request.reasoning_effort = Some(ReasoningEffort::Low);
+        let generate_error = within(provider.generate("m", request.clone()))
+            .await
+            .expect_err("a reserved key must fail");
+        let stream_error = within(provider.stream("m", request))
+            .await
+            .err()
+            .expect("a reserved key must fail for streams too");
+        for error in [generate_error, stream_error] {
+            assert!(
+                matches!(&error, GenerationError::InvalidRequest(message) if message.contains(key)),
+                "{key}: {error:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -946,6 +974,111 @@ async fn by_default_reasoning_goes_back_under_the_field_the_server_used() {
 }
 
 #[tokio::test]
+async fn reasoning_replay_is_learned_separately_for_each_model() {
+    let first = Server::start(first_turn_reply("reasoning_content")).await;
+    let mut provider = first.provider();
+    let content_a = within(provider.generate("model-a", hello()))
+        .await
+        .expect("model-a should answer")
+        .content;
+
+    let second = Server::start(first_turn_stream_reply("reasoning")).await;
+    provider = provider.with_base_url(&second.base_url);
+    let stream = within(provider.stream("model-b", hello()))
+        .await
+        .expect("model-b should stream");
+    let content_b = within(stream.collect_response())
+        .await
+        .expect("model-b should answer")
+        .content;
+
+    for (model, field, other, content) in [
+        ("model-a", "reasoning_content", "reasoning", content_a),
+        ("model-b", "reasoning", "reasoning_content", content_b),
+    ] {
+        let mut next = Server::start(Reply::json(&json!({
+            "choices": [{ "message": { "content": "Sunny" } }],
+        })))
+        .await;
+        provider = provider.with_base_url(&next.base_url);
+        within(provider.generate(model, second_turn_request(content)))
+            .await
+            .expect("the next turn should succeed");
+        let body = next.recorded().await.body;
+        let assistant = assistant_message(&body);
+        assert_eq!(
+            assistant[field], "I should look the weather up.",
+            "{model}: {body}"
+        );
+        assert!(assistant.get(other).is_none(), "{model}: {body}");
+        assert_eq!(body["model"], model);
+    }
+}
+
+#[tokio::test]
+async fn reasoning_replay_tracks_field_changes_through_clones_and_keeps_them_without_reasoning() {
+    for how in [FirstTurn::Generate, FirstTurn::Stream] {
+        let provider =
+            ChatCompletionsProvider::without_api_key().with_http_client(no_proxy_client());
+        // Clone before learning so updates must be shared in both directions.
+        let cloned = provider.clone();
+        for (index, field) in ["reasoning", "reasoning_content", "reasoning"]
+            .into_iter()
+            .enumerate()
+        {
+            let reply = match how {
+                FirstTurn::Generate => first_turn_reply(field),
+                FirstTurn::Stream => first_turn_stream_reply(field),
+            };
+            let server = Server::start(reply).await;
+            let active = if index % 2 == 0 { &cloned } else { &provider };
+            let active = active.clone().with_base_url(&server.base_url);
+            let content = match how {
+                FirstTurn::Generate => {
+                    within(active.generate("m", hello()))
+                        .await
+                        .expect("the reply should succeed")
+                        .content
+                }
+                FirstTurn::Stream => {
+                    let stream = within(active.stream("m", hello()))
+                        .await
+                        .expect("the stream should start");
+                    within(stream.collect_response())
+                        .await
+                        .expect("the reply should succeed")
+                        .content
+                }
+            };
+            // Both requests receive no reasoning; neither may clear the learned field.
+            for shared in [&provider, &cloned] {
+                let mut next = Server::start(Reply::json(&json!({
+                    "choices": [{ "message": { "content": "Sunny" } }],
+                })))
+                .await;
+                within(
+                    shared
+                        .clone()
+                        .with_base_url(&next.base_url)
+                        .generate("m", second_turn_request(content.clone())),
+                )
+                .await
+                .expect("the next turn should succeed");
+                let body = next.recorded().await.body;
+                let assistant = assistant_message(&body);
+                assert_eq!(assistant[field], "I should look the weather up.", "{body}");
+                let other = if field == "reasoning" {
+                    "reasoning_content"
+                } else {
+                    "reasoning"
+                };
+                assert!(assistant.get(other).is_none(), "{body}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn without_any_reply_to_learn_from_reasoning_goes_back_as_reasoning_content() {
     // History that did not come from this provider, such as a restored session.
     let content = vec![
@@ -1111,6 +1244,52 @@ async fn a_response_body_over_the_size_limit_is_refused() {
         matches!(&error, GenerationError::InvalidResponse(message) if message.contains("100 byte limit")),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn error_statuses_survive_an_error_body_that_stalls() {
+    for status in [
+        "401 Unauthorized",
+        "403 Forbidden",
+        "429 Too Many Requests",
+        "502 Bad Gateway",
+    ] {
+        for streaming in [false, true] {
+            let server = Server::start(Reply {
+                stall: true,
+                ..Reply::with_status(status, "application/json", "{\"error\":".to_owned())
+                    .header("Retry-After: 7")
+            })
+            .await;
+            let provider = server.provider_with(short_timeouts());
+            let error = if streaming {
+                within(provider.stream("m", hello()))
+                    .await
+                    .err()
+                    .expect("the status must fail")
+            } else {
+                within(provider.generate("m", hello()))
+                    .await
+                    .expect_err("the status must fail")
+            };
+            match status {
+                "401 Unauthorized" | "403 Forbidden" => assert!(
+                    matches!(&error, GenerationError::Auth(message) if message == status),
+                    "{error:?}"
+                ),
+                "429 Too Many Requests" => assert!(
+                    matches!(error, GenerationError::RateLimited { retry_after: Some(wait) }
+                        if wait == Duration::from_secs(7)),
+                    "{error:?}"
+                ),
+                _ => assert!(
+                    matches!(&error, GenerationError::Provider { status: Some(502), message, .. }
+                        if message == status),
+                    "{error:?}"
+                ),
+            }
+        }
+    }
 }
 
 #[tokio::test]
