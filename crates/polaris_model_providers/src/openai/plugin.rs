@@ -14,6 +14,11 @@ use polaris_system::plugin::{Extends, Plugin};
 /// [`ModelRegistry::llm`](polaris_models::ModelRegistry::llm) under
 /// the `openai/<model>` identifier.
 ///
+/// The provider also works with other servers that implement the Responses
+/// API: set the `OPENAI_BASE_URL` environment variable to the server's base
+/// URL before the plugin is built. See
+/// [OpenAI and compatible servers](https://github.com/RadiantAILabs/polaris/blob/main/docs/reference/model-providers.md#openai-and-compatible-servers).
+///
 /// # Resources Provided
 ///
 /// | Resource | Scope | Description |

@@ -676,7 +676,8 @@ mod tests {
 
     #[test]
     fn count_message_with_tool_result() {
-        let msg = Message::tool_result("call_1", ToolResultContent::Text("Sunny, 22C".to_owned()));
+        let call = ToolCall::new("call_1", "get_weather", serde_json::json!({}));
+        let msg = Message::tool_result_for(&call, ToolResultContent::Text("Sunny, 22C".to_owned()));
         let count = counter().count_message("gpt-5.4", &msg).unwrap();
         assert!(
             count.exact,

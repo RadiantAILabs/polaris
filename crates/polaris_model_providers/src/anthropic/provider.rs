@@ -1534,14 +1534,11 @@ mod tests {
         // A breakpoint can land on a message whose last block is a tool_use
         // (assistant) or tool_result (user), not just plain text — the marker
         // must attach to those `ContentBlockParam` arms too, not only `Text`.
+        let call = ToolCall::new("call_1", "search", serde_json::json!({ "q": "x" }));
         let request = LlmRequest {
             messages: vec![
-                Message::assistant_tool_call(ToolCall::new(
-                    "call_1",
-                    "search",
-                    serde_json::json!({ "q": "x" }),
-                )),
-                Message::tool_result("call_1", PolarisToolResult::Text("done".to_string())),
+                Message::assistant_tool_call(call.clone()),
+                Message::tool_result_for(&call, PolarisToolResult::Text("done".to_string())),
             ],
             cache: CacheControl::default().with_breakpoints([0, 1]),
             ..Default::default()

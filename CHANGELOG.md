@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ToolCall::result`, `ToolCall::error`, `Message::tool_result_for`, `Message::tool_error_for`** (`polaris_models`) — build a tool result from its call, copying both `id` and `call_id`. Anthropic and Bedrock Converse link results by `id`; the OpenAI Responses path, including Bedrock `openai.*` models, links them by `call_id`. See [Model Providers — Tool results need the call's `call_id`](docs/reference/model-providers.md#tool-results-need-the-calls-call_id).
+
+### Changed
+
+- **Deprecated: `UserBlock::tool_result`, `UserBlock::tool_error`, `Message::tool_result`, `Message::tool_error`** (`polaris_models`) — they set only `id`, so every tool turn sent through the OpenAI Responses path (the OpenAI provider and Bedrock `openai.*` models) failed with "Tool result is missing a call_id". **Migration:** call `tool_call.result(content)` / `tool_call.error(content)`, or the `Message::*_for` versions. If you have only the two ids and not the `ToolCall`, use the existing `tool_result_with_call_id` / `tool_error_with_call_id` constructors.
+
+### Fixed
+
+- **OpenAI provider works with other Responses API servers** (`polaris_model_providers`) — events are read as raw JSON, missing fields the provider does not need are filled in, and event types it does not use are skipped, so servers that leave out fields such as `annotations`, `output_index` or usage details no longer fail. A tool call whose name or `call_id` arrives only in `response.output_item.done` is held until then; it used to be emitted with an empty name and `call_id`. The stream fails with `GenerationError::InvalidResponse` if the name or `call_id` is still missing then, or if the stream ends while a call is still held. Non-streaming `generate` uses the same lenient parsing, and rejects a function call with an empty name or `call_id` with `GenerationError::InvalidResponse`. Select another server with the `OPENAI_BASE_URL` environment variable. See [Model Providers — OpenAI and compatible servers](docs/reference/model-providers.md#openai-and-compatible-servers).
+
 ## [0.8.1] - 2026-11-06
 
 ### Added

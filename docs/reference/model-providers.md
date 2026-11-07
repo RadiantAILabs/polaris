@@ -281,6 +281,32 @@ let provider = AnthropicProvider::new(api_key)
     .with_pricing_override("claude-sonnet-4-6", ModelPricing::new(1.0, 5.0));
 ```
 
+## OpenAI and compatible servers
+
+`OpenAiProvider` talks to the OpenAI Responses API. It also works with other servers that implement the same API, which often send slightly different events.
+
+**Select another server.** Set the `OPENAI_BASE_URL` environment variable to the server's base URL (for example `http://localhost:8000/v1`) before the provider is created. `OpenAiProvider::new` and `OpenAiPlugin::from_env` read it, and the API key you pass is sent to that server. There is no builder method for the URL.
+
+- **Missing fields are filled in.** Each event is read as raw JSON first. Fields the provider does not use, or can work out, get a default, such as `sequence_number`, `item_id`, `annotations`, `content_index`, `summary_index`, usage details (missing token counts become 0), response metadata, and `output_index` (taken from the item ID, or the most recent item). A field the provider needs and cannot work out, such as the text of a text delta, still fails with `GenerationError::Json`. The stream fails with `GenerationError::InvalidResponse` if an event is not a JSON object or has no `type`.
+- **Event types the provider does not use are skipped** before they are parsed, so an unknown or unusual event cannot fail the stream.
+- **Tool name and `call_id` may arrive late.** If `response.output_item.added` has no tool name or no `call_id`, the provider holds the tool call until `response.output_item.done` and takes them from there. If the name or the `call_id` is still missing then, the stream fails with `GenerationError::InvalidResponse`. The stream also fails with `InvalidResponse`, naming the call, if it ends (completed, incomplete or failed) while a tool call is still held.
+- **Non-streaming `generate` uses the same parsing.** A function call with an empty name or an empty `call_id` fails with `GenerationError::InvalidResponse`.
+
+### Tool results need the call's `call_id`
+
+OpenAI links a tool result to its call by `call_id`, not by `id`. This applies to the whole OpenAI Responses path, including Bedrock `openai.*` models, which reuse the OpenAI request conversion. Anthropic and Bedrock Converse link results by `id`.
+
+Build results from the call so both are copied: `ToolCall::result` / `ToolCall::error`, or `Message::tool_result_for` / `Message::tool_error_for`. The result then works on every provider.
+
+```rust
+use polaris_models::llm::{Message, ToolResultContent};
+
+// `call` is a `ToolCall` taken from the model's response.
+let reply = Message::tool_result_for(&call, ToolResultContent::Text("Sunny".into()));
+```
+
+The older `UserBlock::tool_result` / `tool_error` and `Message::tool_result` / `tool_error` set only `id`, so these providers reject them (a missing or empty `call_id` fails with "Tool result is missing a call_id"); they are deprecated. If you have only the two ids and not the `ToolCall`, use `UserBlock::tool_result_with_call_id` / `tool_error_with_call_id` or `Message::tool_result_with_call_id` / `tool_error_with_call_id`.
+
 ## AWS Bedrock
 
 `BedrockPlugin::from_env()` loads credentials from the default AWS chain; `BedrockPlugin::from_sdk_config(config)` uses a config you built. Model ids are `bedrock/<bedrock model id>`, for example `bedrock/us.anthropic.claude-sonnet-4-6`.

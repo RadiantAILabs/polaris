@@ -41,7 +41,7 @@ use polaris::agent::{Agent, SetupError};
 use polaris::graph::{CaughtError, Graph};
 use polaris::models::ModelRegistry;
 use polaris::models::llm::LlmResponse;
-use polaris::models::llm::{Llm, Message, ToolResultContent, UserBlock};
+use polaris::models::llm::{Llm, Message, ToolResultContent};
 use polaris::plugins::{IOContent, IOMessage, IOSource, PersistenceAPI, UserIO};
 use polaris::prelude::Out;
 use polaris::system::param::{ErrOut, Res, ResMut, SystemContext};
@@ -222,7 +222,7 @@ async fn execute_tools(
 
         let block = if let Some(reason) = denied_reason {
             send_error(&user_io, format!("\n[Denied] {reason}")).await;
-            UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(reason))
+            tool_call.error(ToolResultContent::Text(reason))
         } else {
             match tool_registry
                 .execute(name, &tool_call.function.arguments)
@@ -234,12 +234,12 @@ async fn execute_tools(
                         .map(String::from)
                         .unwrap_or_else(|| value.to_string());
                     send_trace(&user_io, format!("\n[Observation] {output}")).await;
-                    UserBlock::tool_result(&tool_call.id, ToolResultContent::Text(output))
+                    tool_call.result(ToolResultContent::Text(output))
                 }
                 Err(err) => {
                     let output = err.to_string();
                     send_error(&user_io, format!("\n[Tool Error] {output}")).await;
-                    UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(output))
+                    tool_call.error(ToolResultContent::Text(output))
                 }
             }
         };

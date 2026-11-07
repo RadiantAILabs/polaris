@@ -84,6 +84,24 @@ let response = llm.builder()
 let tool_calls = response.tool_calls();
 ```
 
+Send each tool's output back by building the result from the call. `tool_call.result(...)` and `Message::tool_result_for` copy both the call's `id` and its `call_id`, so the conversation works with every provider (OpenAI needs `call_id`, Anthropic and Bedrock use `id`). Use `tool_call.error(...)` or `Message::tool_error_for` when the tool failed:
+
+```rust
+use polaris_models::llm::{Message, ToolResultContent};
+
+let call = tool_calls[0];
+
+let followup = llm.builder()
+    .with_definitions(vec![weather_tool])
+    .user("What's the weather in Tokyo?")
+    .message(Message::assistant_tool_call(call.clone()))
+    .message(Message::tool_result_for(call, ToolResultContent::Text("Sunny, 22°C".into())))
+    .generate()
+    .await?;
+```
+
+If you have only the two ids and not the `ToolCall`, use `Message::tool_result_with_call_id`. The older `Message::tool_result` and `UserBlock::tool_result` drop the `call_id` and are deprecated.
+
 ### Multi-turn Conversations
 
 Build conversations with alternating user/assistant messages:

@@ -83,7 +83,7 @@ Provider-agnostic LLM access plus concrete provider plugins.
 | [`ModelsPlugin`](crate::models::ModelsPlugin) | The global [`ModelRegistry`](crate::models::ModelRegistry) — provider-keyed model lookup so consumers depend on the registry, not on a specific provider. With the `dashboard` feature, also mounts `GET /v1/models/providers` — a frozen snapshot of registered providers for an external dashboard frontend to consume. |
 | [`TokenizerPlugin`](crate::models::TokenizerPlugin) | Pluggable [`Tokenizer`](crate::models::Tokenizer) resource for token counting and prompt budgeting; backed by tiktoken when the `tiktoken` feature is on. |
 | [`AnthropicPlugin`](crate::models::AnthropicPlugin) *(feature `anthropic`)* | Registers the Anthropic provider (Messages API, including tool use and streaming) with [`ModelRegistry`](crate::models::ModelRegistry). |
-| [`OpenAiPlugin`](crate::models::OpenAiPlugin) *(feature `openai`)* | Registers the `OpenAI` provider (Chat Completions, tool use, streaming) with [`ModelRegistry`](crate::models::ModelRegistry). |
+| [`OpenAiPlugin`](crate::models::OpenAiPlugin) *(feature `openai`)* | Registers the `OpenAI` provider (Responses API, tool use, streaming) with [`ModelRegistry`](crate::models::ModelRegistry). |
 | [`BedrockPlugin`](crate::models::BedrockPlugin) *(feature `bedrock`)* | Registers AWS Bedrock-hosted models (Anthropic, Meta, etc.) with [`ModelRegistry`](crate::models::ModelRegistry). |
 
 ## Layer 3 — Sessions
