@@ -38,6 +38,15 @@ pub struct LlmRequest {
     /// The limit is non-zero by type: a request for zero output tokens has no
     /// useful meaning, and providers reject it. Deserializing a `0` fails.
     pub max_output_tokens: Option<NonZeroU32>,
+    /// How much effort the model should spend reasoning, when supported.
+    ///
+    /// `None` leaves the provider's and the model's own default in place. A
+    /// provider that cannot honour a requested effort fails the request with
+    /// [`GenerationError::UnsupportedOperation`](super::GenerationError::UnsupportedOperation)
+    /// before sending anything; it never ignores the setting silently. See
+    /// [`ReasoningEffort`] for the levels and how each provider maps them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Prompt-cache breakpoint markers for this request.
     ///
     /// Provider-agnostic: a provider that supports prompt caching (e.g.
@@ -119,6 +128,134 @@ impl CacheControl {
     #[must_use]
     pub fn is_disabled(&self) -> bool {
         !self.is_enabled()
+    }
+}
+
+/// How much effort the model should spend reasoning before it answers.
+///
+/// A provider-neutral request setting, carried by
+/// [`LlmRequest::reasoning_effort`] and set with
+/// [`LlmRequestBuilder::reasoning_effort`](super::builder::LlmRequestBuilder::reasoning_effort).
+/// Each provider sends it in its own way:
+///
+/// | Provider | Sent as | Levels it accepts |
+/// |----------|---------|-------------------|
+/// | Chat Completions | `reasoning_effort` | every level, as the level's name; the server accepts or rejects it |
+/// | OpenAI (Responses) | `reasoning.effort` | every level, as the level's name |
+/// | Anthropic | `output_config.effort` | [`Low`](Self::Low) to [`Max`](Self::Max) |
+/// | Bedrock, `openai.*` models | `reasoning.effort` | every level, as the level's name |
+/// | Bedrock, Converse | not supported | none |
+///
+/// The levels are the names servers use, not a promise that every model has
+/// that level. A server that does not know a level rejects the request and its
+/// error reaches the caller. A provider that has no way to send the setting at
+/// all (or no way to send this level) returns
+/// [`GenerationError::UnsupportedOperation`](super::GenerationError::UnsupportedOperation)
+/// before it sends anything, so a run that pins an effort never runs at a
+/// different one without saying so.
+///
+/// Text converts both ways: [`Display`](core::fmt::Display) writes the name
+/// in lower case and [`FromStr`](core::str::FromStr) reads the known names in
+/// any case. Other non-empty text becomes [`Other`](Self::Other), so a level
+/// that only some servers define can be requested.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_models::llm::ReasoningEffort;
+///
+/// assert_eq!("High".parse::<ReasoningEffort>(), Ok(ReasoningEffort::High));
+/// assert_eq!(ReasoningEffort::XHigh.to_string(), "xhigh");
+/// assert_eq!(
+///     "ultra".parse::<ReasoningEffort>(),
+///     Ok(ReasoningEffort::Other("ultra".to_owned()))
+/// );
+/// assert!("  ".parse::<ReasoningEffort>().is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReasoningEffort {
+    /// Ask the model not to reason, where it allows that.
+    None,
+    /// The least reasoning a model offers above none.
+    Minimal,
+    /// Light reasoning.
+    Low,
+    /// Moderate reasoning.
+    Medium,
+    /// Deep reasoning.
+    High,
+    /// Deeper than [`High`](Self::High), for models that have the level.
+    XHigh,
+    /// The most reasoning a model offers.
+    Max,
+    /// A level this enum does not name, sent as written to providers that take
+    /// free-form levels. Providers with a fixed list of levels reject it.
+    Other(String),
+}
+
+impl ReasoningEffort {
+    /// The level's name as servers write it: lower case for the named levels,
+    /// the given text for [`Other`](Self::Other).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Other(level) => level,
+        }
+    }
+}
+
+impl core::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The text given to [`ReasoningEffort`]'s `FromStr` was empty.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a reasoning effort cannot be empty")]
+pub struct ParseReasoningEffortError {
+    _private: (),
+}
+
+impl core::str::FromStr for ReasoningEffort {
+    type Err = ParseReasoningEffortError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(ParseReasoningEffortError { _private: () });
+        }
+        Ok(match text.to_ascii_lowercase().as_str() {
+            "none" => Self::None,
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::XHigh,
+            "max" => Self::Max,
+            _ => Self::Other(text.to_owned()),
+        })
+    }
+}
+
+impl Serialize for ReasoningEffort {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -1150,6 +1287,100 @@ pub type LlmStream =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_reads_every_named_level_in_any_case() {
+        let cases = [
+            ("none", ReasoningEffort::None),
+            ("Minimal", ReasoningEffort::Minimal),
+            ("LOW", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            (" high ", ReasoningEffort::High),
+            ("XHigh", ReasoningEffort::XHigh),
+            ("max", ReasoningEffort::Max),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(text.parse::<ReasoningEffort>(), Ok(expected), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_keeps_unknown_text_as_other_without_changing_case() {
+        assert_eq!(
+            " Ultra ".parse::<ReasoningEffort>(),
+            Ok(ReasoningEffort::Other("Ultra".to_owned()))
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rejects_empty_text() {
+        assert!("".parse::<ReasoningEffort>().is_err());
+        assert!(" \t".parse::<ReasoningEffort>().is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_display_round_trips_through_from_str() {
+        let levels = [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Other("ultra".to_owned()),
+        ];
+        for level in levels {
+            assert_eq!(level.to_string().parse(), Ok(level.clone()), "{level:?}");
+        }
+        assert_eq!(ReasoningEffort::XHigh.to_string(), "xhigh");
+    }
+
+    #[test]
+    fn reasoning_effort_serializes_as_its_name() {
+        assert_eq!(
+            serde_json::to_value(ReasoningEffort::High).unwrap(),
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningEffort::Other("Ultra".to_owned())).unwrap(),
+            serde_json::json!("Ultra")
+        );
+        let read: ReasoningEffort = serde_json::from_value(serde_json::json!("HIGH")).unwrap();
+        assert_eq!(read, ReasoningEffort::High);
+        assert!(serde_json::from_value::<ReasoningEffort>(serde_json::json!("")).is_err());
+        assert!(serde_json::from_value::<ReasoningEffort>(serde_json::json!(3)).is_err());
+    }
+
+    #[test]
+    fn request_without_reasoning_effort_omits_the_field_and_reads_it_back() {
+        let request = LlmRequest::default();
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("reasoning_effort").is_none(), "{value}");
+
+        let request = LlmRequest {
+            reasoning_effort: Some(ReasoningEffort::Max),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["reasoning_effort"], "max");
+        let back: LlmRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Max));
+
+        // A payload written before the field existed still reads.
+        let old: LlmRequest = serde_json::from_value(serde_json::json!({
+            "system": null,
+            "system_prompt_name": null,
+            "system_prompt_version": null,
+            "messages": [],
+            "tools": null,
+            "tool_choice": null,
+            "output_schema": null,
+            "max_output_tokens": null,
+        }))
+        .unwrap();
+        assert_eq!(old.reasoning_effort, None);
+    }
 
     #[test]
     fn cache_control_default_is_disabled() {
