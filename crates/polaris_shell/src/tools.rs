@@ -153,9 +153,10 @@ impl ShellTools {
     /// cancellable run should build a [`ShellCancel`] from its own
     /// cancellation signal and put it in the context to stop the child while
     /// keeping the invocation future alive. Dropping that future also requests
-    /// a stop through the foreground process handle. `allowed_dirs` is also a
-    /// `#[context]` parameter: a [`ShellAllowedDirs`] narrows where this call
-    /// may start.
+    /// a stop through the foreground process handle.
+    // This comment is not part of the tool description sent to the model:
+    // `allowed_dirs` is also a `#[context]` parameter, and a
+    // `ShellAllowedDirs` narrows where this call may start.
     #[tool]
     async fn run_command(
         &self,
