@@ -177,4 +177,4 @@ pub use process::{
     ShellEventReceiver, ShellOutcome, ShellProcess, ShellProcessId, ShellProcessState,
     ShellProcessStatus, ShellSink, ShellSinkHandle, ShellStream,
 };
-pub use tools::{ShellToolResponse, ShellTools};
+pub use tools::{ShellAllowedDirs, ShellToolResponse, ShellTools};
