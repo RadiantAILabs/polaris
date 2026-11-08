@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-08
+
+### Fixed
+
+- **OpenAI Responses provider no longer sends invalid assistant history** (`polaris_model_providers`) — an assistant turn with two or more text blocks was replayed as one message with `input_text` parts, which the Responses API rejects with HTTP 400. Each text block is now sent as its own plain-string assistant message, with the text unchanged, so such a turn now appears as several consecutive assistant messages in the request. Affects the OpenAI provider and Bedrock `openai.*` models.
+
 ## [0.9.0] - 2026-11-07
 
 ### Added
