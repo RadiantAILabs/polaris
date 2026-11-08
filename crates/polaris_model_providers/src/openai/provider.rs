@@ -312,7 +312,7 @@ fn convert_user_message(
             UserBlock::ToolResult(result) => {
                 // Each tool result is a separate top-level item.
                 // Flush any accumulated content first.
-                flush_content_parts(&mut content_parts, Role::User, items);
+                flush_user_parts(&mut content_parts, items);
 
                 let output_text = match &result.content {
                     PolarisToolResult::Text(text) => text.clone(),
@@ -360,7 +360,7 @@ fn convert_user_message(
     }
 
     // Flush any remaining content.
-    flush_content_parts(&mut content_parts, Role::User, items);
+    flush_user_parts(&mut content_parts, items);
 
     Ok(())
 }
@@ -369,20 +369,22 @@ fn convert_assistant_message(
     blocks: &[AssistantBlock],
     items: &mut Vec<InputItem>,
 ) -> Result<(), GenerationError> {
-    // Text blocks get grouped into a single EasyInputMessage with role assistant.
-    // Tool calls and reasoning blocks become individual top-level Item entries.
-    let mut text_parts: Vec<InputContent> = Vec::new();
-
+    // Each text block becomes its own assistant message with plain string
+    // content. The Responses API requires `output_text` parts inside assistant
+    // messages, and `EasyInputContent` can only hold `input_text` parts, so a
+    // content list would be rejected. Plain strings keep every block's text
+    // unchanged and need no message id. Tool calls and reasoning blocks become
+    // individual top-level Item entries, in order.
     for block in blocks {
         match block {
             AssistantBlock::Text(block) => {
-                text_parts.push(InputContent::InputText(InputTextContent {
-                    text: block.text.clone(),
+                items.push(InputItem::EasyMessage(EasyInputMessage {
+                    content: EasyInputContent::Text(block.text.clone()),
+                    role: Role::Assistant,
+                    r#type: Default::default(),
                 }));
             }
             AssistantBlock::ToolCall(call) => {
-                flush_content_parts(&mut text_parts, Role::Assistant, items);
-
                 let arguments =
                     serde_json::to_string(&call.function.arguments).map_err(|json_err| {
                         GenerationError::InvalidRequest(format!(
@@ -403,8 +405,6 @@ fn convert_assistant_message(
                 })));
             }
             AssistantBlock::Reasoning(reasoning) => {
-                flush_content_parts(&mut text_parts, Role::Assistant, items);
-
                 let summary = reasoning
                     .reasoning
                     .iter()
@@ -428,14 +428,15 @@ fn convert_assistant_message(
         }
     }
 
-    flush_content_parts(&mut text_parts, Role::Assistant, items);
-
     Ok(())
 }
 
-/// Flushes accumulated content parts into an [`EasyInputMessage`] and appends
-/// it to the items list. Does nothing if `parts` is empty.
-fn flush_content_parts(parts: &mut Vec<InputContent>, role: Role, items: &mut Vec<InputItem>) {
+/// Flushes accumulated user content parts into an [`EasyInputMessage`] and
+/// appends it to the items list. Does nothing if `parts` is empty.
+///
+/// User-only: [`InputContent`] parts serialize as `input_*` types, which the
+/// Responses API rejects inside assistant messages.
+fn flush_user_parts(parts: &mut Vec<InputContent>, items: &mut Vec<InputItem>) {
     if parts.is_empty() {
         return;
     }
@@ -453,7 +454,7 @@ fn flush_content_parts(parts: &mut Vec<InputContent>, role: Role, items: &mut Ve
 
     items.push(InputItem::EasyMessage(EasyInputMessage {
         content,
-        role,
+        role: Role::User,
         r#type: Default::default(),
     }));
 
@@ -1323,6 +1324,83 @@ mod tests {
         };
 
         assert!(request_json(&request).get("max_output_tokens").is_none());
+    }
+
+    /// The Responses API rejects `input_text` parts inside assistant messages
+    /// (HTTP 400). An assistant turn with several text blocks must therefore
+    /// replay as plain-string assistant messages, one per block, with the text
+    /// unchanged.
+    #[test]
+    fn assistant_text_blocks_replay_as_plain_string_messages() {
+        let request = LlmRequest {
+            messages: vec![
+                Message::user("hi"),
+                Message::Assistant {
+                    id: None,
+                    content: vec![
+                        AssistantBlock::Text(TextBlock {
+                            text: "first".to_owned(),
+                        }),
+                        AssistantBlock::Text(TextBlock {
+                            text: "second".to_owned(),
+                        }),
+                    ],
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            request_json(&request)["input"],
+            serde_json::json!([
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "message", "role": "assistant", "content": "first"},
+                {"type": "message", "role": "assistant", "content": "second"},
+            ])
+        );
+    }
+
+    /// Text around a tool call keeps its position relative to the call.
+    #[test]
+    fn assistant_text_and_tool_call_keep_their_order() {
+        let request = LlmRequest {
+            messages: vec![Message::Assistant {
+                id: None,
+                content: vec![
+                    AssistantBlock::Text(TextBlock {
+                        text: "before".to_owned(),
+                    }),
+                    AssistantBlock::ToolCall(ToolCall {
+                        id: "fc_1".to_owned(),
+                        call_id: Some("call_1".to_owned()),
+                        function: ToolFunction {
+                            name: "lookup".to_owned(),
+                            arguments: serde_json::json!({}),
+                        },
+                        signature: None,
+                        additional_params: None,
+                    }),
+                    AssistantBlock::Text(TextBlock {
+                        text: "after".to_owned(),
+                    }),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        let input = request_json(&request)["input"].clone();
+        let input = input.as_array().expect("input is a list of items");
+        assert_eq!(input.len(), 3);
+        assert_eq!(
+            input[0],
+            serde_json::json!({"type": "message", "role": "assistant", "content": "before"})
+        );
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(
+            input[2],
+            serde_json::json!({"type": "message", "role": "assistant", "content": "after"})
+        );
     }
 
     #[test]
