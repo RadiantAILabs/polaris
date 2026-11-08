@@ -969,7 +969,7 @@ pub(crate) async fn start_managed(
     timeout: Duration,
     reserved: bool,
 ) -> Result<ShellProcess, ShellError> {
-    let working_dir = executor.pin_working_dir(&working_dir)?;
+    let working_dir = executor.pin_working_dir(&working_dir, request.allowed_dirs.as_deref())?;
     if let Some(sink) = &request.sink
         && !sink.0.try_claim()
     {

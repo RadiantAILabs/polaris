@@ -108,8 +108,10 @@ pub struct ShellConfig {
     /// with sandboxing enabled means **no** directory is allowed — the caller
     /// must explicitly grant access before any command can run.
     ///
-    /// When `false`, `allowed_dirs` is ignored and any directory is permitted.
-    /// This is an explicit opt-out of the security sandbox.
+    /// When `false`, `allowed_dirs` is ignored and any directory is permitted,
+    /// unless the request sets its own
+    /// [`allowed_dirs`](ShellRequest::allowed_dirs). This is an explicit
+    /// opt-out of the security sandbox.
     pub sandbox: bool,
 
     /// Directories the shell is allowed to operate in when `sandbox` is `true`.
@@ -444,8 +446,9 @@ impl ShellConfig {
 
     /// Disables directory sandboxing.
     ///
-    /// When disabled, `allowed_dirs` is ignored and any directory is permitted.
-    /// Sandboxing is enabled by default — call this only when unrestricted
+    /// When disabled, `allowed_dirs` is ignored and any directory is permitted,
+    /// unless the request sets its own
+    /// [`allowed_dirs`](ShellRequest::allowed_dirs). Sandboxing is enabled by default — call this only when unrestricted
     /// directory access is intentionally required.
     #[must_use]
     pub fn disable_sandbox(mut self) -> Self {
@@ -521,6 +524,12 @@ pub struct ShellRequest {
 
     /// Optional destination for incremental process events.
     pub sink: Option<ShellSinkHandle>,
+
+    /// Extra folder limit for this request only. If `Some`, the working
+    /// directory must be inside one of these folders, in addition to every
+    /// check the executor already makes. It can only narrow what the
+    /// executor allows, never widen it. An empty list refuses every folder.
+    pub allowed_dirs: Option<Vec<PathBuf>>,
 }
 
 impl ShellRequest {
@@ -543,6 +552,7 @@ impl ShellRequest {
             timeout_secs: None,
             cancel: None,
             sink: None,
+            allowed_dirs: None,
         }
     }
 
@@ -571,6 +581,34 @@ impl ShellRequest {
     #[must_use]
     pub fn with_sink(mut self, sink: ShellSinkHandle) -> Self {
         self.sink = Some(sink);
+        self
+    }
+
+    /// Limits this request's working directory to these folders.
+    ///
+    /// Use it when one executor serves sessions with different roots, for
+    /// example a helper agent confined to its own git worktree. The limit is
+    /// checked on the opened directory, after symlinks are resolved, like
+    /// [`ShellConfig::allowed_dirs`]. It applies even when the executor's
+    /// sandbox is disabled. Each folder must exist; a folder that cannot be
+    /// resolved refuses the request.
+    ///
+    /// This limits where the command starts, not which files the command
+    /// can touch once it runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_shell::ShellRequest;
+    ///
+    /// let req = ShellRequest::new("cargo test")
+    ///     .with_working_dir("/work/repo/.worktrees/helper-1")
+    ///     .with_allowed_dirs(vec!["/work/repo/.worktrees/helper-1".into()]);
+    /// assert_eq!(req.allowed_dirs.as_ref().map(Vec::len), Some(1));
+    /// ```
+    #[must_use]
+    pub fn with_allowed_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.allowed_dirs = Some(dirs);
         self
     }
 }
@@ -1075,8 +1113,10 @@ impl ShellExecutor {
     /// - [`ShellError::PermissionDenied`] — a deny pattern matched.
     /// - [`ShellError::CommandTooLong`] — the command exceeds
     ///   [`ShellConfig::max_command_length`].
-    /// - [`ShellError::InvalidWorkingDir`] — the directory does not exist or
-    ///   is outside the sandbox.
+    /// - [`ShellError::InvalidWorkingDir`] — the directory does not exist, is
+    ///   outside the sandbox, or is outside the request's
+    ///   [`allowed_dirs`](ShellRequest::allowed_dirs) (checked even with the
+    ///   sandbox off), or one of those request folders cannot be resolved.
     /// - [`ShellError::SpawnFailed`] / [`ShellError::IoError`] — the child
     ///   could not be started or its pipes could not be taken.
     /// - [`ShellError::ResultConsumed`] — the reservation was bypassed and the
@@ -1099,7 +1139,9 @@ impl ShellExecutor {
     ///
     /// Bypasses the `Confirm` check but still enforces `Deny` — denied
     /// commands can never be executed. Reserves its run exactly as
-    /// [`execute`](Self::execute) does.
+    /// [`execute`](Self::execute) does. The request's
+    /// [`allowed_dirs`](ShellRequest::allowed_dirs) still apply, so a request
+    /// rebuilt after approval must set them again.
     ///
     /// # Errors
     ///
@@ -1314,7 +1356,17 @@ impl ShellExecutor {
     /// rename or symlink exchange cannot replace it between validation and
     /// spawn. The caller must retain the handle and use `fchdir` in the child.
     /// Other platforms require trusted directory ancestry through spawn.
-    pub(crate) fn pin_working_dir(&self, dir: &Path) -> Result<ValidatedWorkingDir, ShellError> {
+    pub(crate) fn pin_working_dir(
+        &self,
+        dir: &Path,
+        request_dirs: Option<&[PathBuf]>,
+    ) -> Result<ValidatedWorkingDir, ShellError> {
+        let check = self.0.config.sandbox || request_dirs.is_some();
+        // Resolve the request's folders before the directory is opened, so a
+        // rename after the opened directory is observed cannot move a folder
+        // onto that stale path.
+        let request_roots = request_dirs.map(resolve_request_dirs).transpose()?;
+        let request_roots = request_roots.as_deref();
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -1330,7 +1382,7 @@ impl ShellExecutor {
                         dir.display()
                     ))
                 })?;
-            let path = if self.0.config.sandbox {
+            let path = if check {
                 let descriptor_path =
                     PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
                 // Procfs reports the physical path of the opened object.
@@ -1342,7 +1394,7 @@ impl ShellExecutor {
                         dir.display()
                     ))
                 })?;
-                self.validate_resolved_working_dir(&observed)?
+                self.validate_resolved_working_dir(&observed, request_roots)?
             } else {
                 dir.to_path_buf()
             };
@@ -1356,14 +1408,14 @@ impl ShellExecutor {
                     dir.display()
                 )));
             }
-            let path = if self.0.config.sandbox {
+            let path = if check {
                 let canonical = dir.canonicalize().map_err(|io_err| {
                     ShellError::InvalidWorkingDir(format!(
                         "cannot canonicalize {}: {io_err}",
                         dir.display()
                     ))
                 })?;
-                self.validate_resolved_working_dir(&canonical)?
+                self.validate_resolved_working_dir(&canonical, request_roots)?
             } else {
                 dir.to_path_buf()
             };
@@ -1372,10 +1424,28 @@ impl ShellExecutor {
     }
 
     /// Checks an already resolved directory path without walking it again.
-    fn validate_resolved_working_dir(&self, dir: &Path) -> Result<PathBuf, ShellError> {
+    ///
+    /// The executor's folders apply when its sandbox is on; the request's
+    /// already resolved folders apply whenever they are given. Both must
+    /// accept the path.
+    fn validate_resolved_working_dir(
+        &self,
+        dir: &Path,
+        request_roots: Option<&[PathBuf]>,
+    ) -> Result<PathBuf, ShellError> {
+        if self.0.config.sandbox {
+            self.validate_executor_dirs(dir)?;
+        }
+        if let Some(request_roots) = request_roots {
+            validate_request_dirs(dir, request_roots)?;
+        }
+        Ok(dir.to_path_buf())
+    }
+
+    fn validate_executor_dirs(&self, dir: &Path) -> Result<(), ShellError> {
         for allowed in &self.0.canonical_allowed_dirs {
             if dir.starts_with(allowed) {
-                return Ok(dir.to_path_buf());
+                return Ok(());
             }
         }
 
@@ -1391,6 +1461,37 @@ impl ShellExecutor {
             )))
         }
     }
+}
+
+/// Resolves every folder of one request's limit.
+///
+/// Each folder is resolved at the time of the request, so a folder that was
+/// moved or replaced by a symlink is judged by what it points to then. Any
+/// folder that cannot be resolved refuses the request, wherever it is in the
+/// list.
+fn resolve_request_dirs(request_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, ShellError> {
+    request_dirs
+        .iter()
+        .map(|allowed| {
+            allowed.canonicalize().map_err(|io_err| {
+                ShellError::InvalidWorkingDir(format!(
+                    "request allowed_dirs entry {} is invalid: {io_err}",
+                    allowed.display()
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Checks a resolved directory against one request's resolved folders.
+fn validate_request_dirs(dir: &Path, request_roots: &[PathBuf]) -> Result<(), ShellError> {
+    if request_roots.iter().any(|allowed| dir.starts_with(allowed)) {
+        return Ok(());
+    }
+    Err(ShellError::InvalidWorkingDir(format!(
+        "directory {} is outside this request's allowed directories",
+        dir.display()
+    )))
 }
 
 /// Simple wildcard pattern matching with O(1) memory.
@@ -2331,7 +2432,7 @@ mod tests {
         std::fs::rename(&outside, &moved).unwrap();
         symlink(&allowed, &outside).unwrap();
         assert!(matches!(
-            executor.validate_resolved_working_dir(&observed),
+            executor.validate_resolved_working_dir(&observed, None),
             Err(ShellError::InvalidWorkingDir(_))
         ));
     }

@@ -60,9 +60,10 @@ to report `cleanup_completed = false`; escaped processes without inherited pipes
 cannot be detected this way. Windows cleanup is direct-child-only. This surface uses pipes rather
 than a PTY.
 
-`run_command` keeps the same LLM-visible schema. Hosts opt into streaming and
-cancellation through [`ToolContext`](crate::tools::ToolContext) values when
-calling [`ToolRegistry::execute_with`](crate::tools::ToolRegistry::execute_with).
+`run_command` keeps the same LLM-visible schema. Hosts opt into streaming,
+cancellation, and a per-call folder limit (`ShellAllowedDirs`) through
+[`ToolContext`](crate::tools::ToolContext) values when calling
+[`ToolRegistry::execute_with`](crate::tools::ToolRegistry::execute_with).
 
 # Related
 

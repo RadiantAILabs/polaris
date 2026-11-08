@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-08
+
+### Added
+
+- **Per-request shell folders** (`polaris_shell`) — `ShellRequest::with_allowed_dirs` and the `ShellAllowedDirs` tool-context value let one command use fewer folders than the executor allows, never more. See [Resources — `ShellExecutor`](docs/reference/resources.md#shellexecutor).
+
 ## [0.9.1] - 2026-11-08
 
 ### Fixed

@@ -86,6 +86,45 @@ pub enum ShellToolResponse {
     },
 }
 
+/// Folder limit for one `run_command` call, supplied by the host.
+///
+/// Put it in the [`ToolContext`](polaris_tools::ToolContext) to confine a
+/// session (for example a helper agent in its own git worktree) to fewer
+/// folders than the shared [`ShellExecutor`] allows. The tool passes it to
+/// [`ShellRequest::with_allowed_dirs`], so it can only narrow the executor's
+/// limits. It never appears in the model-facing JSON schema.
+///
+/// When the call needs confirmation, the returned
+/// [`ShellToolResponse::ConfirmationRequired`] does not carry this limit: a
+/// host that runs the approved command must attach it again.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_shell::ShellAllowedDirs;
+/// use polaris_tools::ToolContext;
+///
+/// let context = ToolContext::new()
+///     .with(ShellAllowedDirs::new(vec!["/work/repo/.worktrees/helper-1".into()]));
+/// assert!(context.get::<ShellAllowedDirs>().is_some());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellAllowedDirs(Vec<PathBuf>);
+
+impl ShellAllowedDirs {
+    /// Creates a limit from these folders. An empty list refuses every folder.
+    #[must_use]
+    pub fn new(dirs: Vec<PathBuf>) -> Self {
+        Self(dirs)
+    }
+
+    /// The folders in this limit.
+    #[must_use]
+    pub fn dirs(&self) -> &[PathBuf] {
+        &self.0
+    }
+}
+
 /// LLM-callable shell tools backed by a [`ShellExecutor`].
 #[derive(Debug)]
 pub struct ShellTools {
@@ -115,6 +154,9 @@ impl ShellTools {
     /// cancellation signal and put it in the context to stop the child while
     /// keeping the invocation future alive. Dropping that future also requests
     /// a stop through the foreground process handle.
+    // This comment is not part of the tool description sent to the model:
+    // `allowed_dirs` is also a `#[context]` parameter, and a
+    // `ShellAllowedDirs` narrows where this call may start.
     #[tool]
     async fn run_command(
         &self,
@@ -132,6 +174,9 @@ impl ShellTools {
         /// Optional destination for incremental process events.
         #[context]
         sink: Option<ShellSinkHandle>,
+        /// Optional folder limit for this call.
+        #[context]
+        allowed_dirs: Option<ShellAllowedDirs>,
     ) -> Result<ShellToolResponse, ToolError> {
         let mut request = ShellRequest::new(&command);
 
@@ -149,6 +194,10 @@ impl ShellTools {
 
         if let Some(sink) = sink {
             request = request.with_sink(sink);
+        }
+
+        if let Some(allowed_dirs) = allowed_dirs {
+            request = request.with_allowed_dirs(allowed_dirs.0);
         }
 
         let response =

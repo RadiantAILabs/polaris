@@ -137,6 +137,11 @@
 //! [`ShellExecutor`] through `Res<ShellExecutor>` in systems and applying
 //! additional permission checks at the agent level.
 //!
+//! A single request can also narrow the executor's folders with
+//! [`ShellRequest::with_allowed_dirs`], or through a [`ShellAllowedDirs`]
+//! context value for `run_command`. This limit applies even when the
+//! executor's sandbox is off, and it can never widen the executor's folders.
+//!
 //! ## Layer 3: External Config File
 //!
 //! An external config file can provide user-editable permission overrides without
@@ -177,4 +182,4 @@ pub use process::{
     ShellEventReceiver, ShellOutcome, ShellProcess, ShellProcessId, ShellProcessState,
     ShellProcessStatus, ShellSink, ShellSinkHandle, ShellStream,
 };
-pub use tools::{ShellToolResponse, ShellTools};
+pub use tools::{ShellAllowedDirs, ShellToolResponse, ShellTools};

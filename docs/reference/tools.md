@@ -167,6 +167,8 @@ Tool context values carry host-only shell observation without changing the
 `run_command` JSON schema. A host can insert a
 `ShellSinkHandle` and `ShellCancel`, then use `execute_with`; callers using
 `execute` receive the existing foreground behavior with neither value present.
+A `ShellAllowedDirs` value in the same context narrows the folders this one
+call may start in, below the executor's `allowed_dirs`.
 
 ```no_run
 use polaris_shell::{ChannelSink, ShellCancel, ShellEvent, ShellSinkHandle};

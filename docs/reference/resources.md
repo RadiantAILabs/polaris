@@ -164,6 +164,14 @@ Incremental delivery is caller-supplied through `ShellSinkHandle`, rather than
 through the `UserIO` local resource. For LLM tool calls, pass the sink and an
 optional `ShellCancel` through `ToolContext` and `ToolRegistry::execute_with`.
 
+One executor can serve sessions with different folders. Its
+`ShellConfig::allowed_dirs` is the outer limit; a single request can narrow it
+with `ShellRequest::with_allowed_dirs`, or, for `run_command`, by putting a
+`ShellAllowedDirs` in the `ToolContext`. A request limit never widens the
+executor's limit, applies even when the sandbox is disabled, and checks the
+opened directory after symlinks are resolved. It limits where a command
+starts, not which files the command touches once running.
+
 ```rust
 # use polaris_ai::polaris_system;
 use polaris_ai::system::{system, system::SystemError};
