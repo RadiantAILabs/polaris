@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-08
+
 ### Added
 
-- **Per-request shell folders: `ShellRequest::with_allowed_dirs`, `ShellRequest::allowed_dirs`, `ShellAllowedDirs`** (`polaris_shell`) — one `ShellExecutor` can now serve sessions with different folders. A request's folders narrow `ShellConfig::allowed_dirs` and never widen it; they apply even with the sandbox disabled, are checked on the opened directory after symlinks are resolved, and an empty or unresolvable entry refuses the request. `run_command` reads a `ShellAllowedDirs` from the `ToolContext`; it is not in the model-facing schema. This limits where a command starts, not what it touches once running. See [Resources — `ShellExecutor`](docs/reference/resources.md#shellexecutor).
+- **Per-request shell folders** (`polaris_shell`) — `ShellRequest::with_allowed_dirs` and the `ShellAllowedDirs` tool-context value let one command use fewer folders than the executor allows, never more. See [Resources — `ShellExecutor`](docs/reference/resources.md#shellexecutor).
 
 ## [0.9.1] - 2026-11-08
 
