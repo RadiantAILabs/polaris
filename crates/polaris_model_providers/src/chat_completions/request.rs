@@ -145,9 +145,18 @@ fn convert_messages(
     Ok(())
 }
 
+/// The text a `tool` message carries when its result is an image.
+///
+/// A `tool` message takes text only, so the image itself goes into the user
+/// message that follows the tool messages, and this note points the model at it.
+pub(super) const IMAGE_TOOL_RESULT_NOTE: &str =
+    "The result is an image. It is attached in the next message.";
+
 /// Converts a user message. Tool results become `tool` messages, which must
 /// directly follow the assistant message that made the calls, so they come
 /// first; any text and images that came with them follow as one user message.
+/// An image tool result becomes a `tool` message with
+/// [`IMAGE_TOOL_RESULT_NOTE`], and its image goes into that user message.
 fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<(), GenerationError> {
     let mut parts = Vec::new();
     let mut has_image = false;
@@ -163,7 +172,16 @@ fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<()
                 }));
                 has_image = true;
             }
-            UserBlock::ToolResult(result) => tool_messages.push(convert_tool_result(result)?),
+            UserBlock::ToolResult(result) => {
+                tool_messages.push(convert_tool_result(result)?);
+                if let ToolResultContent::Image(image) = &result.content {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": image_data_url(image)? },
+                    }));
+                    has_image = true;
+                }
+            }
             UserBlock::Audio(_) => {
                 return Err(GenerationError::UnsupportedContent(
                     "audio content is not supported by the Chat Completions provider".to_owned(),
@@ -199,11 +217,7 @@ fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<()
 fn convert_tool_result(result: &ToolResult) -> Result<Value, GenerationError> {
     let text = match &result.content {
         ToolResultContent::Text(text) => text.clone(),
-        ToolResultContent::Image(_) => {
-            return Err(GenerationError::UnsupportedContent(
-                "image tool results are not supported by the Chat Completions provider".to_owned(),
-            ));
-        }
+        ToolResultContent::Image(_) => IMAGE_TOOL_RESULT_NOTE.to_owned(),
     };
     let text = match result.status {
         ToolResultStatus::Success => text,
