@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Chat Completions provider sends image tool results** (`polaris_model_providers`) — a `ToolResultContent::Image` no longer fails with `GenerationError::UnsupportedContent`. A `tool` message takes text only, so the result is sent as a `tool` message with a note, and the image follows in a user message after the tool messages, as an `image_url` part with a label that names the call and marks it as tool output. `tool` messages now stay together after the calls even when their results come in separate messages. A server whose model takes no images may reject the request. See [Model Providers — Chat Completions servers](docs/reference/model-providers.md#chat-completions-servers).
+
 ## [0.9.2] - 2026-11-08
 
 ### Added

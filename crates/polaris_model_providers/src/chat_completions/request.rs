@@ -134,21 +134,46 @@ fn convert_messages(
     reasoning_field: Option<&'static str>,
     out: &mut Vec<Value>,
 ) -> Result<(), GenerationError> {
+    // `tool` messages must directly follow the assistant message that made the
+    // calls, so the rest of a user message waits until its run of tool results
+    // ends, even when the results come in several messages.
+    let mut held = Vec::new();
     for message in messages {
         match message {
-            Message::User { content } => convert_user_message(content, out)?,
+            Message::User { content } => {
+                let (tool_messages, user_message) = convert_user_message(content)?;
+                if tool_messages.is_empty() {
+                    out.append(&mut held);
+                }
+                out.extend(tool_messages);
+                held.extend(user_message);
+            }
             Message::Assistant { content, .. } => {
+                out.append(&mut held);
                 convert_assistant_message(content, reasoning_field, out)?;
             }
         }
     }
+    out.append(&mut held);
     Ok(())
 }
 
-/// Converts a user message. Tool results become `tool` messages, which must
-/// directly follow the assistant message that made the calls, so they come
-/// first; any text and images that came with them follow as one user message.
-fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<(), GenerationError> {
+/// The text a `tool` message carries when its result is an image.
+///
+/// A `tool` message takes text only, so the image itself goes into a user
+/// message after the tool messages, under a label naming the call.
+pub(super) const IMAGE_TOOL_RESULT_NOTE: &str =
+    "The result is an image. It is attached after the tool results, labeled with this call's id.";
+
+/// Converts a user message into its `tool` messages and the user message for
+/// the rest of its content, if any.
+///
+/// An image tool result becomes a `tool` message with [`IMAGE_TOOL_RESULT_NOTE`],
+/// and its image goes into the user message after a label that names the call
+/// and marks the image as tool output, so the model can tell it from user input.
+fn convert_user_message(
+    blocks: &[UserBlock],
+) -> Result<(Vec<Value>, Option<Value>), GenerationError> {
     let mut parts = Vec::new();
     let mut has_image = false;
     let mut tool_messages = Vec::new();
@@ -157,13 +182,21 @@ fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<()
         match block {
             UserBlock::Text(text) => parts.push(json!({ "type": "text", "text": text.text })),
             UserBlock::Image(image) => {
-                parts.push(json!({
-                    "type": "image_url",
-                    "image_url": { "url": image_data_url(image)? },
-                }));
+                parts.push(image_part(image)?);
                 has_image = true;
             }
-            UserBlock::ToolResult(result) => tool_messages.push(convert_tool_result(result)?),
+            UserBlock::ToolResult(result) => {
+                let id = tool_result_id(result)?;
+                tool_messages.push(convert_tool_result(result, id));
+                if let ToolResultContent::Image(image) = &result.content {
+                    parts.push(json!({
+                        "type": "text",
+                        "text": format!("Image returned by tool call `{id}` (tool output, not user input):"),
+                    }));
+                    parts.push(image_part(image)?);
+                    has_image = true;
+                }
+            }
             UserBlock::Audio(_) => {
                 return Err(GenerationError::UnsupportedContent(
                     "audio content is not supported by the Chat Completions provider".to_owned(),
@@ -177,9 +210,8 @@ fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<()
         }
     }
 
-    out.extend(tool_messages);
     if parts.is_empty() {
-        return Ok(());
+        return Ok((tool_messages, None));
     }
     // Text only is sent as a plain string, which every server reads. Images
     // need the parts form.
@@ -192,29 +224,30 @@ fn convert_user_message(blocks: &[UserBlock], out: &mut Vec<Value>) -> Result<()
             .collect();
         Value::String(text.join("\n"))
     };
-    out.push(json!({ "role": "user", "content": content }));
-    Ok(())
+    Ok((
+        tool_messages,
+        Some(json!({ "role": "user", "content": content })),
+    ))
 }
 
-fn convert_tool_result(result: &ToolResult) -> Result<Value, GenerationError> {
+fn tool_result_id(result: &ToolResult) -> Result<&str, GenerationError> {
+    tool_call_id(result.call_id.as_deref(), &result.id).ok_or_else(|| {
+        GenerationError::InvalidRequest(
+            "a tool result has no id to link it to its tool call".to_owned(),
+        )
+    })
+}
+
+fn convert_tool_result(result: &ToolResult, id: &str) -> Value {
     let text = match &result.content {
         ToolResultContent::Text(text) => text.clone(),
-        ToolResultContent::Image(_) => {
-            return Err(GenerationError::UnsupportedContent(
-                "image tool results are not supported by the Chat Completions provider".to_owned(),
-            ));
-        }
+        ToolResultContent::Image(_) => IMAGE_TOOL_RESULT_NOTE.to_owned(),
     };
     let text = match result.status {
         ToolResultStatus::Success => text,
         ToolResultStatus::Error => format!("Error: {text}"),
     };
-    let id = tool_call_id(result.call_id.as_deref(), &result.id).ok_or_else(|| {
-        GenerationError::InvalidRequest(
-            "a tool result has no id to link it to its tool call".to_owned(),
-        )
-    })?;
-    Ok(json!({ "role": "tool", "tool_call_id": id, "content": text }))
+    json!({ "role": "tool", "tool_call_id": id, "content": text })
 }
 
 /// The id a tool call goes by on the wire: the provider call id when there is
@@ -287,6 +320,10 @@ fn convert_tool_call(call: &ToolCall) -> Result<Value, GenerationError> {
         "type": "function",
         "function": { "name": call.function.name, "arguments": arguments },
     }))
+}
+
+fn image_part(image: &ImageBlock) -> Result<Value, GenerationError> {
+    Ok(json!({ "type": "image_url", "image_url": { "url": image_data_url(image)? } }))
 }
 
 fn image_data_url(image: &ImageBlock) -> Result<String, GenerationError> {

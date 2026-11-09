@@ -178,6 +178,70 @@ fn each_tool_result_is_its_own_message_in_order() {
     );
 }
 
+fn png() -> ToolResultContent {
+    ToolResultContent::Image(ImageBlock {
+        data: DocumentSource::Base64("QUJD".to_owned()),
+        media_type: ImageMediaType::PNG,
+        additional_params: None,
+    })
+}
+
+/// The user content an image result from `png` is sent as.
+fn labeled_png(id: &str) -> Value {
+    json!([
+        { "type": "text", "text": format!("Image returned by tool call `{id}` (tool output, not user input):") },
+        { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } },
+    ])
+}
+
+#[test]
+fn results_in_separate_messages_keep_their_tool_messages_together() {
+    let (first, second) = (call("c1", None), call("c2", None));
+    let request = LlmRequest {
+        messages: vec![
+            assistant(vec![
+                AssistantBlock::ToolCall(first.clone()),
+                AssistantBlock::ToolCall(second.clone()),
+            ]),
+            Message::tool_result_for(&first, png()),
+            Message::tool_result_for(&second, ToolResultContent::Text("a.png".to_owned())),
+            Message::user("next"),
+        ],
+        ..Default::default()
+    };
+    let sent = messages(&request);
+    let roles: Vec<&str> = sent.iter().filter_map(|m| m["role"].as_str()).collect();
+    assert_eq!(
+        roles,
+        ["assistant", "tool", "tool", "user", "user"],
+        "{sent:?}"
+    );
+    assert_eq!(sent[1]["tool_call_id"], "c1");
+    assert_eq!(sent[2]["tool_call_id"], "c2");
+    assert_eq!(sent[3]["content"], labeled_png("c1"));
+    assert_eq!(sent[4], json!({ "role": "user", "content": "next" }));
+}
+
+#[test]
+fn a_failed_image_result_is_marked_and_keeps_its_image() {
+    let call = call("c1", None);
+    let request = LlmRequest {
+        messages: vec![
+            assistant(vec![AssistantBlock::ToolCall(call.clone())]),
+            Message::User {
+                content: vec![call.error(png())],
+            },
+        ],
+        ..Default::default()
+    };
+    let sent = messages(&request);
+    assert_eq!(
+        sent[1],
+        json!({ "role": "tool", "tool_call_id": "c1", "content": format!("Error: {IMAGE_TOOL_RESULT_NOTE}") })
+    );
+    assert_eq!(sent[2]["content"], labeled_png("c1"));
+}
+
 #[test]
 fn a_call_from_the_responses_api_goes_by_its_call_id_in_both_places() {
     let call = call("fc_item", Some("call_link"));
@@ -292,6 +356,11 @@ fn audio_documents_and_unsupported_images_are_refused() {
         UserBlock::audio_base64("QQ==", AudioMediaType::WAV),
         UserBlock::document_base64("a.txt", "QQ==", DocumentMediaType::TXT),
         UserBlock::image_base64("QQ==", ImageMediaType::HEIC),
+        call("c1", None).result(ToolResultContent::Image(ImageBlock {
+            data: DocumentSource::Base64("QQ==".to_owned()),
+            media_type: ImageMediaType::HEIC,
+            additional_params: None,
+        })),
     ];
     for block in blocks {
         let request = LlmRequest {

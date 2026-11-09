@@ -1310,7 +1310,7 @@ async fn a_long_error_body_is_cut_off_but_its_status_is_kept() {
 }
 
 #[tokio::test]
-async fn a_failed_tool_result_is_marked_and_images_in_results_are_refused() {
+async fn a_failed_tool_result_is_marked() {
     let mut call = polaris_models::llm::ToolCall::new("c1", "get_weather", json!({}));
     call.call_id = Some("c1".to_owned());
     let mut server = Server::start(Reply::json(&json!({
@@ -1333,8 +1333,18 @@ async fn a_failed_tool_result_is_marked_and_images_in_results_are_refused() {
         seen.body["messages"][2],
         json!({ "role": "tool", "tool_call_id": "c1", "content": "Error: timed out" })
     );
+}
 
-    let provider = ChatCompletionsProvider::without_api_key().with_http_client(no_proxy_client());
+#[tokio::test]
+async fn an_image_tool_result_is_a_note_then_the_image_in_a_user_message() {
+    let mut call = polaris_models::llm::ToolCall::new("c1", "read_file", json!({}));
+    call.call_id = Some("c1".to_owned());
+    let mut other = polaris_models::llm::ToolCall::new("c2", "list_files", json!({}));
+    other.call_id = Some("c2".to_owned());
+    let mut server = Server::start(Reply::json(&json!({
+        "choices": [{ "message": { "content": "ok" } }],
+    })))
+    .await;
     let image = polaris_models::llm::ImageBlock {
         data: polaris_models::llm::DocumentSource::Base64("QUJD".to_owned()),
         media_type: ImageMediaType::PNG,
@@ -1343,17 +1353,47 @@ async fn a_failed_tool_result_is_marked_and_images_in_results_are_refused() {
     let request = LlmRequest {
         messages: vec![
             Message::user("go"),
-            Message::assistant_tool_call(call.clone()),
-            Message::tool_result_for(&call, ToolResultContent::Image(image)),
+            Message::Assistant {
+                id: None,
+                content: vec![
+                    AssistantBlock::ToolCall(call.clone()),
+                    AssistantBlock::ToolCall(other.clone()),
+                ],
+            },
+            Message::User {
+                content: vec![
+                    call.result(ToolResultContent::Image(image)),
+                    other.result(ToolResultContent::Text("a.png".to_owned())),
+                ],
+            },
         ],
         ..Default::default()
     };
-    let error = within(provider.generate("m", request))
+    within(server.provider().generate("m", request))
         .await
-        .expect_err("image results cannot be sent");
-    assert!(
-        matches!(error, GenerationError::UnsupportedContent(_)),
-        "{error:?}"
+        .expect("an image result is sent");
+    let seen = server.recorded().await;
+    let messages = seen.body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 5, "{messages:?}");
+    // Both tool messages come straight after the calls, the image one as a note.
+    assert_eq!(
+        messages[2],
+        json!({ "role": "tool", "tool_call_id": "c1", "content": request::IMAGE_TOOL_RESULT_NOTE })
+    );
+    assert_eq!(
+        messages[3],
+        json!({ "role": "tool", "tool_call_id": "c2", "content": "a.png" })
+    );
+    // The image follows as a user message, labeled as the output of its call.
+    assert_eq!(
+        messages[4],
+        json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Image returned by tool call `c1` (tool output, not user input):" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } },
+            ],
+        })
     );
 }
 

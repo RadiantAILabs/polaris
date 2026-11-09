@@ -100,7 +100,7 @@ const MAX_ERROR_BODY_CHARS: usize = 2_000;
 /// | Request | Body |
 /// |---------|------|
 /// | `system` | a first `system` message |
-/// | messages | `user` messages (text as a string; with images, as `text` / `image_url` parts), `assistant` messages with `tool_calls`, and one `tool` message per tool result |
+/// | messages | `user` messages (text as a string; with images, as `text` / `image_url` parts), `assistant` messages with `tool_calls`, and one `tool` message per tool result (an image result as a note, with the image in a user message after the tool messages) |
 /// | `tools`, `tool_choice` | `tools`, `tool_choice`; no `strict` unless [`with_strict_tools`](Self::with_strict_tools) |
 /// | `output_schema` | `response_format` of type `json_schema` |
 /// | `max_output_tokens` | `max_completion_tokens`, or `max_tokens` with [`with_max_tokens_field`](Self::with_max_tokens_field) |
@@ -108,9 +108,13 @@ const MAX_ERROR_BODY_CHARS: usize = 2_000;
 /// | streaming | `stream: true` and `stream_options.include_usage: true` |
 ///
 /// A tool result's text gets an `Error: ` prefix when it reports a failure.
+/// `tool` messages always directly follow the calls, so a user message's other
+/// content waits until its run of tool results ends. A `tool` message takes
+/// text only, so an image result's image goes into that user message, after a
+/// label that names the call and marks the image as tool output.
 /// Earlier reasoning is sent back on assistant messages under the field the server used for it, `reasoning_content` or `reasoning`
-/// (see [`ReasoningReplay`]). Audio and document blocks, and images in tool
-/// results, fail with [`GenerationError::UnsupportedContent`].
+/// (see [`ReasoningReplay`]). Audio and document blocks fail with
+/// [`GenerationError::UnsupportedContent`].
 /// `LlmRequest::cache` markers are ignored by this provider.
 ///
 /// [`with_extra_body`](Self::with_extra_body) adds fields that Polaris has no
