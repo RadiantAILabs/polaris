@@ -1356,8 +1356,8 @@ async fn an_image_tool_result_is_a_note_then_the_image_in_a_user_message() {
             Message::Assistant {
                 id: None,
                 content: vec![
-                    polaris_models::llm::AssistantBlock::ToolCall(call.clone()),
-                    polaris_models::llm::AssistantBlock::ToolCall(other.clone()),
+                    AssistantBlock::ToolCall(call.clone()),
+                    AssistantBlock::ToolCall(other.clone()),
                 ],
             },
             Message::User {
@@ -1378,18 +1378,21 @@ async fn an_image_tool_result_is_a_note_then_the_image_in_a_user_message() {
     // Both tool messages come straight after the calls, the image one as a note.
     assert_eq!(
         messages[2],
-        json!({ "role": "tool", "tool_call_id": "c1", "content": "The result is an image. It is attached in the next message." })
+        json!({ "role": "tool", "tool_call_id": "c1", "content": request::IMAGE_TOOL_RESULT_NOTE })
     );
     assert_eq!(
         messages[3],
         json!({ "role": "tool", "tool_call_id": "c2", "content": "a.png" })
     );
-    // The image follows as a user message in the parts form.
+    // The image follows as a user message, labeled as the output of its call.
     assert_eq!(
         messages[4],
         json!({
             "role": "user",
-            "content": [{ "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } }],
+            "content": [
+                { "type": "text", "text": "Image returned by tool call `c1` (tool output, not user input):" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } },
+            ],
         })
     );
 }
