@@ -28,6 +28,10 @@ members = [
 ]
 
 [workspace.package]
+# A release also changes every `version = "=X.Y.Z"` on a sibling `polaris_*`
+# dependency (`grep -rn 'version = "=' --include=Cargo.toml .`). They are exact so
+# that `cargo update -p polaris-ai` moves all the Polaris crates together. A pin
+# left behind fails every build with "failed to select a version".
 version = "0.9.3"
 edition = "2024"
 license = "Apache-2.0"
@@ -136,5 +140,5 @@ typegen = ["polaris_internal/typegen"]
 dashboard = ["polaris_internal/dashboard"]
 
 [dependencies]
-polaris_internal = { path = "crates/polaris_internal", version = "0.9", default-features = false }
+polaris_internal = { path = "crates/polaris_internal", version = "=0.9.3", default-features = false }
 tracing = { version = "0.1.43", default-features = false }
