@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Polaris crates require each other at the exact same version** (all crates) — a dependency between two Polaris crates, such as `polaris-ai` on `polaris_internal`, was `0.9`, which any 0.9.x satisfies. `cargo update -p polaris-ai` then moved `polaris-ai` alone and left `polaris_internal`, `polaris_models` and the others at the version already in the consumer's `Cargo.lock`, so a `--locked` build ran old code from them. These requirements are now `=0.9.3` and change with each release, so updating `polaris-ai` moves them all. `cargo publish` for a crate now needs the Polaris crates it requires on the registry first, so publish in dependency order (`cargo publish --workspace` does).
+
 ## [0.9.3] - 2026-11-09
 
 ### Changed

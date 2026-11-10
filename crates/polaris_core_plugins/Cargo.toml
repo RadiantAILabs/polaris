@@ -19,10 +19,10 @@ rustdoc-args = ["--cfg", "docsrs", "--cfg", "docsrs_dep"]
 workspace = true
 
 [dependencies]
-polaris_system = { path = "../polaris_system", version = "0.9" }
-polaris_graph = { path = "../polaris_graph", version = "0.9" }
-polaris_models = { path = "../polaris_models", version = "0.9" }
-polaris_tools = { path = "../polaris_tools", version = "0.9" }
+polaris_system = { path = "../polaris_system", version = "=0.9.3" }
+polaris_graph = { path = "../polaris_graph", version = "=0.9.3" }
+polaris_models = { path = "../polaris_models", version = "=0.9.3" }
+polaris_tools = { path = "../polaris_tools", version = "=0.9.3" }
 persistence_macros = { path = "persistence_macros", version = "0.9" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
